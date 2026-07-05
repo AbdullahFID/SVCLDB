@@ -307,16 +307,43 @@ static void state_flush_if_due(void) {
 }
 
 /* Restore saved state from disk if the file exists + is well-formed.
- * Called ONCE during ensure_cs(). Silently no-op on any error. */
+ * Called ONCE during ensure_cs(). Silently no-op on any error.
+ *
+ * Version-tolerant reader (Bypassify parity — they carry v5→v8
+ * migration; we start with v1 and grow forward). Rules:
+ *  - Magic MUST match (else file is corrupt or from a different tool)
+ *  - version MUST be >= 1 (0 is invalid)
+ *  - version > STATE_VERSION: reject entirely (file is newer than us,
+ *    reading it risks misinterpreting trailing fields as ours)
+ *  - version == STATE_VERSION: full read (fast path today)
+ *  - version < STATE_VERSION: read only the fields that existed at
+ *    THAT version; leave newer fields at their defaults. Requires
+ *    a version-size table so we know how many bytes to trust.
+ *
+ * All future struct extensions should append AFTER the last field
+ * and bump STATE_VERSION. Never rearrange existing fields or the
+ * migrator breaks. */
+static const unsigned int STATE_SIZE_BY_VERSION[] = {
+    0,   /* v0 — invalid */
+    40,  /* v1 — magic+version + visible/corner/offX/offY/extraW/extraH/alpha/font */
+};
+#define STATE_MAX_KNOWN_VERSION \
+    (sizeof(STATE_SIZE_BY_VERSION) / sizeof(STATE_SIZE_BY_VERSION[0]) - 1)
+
 static void state_load_once(void) {
     char path[MAX_PATH];
     state_file_path(path, sizeof(path));
     HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return;
-    unsigned char buf[40];
+    /* Read whatever's there up to our current struct size, plus a bit
+     * of slack in case a slightly-newer minor version added trailing
+     * bytes we choose to skip. 256 bytes is way more than any legit
+     * future extension we plan. */
+    unsigned char buf[256] = {0};
     DWORD r = 0;
-    if (!ReadFile(h, buf, sizeof(buf), &r, NULL) || r < sizeof(buf)) {
+    if (!ReadFile(h, buf, sizeof(buf), &r, NULL) || r < 8) {
+        /* Need at least magic+version — 8 bytes. */
         CloseHandle(h); return;
     }
     CloseHandle(h);
@@ -324,8 +351,19 @@ static void state_load_once(void) {
     unsigned int magic = 0, version = 0;
     memcpy(&magic,   buf + 0, 4);
     memcpy(&version, buf + 4, 4);
-    if (magic != STATE_MAGIC || version != STATE_VERSION) return;
+    if (magic != STATE_MAGIC) return;
+    if (version < 1) return;
+    /* Reject files from a FUTURE version — we can't safely read them. */
+    if (version > (unsigned int)STATE_VERSION) return;
 
+    /* Sanity: min bytes for this version. */
+    unsigned int need =
+        (version <= STATE_MAX_KNOWN_VERSION)
+            ? STATE_SIZE_BY_VERSION[version]
+            : 0;
+    if (need == 0 || r < need) return;
+
+    /* v1 fields — always present in every version >= 1. */
     int   iv_visible = 0, iv_corner = 0, iv_off_x = 0, iv_off_y = 0;
     int   iv_ew = 0, iv_eh = 0;
     float f_alpha = 0.94f, f_font = 1.0f;
@@ -356,6 +394,15 @@ static void state_load_once(void) {
     g_extra_h  = iv_eh;
     g_alpha    = f_alpha;
     g_font     = f_font;
+
+    /* Future: when STATE_VERSION bumps, read the newly-added fields
+     * here gated on `version >= 2`, etc. Each addition needs a new
+     * entry in STATE_SIZE_BY_VERSION[] with the total byte size for
+     * that version. On next save we'll write at STATE_VERSION and
+     * old files get automatically migrated forward. */
+
+    slog_writef("payload.log", "state: loaded v%u (%u bytes) -> STATE_VERSION=%u",
+                version, need, (unsigned)STATE_VERSION);
 }
 
 /* ---------- DWM-side screen capture ---------- *
