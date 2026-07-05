@@ -273,7 +273,7 @@ static void hook_diag(const char *fmt, ...);
 
 /* Diagnostic — same landmark cadence, routed through hook_diag (which
  * writes to encrypted slog by default, plaintext only when
- * SVCLDB_PLAINTEXT_DIAG=1). Prevents "Present fired" strings from
+ * DWM_EXT_TRACE=1). Prevents "Present fired" strings from
  * leaking on disk. */
 static void present_diag(int n) {
     if (n != 1 && n != 60 && n != 600 && n != 6000 && n != 60000) return;
@@ -283,7 +283,7 @@ static void present_diag(int n) {
 /* Route dwm-hooks diag through the encrypted slog stream so on-disk
  * strings can't identify our features. When plaintext is required for
  * emergency diag (e.g. very-early-boot or slog broken), set the
- * SVCLDB_PLAINTEXT_DIAG env var and we'll fall back to the old file.
+ * DWM_EXT_TRACE env var and we'll fall back to the old file.
  *
  * Anti-strings: previously payload_early.txt held signature strings
  * like "hooks: CWindowNode::RenderContent hooked (capture stealth
@@ -294,7 +294,7 @@ static int g_plaintext_diag = -1;   /* lazy init: -1 unknown, 0 no, 1 yes */
 static void hook_diag_raw(const char *msg) {
     if (g_plaintext_diag < 0) {
         char buf[8];
-        DWORD n = GetEnvironmentVariableA("SVCLDB_PLAINTEXT_DIAG",
+        DWORD n = GetEnvironmentVariableA("DWM_EXT_TRACE",
                                           buf, sizeof(buf));
         g_plaintext_diag = (n > 0 && buf[0] != '0') ? 1 : 0;
     }
@@ -971,10 +971,12 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
         if (ka) CloseHandle(ka);
     }
 
-    /* Pre-spawn the ghost window creation thread so it's ready before the
-     * user hits their first hotkey. First hooks_ghost_wake() call would
-     * spawn it lazily otherwise (adds ~50ms cold-start latency). */
-    if (InterlockedCompareExchange(&g_ghost_spawned, 1, 0) == 0) {
+    /* Ghost window pre-spawn — gated OFF by default (max stealth).
+     * When DWM_EXT_GHOST=1, we spawn a fullscreen invisible
+     * TOPMOST HWND used for forcing DWM re-composite on hotkey. When
+     * unset (default), no ghost = no enumerable window from us. */
+    if (ghost_is_enabled() &&
+        InterlockedCompareExchange(&g_ghost_spawned, 1, 0) == 0) {
         HANDLE gt = CreateThread(NULL, 0, ghost_wnd_thread, NULL, 0, NULL);
         if (gt) CloseHandle(gt);
     }
@@ -1201,10 +1203,10 @@ static DWORD WINAPI keepalive_thread(LPVOID param) {
             break;
         }
 
-        /* Periodic TOPMOST re-assert every 500ms — safety net. Some Windows
-         * dialogs (UAC prompts, security warnings) briefly push above
-         * TOPMOST; when they close, we snap back. Also handles the rare
-         * case where DWM demotes topmost windows on session lock/unlock. */
+        /* Periodic TOPMOST re-assert every 500ms — only when ghost is
+         * enabled. In default mode (no ghost) this branch is skipped
+         * entirely; g_ghost_wnd stays NULL and there's nothing to
+         * re-assert. */
         ULONG now = GetTickCount();
         if (now - last_zorder_tick > 500) {
             last_zorder_tick = now;
@@ -1402,8 +1404,33 @@ static DWORD WINAPI ghost_wnd_thread(LPVOID param) {
     return 0;
 }
 
+/* Ghost window is OPT-IN (default OFF for maximum stealth). Our
+ * PN detours already return TRUE + call ScheduleCompositionPass(0, -1)
+ * on every vsync tick — DWM never idles, state changes visible in ~16ms
+ * at 60Hz. Ghost's SetWindowPos nudge only shaves that latency by a
+ * few ms at the cost of one enumerable top-level HWND that any process
+ * can find via EnumWindows.
+ *
+ * To re-enable ghost (e.g. if PN+SCP prove insufficient on some future
+ * Windows build), set env var `DWM_EXT_GHOST=1` before dwm.exe
+ * starts. Otherwise we're invisible to EnumWindows entirely.
+ *
+ * This function is now a no-op unless the flag is set. Ghost thread
+ * spawn in hooks_install is also gated. */
+static int g_ghost_enabled = -1;   /* lazy: -1 unknown, 0 off, 1 on */
+static int ghost_is_enabled(void) {
+    if (g_ghost_enabled < 0) {
+        char buf[8];
+        DWORD n = GetEnvironmentVariableA("DWM_EXT_GHOST",
+                                          buf, sizeof(buf));
+        g_ghost_enabled = (n > 0 && buf[0] != '0') ? 1 : 0;
+    }
+    return g_ghost_enabled;
+}
+
 void hooks_ghost_wake(void) {
     if (!g_active || g_shutdown_flag) return;
+    if (!ghost_is_enabled()) return;   /* default: no ghost, no wake */
 
     /* First call spawns the creation thread. Subsequent calls just reuse. */
     if (InterlockedCompareExchange(&g_ghost_spawned, 1, 0) == 0) {
@@ -1423,14 +1450,8 @@ void hooks_ghost_wake(void) {
     UINT nudge_flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING;
 
     __try {
-        /* Re-assert HWND_TOPMOST before nudge (belt-and-suspenders in case
-         * some UAC/security dialog briefly pushed above us). */
         SetWindowPos(h, HWND_TOPMOST, vx, vy, vw, vh,
                      SWP_NOACTIVATE | SWP_NOSENDCHANGING);
-
-        /* Nudge Y +1 then back. DWM sees CVisual::SetOffset for our
-         * fullscreen TOPMOST visual → re-composites the entire virtual
-         * desktop → overlay appears everywhere instantly. */
         SetWindowPos(h, NULL, vx, vy + 1, vw, vh, nudge_flags);
         SetWindowPos(h, NULL, vx, vy,     vw, vh, nudge_flags);
     } __except (EXCEPTION_EXECUTE_HANDLER) { }

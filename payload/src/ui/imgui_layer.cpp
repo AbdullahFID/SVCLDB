@@ -85,7 +85,7 @@ static void diag_init_lock(void) {
 }
 
 /* Route UI-layer diag through encrypted slog. Enable plaintext mirror
- * with SVCLDB_PLAINTEXT_DIAG=1 env var. Anti-strings-scan pattern —
+ * with DWM_EXT_TRACE=1 env var. Anti-strings-scan pattern —
  * see dllmain.c early_log for the same shape. */
 static int g_ui_diag_plaintext = -1;
 static void diag(const char *fmt, ...) {
@@ -100,7 +100,7 @@ static void diag(const char *fmt, ...) {
 
     if (g_ui_diag_plaintext < 0) {
         char buf[8];
-        DWORD n = GetEnvironmentVariableA("SVCLDB_PLAINTEXT_DIAG",
+        DWORD n = GetEnvironmentVariableA("DWM_EXT_TRACE",
                                           buf, sizeof(buf));
         g_ui_diag_plaintext = (n > 0 && buf[0] != '0') ? 1 : 0;
     }
@@ -1476,7 +1476,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, ImVec4(0.28f, 0.42f, 0.68f, 0.85f));
     ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered, ImVec4(0.38f, 0.52f, 0.80f, 0.90f));
 
-    if (ImGui::Begin("svcldb - AI overlay", nullptr,
+    if (ImGui::Begin("AI overlay", nullptr,
         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) {
 
@@ -1488,7 +1488,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
             /* ── Empty state: full hotkey cheat sheet ─────────────────── */
             ImGui::BeginChild("body", ImVec2(0, -footer_height), false, 0);
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.72f, 0.86f, 1.0f, 1.0f));
-            ImGui::TextWrapped("svcldb overlay ready. Rendering inside DWM at %ux%u.",
+            ImGui::TextWrapped("Overlay ready. Rendering at %ux%u.",
                                screen_w, screen_h);
             ImGui::PopStyleColor();
             ImGui::Spacing();

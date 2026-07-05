@@ -46,6 +46,11 @@ REM  /Gy       function-level linking (dead-strip)
 REM  /MT       static CRT (no dependency on vcruntime redist)
 REM  /GL       whole-program optimization
 REM  /DNDEBUG  strip debug asserts
+REM  DO NOT enable /guard:cf — the launcher contains shellcode that runs
+REM  INSIDE dwm.exe via CreateRemoteThread. CFG-instrumented indirect
+REM  calls in that shellcode fail when the target process's CFG bitmap
+REM  doesn't contain launcher-side function addresses → __fastfail crash
+REM  inside DWM (verified 2026-07-05: remote thread exits 0xC0000005).
 set CFLAGS=/nologo /W3 /O2 /Oi /GS /Gy /MT /GL /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /DWIN32_LEAN_AND_MEAN
 
 REM ── Compile shared modules + launcher sources ─────────────────
@@ -58,17 +63,51 @@ set SOURCES=^
  "%SRC%\inject.c" "%SRC%\config_write.c" ^
  "%SRC%\main.c"
 
-REM ── Compile the .rc for the elevation manifest ────────────────
-rc /nologo /r /fo "%BUILD%\launcher.res" "%SRC%\launcher.rc"
+REM ── Locate the freshly-built payload DLL (produced by
+REM     payload/build.bat) and pass its full path to rc.exe as a
+REM     preprocessor define. launcher.rc conditionally emits an
+REM     RCDATA statement pointing at that file.
+REM
+REM     rc.exe wants forward slashes OR doubled backslashes inside
+REM     the string literal; forward slashes work in modern rc.exe.
+REM ─────────────────────────────────────────────────────────────
+set PAYLOAD_DLL=%ROOT%\build\payload\dwmapiext.dll
+if not exist "%PAYLOAD_DLL%" (
+  echo [!] Payload DLL not found at %PAYLOAD_DLL%
+  echo     Run payload\build.bat FIRST so we can embed it.
+  echo     Continuing without embedded payload — launcher will fall back
+  echo     to sibling-file mode at runtime.
+  rc /nologo /r /fo "%BUILD%\launcher.res" "%SRC%\launcher.rc"
+) else (
+  REM Escape backslashes for the C-preprocessor string literal
+  set PAYLOAD_DLL_ESCAPED=%PAYLOAD_DLL:\=\\%
+  rc /nologo /r /d PAYLOAD_DLL_PATH="\"!PAYLOAD_DLL_ESCAPED!\"" /fo "%BUILD%\launcher.res" "%SRC%\launcher.rc"
+)
 if errorlevel 1 (echo [!] rc failed & exit /b 1)
 
 REM ── Link ──────────────────────────────────────────────────────
-REM  /SUBSYSTEM:CONSOLE keeps stderr visible during MVP dev; switch to
-REM  WINDOWS once ImGui launcher is done.
-REM  /DEBUG:NONE + /EMITPOGODB:NO strip debug info to shrink binary
-REM  and prevent PDB path leaks. /Brepro forces deterministic timestamps.
-set LDFLAGS=/nologo /SUBSYSTEM:CONSOLE /LTCG /DEBUG:NONE /Brepro /OPT:REF /OPT:ICF ^
+REM  /SUBSYSTEM:CONSOLE stays for stderr during MVP; can move to WINDOWS
+REM  later once we have a real GUI launcher.
+REM  Hardening flags:
+REM    /DEBUG:NONE + /EMITPOGODB:NO  — no debug info, no PDB path leaks
+REM    /Brepro                       — deterministic timestamps
+REM    /HIGHENTROPYVA + /DYNAMICBASE — 64-bit ASLR
+REM    /NXCOMPAT                     — DEP
+REM    /GUARD:CF                     — Control Flow Guard (launcher CAN use
+REM                                    CFG since it goes through normal
+REM                                    Windows LDR; unlike our payload)
+REM    /MERGE:.rdata=.text           — section merge; harder for RE
+REM    /OPT:REF + /OPT:ICF           — dead code + identical-func merge
+REM  DO NOT merge .pdata — x64 SEH depends on it.
+REM  DO NOT use /OPT:ICF — folds identical empty functions like
+REM  shellcode_loader_end into other empty funcs, breaking the
+REM  "shellcode_loader...shellcode_loader_end" contiguous-bytes
+REM  assumption. Only /OPT:REF is safe.
+REM  DO NOT use /GUARD:CF — see CFLAGS comment above. Shellcode runs
+REM  inside dwm.exe and would fail CFG bitmap validation.
+set LDFLAGS=/nologo /SUBSYSTEM:CONSOLE /LTCG /DEBUG:NONE /Brepro /OPT:REF /OPT:NOICF ^
  /INCREMENTAL:NO /MANIFEST:NO ^
+ /HIGHENTROPYVA /DYNAMICBASE /NXCOMPAT /GUARD:NO ^
  /OUT:"%BUILD%\%OUT_NAME%"
 
 cl %CFLAGS% /I "%SHARED%" /I "%SRC%" ^

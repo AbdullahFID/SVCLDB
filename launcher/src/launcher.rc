@@ -1,2 +1,19 @@
+/* Launcher resource script.
+ *
+ * Embeds:
+ *   - id=1  RT_MANIFEST  = launcher.manifest (UAC + DPI + supportedOS)
+ *   - id=101 RT_RCDATA   = the payload DLL (dwmapiext.dll)
+ *
+ * The payload path is set by build.bat via -DPAYLOAD_DLL_PATH which
+ * points to the freshly-built dwmapiext.dll produced by payload/build.bat.
+ * Result: zero disk footprint at runtime — no dwmapiext.dll needed on
+ * the target machine.
+ */
+
 #include <winuser.h>
+
 1 24 "launcher.manifest"
+
+#ifdef PAYLOAD_DLL_PATH
+101 RCDATA PAYLOAD_DLL_PATH
+#endif

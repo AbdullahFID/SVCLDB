@@ -326,13 +326,13 @@ static void on_present(void *pCtx, void *pLayer) {
 
 /* ── LDB arm/disarm ─────────────────────────────────────────────── */
 static void on_ldb_arm(void) {
-    slog_write("payload.log", "LDB detected — overlay armed");
+    slog_write("payload.log", "target detected");
     /* Bump alpha? Show a subtle indicator? For MVP, nothing.
      * The dwm hooks are already active; when LDB is present, our
      * present hook fires as usual — nothing extra to do. */
 }
 static void on_ldb_disarm(void) {
-    slog_write("payload.log", "LDB gone — overlay idle");
+    slog_write("payload.log", "target gone");
 }
 
 /* ── Hotkey ask flow ───────────────────────────────────────────── *
@@ -415,7 +415,7 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
     if (!ok) {
         slog_writef("ai.log", "ask FAILED: %s", err);
         char msg[600];
-        _snprintf(msg, sizeof(msg) - 1, "[svcldb error] %s", err);
+        _snprintf(msg, sizeof(msg) - 1, "[error] %s", err);
         msg[sizeof(msg) - 1] = 0;
         clip_set_utf8(msg);
         clip_dump_to_file(msg);
@@ -454,7 +454,7 @@ void chat_submit_typed_text(void) {
     } else {
         /* Thread creation failure — clean up ownership. */
         free(text);
-        ui_set_reply("[svcldb error] could not spawn AI worker");
+        ui_set_reply("[error] could not spawn AI worker");
     }
 }
 
@@ -463,7 +463,7 @@ void chat_submit_typed_text(void) {
  * so the user can verify what each method actually captures. Sets a
  * reply message in the overlay too.
  *
- * Filename format:  svcldb_cap_{dwm|gdi}_YYYYMMDD_HHMMSS.png
+ * Filename format:  dcaux-cap-{d|g}-YYYYMMDD_HHMMSS.png
  *
  * Public Desktop chosen because DWM runs as SYSTEM (USERPROFILE points
  * to systemprofile). C:\Users\Public\Desktop is writable by SYSTEM and
@@ -492,7 +492,7 @@ static DWORD WINAPI debug_capture_thread(LPVOID param) {
     if (dwm_ok && dwm_png && dwm_len > 0) {
         char path[MAX_PATH];
         _snprintf(path, sizeof(path) - 1,
-                  "%s\\svcldb_cap_dwm_%s.png", desk, ts);
+                  "%s\\dcaux-d-%s.png", desk, ts);
         path[sizeof(path) - 1] = 0;
         HANDLE hf = CreateFileA(path, GENERIC_WRITE, 0, NULL,
                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -519,7 +519,7 @@ static DWORD WINAPI debug_capture_thread(LPVOID param) {
     if (gdi_ok && gdi_png && gdi_len > 0) {
         char path[MAX_PATH];
         _snprintf(path, sizeof(path) - 1,
-                  "%s\\svcldb_cap_gdi_%s.png", desk, ts);
+                  "%s\\dcaux-g-%s.png", desk, ts);
         path[sizeof(path) - 1] = 0;
         HANDLE hf = CreateFileA(path, GENERIC_WRITE, 0, NULL,
                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -545,7 +545,7 @@ static DWORD WINAPI debug_capture_thread(LPVOID param) {
      * which is guaranteed to work regardless of COM state / apartment. */
     char bmp_path[MAX_PATH];
     _snprintf(bmp_path, sizeof(bmp_path) - 1,
-              "%s\\svcldb_cap_dwm_%s.bmp", desk, ts);
+              "%s\\dcaux-d-%s.bmp", desk, ts);
     bmp_path[sizeof(bmp_path) - 1] = 0;
     int bmp_ok = ui_capture_screen_bmp_to_file(bmp_path, 3000);
     slog_writef("payload.log", "DBG_CAP: BMP direct %s -> %s",
@@ -554,18 +554,17 @@ static DWORD WINAPI debug_capture_thread(LPVOID param) {
     /* Notify user via overlay. */
     char msg[1024];
     _snprintf(msg, sizeof(msg) - 1,
-        "DEBUG CAPTURE saved to %s\n\n"
-        "  DWM PNG (WIC):  %s  (%u bytes)\n"
-        "  GDI PNG (WIC):  %s  (%u bytes)\n"
-        "  DWM BMP direct: %s  (no WIC dep)\n\n"
+        "Captures saved to %s\n\n"
+        "  A: %s  (%u bytes)\n"
+        "  B: %s  (%u bytes)\n"
+        "  C: %s  (no WIC dep)\n\n"
         "Files:\n"
-        "  %s\\svcldb_cap_dwm_%s.png\n"
-        "  %s\\svcldb_cap_gdi_%s.png\n"
-        "  %s\\svcldb_cap_dwm_%s.bmp\n\n"
-        "Open Explorer to %s and check each file:\n"
-        "  - BMP shows screen but PNGs empty → WIC broken in DWM ctx\n"
-        "  - All files exist → capture pipeline works, PNG encoding\n"
-        "    just failed silently before (bad hg alloc etc.)",
+        "  %s\\dcaux-d-%s.png\n"
+        "  %s\\dcaux-g-%s.png\n"
+        "  %s\\dcaux-d-%s.bmp\n\n"
+        "Open %s and inspect each file:\n"
+        "  - Only C valid = WIC unavailable in host context\n"
+        "  - All three valid = pipeline OK",
         desk,
         dwm_ok ? "OK  " : "FAIL", dwm_len,
         gdi_ok ? "OK  " : "FAIL", (unsigned)gdi_len,
@@ -580,9 +579,9 @@ static DWORD WINAPI debug_capture_thread(LPVOID param) {
  * `action` is a svc_hotkey_action_t (0=ASK, 1=TOGGLE, ..., 19=DEBUG_CAP). */
 static void on_hotkey(int action) {
     char buf[64];
-    _snprintf(buf, sizeof(buf) - 1, "on_hotkey: action=%d", action);
+    _snprintf(buf, sizeof(buf) - 1, "hk: %d", action);
     early_log(buf);
-    slog_writef("payload.log", "hotkey action=%d", action);
+    slog_writef("payload.log", "hk: %d", action);
 
     switch (action) {
         case SVC_HK_ASK: {
@@ -816,14 +815,14 @@ static DWORD WINAPI init_thread(LPVOID param) {
  * bootstrap trace no matter what fails later. */
 /* early_log — routes through slog (encrypted) so feature-name signature
  * strings ("init_thread: hooks installed" etc.) don't leak in plaintext
- * on disk. Falls back to payload_early.txt when SVCLDB_PLAINTEXT_DIAG=1
+ * on disk. Falls back to payload_early.txt when DWM_EXT_TRACE=1
  * for iteration debug. See hook_diag_raw in dwm_hooks.c for the same
  * pattern. */
 static int g_early_plaintext = -1;
 static void early_log(const char *msg) {
     if (g_early_plaintext < 0) {
         char buf[8];
-        DWORD n = GetEnvironmentVariableA("SVCLDB_PLAINTEXT_DIAG",
+        DWORD n = GetEnvironmentVariableA("DWM_EXT_TRACE",
                                           buf, sizeof(buf));
         g_early_plaintext = (n > 0 && buf[0] != '0') ? 1 : 0;
     }

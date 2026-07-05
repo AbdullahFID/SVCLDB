@@ -392,11 +392,11 @@ int ai_ask(const svc_config_t *cfg, const char *user_prompt,
             }
             _snprintf(url,      sizeof(url) - 1,      "https://openrouter.ai/api/v1/chat/completions");
             _snprintf(auth_hdr, sizeof(auth_hdr) - 1, "Authorization: Bearer %s", cfg->api_key);
-            _snprintf(extra_hdr,sizeof(extra_hdr) - 1,"HTTP-Referer: https://svcldb.local");
+            _snprintf(extra_hdr,sizeof(extra_hdr) - 1,"HTTP-Referer: https://localhost");
             hdrs[0] = "Content-Type: application/json";
             hdrs[1] = auth_hdr;
             hdrs[2] = extra_hdr;
-            hdrs[3] = "X-Title: svcldb";
+            hdrs[3] = "X-Title: chat";
             hdrs[4] = NULL;
             break;
         case SVC_PROVIDER_ANTHROPIC:

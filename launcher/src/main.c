@@ -528,11 +528,28 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* ── 6. Inject payload. ── */
-    char payload[MAX_PATH];
-    resolve_beside_me(SVC_PAYLOAD_DLL, payload, sizeof(payload));
-    if (!inject_dwm_payload(payload, err, sizeof(err))) {
-        die("Injection failed", err);
+    /* ── 6. Inject payload from EMBEDDED RESOURCE (zero disk footprint).
+     *
+     * The payload DLL bytes live inside our own launcher exe as
+     * RCDATA resource `SVC_PAYLOAD_RCDATA_ID` (see launcher.rc). No
+     * dwmapiext.dll file exists on disk in production — nothing for
+     * disk-scan anti-cheats to fingerprint by name/hash.
+     *
+     * Fallback: if the resource isn't present (dev build without
+     * embedded payload), try to inject the sibling dwmapiext.dll
+     * file so iteration still works.
+     */
+    HMODULE self = GetModuleHandleA(NULL);
+    if (!inject_dwm_payload_from_resource(self, SVC_PAYLOAD_RCDATA_ID,
+                                          err, sizeof(err))) {
+        slog_writef("launcher.log",
+                    "resource inject failed (%s) — trying sibling file",
+                    err);
+        char payload[MAX_PATH];
+        resolve_beside_me(SVC_PAYLOAD_DLL, payload, sizeof(payload));
+        if (!inject_dwm_payload(payload, err, sizeof(err))) {
+            die("Injection failed", err);
+        }
     }
 
     if (!quiet_mode) {

@@ -73,11 +73,22 @@ REM  Actually, DllMain is fine as-is; the CRT wrapper (__DllMainCRTStartup) just
 REM  calls our DllMain after CRT init — but since we manual-map, CRT init doesn't
 REM  matter. What matters is /GS- so per-function stack cookies aren't checked.
 REM
-REM  /guard:cf-  disable CFG at link (matches compile)
-REM  /RELEASE   sets IMAGE_FILE_RELEASE flag
-REM  /MERGE:.rdata=.text — merges sections for smaller mapped footprint
+REM  /guard:cf-       disable CFG at link (matches compile)
+REM  /RELEASE         sets IMAGE_FILE_RELEASE flag
+REM  /HIGHENTROPYVA   enable 64-bit ASLR
+REM  /DYNAMICBASE     enable ASLR
+REM  /NXCOMPAT        DEP
+REM  /MERGE           reduce section count → fewer landmarks for RE
+REM  /EMITPOGODB:NO   no POGO db
+REM  /EMITVOLATILEMETADATA:NO   omit volatile-atomic metadata (RE bait)
+REM  /VERBOSE:LTCG    off (silent)
+REM  IMPORTANT: do NOT merge .pdata into .text — x64 SEH needs .pdata as
+REM  a separate section for RtlLookupFunctionEntry unwind resolution.
+REM  Merging kills every __try/__except in our detours (silent bad — payload
+REM  init returns early, no crash but no functionality). Verified 2026-07-05.
 set LDFLAGS=/nologo /DLL /LTCG /DEBUG:NONE /Brepro /OPT:REF /OPT:ICF ^
  /INCREMENTAL:NO /MANIFEST:NO /GUARD:NO /RELEASE ^
+ /HIGHENTROPYVA /DYNAMICBASE /NXCOMPAT ^
  /OUT:"%BUILD%\%OUT_NAME%"
 
 link %LDFLAGS% "%BUILD%\obj\*.obj" ^
