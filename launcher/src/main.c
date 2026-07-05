@@ -132,10 +132,26 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
     cfg->hotkeys[SVC_HK_KILL_ALL]      = SVC_HK_PACK(MOD_CSA, 'K');  /* Ctrl+Shift+Alt+K — emergency stop (unload+kill DWM+kill launcher) */
     cfg->hotkeys[SVC_HK_SCROLL_UP]     = SVC_HK_PACK(MOD_CA, 'K');   /* Ctrl+Alt+K — scroll reply UP (vi convention)   */
     cfg->hotkeys[SVC_HK_SCROLL_DOWN]   = SVC_HK_PACK(MOD_CA, 'J');   /* Ctrl+Alt+J — scroll reply DOWN                 */
+    /* Chat / config controls (v3 additions 2026-07-05). */
+    cfg->hotkeys[SVC_HK_NEW_CHAT]      = SVC_HK_PACK(MOD_CA, 'N');   /* Ctrl+Alt+N — new chat (wipe all messages)      */
+    cfg->hotkeys[SVC_HK_CYCLE_TIER]    = SVC_HK_PACK(MOD_CA, 'M');   /* Ctrl+Alt+M — cycle STRONG/MED/CHEAP            */
+    cfg->hotkeys[SVC_HK_CYCLE_PROVIDER]= SVC_HK_PACK(MOD_CSA, 'P');  /* Ctrl+Shift+Alt+P — cycle provider              */
+    cfg->hotkeys[SVC_HK_REGENERATE]    = SVC_HK_PACK(MOD_CA, 0x0D);  /* Ctrl+Alt+Enter — regenerate last turn          */
+    cfg->hotkeys[SVC_HK_STREAM_TOGGLE] = SVC_HK_PACK(MOD_CSA, 'T');  /* Ctrl+Shift+Alt+T — toggle SSE streaming        */
 
     cfg->overlay_x = 40; cfg->overlay_y = 40;
     cfg->overlay_w = 560; cfg->overlay_h = 420;
     cfg->overlay_alpha = 0.94f;
+
+    /* Defaults for the new AI-config fields (v3). Tier=MEDIUM is a
+     * sensible baseline (Sonnet-5 / gpt-5.5 / Gemini-3.5-flash) —
+     * user can rotate live via Ctrl+Alt+M. Streaming ON by default
+     * for the live-typing feel. */
+    if (cfg->tier == 0 && cfg->model[0] == 0) {
+        cfg->tier = 1;   /* SVC_TIER_MEDIUM */
+    }
+    if (cfg->reasoning_effort == 0) cfg->reasoning_effort = 4;   /* high */
+    cfg->streaming_enabled = 1;
 }
 
 /* ── Locate resolver + payload beside our exe ───────────────────── */

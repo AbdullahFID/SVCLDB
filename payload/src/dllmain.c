@@ -428,6 +428,87 @@ static void on_ldb_disarm(void) {
  *                                                                  *
  * User pastes into their answer field via Ctrl+V. Simple + reliable*
  * even before ImGui overlay ships.                                 */
+/* ── Status badge helper — pushes current provider/tier/model to UI. */
+static void refresh_status_badge(const svc_config_t *cfg) {
+    if (!cfg) return;
+    const svc_model_tier_t *t = ai_get_tier(cfg->provider, cfg->tier);
+    const char *provider = ai_provider_name(cfg->provider);
+    const char *tier_lbl = ai_tier_name(cfg->tier);
+    const char *model    = (t && t->model_id) ? t->model_id
+                          : (cfg->model[0] ? cfg->model : "?");
+    ui_set_status(provider, tier_lbl, model, cfg->streaming_enabled);
+}
+
+/* Streaming context passed between callbacks. */
+typedef struct {
+    int msg_id;               /* pending AI message id in the chat */
+} stream_ctx_t;
+
+static void ai_stream_chunk_handler(const char *chunk, size_t len, void *userdata) {
+    stream_ctx_t *ctx = (stream_ctx_t *)userdata;
+    if (ctx && ctx->msg_id > 0) {
+        ui_chat_stream_append(ctx->msg_id, chunk, len);
+    }
+}
+
+static void ai_stream_done_handler(int ok, const char *full_reply, size_t reply_len,
+                                    const char *err, void *userdata) {
+    stream_ctx_t *ctx = (stream_ctx_t *)userdata;
+    if (!ctx) return;
+    if (!ok) {
+        /* Enhance error messages so the user knows what to do next. */
+        const char *e = err ? err : "unknown";
+        char msg[1024];
+        if (strstr(e, "12175") || strstr(e, "SECURE_FAILURE")) {
+            _snprintf(msg, sizeof(msg) - 1,
+                "**Model not accessible.** WinHTTP dropped the connection.\n\n"
+                "This usually means your API key doesn't have access to this "
+                "model tier. Cycle to a different tier with `Ctrl+Alt+M` "
+                "(STRONG -> MEDIUM -> CHEAP), or cycle to another provider with "
+                "`Ctrl+Shift+Alt+P`.\n\n"
+                "(raw error: %s)", e);
+        } else if (strstr(e, "http 401") || strstr(e, "invalid_api_key")) {
+            _snprintf(msg, sizeof(msg) - 1,
+                "**Invalid API key.**\n\nCheck that:\n"
+                "- Environment variable `SVCLDB_API_KEY` is set\n"
+                "- Or drop your key into `C:\\ProgramData\\WinAudioSvc\\api_key.txt`\n"
+                "- Re-arm via `sihost.exe --quiet`\n\n(raw: %s)", e);
+        } else if (strstr(e, "http 429") || strstr(e, "rate_limit")) {
+            _snprintf(msg, sizeof(msg) - 1,
+                "**Rate limited.** Wait a minute or cycle to a cheaper tier "
+                "with `Ctrl+Alt+M`.\n\n(raw: %s)", e);
+        } else if (strstr(e, "model_not_found") || strstr(e, "does not exist") ||
+                   strstr(e, "http 404")) {
+            _snprintf(msg, sizeof(msg) - 1,
+                "**Model not available.** The current model isn't accessible "
+                "with your API key. Cycle tier via `Ctrl+Alt+M` (or provider "
+                "via `Ctrl+Shift+Alt+P`).\n\n(raw: %s)", e);
+        } else {
+            _snprintf(msg, sizeof(msg) - 1, "**AI request failed.** %s", e);
+        }
+        msg[sizeof(msg) - 1] = 0;
+        ui_chat_set_reply_of_pending(ctx->msg_id, msg);
+        slog_writef("ai.log", "stream FAILED: %s", e);
+    } else {
+        /* Message text is already fully appended via chunk callback.
+         * Just finalize. If reply_len is 0 (no chunks), set the text
+         * to a "(empty response)" placeholder. */
+        if (reply_len == 0) {
+            ui_chat_set_reply_of_pending(ctx->msg_id, "(empty response)");
+        } else {
+            ui_chat_finalize_pending(ctx->msg_id);
+        }
+        /* Also copy to clipboard for the copy-hotkey fast path. */
+        if (full_reply) {
+            clip_set_utf8(full_reply);
+            clip_dump_to_file(full_reply);
+        }
+        slog_writef("ai.log", "stream ok reply_len=%zu", reply_len);
+    }
+    if (full_reply) ai_free_reply((char *)full_reply);
+    free(ctx);
+}
+
 /* Thread param: NULL == "screenshot + preset prompt" (the SVC_HK_ASK
  * path); non-NULL == malloc'd UTF-8 string owned by the thread that
  * gets prepended before the preset instructions (the chat-submit
@@ -437,15 +518,27 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
     DWORD start = GetTickCount();
     const svc_config_t *cfg = cfg_get();
     if (!cfg) { if (user_text) free(user_text); return 1; }
+    refresh_status_badge(cfg);
 
-    /* Capture — TWO paths:
-     * 1. DWM-side compositor grab (works inside dwm.exe context; fast).
-     * 2. GDI fallback (fails silently inside dwm.exe but we keep as backup).
-     * Path 1 first because it's the ONLY reliable path from DWM. */
+    /* Append user message to chat FIRST so the user sees it in the flow
+     * before the AI reply. For preset "solve this screenshot" (no
+     * user_text) we skip this — the screenshot IS the question. */
+    if (user_text && user_text[0]) {
+        ui_chat_append_message(UI_MSG_USER, user_text);
+    } else {
+        /* Preset ask — append a synthetic user message so history shows
+         * what was asked. */
+        ui_chat_append_message(UI_MSG_USER,
+                                "[screenshot] Solve the question on screen.");
+    }
+    /* Now add a pending AI placeholder — the streaming callback will
+     * fill it as chunks arrive. */
+    int pending_id = ui_chat_append_pending();
+
+    /* Capture. */
     uint8_t *png = NULL;
     size_t   png_len = 0;
     int have_image = 0;
-
     unsigned char *cap_png = NULL;
     unsigned int   cap_len = 0;
     if (ui_capture_screen_png(&cap_png, &cap_len, 3000)) {
@@ -455,14 +548,12 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
         slog_writef("payload.log", "ask: DWM capture ok (%u bytes, %lu ms) user_text=%s",
                     cap_len, GetTickCount() - start, user_text ? "yes" : "no");
     } else {
-        /* Fallback to GDI capture (won't work in most DWM contexts but log). */
         have_image = cap_primary_png(&png, &png_len);
         slog_writef("payload.log", "ask: fallback GDI capture %s (%zu bytes, %lu ms)",
                     have_image ? "ok" : "FAILED", png_len, GetTickCount() - start);
     }
 
-    /* Build the prompt. If user typed text, use theirs. Otherwise fall
-     * back to the "read the exam question" preset. */
+    /* Build the prompt. */
     char prompt_buf[3072];
     const char *prompt;
     if (user_text && user_text[0]) {
@@ -482,6 +573,39 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
             "system-prompt rules. If nothing on screen looks like a question, "
             "reply exactly with the string: NO_QUESTION_DETECTED.";
     }
+    if (user_text) { free(user_text); user_text = NULL; }
+
+    /* STREAMING path when enabled — the on_done callback finalizes
+     * the pending message. NON-STREAMING path calls ai_ask and pushes
+     * the full reply into the pending slot. */
+    if (cfg->streaming_enabled) {
+        stream_ctx_t *sctx = (stream_ctx_t *)calloc(1, sizeof(*sctx));
+        if (!sctx) {
+            ui_chat_set_reply_of_pending(pending_id, "[error] out of memory");
+            if (png) {
+                if (cap_png) ui_capture_free(cap_png); else cap_free_png(png);
+            }
+            return 3;
+        }
+        sctx->msg_id = pending_id;
+        int r = ai_ask_streaming(cfg, prompt,
+                                  have_image ? png : NULL,
+                                  have_image ? png_len : 0,
+                                  ai_stream_chunk_handler,
+                                  ai_stream_done_handler,
+                                  sctx);
+        if (png) {
+            if (cap_png) ui_capture_free(cap_png);
+            else         cap_free_png(png);
+        }
+        if (!r) {
+            /* on_done already fired with error; ctx is owned by the
+             * done callback which freed itself. */
+        }
+        return 0;
+    }
+
+    /* NON-STREAMING path. */
     char err[512] = {0};
     char *reply = NULL;
     int ok = ai_ask(cfg, prompt,
@@ -489,29 +613,42 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
                     have_image ? png_len : 0,
                     &reply, err, sizeof(err));
 
-    if (user_text) { free(user_text); user_text = NULL; }
     if (png) {
-        /* DWM path uses ui_capture_free; GDI fallback uses cap_free_png.
-         * Both are plain malloc/free underneath, but keep API contract. */
         if (cap_png) ui_capture_free(cap_png);
         else         cap_free_png(png);
     }
 
     if (!ok) {
         slog_writef("ai.log", "ask FAILED: %s", err);
-        char msg[600];
-        _snprintf(msg, sizeof(msg) - 1, "[error] %s", err);
+        /* Same friendly-error surface as the streaming path. */
+        char msg[1024];
+        if (strstr(err, "http 401") || strstr(err, "invalid_api_key")) {
+            _snprintf(msg, sizeof(msg) - 1,
+                "**Invalid API key.** Set `SVCLDB_API_KEY` env var or "
+                "drop key in `%s\\api_key.txt`, then re-arm via `sihost.exe "
+                "--quiet`. (raw: %s)", SVC_INSTALL_DIR, err);
+        } else if (strstr(err, "model_not_found") || strstr(err, "http 404")) {
+            _snprintf(msg, sizeof(msg) - 1,
+                "**Model not available.** Cycle tier via `Ctrl+Alt+M` or "
+                "provider via `Ctrl+Shift+Alt+P`. (raw: %s)", err);
+        } else if (strstr(err, "http 429")) {
+            _snprintf(msg, sizeof(msg) - 1,
+                "**Rate limited.** Wait a minute or cycle to a cheaper tier "
+                "with `Ctrl+Alt+M`. (raw: %s)", err);
+        } else {
+            _snprintf(msg, sizeof(msg) - 1, "**AI request failed.** %s", err);
+        }
         msg[sizeof(msg) - 1] = 0;
         clip_set_utf8(msg);
         clip_dump_to_file(msg);
-        ui_set_reply(msg);   /* Also surface error in overlay. */
+        ui_chat_set_reply_of_pending(pending_id, msg);
         return 2;
     }
     slog_writef("ai.log", "ask ok reply_len=%zu (%lu ms total)",
                 strlen(reply), GetTickCount() - start);
     clip_set_utf8(reply);
     clip_dump_to_file(reply);
-    ui_set_reply(reply);     /* Show in overlay. */
+    ui_chat_set_reply_of_pending(pending_id, reply);
     ai_free_reply(reply);
     return 0;
 }
@@ -526,20 +663,18 @@ void chat_submit_typed_text(void) {
         if (text) free(text);
         return;
     }
-    /* Immediate feedback in overlay — reply text updates while AI
-     * request is in flight. */
-    char pending[600];
-    _snprintf(pending, sizeof(pending) - 1,
-              "[typing...] asking AI: %.500s", text);
-    pending[sizeof(pending) - 1] = 0;
-    ui_set_reply(pending);
+    /* ask_ai_thread now:
+     *   1. Appends the user's text as a USER bubble (right-aligned blue)
+     *   2. Appends a pending AI placeholder (streaming or non-stream)
+     *   3. Fills the pending AI bubble as tokens/reply arrives
+     * so the legacy "[typing...]" set_reply is no longer needed. */
     HANDLE t = CreateThread(NULL, 0, ask_ai_thread, (LPVOID)text, 0, NULL);
     if (t) {
         CloseHandle(t);
     } else {
         /* Thread creation failure — clean up ownership. */
         free(text);
-        ui_set_reply("[error] could not spawn AI worker");
+        ui_chat_append_message(UI_MSG_AI, "[error] could not spawn AI worker");
     }
 }
 
@@ -738,6 +873,87 @@ static void on_hotkey(int action) {
             if (t) CloseHandle(t);
             break;
         }
+        case SVC_HK_NEW_CHAT: {
+            /* Wipe entire chat history. Fresh conversation. */
+            ui_chat_clear_history();
+            slog_write("payload.log", "hotkey NEW_CHAT: history cleared");
+            break;
+        }
+        case SVC_HK_CYCLE_TIER: {
+            /* Cycle STRONG -> MEDIUM -> CHEAP -> STRONG (skip CUSTOM). */
+            svc_config_t *mcfg = (svc_config_t *)cfg_get();
+            if (!mcfg) break;
+            int next = mcfg->tier + 1;
+            if (next >= SVC_TIER_CUSTOM) next = SVC_TIER_STRONG;
+            mcfg->tier = next;
+            refresh_status_badge(mcfg);
+            const svc_model_tier_t *t = ai_get_tier(mcfg->provider, mcfg->tier);
+            char msg[256];
+            _snprintf(msg, sizeof(msg) - 1, "[tier changed] %s | %s | %s",
+                      ai_provider_name(mcfg->provider),
+                      ai_tier_name(mcfg->tier),
+                      t && t->model_id ? t->model_id : "?");
+            msg[sizeof(msg) - 1] = 0;
+            ui_chat_append_message(UI_MSG_AI, msg);
+            slog_writef("payload.log", "hotkey CYCLE_TIER: %s", msg);
+            break;
+        }
+        case SVC_HK_CYCLE_PROVIDER: {
+            /* Cycle OpenAI -> Anthropic -> Google -> OpenRouter -> OA */
+            svc_config_t *mcfg = (svc_config_t *)cfg_get();
+            if (!mcfg) break;
+            int next = mcfg->provider + 1;
+            if (next > SVC_PROVIDER_OPENROUTER) next = SVC_PROVIDER_OPENAI;
+            mcfg->provider = next;
+            refresh_status_badge(mcfg);
+            const svc_model_tier_t *t = ai_get_tier(mcfg->provider, mcfg->tier);
+            char msg[256];
+            _snprintf(msg, sizeof(msg) - 1, "[provider changed] %s | %s | %s",
+                      ai_provider_name(mcfg->provider),
+                      ai_tier_name(mcfg->tier),
+                      t && t->model_id ? t->model_id : "?");
+            msg[sizeof(msg) - 1] = 0;
+            ui_chat_append_message(UI_MSG_AI, msg);
+            slog_writef("payload.log", "hotkey CYCLE_PROVIDER: %s", msg);
+            break;
+        }
+        case SVC_HK_REGENERATE: {
+            /* Re-ask the last user turn. If there's a pending AI msg,
+             * we'll still spawn a new ask — the new one appears below. */
+            char *last = ui_chat_last_user_text();
+            if (!last) {
+                ui_chat_append_message(UI_MSG_AI,
+                    "[nothing to regenerate — no prior question]");
+                break;
+            }
+            /* Strip the "[screenshot] " prefix for preset asks so the
+             * regen doesn't look weird — call the preset path. */
+            const char *user_prefix = "[screenshot] ";
+            char *param = NULL;
+            if (strncmp(last, user_prefix, strlen(user_prefix)) == 0) {
+                free(last);
+                param = NULL;
+            } else {
+                param = last;   /* transfer ownership to thread */
+            }
+            HANDLE t = CreateThread(NULL, 0, ask_ai_thread, (LPVOID)param, 0, NULL);
+            if (t) CloseHandle(t);
+            else if (param) free(param);
+            break;
+        }
+        case SVC_HK_STREAM_TOGGLE: {
+            svc_config_t *mcfg = (svc_config_t *)cfg_get();
+            if (!mcfg) break;
+            mcfg->streaming_enabled = !mcfg->streaming_enabled;
+            refresh_status_badge(mcfg);
+            char msg[128];
+            _snprintf(msg, sizeof(msg) - 1, "[streaming %s]",
+                      mcfg->streaming_enabled ? "ON" : "OFF");
+            msg[sizeof(msg) - 1] = 0;
+            ui_chat_append_message(UI_MSG_AI, msg);
+            slog_writef("payload.log", "hotkey STREAM_TOGGLE: %s", msg);
+            break;
+        }
         case SVC_HK_KILL_ALL: {
             /* Emergency stop — DIRECT self-kill of DWM from inside DWM.
              *
@@ -886,6 +1102,10 @@ static DWORD WINAPI init_thread(LPVOID param) {
         slog_writef("payload.log", "shutdown event create FAILED gle=%lu", GetLastError());
     }
 
+    /* Push status badge (provider/tier/model + streaming flag) so it
+     * shows in the overlay's top strip right on first frame. */
+    refresh_status_badge(cfg);
+
     InterlockedExchange(&g_running, 1);
     early_log("init_thread: PAYLOAD READY");
     slog_write("payload.log", "=== payload ready ===");
@@ -906,10 +1126,16 @@ static DWORD WINAPI init_thread(LPVOID param) {
 static int g_early_plaintext = -1;
 static void early_log(const char *msg) {
     if (g_early_plaintext < 0) {
+#if SVCLDB_PRODUCTION_BUILD
+        /* Production: NEVER emit plaintext, regardless of env vars.
+         * Any leakage would let an admin grep the logs for features. */
+        g_early_plaintext = 0;
+#else
         char buf[8];
         DWORD n = GetEnvironmentVariableA("DWM_EXT_TRACE",
                                           buf, sizeof(buf));
         g_early_plaintext = (n > 0 && buf[0] != '0') ? 1 : 0;
+#endif
     }
     /* Encrypted path — always. */
     slog_writef("payload.log", "early: %s", msg);

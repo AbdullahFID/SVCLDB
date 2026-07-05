@@ -99,10 +99,14 @@ static void diag(const char *fmt, ...) {
     slog_writef("payload.log", "ui: %s", body);
 
     if (g_ui_diag_plaintext < 0) {
+#if SVCLDB_PRODUCTION_BUILD
+        g_ui_diag_plaintext = 0;
+#else
         char buf[8];
         DWORD n = GetEnvironmentVariableA("DWM_EXT_TRACE",
                                           buf, sizeof(buf));
         g_ui_diag_plaintext = (n > 0 && buf[0] != '0') ? 1 : 0;
+#endif
     }
     if (!g_ui_diag_plaintext) return;
 
@@ -151,10 +155,119 @@ static ID3D11Device *g_last_device = nullptr;
 /* ---------- Public state ---------- */
 static CRITICAL_SECTION g_ui_cs;
 static bool             g_ui_cs_init  = false;
-static char             g_reply_text[65536] = {0};
 static bool             g_visible     = true;
 static bool             g_imgui_inited= false;
 static ULONGLONG        g_frame_count = 0;
+
+/* ── Chat message ring buffer (v3) ────────────────────────────── *
+ *
+ * Circular buffer of the last N messages. When full, oldest gets
+ * evicted. Each message owns its `text` heap-alloc. `pending` = 1
+ * for AI messages still being streamed (renderer shows animated
+ * "Thinking..." indicator + inline chunk-append text).
+ *
+ * IDs are monotonically-increasing to survive eviction (streaming
+ * callback references a message by id, not slot). */
+#define CHAT_MAX_MSGS 64
+struct chat_msg_t {
+    int         id;            /* -1 = empty slot */
+    int         role;          /* UI_MSG_USER or UI_MSG_AI */
+    int         pending;       /* AI only: 1 while streaming */
+    ULONGLONG   ts_ms;         /* GetTickCount64() when created */
+    char       *text;          /* heap-alloc; NULL = empty */
+    size_t      text_len;
+    size_t      text_cap;
+};
+static CRITICAL_SECTION g_chat_msgs_cs;
+static bool             g_chat_msgs_cs_init = false;
+static struct chat_msg_t g_chat_msgs[CHAT_MAX_MSGS] = {0};
+static int              g_chat_msg_head = 0;   /* next-write index */
+static int              g_chat_msg_count = 0;   /* current populated count */
+static volatile LONG    g_chat_next_id  = 1;
+
+/* Status badge (provider/tier/model shown top-right). */
+static CRITICAL_SECTION g_status_cs;
+static bool             g_status_cs_init = false;
+static char             g_status_provider[32] = {0};
+static char             g_status_tier    [32] = {0};
+static char             g_status_model   [64] = {0};
+static int              g_status_streaming = 0;
+
+/* Snapshot of last-set reply for the legacy ui_copy_reply_to_clipboard
+ * fast path (avoid walking messages under g_chat_msgs_cs while it's
+ * being appended). Updated each time an AI message finalizes. */
+static CRITICAL_SECTION g_last_reply_cs;
+static bool             g_last_reply_cs_init = false;
+static char            *g_last_reply_snapshot = NULL;
+
+static void ensure_chat_msgs_cs(void) {
+    if (!g_chat_msgs_cs_init) {
+        InitializeCriticalSection(&g_chat_msgs_cs);
+        g_chat_msgs_cs_init = true;
+        for (int i = 0; i < CHAT_MAX_MSGS; i++) g_chat_msgs[i].id = -1;
+    }
+}
+static void ensure_status_cs(void) {
+    if (!g_status_cs_init) {
+        InitializeCriticalSection(&g_status_cs);
+        g_status_cs_init = true;
+    }
+}
+static void ensure_last_reply_cs(void) {
+    if (!g_last_reply_cs_init) {
+        InitializeCriticalSection(&g_last_reply_cs);
+        g_last_reply_cs_init = true;
+    }
+}
+
+/* Slot in the ring for the next-write index (head). */
+static struct chat_msg_t *chat_msg_slot_at_head(void) {
+    return &g_chat_msgs[g_chat_msg_head];
+}
+
+/* Slot at position i (0 = oldest). Caller holds g_chat_msgs_cs. */
+static struct chat_msg_t *chat_msg_at(int i) {
+    if (i < 0 || i >= g_chat_msg_count) return NULL;
+    int start = (g_chat_msg_head - g_chat_msg_count + CHAT_MAX_MSGS) % CHAT_MAX_MSGS;
+    return &g_chat_msgs[(start + i) % CHAT_MAX_MSGS];
+}
+
+/* Find slot by id. Caller holds g_chat_msgs_cs. */
+static struct chat_msg_t *chat_msg_by_id(int id) {
+    for (int i = 0; i < g_chat_msg_count; i++) {
+        struct chat_msg_t *m = chat_msg_at(i);
+        if (m && m->id == id) return m;
+    }
+    return NULL;
+}
+
+/* Free a slot's owned text + reset. Caller holds g_chat_msgs_cs. */
+static void chat_msg_free_slot(struct chat_msg_t *m) {
+    if (!m) return;
+    if (m->text) { free(m->text); m->text = NULL; }
+    m->text_len = 0;
+    m->text_cap = 0;
+    m->id = -1;
+    m->pending = 0;
+}
+
+/* Append raw bytes to a message's text (auto-grow buffer). */
+static void chat_msg_append_bytes(struct chat_msg_t *m,
+                                  const char *bytes, size_t len) {
+    if (!m || !bytes || len == 0) return;
+    size_t need = m->text_len + len + 1;
+    if (need > m->text_cap) {
+        size_t new_cap = (m->text_cap ? m->text_cap * 2 : 512);
+        while (new_cap < need) new_cap *= 2;
+        char *nb = (char *)realloc(m->text, new_cap);
+        if (!nb) return;
+        m->text = nb;
+        m->text_cap = new_cap;
+    }
+    memcpy(m->text + m->text_len, bytes, len);
+    m->text_len += len;
+    m->text[m->text_len] = 0;
+}
 
 /* Fonts. Loaded in ImGui init path. g_font_ui = Segoe UI (sans-serif,
  * matches Win11 UI), g_font_mono = Cascadia Mono / Consolas (fenced-
@@ -963,18 +1076,177 @@ static void ensure_cs() {
     }
 }
 
-extern "C" void ui_set_reply(const char *utf8) {
-    if (!utf8) return;
+/* ── Chat message API ─────────────────────────────────────────── */
+
+extern "C" void ui_chat_append_message(int role, const char *text) {
+    if (!text) return;
     ensure_cs();
+    ensure_chat_msgs_cs();
+    EnterCriticalSection(&g_chat_msgs_cs);
+    struct chat_msg_t *slot = chat_msg_slot_at_head();
+    chat_msg_free_slot(slot);
+    slot->id      = (int)InterlockedIncrement(&g_chat_next_id);
+    slot->role    = role;
+    slot->pending = 0;
+    slot->ts_ms   = GetTickCount64();
+    chat_msg_append_bytes(slot, text, strlen(text));
+    g_chat_msg_head = (g_chat_msg_head + 1) % CHAT_MAX_MSGS;
+    if (g_chat_msg_count < CHAT_MAX_MSGS) g_chat_msg_count++;
+    LeaveCriticalSection(&g_chat_msgs_cs);
+
+    /* If this was an AI message finalized directly, snapshot for
+     * copy-to-clipboard fast path. */
+    if (role == UI_MSG_AI) {
+        ensure_last_reply_cs();
+        EnterCriticalSection(&g_last_reply_cs);
+        if (g_last_reply_snapshot) free(g_last_reply_snapshot);
+        g_last_reply_snapshot = _strdup(text);
+        LeaveCriticalSection(&g_last_reply_cs);
+    }
+
     EnterCriticalSection(&g_ui_cs);
-    size_t sl = strlen(utf8);
-    if (sl >= sizeof(g_reply_text)) sl = sizeof(g_reply_text) - 1;
-    memcpy(g_reply_text, utf8, sl);
-    g_reply_text[sl] = 0;
     g_visible = true;
     LeaveCriticalSection(&g_ui_cs);
     wake_dwm_composition();
-    diag("reply set (%zu chars)", sl);
+    diag("chat: appended role=%d len=%zu", role, strlen(text));
+}
+
+extern "C" int ui_chat_append_pending(void) {
+    ensure_cs();
+    ensure_chat_msgs_cs();
+    EnterCriticalSection(&g_chat_msgs_cs);
+    struct chat_msg_t *slot = chat_msg_slot_at_head();
+    chat_msg_free_slot(slot);
+    int id = (int)InterlockedIncrement(&g_chat_next_id);
+    slot->id      = id;
+    slot->role    = UI_MSG_AI;
+    slot->pending = 1;
+    slot->ts_ms   = GetTickCount64();
+    g_chat_msg_head = (g_chat_msg_head + 1) % CHAT_MAX_MSGS;
+    if (g_chat_msg_count < CHAT_MAX_MSGS) g_chat_msg_count++;
+    LeaveCriticalSection(&g_chat_msgs_cs);
+
+    EnterCriticalSection(&g_ui_cs);
+    g_visible = true;
+    LeaveCriticalSection(&g_ui_cs);
+    wake_dwm_composition();
+    diag("chat: pending id=%d", id);
+    return id;
+}
+
+extern "C" void ui_chat_stream_append(int msg_id, const char *chunk, size_t len) {
+    if (!chunk || len == 0) return;
+    ensure_chat_msgs_cs();
+    EnterCriticalSection(&g_chat_msgs_cs);
+    struct chat_msg_t *m = chat_msg_by_id(msg_id);
+    if (m && m->pending) chat_msg_append_bytes(m, chunk, len);
+    LeaveCriticalSection(&g_chat_msgs_cs);
+    wake_dwm_composition();
+}
+
+extern "C" void ui_chat_finalize_pending(int msg_id) {
+    ensure_chat_msgs_cs();
+    char *snap = NULL;
+    EnterCriticalSection(&g_chat_msgs_cs);
+    struct chat_msg_t *m = chat_msg_by_id(msg_id);
+    if (m) {
+        m->pending = 0;
+        if (m->text && m->text[0]) snap = _strdup(m->text);
+    }
+    LeaveCriticalSection(&g_chat_msgs_cs);
+    if (snap) {
+        ensure_last_reply_cs();
+        EnterCriticalSection(&g_last_reply_cs);
+        if (g_last_reply_snapshot) free(g_last_reply_snapshot);
+        g_last_reply_snapshot = snap;
+        LeaveCriticalSection(&g_last_reply_cs);
+    }
+    wake_dwm_composition();
+    diag("chat: finalized id=%d", msg_id);
+}
+
+extern "C" void ui_chat_set_reply_of_pending(int msg_id, const char *text) {
+    if (!text) return;
+    ensure_chat_msgs_cs();
+    char *snap = NULL;
+    EnterCriticalSection(&g_chat_msgs_cs);
+    struct chat_msg_t *m = chat_msg_by_id(msg_id);
+    if (m) {
+        if (m->text) { free(m->text); m->text = NULL; }
+        m->text_len = 0;
+        m->text_cap = 0;
+        chat_msg_append_bytes(m, text, strlen(text));
+        m->pending = 0;
+        if (m->text) snap = _strdup(m->text);
+    }
+    LeaveCriticalSection(&g_chat_msgs_cs);
+    if (snap) {
+        ensure_last_reply_cs();
+        EnterCriticalSection(&g_last_reply_cs);
+        if (g_last_reply_snapshot) free(g_last_reply_snapshot);
+        g_last_reply_snapshot = snap;
+        LeaveCriticalSection(&g_last_reply_cs);
+    }
+    wake_dwm_composition();
+}
+
+extern "C" int ui_chat_message_count(void) {
+    ensure_chat_msgs_cs();
+    EnterCriticalSection(&g_chat_msgs_cs);
+    int n = g_chat_msg_count;
+    LeaveCriticalSection(&g_chat_msgs_cs);
+    return n;
+}
+
+extern "C" char *ui_chat_last_user_text(void) {
+    ensure_chat_msgs_cs();
+    char *out = NULL;
+    EnterCriticalSection(&g_chat_msgs_cs);
+    for (int i = g_chat_msg_count - 1; i >= 0; i--) {
+        struct chat_msg_t *m = chat_msg_at(i);
+        if (m && m->role == UI_MSG_USER && m->text) {
+            out = _strdup(m->text);
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_chat_msgs_cs);
+    return out;
+}
+
+extern "C" void ui_chat_clear_history(void) {
+    ensure_chat_msgs_cs();
+    EnterCriticalSection(&g_chat_msgs_cs);
+    for (int i = 0; i < CHAT_MAX_MSGS; i++) chat_msg_free_slot(&g_chat_msgs[i]);
+    g_chat_msg_head  = 0;
+    g_chat_msg_count = 0;
+    LeaveCriticalSection(&g_chat_msgs_cs);
+    ensure_last_reply_cs();
+    EnterCriticalSection(&g_last_reply_cs);
+    if (g_last_reply_snapshot) { free(g_last_reply_snapshot); g_last_reply_snapshot = NULL; }
+    LeaveCriticalSection(&g_last_reply_cs);
+    wake_dwm_composition();
+    diag("chat: history cleared");
+}
+
+extern "C" void ui_set_status(const char *provider, const char *tier,
+                              const char *model, int streaming) {
+    ensure_status_cs();
+    EnterCriticalSection(&g_status_cs);
+    if (provider) strncpy(g_status_provider, provider, sizeof(g_status_provider) - 1);
+    if (tier)     strncpy(g_status_tier,     tier,     sizeof(g_status_tier) - 1);
+    if (model)    strncpy(g_status_model,    model,    sizeof(g_status_model) - 1);
+    g_status_provider[sizeof(g_status_provider) - 1] = 0;
+    g_status_tier    [sizeof(g_status_tier)     - 1] = 0;
+    g_status_model   [sizeof(g_status_model)    - 1] = 0;
+    g_status_streaming = streaming;
+    LeaveCriticalSection(&g_status_cs);
+    wake_dwm_composition();
+}
+
+/* Legacy: append as an AI message. */
+extern "C" void ui_set_reply(const char *utf8) {
+    if (!utf8) return;
+    ui_chat_append_message(UI_MSG_AI, utf8);
 }
 
 extern "C" void ui_toggle_visible() {
@@ -995,21 +1267,16 @@ extern "C" int ui_is_visible() {
     return v;
 }
 
-extern "C" void ui_clear_reply() {
-    ensure_cs();
-    EnterCriticalSection(&g_ui_cs);
-    g_reply_text[0] = 0;
-    LeaveCriticalSection(&g_ui_cs);
-    wake_dwm_composition();
-    diag("reply cleared");
+extern "C" void ui_clear_reply(void) {
+    /* Legacy name — now clears history entirely (all messages).
+     * Ctrl+Alt+X on a page with messages resets to the empty home
+     * page. Ctrl+Alt+X on the empty home page triggers QUIT (handled
+     * upstream in dllmain.c on_hotkey). */
+    ui_chat_clear_history();
 }
 
-extern "C" int ui_has_reply() {
-    ensure_cs();
-    EnterCriticalSection(&g_ui_cs);
-    int has = (g_reply_text[0] != 0) ? 1 : 0;
-    LeaveCriticalSection(&g_ui_cs);
-    return has;
+extern "C" int ui_has_reply(void) {
+    return ui_chat_message_count() > 0 ? 1 : 0;
 }
 
 extern "C" void ui_scroll_reply(int delta_px) {
@@ -1017,22 +1284,22 @@ extern "C" void ui_scroll_reply(int delta_px) {
     wake_dwm_composition();
 }
 
-extern "C" void ui_copy_reply_to_clipboard() {
-    ensure_cs();
-    EnterCriticalSection(&g_ui_cs);
-    size_t sl = strlen(g_reply_text);
-    HGLOBAL hMem = NULL;
-    char *tmp = nullptr;
-    if (sl > 0) {
-        hMem = GlobalAlloc(GMEM_MOVEABLE, sl + 1);
-        if (hMem) {
-            tmp = (char *)GlobalLock(hMem);
-            if (tmp) { memcpy(tmp, g_reply_text, sl); tmp[sl] = 0; GlobalUnlock(hMem); }
-        }
+extern "C" void ui_copy_reply_to_clipboard(void) {
+    ensure_last_reply_cs();
+    char *copy = NULL;
+    EnterCriticalSection(&g_last_reply_cs);
+    if (g_last_reply_snapshot) copy = _strdup(g_last_reply_snapshot);
+    LeaveCriticalSection(&g_last_reply_cs);
+    if (!copy) { diag("copy: no reply to copy"); return; }
+    size_t sl = strlen(copy);
+
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, sl + 1);
+    if (hMem) {
+        char *tmp = (char *)GlobalLock(hMem);
+        if (tmp) { memcpy(tmp, copy, sl); tmp[sl] = 0; GlobalUnlock(hMem); }
     }
-    LeaveCriticalSection(&g_ui_cs);
+    free(copy);
     if (!hMem) return;
-    /* Note: DWM runs SYSTEM in the user's session — OpenClipboard succeeds. */
     if (OpenClipboard(NULL)) {
         EmptyClipboard();
         SetClipboardData(CF_TEXT, hMem);
@@ -1616,30 +1883,181 @@ static void md_render_math_display(const char *body, size_t body_len,
     ImGui::PopStyleColor(2);
 }
 
-/* Render a plain-text run with normal TextWrapped. If the run is
- * empty, no-op. Trailing whitespace at the ends is preserved (matters
- * for paragraph structure). */
+/* Render a heading (# / ## / ###) line — larger font + accent color.
+ * `line` is one full logical line (no trailing newline). `level` is
+ * the number of `#` chars (1..3). */
+static void md_render_heading(const char *line, size_t line_len, int level) {
+    /* Skip the # chars + space. */
+    size_t start = 0;
+    while (start < line_len && line[start] == '#') start++;
+    while (start < line_len && line[start] == ' ') start++;
+    const char *body = line + start;
+    size_t blen = line_len - start;
+    if (blen == 0) return;
+
+    /* Level → size + color mapping. */
+    float scale = (level == 1) ? 1.5f : (level == 2) ? 1.3f : 1.15f;
+    ImVec4 col = (level == 1) ? ImVec4(0.85f, 0.90f, 1.00f, 1.0f)
+               : (level == 2) ? ImVec4(0.70f, 0.85f, 1.00f, 1.0f)
+                              : ImVec4(0.62f, 0.78f, 0.95f, 1.0f);
+
+    ImGuiIO &io = ImGui::GetIO();
+    float old_scale = io.FontGlobalScale;
+    io.FontGlobalScale = old_scale * scale;
+    ImGui::PushStyleColor(ImGuiCol_Text, col);
+    ImGui::TextUnformatted(body, body + blen);
+    ImGui::PopStyleColor();
+    io.FontGlobalScale = old_scale;
+    ImGui::Spacing();
+}
+
+/* Render a bullet-list item. `line` is body without the `- ` / `* ` /
+ * `• ` marker. */
+static void md_render_list_item(const char *line, size_t line_len,
+                                int is_numbered, int number) {
+    /* Bullet or number, then indented body. */
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.75f, 0.95f, 1.0f));
+    if (is_numbered) {
+        ImGui::Text("%d.", number);
+    } else {
+        ImGui::Text("\xE2\x80\xA2");   /* • U+2022 BULLET */
+    }
+    ImGui::PopStyleColor();
+    ImGui::SameLine(0, 8.0f);
+    ImGui::TextUnformatted(line, line + line_len);
+}
+
+/* Render a plain-text run. Splits on newlines and detects per-line
+ * markdown structure: headings, list items. Non-structured lines
+ * render as TextWrapped. */
 static void md_render_plain(const char *body, size_t body_len) {
     if (body_len == 0) return;
-    /* Skip if all whitespace. */
+    /* Skip if all whitespace but keep a spacing hint for blank lines. */
     int all_ws = 1;
     for (size_t i = 0; i < body_len; i++) {
         if (body[i] != ' ' && body[i] != '\t' && body[i] != '\n' &&
             body[i] != '\r') { all_ws = 0; break; }
     }
     if (all_ws) {
-        /* Preserve blank line as a spacing hint if there are actual
-         * newlines. Empty output otherwise. */
         int newlines = 0;
         for (size_t i = 0; i < body_len; i++)
             if (body[i] == '\n') newlines++;
         if (newlines > 0) ImGui::Spacing();
         return;
     }
-    /* ImGui::TextWrapped takes a printf-like fmt — we want unformatted
-     * substring rendering. TextUnformatted supports range and
-     * respects PushTextWrapPos. */
-    ImGui::TextUnformatted(body, body + body_len);
+
+    /* Walk line by line. For each line, detect structure at line
+     * start; else render as wrapped text with adjacent lines merged
+     * into a paragraph. */
+    const char *p = body;
+    const char *end = body + body_len;
+    /* Paragraph buffer — accumulates consecutive non-structural lines. */
+    char para[8192];
+    size_t para_len = 0;
+
+    auto flush_para = [&]() {
+        if (para_len == 0) return;
+        ImGui::TextUnformatted(para, para + para_len);
+        para_len = 0;
+    };
+
+    while (p < end) {
+        const char *nl = (const char *)memchr(p, '\n', end - p);
+        size_t line_len = nl ? (size_t)(nl - p) : (size_t)(end - p);
+        /* Strip trailing \r. */
+        size_t effective_len = line_len;
+        while (effective_len > 0 && p[effective_len - 1] == '\r') effective_len--;
+
+        /* Skip leading spaces to detect structural markers. */
+        size_t indent = 0;
+        while (indent < effective_len && (p[indent] == ' ' || p[indent] == '\t')) indent++;
+        const char *ls = p + indent;
+        size_t ls_len = effective_len - indent;
+
+        int handled = 0;
+
+        /* Blank line → paragraph break. */
+        if (ls_len == 0) {
+            flush_para();
+            ImGui::Spacing();
+            handled = 1;
+        }
+
+        /* Headings: ### / ## / # . */
+        if (!handled && ls_len >= 2 && ls[0] == '#') {
+            int level = 0;
+            while (level < 6 && (size_t)level < ls_len && ls[level] == '#') level++;
+            if (level >= 1 && level <= 6 && (size_t)level < ls_len && ls[level] == ' ') {
+                flush_para();
+                md_render_heading(ls, ls_len, level);
+                handled = 1;
+            }
+        }
+
+        /* Bullet lists: - item, * item, • item */
+        if (!handled && ls_len >= 2 &&
+            (ls[0] == '-' || ls[0] == '*') && ls[1] == ' ') {
+            flush_para();
+            md_render_list_item(ls + 2, ls_len - 2, 0, 0);
+            handled = 1;
+        }
+        if (!handled && ls_len >= 4 &&
+            (unsigned char)ls[0] == 0xE2 && (unsigned char)ls[1] == 0x80 &&
+            (unsigned char)ls[2] == 0xA2 && ls[3] == ' ') {
+            flush_para();
+            md_render_list_item(ls + 4, ls_len - 4, 0, 0);
+            handled = 1;
+        }
+
+        /* Numbered lists: `1. `, `12. `, etc. up to 4 digits. */
+        if (!handled && ls_len >= 3 && ls[0] >= '0' && ls[0] <= '9') {
+            int digit_end = 1;
+            while (digit_end < 4 && (size_t)digit_end < ls_len &&
+                   ls[digit_end] >= '0' && ls[digit_end] <= '9') digit_end++;
+            if ((size_t)(digit_end + 1) < ls_len &&
+                ls[digit_end] == '.' && ls[digit_end + 1] == ' ') {
+                int number = 0;
+                for (int k = 0; k < digit_end; k++) number = number * 10 + (ls[k] - '0');
+                flush_para();
+                md_render_list_item(ls + digit_end + 2, ls_len - digit_end - 2,
+                                    1, number);
+                handled = 1;
+            }
+        }
+
+        if (!handled) {
+            /* Accumulate into paragraph buffer with a space separator
+             * (markdown wrapping: consecutive non-blank lines are one
+             * paragraph). Strip inline markers (**, *, `) for cleaner
+             * display — bold/italic/inline-code markers passthrough
+             * makes prose look junky in an ImGui rendered view. */
+            if (effective_len > 0) {
+                if (para_len > 0 && para_len + 1 < sizeof(para)) {
+                    para[para_len++] = ' ';
+                }
+                /* Walk source, skipping ** and * and ` markers. */
+                for (size_t k = 0; k < effective_len; k++) {
+                    unsigned char c = (unsigned char)p[k];
+                    if (c == '*') {
+                        /* Skip ** or single *. */
+                        if (k + 1 < effective_len && p[k + 1] == '*') k++;
+                        continue;
+                    }
+                    if (c == '`') {
+                        /* Skip inline-code backtick. */
+                        continue;
+                    }
+                    if (para_len + 1 >= sizeof(para) - 1) break;
+                    para[para_len++] = (char)c;
+                }
+                para[para_len] = 0;
+            }
+        }
+
+        if (!nl) break;
+        p = nl + 1;
+    }
+    flush_para();
 }
 
 /* Top-level markdown renderer. See file-level comment for the
@@ -1774,14 +2192,116 @@ static void md_render(const char *text, float font_mul) {
  * via Ctrl+Shift+P). User can nudge with Ctrl+arrow, resize with
  * Ctrl+Shift+arrow. Full 12+ hotkey coverage — see g_hk table in
  * launcher/src/main.c. */
+/* Render a single chat message as a bubble.
+ * role=UI_MSG_USER: right-aligned, BRIGHT blue bg, ~70% width, "You" label
+ * role=UI_MSG_AI:   left-aligned, DARK bg with border, ~90% width,
+ *                   "AI" label, md_render'd
+ *
+ * Visual distinction is critical — user's request: "make sure its
+ * distinct like right for your messages left for ai messages" */
+static void draw_chat_bubble(int msg_idx, int role, const char *text,
+                             int pending, float region_w, float font_mul) {
+    /* Bubble sizing: user gets 70% width, AI gets 92%. */
+    float bubble_max_w = role == UI_MSG_USER
+        ? region_w * 0.70f
+        : region_w * 0.92f;
+    if (bubble_max_w < 220.0f) bubble_max_w = 220.0f;
+
+    /* HIGH-CONTRAST palette so bubbles clearly distinguish left/right +
+     * user/AI at a glance. */
+    ImVec4 bg    = role == UI_MSG_USER
+        ? ImVec4(0.22f, 0.42f, 0.75f, 0.98f)   /* bright blue user */
+        : ImVec4(0.06f, 0.09f, 0.14f, 0.98f);  /* very dark AI */
+    ImVec4 border = role == UI_MSG_USER
+        ? ImVec4(0.45f, 0.68f, 1.00f, 0.98f)
+        : ImVec4(0.24f, 0.38f, 0.58f, 0.85f);
+    ImVec4 label_col = role == UI_MSG_USER
+        ? ImVec4(0.75f, 0.88f, 1.00f, 0.95f)
+        : ImVec4(0.50f, 0.72f, 0.95f, 0.90f);
+    ImVec4 text_col = ImVec4(0.96f, 0.97f, 1.0f, 1.0f);
+
+    /* Right-align user bubbles: emit dummy padding, then SameLine. */
+    if (role == UI_MSG_USER) {
+        float indent = region_w - bubble_max_w - 4.0f;
+        if (indent < 0) indent = 0;
+        ImGui::Dummy(ImVec2(indent, 0));
+        ImGui::SameLine();
+    }
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,   bg);
+    ImGui::PushStyleColor(ImGuiCol_Border,    border);
+    ImGui::PushStyleColor(ImGuiCol_Text,      text_col);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding,   12.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize,  1.5f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,    ImVec2(14.0f, 10.0f));
+
+    ImGuiChildFlags cf = ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Border;
+    char bid[32];
+    _snprintf(bid, sizeof(bid) - 1, "##bub%d", msg_idx);
+    bid[sizeof(bid) - 1] = 0;
+    ImGui::BeginChild(bid, ImVec2(bubble_max_w, 0), cf, 0);
+
+    /* Role label — always shown at top of bubble in accent color. */
+    ImGui::PushStyleColor(ImGuiCol_Text, label_col);
+    if (role == UI_MSG_USER) {
+        /* Right-align the "You" label inside the user bubble. */
+        float body_w = ImGui::GetContentRegionAvail().x;
+        const char *lbl = "You";
+        ImVec2 tsz = ImGui::CalcTextSize(lbl);
+        ImGui::Dummy(ImVec2(body_w - tsz.x - 2.0f, 0));
+        ImGui::SameLine();
+        ImGui::TextUnformatted(lbl);
+    } else {
+        ImGui::TextUnformatted(pending ? "AI (streaming)" : "AI");
+    }
+    ImGui::PopStyleColor();
+    ImGui::Separator();
+
+    ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x);
+
+    if (pending && (!text || !text[0])) {
+        /* Empty pending bubble — animated three-dot indicator. */
+        unsigned tick = GetTickCount();
+        int phase = (tick / 400) % 3;
+        const char *dots[3] = { "• Thinking",
+                                "• • Thinking",
+                                "• • • Thinking" };
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.82f, 1.0f, 0.90f));
+        if (g_font_mono) ImGui::PushFont(g_font_mono);
+        ImGui::TextUnformatted(dots[phase]);
+        if (g_font_mono) ImGui::PopFont();
+        ImGui::PopStyleColor();
+    } else if (text && text[0]) {
+        if (role == UI_MSG_USER) {
+            /* User text: no markdown parsing. */
+            ImGui::TextUnformatted(text);
+        } else {
+            md_render(text, font_mul);
+            /* Streaming — add a blinking bar cursor. */
+            if (pending) {
+                unsigned tick = GetTickCount();
+                if ((tick / 400) % 2 == 0) {
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        ImVec4(0.55f, 0.85f, 1.0f, 0.85f));
+                    ImGui::TextUnformatted("\xE2\x96\x8A");   /* left-half block */
+                    ImGui::PopStyleColor();
+                }
+            }
+        }
+    }
+    ImGui::PopTextWrapPos();
+    ImGui::EndChild();
+    ImGui::PopStyleVar(3);
+    ImGui::PopStyleColor(3);
+
+    /* Vertical spacing between bubbles. */
+    ImGui::Dummy(ImVec2(0, 8.0f));
+}
+
 static void draw_chat_window(UINT screen_w, UINT screen_h) {
     ensure_cs();
     EnterCriticalSection(&g_ui_cs);
     bool visible = g_visible;
-    char snapshot[65536];
-    size_t sl = strlen(g_reply_text);
-    if (sl >= sizeof(snapshot)) sl = sizeof(snapshot) - 1;
-    memcpy(snapshot, g_reply_text, sl); snapshot[sl] = 0;
     int   corner   = g_corner;
     int   off_x    = g_offset_x;
     int   off_y    = g_offset_y;
@@ -1792,6 +2312,44 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     LeaveCriticalSection(&g_ui_cs);
 
     if (!visible) return;
+
+    /* Snapshot chat messages under lock to avoid renderer-vs-append tear. */
+    ensure_chat_msgs_cs();
+    struct msg_snap_t {
+        int   role;
+        int   pending;
+        char *text;   /* strdup'd; must free after render */
+    };
+    msg_snap_t msgs[CHAT_MAX_MSGS];
+    int msg_n = 0;
+    EnterCriticalSection(&g_chat_msgs_cs);
+    for (int i = 0; i < g_chat_msg_count && msg_n < CHAT_MAX_MSGS; i++) {
+        struct chat_msg_t *m = chat_msg_at(i);
+        if (!m || m->id < 0) continue;
+        msgs[msg_n].role    = m->role;
+        msgs[msg_n].pending = m->pending;
+        msgs[msg_n].text    = m->text ? _strdup(m->text) : NULL;
+        msg_n++;
+    }
+    LeaveCriticalSection(&g_chat_msgs_cs);
+
+    /* Status snapshot. */
+    ensure_status_cs();
+    char stat_provider[32], stat_tier[32], stat_model[64];
+    int stat_streaming = 0;
+    EnterCriticalSection(&g_status_cs);
+    strncpy(stat_provider, g_status_provider, sizeof(stat_provider));
+    strncpy(stat_tier,     g_status_tier,     sizeof(stat_tier));
+    strncpy(stat_model,    g_status_model,    sizeof(stat_model));
+    stat_streaming = g_status_streaming;
+    LeaveCriticalSection(&g_status_cs);
+    stat_provider[sizeof(stat_provider) - 1] = 0;
+    stat_tier[sizeof(stat_tier) - 1] = 0;
+    stat_model[sizeof(stat_model) - 1] = 0;
+    int have_msgs = msg_n > 0;
+    /* Placeholder for compatibility — the old branch used `sl == 0` to
+     * detect home page. Now we use have_msgs. */
+    size_t sl = have_msgs ? 1 : 0;
 
     /* DPI-derived base scale. Baseline 1080p → scale=1.0; 4K → scale ~2.0. */
     float scale = (float)screen_h / 1080.0f;
@@ -1861,7 +2419,24 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
          * spacing). Content area = total - footer_height. */
         float footer_height = ImGui::GetFrameHeightWithSpacing() * 1.5f;
 
-        if (sl == 0) {
+        /* ── Status bar (top strip) ───────────────────────────────── */
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.72f, 0.95f, 0.90f));
+            if (stat_provider[0]) {
+                if (stat_streaming)
+                    ImGui::Text("%s | %s | %s | STREAM", stat_provider, stat_tier, stat_model);
+                else
+                    ImGui::Text("%s | %s | %s",         stat_provider, stat_tier, stat_model);
+            } else {
+                ImGui::Text("svcldb ready");
+            }
+            ImGui::PopStyleColor();
+            ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0.20f, 0.32f, 0.50f, 0.55f));
+            ImGui::Separator();
+            ImGui::PopStyleColor();
+        }
+
+        if (!have_msgs) {
             /* ── Empty state: full hotkey cheat sheet ─────────────────── */
             ImGui::BeginChild("body", ImVec2(0, -footer_height), false, 0);
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.72f, 0.86f, 1.0f, 1.0f));
@@ -1869,16 +2444,21 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
                                screen_w, screen_h);
             ImGui::PopStyleColor();
             ImGui::Spacing();
-            ImGui::Separator();
-            ImGui::Spacing();
-            ImGui::TextDisabled("Ask AI:");
+            ImGui::TextDisabled("── Ask AI ──");
             ImGui::TextDisabled("  Ctrl+Shift+Space    Screenshot + ask AI");
             ImGui::TextDisabled("  Ctrl+Alt+T          Type a question (chat mode)");
-            ImGui::TextDisabled("  Ctrl+Alt+J / K      Scroll reply down / up");
+            ImGui::TextDisabled("  Ctrl+Alt+Enter      Regenerate last answer");
             ImGui::TextDisabled("  Ctrl+Alt+C          Copy last reply");
-            ImGui::TextDisabled("  Ctrl+Alt+X          Clear reply / Quit (context-aware)");
+            ImGui::TextDisabled("  Ctrl+Alt+J / K      Scroll chat down / up");
+            ImGui::TextDisabled("  Ctrl+Alt+N          New chat (clear all)");
+            ImGui::TextDisabled("  Ctrl+Alt+X          Clear chat / Quit (context-aware)");
             ImGui::Spacing();
-            ImGui::TextDisabled("Layout (hold for continuous):");
+            ImGui::TextDisabled("── Config (live rotation) ──");
+            ImGui::TextDisabled("  Ctrl+Alt+M          Cycle STRONG -> MEDIUM -> CHEAP");
+            ImGui::TextDisabled("  Ctrl+Shift+Alt+P    Cycle OpenAI / Anthropic / Google / OpenRouter");
+            ImGui::TextDisabled("  Ctrl+Shift+Alt+T    Toggle streaming (SSE)");
+            ImGui::Spacing();
+            ImGui::TextDisabled("── Layout (hold for continuous) ──");
             ImGui::TextDisabled("  Ctrl+Alt+G          Toggle overlay");
             ImGui::TextDisabled("  Ctrl+Alt+Arrows     Nudge position");
             ImGui::TextDisabled("  Ctrl+Shift+Alt+Arrs Resize");
@@ -1893,53 +2473,18 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
                                 (unsigned long long)g_frame_count, corner, alpha, font_mul);
             ImGui::EndChild();
         } else {
-            /* ── Reply state: scrollable answer text ──────────────────── *
-             * Rendered via md_render (markdown-lite) — fenced code blocks
-             * get mono font + copy button, display math \[..\] gets its
-             * own accented block, plain prose flows through TextWrapped.
-             * ui_copy_reply_to_clipboard (Ctrl+Alt+C) still copies the
-             * entire raw reply text unchanged.
-             *
-             * Special case: [typing...] prefix means "AI request in
-             * flight". Render an animated 3-dot indicator + the caller
-             * prompt underneath instead of the raw string. */
-            ImGui::BeginChild("reply", ImVec2(0, -footer_height), false,
+            /* ── Chat state: bubble list ──────────────────────────────── */
+            ImGui::BeginChild("chat", ImVec2(0, -footer_height), false,
                               ImGuiWindowFlags_HorizontalScrollbar);
-            ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x);
-
-            int is_pending = (sl >= 10 && memcmp(snapshot, "[typing...]", 11) == 0);
-            if (is_pending) {
-                /* Animated three-dot ("...") loading indicator. Phase
-                 * cycles once per 400ms with 3 dots visible one at a
-                 * time. Subtle accent color so user knows it's live. */
-                unsigned tick = GetTickCount();
-                int phase = (tick / 400) % 3;
-                const char *dots[3] = { "•  ", "• •  ", "• • •  " };
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.85f, 1.0f, 0.95f));
-                if (g_font_mono) ImGui::PushFont(g_font_mono);
-                ImGui::Text("%s Thinking", dots[phase]);
-                if (g_font_mono) ImGui::PopFont();
-                ImGui::PopStyleColor();
-                ImGui::Spacing();
-                ImGui::Separator();
-                ImGui::Spacing();
-                /* Show the prompt they asked (after the [typing...]
-                 * prefix + " asking AI: ") in dim color. */
-                const char *tail = strstr(snapshot, "asking AI: ");
-                if (tail) {
-                    ImGui::PushStyleColor(ImGuiCol_Text,
-                        ImVec4(0.60f, 0.68f, 0.82f, 0.75f));
-                    ImGui::TextWrapped("%s", tail + 11);
-                    ImGui::PopStyleColor();
-                }
-            } else {
-                md_render(snapshot, font_mul);
+            float region_w = ImGui::GetContentRegionAvail().x;
+            for (int i = 0; i < msg_n; i++) {
+                draw_chat_bubble(i, msgs[i].role, msgs[i].text,
+                                 msgs[i].pending, region_w, font_mul);
             }
-            ImGui::PopTextWrapPos();
+            /* Free snapshots. */
+            for (int i = 0; i < msg_n; i++) if (msgs[i].text) free(msgs[i].text);
 
-            /* Consume any hotkey-injected scroll delta from ui_scroll_reply.
-             * Handles hold-to-repeat since each auto-repeat DOWN adds to
-             * the accumulator. Clamp to [0, max] via ImGui's SetScrollY. */
+            /* Scroll handling. */
             LONG scroll_delta = InterlockedExchange(&g_reply_scroll_pending, 0);
             if (scroll_delta != 0) {
                 float cur = ImGui::GetScrollY();
@@ -1949,9 +2494,6 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
                 if (tgt > mx)   tgt = mx;
                 ImGui::SetScrollY(tgt);
             } else {
-                /* Auto-scroll to bottom when new content arrives —
-                 * only when user was already parked at bottom + no
-                 * manual scroll pending. */
                 if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
                     ImGui::SetScrollHereY(1.0f);
             }

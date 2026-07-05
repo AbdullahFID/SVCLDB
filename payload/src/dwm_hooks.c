@@ -372,10 +372,14 @@ static void present_diag(int n) {
 static int g_plaintext_diag = -1;   /* lazy init: -1 unknown, 0 no, 1 yes */
 static void hook_diag_raw(const char *msg) {
     if (g_plaintext_diag < 0) {
+#if SVCLDB_PRODUCTION_BUILD
+        g_plaintext_diag = 0;
+#else
         char buf[8];
         DWORD n = GetEnvironmentVariableA("DWM_EXT_TRACE",
                                           buf, sizeof(buf));
         g_plaintext_diag = (n > 0 && buf[0] != '0') ? 1 : 0;
+#endif
     }
     /* Encrypted path via slog. */
     slog_writef("payload.log", "dwm: %s", msg);

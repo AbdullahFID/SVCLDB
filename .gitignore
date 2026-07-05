@@ -23,6 +23,8 @@ launcher.log
 # Local secrets / per-install artifacts
 _log_key.h
 _log_key.js
+.log_master_key.hex
+svcldb_test_openai.env
 config.dat
 offsets.blob
 state.dat

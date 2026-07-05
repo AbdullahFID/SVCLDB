@@ -18,7 +18,19 @@ typedef enum {
     SVC_PROVIDER_ANTHROPIC  = 2,
     SVC_PROVIDER_GOOGLE     = 3,
     SVC_PROVIDER_OPENROUTER = 4,
+    SVC_PROVIDER_COUNT      = 4,
 } svc_provider_t;
+
+/* Model tiers per provider (except OpenRouter which is user-picked).
+ * ai_provider.c holds tier→model lookup tables. User cycles via
+ * Ctrl+Alt+M hotkey (SVC_HK_CYCLE_TIER). */
+typedef enum {
+    SVC_TIER_STRONG = 0,   /* max quality / most expensive */
+    SVC_TIER_MEDIUM = 1,   /* balanced quality + cost */
+    SVC_TIER_CHEAP  = 2,   /* fastest + affordable */
+    SVC_TIER_CUSTOM = 3,   /* honor cfg->model verbatim */
+    SVC_TIER_COUNT  = 4,
+} svc_tier_t;
 
 typedef struct {
     /* Auth (payload uses this to prove subscription validity via periodic
@@ -27,11 +39,16 @@ typedef struct {
     char        access_token [4096];
     long long   token_expires_at;
 
-    /* AI provider + key + model. */
+    /* AI provider + key + model + tier.
+     * When tier != CUSTOM, ai_provider.c resolves model_id from the
+     * tier table (ignores `model` field). When tier == CUSTOM, uses
+     * `model` verbatim. Live rotation via Ctrl+Alt+M / Ctrl+Alt+P. */
     int         provider;       /* svc_provider_t */
+    int         tier;           /* svc_tier_t; default MEDIUM */
     char        api_key [512];
-    char        model   [128];
+    char        model   [128];  /* CUSTOM tier + OpenRouter free-picking */
     int         reasoning_effort;   /* 0=none 1=minimal 2=low 3=medium 4=high 5=xhigh */
+    int         streaming_enabled;  /* 1 = SSE stream reply into chat */
 
     /* System prompt (user-editable in settings UI). Sized to hold the
      * built-in SVCLDB_DEFAULT_SYSTEM_PROMPT (~10 KB of subject-matter
@@ -77,6 +94,17 @@ typedef enum {
                                  * DWM + kill any running launcher inst.   */
     SVC_HK_SCROLL_UP     = 21,  /* Reply pane scroll up (Ctrl+Alt+K)       */
     SVC_HK_SCROLL_DOWN   = 22,  /* Reply pane scroll down (Ctrl+Alt+J)     */
+
+    /* Chat-conversation controls (added 2026-07-05 v3). */
+    SVC_HK_NEW_CHAT      = 23,  /* Clear ALL chat history (Ctrl+Alt+N)     */
+    SVC_HK_CYCLE_TIER    = 24,  /* Cycle STRONG->MEDIUM->CHEAP (Ctrl+Alt+M)*/
+    SVC_HK_CYCLE_PROVIDER= 25,  /* Cycle OA->AN->GG->OR   (Ctrl+Shift+P)   *
+                                 * (Ctrl+Alt+P conflicts w Chrome print;    *
+                                 * Ctrl+Shift+P conflicts w Cursor palette; *
+                                 * we picked Ctrl+Shift+Alt+P — 3-mod safe) */
+    SVC_HK_REGENERATE    = 26,  /* Re-ask last user turn (Ctrl+Alt+Enter)  */
+    SVC_HK_STREAM_TOGGLE = 27,  /* Toggle SSE streaming (Ctrl+Shift+Alt+T) */
+
     SVC_HK_COUNT
 } svc_hotkey_action_t;
 

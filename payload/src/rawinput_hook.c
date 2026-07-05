@@ -124,10 +124,14 @@ static void rin_diag(const char *fmt, ...) {
     body[sizeof(body) - 1] = 0;
     slog_writef("payload.log", "rin: %s", body);
     if (g_rin_plaintext < 0) {
+#if SVCLDB_PRODUCTION_BUILD
+        g_rin_plaintext = 0;
+#else
         char buf[8];
         DWORD n = GetEnvironmentVariableA("DWM_EXT_TRACE",
                                           buf, sizeof(buf));
         g_rin_plaintext = (n > 0 && buf[0] != '0') ? 1 : 0;
+#endif
     }
     if (g_rin_plaintext) {
         HANDLE h = CreateFileA(SVC_INSTALL_DIR "\\payload_early.txt",

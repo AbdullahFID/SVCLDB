@@ -29,22 +29,73 @@ void ui_present_frame(void *pCtx, void *pLayer);
  * (e.g. "C:\\Users\\Public\\Desktop\\capture.bmp"). */
 int ui_capture_screen_bmp_to_file(const char *path_bmp, unsigned int timeout_ms);
 
-/* Reply text (from AI worker thread). Thread-safe. */
+/* ── Chat message model (v3, 2026-07-05) ──
+ *
+ * Overlay renders a chat as a scrolling list of bubbles:
+ *   - USER messages: right-aligned, blue accent, ~70% width
+ *   - AI   messages: left-aligned, dark bg + border, ~85% width, md_render-formatted
+ *   - PENDING flag on an AI message shows the animated "Thinking..." indicator
+ *     until the message is finalized (streaming complete / non-stream reply).
+ *
+ * All API is thread-safe (guarded by g_chat_cs). */
+typedef enum { UI_MSG_USER = 0, UI_MSG_AI = 1 } ui_msg_role_t;
+
+/* Append a new message with the given role + text. `text` is copied. */
+void ui_chat_append_message(int role, const char *text);
+
+/* Append a placeholder AI message showing "Thinking..." — returns
+ * the message id so ui_chat_stream_append / ui_chat_finalize_pending
+ * can target it. Returns -1 on failure. */
+int  ui_chat_append_pending(void);
+
+/* Append a chunk of text to a specific pending message id (streaming). */
+void ui_chat_stream_append(int msg_id, const char *chunk, size_t len);
+
+/* Finalize a pending message — clears the "thinking" flag. */
+void ui_chat_finalize_pending(int msg_id);
+
+/* If the last AI message is still pending, replace its full content
+ * with `text` and mark it final. Used for non-streaming replies. */
+void ui_chat_set_reply_of_pending(int msg_id, const char *text);
+
+/* Total messages in the ring. */
+int  ui_chat_message_count(void);
+
+/* Copy the LAST assistant reply to the clipboard (Ctrl+Alt+C).
+ * NO-OP if no assistant reply exists. */
+void ui_copy_reply_to_clipboard(void);
+
+/* Legacy setter — kept for compatibility. Appends as a new AI message. */
 void ui_set_reply(const char *utf8);
+
+/* Return the text of the last USER message (heap-alloc'd) — used by
+ * the REGENERATE hotkey. Returns NULL if none. Caller frees. */
+char *ui_chat_last_user_text(void);
+
+/* Clear ENTIRE chat history (Ctrl+Alt+N New Chat). */
+void ui_chat_clear_history(void);
+
+/* Legacy alias: clears everything (same as ui_chat_clear_history). */
+void ui_clear_reply(void);
 
 /* Visibility. */
 void ui_toggle_visible(void);
 int  ui_is_visible(void);
 
-/* Reply text ops. */
-void ui_clear_reply(void);
-void ui_copy_reply_to_clipboard(void);
 /* Reply pane scroll — signed pixel delta consumed on next frame.
  * Positive = scroll DOWN (toward end), negative = scroll UP. */
 void ui_scroll_reply(int delta_px);
-/* TRUE (1) if reply text is empty (home page state). Used by the
- * CLEAR hotkey handler to switch to "quit" behavior on home page. */
+/* TRUE (1) if there's at least one message (i.e. NOT the empty home
+ * page). Used by the CLEAR hotkey handler to switch to "quit" behavior
+ * on home page. */
 int  ui_has_reply(void);
+
+/* ── Status-bar text (top-right badge) ──
+ * Small provider+tier+model indicator so user knows which config
+ * they're on right now. Update whenever cfg changes (cycle tier/prov).
+ * text is copied; safe to call from any thread. */
+void ui_set_status(const char *provider, const char *tier,
+                   const char *model, int streaming);
 
 /* Geometry adjustments — called from hotkey callbacks in dllmain.c.
  * All are best-effort; if the requested value goes out of range, we

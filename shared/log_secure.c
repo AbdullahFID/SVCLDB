@@ -106,6 +106,52 @@ static void ensure_lock(void) {
     }
 }
 
+/* Master material — 2 halves + salt, defined in log_key.c. Working
+ * key derived at init: SHA256((MA XOR MB) || SALT). This means:
+ *  (1) The 32-byte AES-256 key never appears as a contiguous byte
+ *      run in the binary — bytesearch tools have to find A + B + salt
+ *      separately and then reproduce the derivation.
+ *  (2) Rotating either material or the salt invalidates all prior
+ *      logs — full-forward-secrecy on rebuild.
+ *  (3) An attacker needs the compiled binary AND to reverse this
+ *      code to get the working key.
+ * The derived hex is written to `.log_master_key.hex` (gitignored)
+ * at build time so the decrypt tool consumes it directly. */
+extern const uint8_t SVCLDB_KEY_MATERIAL_A[32];
+extern const uint8_t SVCLDB_KEY_MATERIAL_B[32];
+extern const uint8_t SVCLDB_KEY_SALT[32];
+/* SVCLDB_LOG_KEY declared in log_secure.h as non-const; defined in
+ * log_key.c as writable storage; populated here at slog_init. */
+
+static BOOL derive_working_key(uint8_t out_key[32]) {
+    /* seed = (A XOR B) || SALT — 64 bytes. */
+    uint8_t seed[64];
+    for (int i = 0; i < 32; i++) {
+        seed[i] = SVCLDB_KEY_MATERIAL_A[i] ^ SVCLDB_KEY_MATERIAL_B[i];
+    }
+    memcpy(seed + 32, SVCLDB_KEY_SALT, 32);
+
+    BCRYPT_ALG_HANDLE h_alg = NULL;
+    BCRYPT_HASH_HANDLE h_hash = NULL;
+    BOOL ok = FALSE;
+
+    if (!NT_SUCCESS(BCryptOpenAlgorithmProvider(&h_alg, BCRYPT_SHA256_ALGORITHM, NULL, 0)))
+        goto done;
+    if (!NT_SUCCESS(BCryptCreateHash(h_alg, &h_hash, NULL, 0, NULL, 0, 0)))
+        goto done;
+    if (!NT_SUCCESS(BCryptHashData(h_hash, seed, sizeof(seed), 0)))
+        goto done;
+    if (!NT_SUCCESS(BCryptFinishHash(h_hash, out_key, 32, 0)))
+        goto done;
+    ok = TRUE;
+done:
+    if (h_hash) BCryptDestroyHash(h_hash);
+    if (h_alg)  BCryptCloseAlgorithmProvider(h_alg, 0);
+    /* Wipe seed. */
+    SecureZeroMemory(seed, sizeof(seed));
+    return ok;
+}
+
 static BOOL slog_init(void) {
     LONG s = g_init_state;
     if (s == 2) return TRUE;
@@ -114,6 +160,9 @@ static BOOL slog_init(void) {
         for (int i = 0; i < 200 && g_init_state == 1; i++) Sleep(2);
         return g_init_state == 2;
     }
+    /* Derive the working key from A/B/salt. */
+    if (!derive_working_key(SVCLDB_LOG_KEY)) goto fail;
+
     NTSTATUS st = BCryptOpenAlgorithmProvider(&g_alg, BCRYPT_AES_ALGORITHM, NULL, 0);
     if (!NT_SUCCESS(st)) goto fail;
     st = BCryptSetProperty(g_alg, BCRYPT_CHAINING_MODE,

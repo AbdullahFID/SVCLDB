@@ -18,7 +18,10 @@
 extern "C" {
 #endif
 
-extern const uint8_t SVCLDB_LOG_KEY[32];
+/* v3: derived at slog_init from A/B/salt material — no longer const.
+ * See shared/log_key.c for the material + shared/log_secure.c
+ * derive_working_key() for the SHA256((A XOR B) || SALT) derivation. */
+extern uint8_t SVCLDB_LOG_KEY[32];
 
 /* Append one encrypted line to <install-dir>\<filename>.
  * filename: basename only, no separators. Full path is composed internally.
