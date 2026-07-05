@@ -91,6 +91,20 @@ static pfnScheduleCompositionPass_t g_schedule_composition = NULL;  /* the KEY w
 static pfnAddDirtyRect_t    g_add_dirty_display = NULL;   /* CDDisplayRenderTarget::AddDirtyRect */
 static pfnAddDirtyRect_t    g_add_dirty_legacy  = NULL;   /* CLegacyRenderTarget::AddDirtyRect  */
 
+/* Hook TARGET addresses (what we passed to MH_CreateHook) — cached at
+ * install time so per-detour SEH __except blocks can pass them into
+ * hook_crash_bump() for the 3-strike auto-disable. NULL if that hook
+ * wasn't installed. */
+static void *g_ht_present         = NULL;
+static void *g_ht_pn1             = NULL;
+static void *g_ht_pn2             = NULL;
+static void *g_ht_present_display = NULL;
+static void *g_ht_present_legacy  = NULL;
+static void *g_ht_rc_window       = NULL;
+static void *g_ht_rc_visual       = NULL;
+static void *g_ht_adr_display     = NULL;
+static void *g_ht_adr_legacy      = NULL;
+
 /* Present1/2: hooked to capture the TRUE `this` from DWM's own context.
  * PN's `this` might be virtual-base-adjusted (crashes AddDirtyRect); the
  * `this` inside Present is the top-level object with complete layout,
@@ -140,10 +154,21 @@ static volatile LONG      g_present_skips_capture = 0;
  * monitor can verify each hook is still armed. Max 16 (we currently
  * install 9). */
 #define HOOK_INTEGRITY_MAX 16
+/* Per-hook 3-strike auto-disable. Every SEH __except in a detour body
+ * bumps its slot's crash_count via hook_crash_bump(). If a hook reaches
+ * HOOK_CRASH_THRESHOLD crashes within HOOK_CRASH_WINDOW_MS, we call
+ * MH_DisableHook so the detour body stops firing (dwmcore's original
+ * function runs directly). Lost feature is preferable to a spiral of
+ * compounded exception logs starving the compositor thread. */
+#define HOOK_CRASH_THRESHOLD    3
+#define HOOK_CRASH_WINDOW_MS    60000
 typedef struct {
     void       *target;           /* function address (with JMP prologue) */
     unsigned char orig_first_bytes[16]; /* pre-hook bytes (for diff logging) */
     const char *name;             /* short label for diag */
+    volatile LONG      crash_count;    /* consecutive crashes inside window */
+    volatile ULONGLONG first_crash_ms; /* GetTickCount64() of oldest counted */
+    volatile LONG      auto_disabled;  /* 1 once MH_DisableHook was called  */
 } hook_reg_t;
 static hook_reg_t g_hook_registry[HOOK_INTEGRITY_MAX] = {0};
 static volatile LONG g_hook_reg_count = 0;
@@ -156,9 +181,63 @@ static void hook_registry_add(void *target, const char *name) {
     if (idx >= HOOK_INTEGRITY_MAX) return;
     g_hook_registry[idx].target = target;
     g_hook_registry[idx].name   = name;
+    g_hook_registry[idx].crash_count = 0;
+    g_hook_registry[idx].first_crash_ms = 0;
+    g_hook_registry[idx].auto_disabled  = 0;
     __try {
         memcpy(g_hook_registry[idx].orig_first_bytes, target, 16);
     } __except (EXCEPTION_EXECUTE_HANDLER) { }
+}
+
+/* Find the registry index whose target equals `key`. Returns -1 if
+ * unknown. Only used by the crash bumper; not perf-critical. */
+static int hook_registry_index(void *key) {
+    if (!key) return -1;
+    LONG cnt = g_hook_reg_count;
+    if (cnt > HOOK_INTEGRITY_MAX) cnt = HOOK_INTEGRITY_MAX;
+    for (LONG i = 0; i < cnt; i++) {
+        if (g_hook_registry[i].target == key) return (int)i;
+    }
+    return -1;
+}
+
+/* Forward decl — hook_diag is defined further down; hook_crash_bump
+ * below emits diag on threshold trip. */
+static void hook_diag(const char *fmt, ...);
+
+/* Called from every detour's __except block. Increments the crash
+ * counter for the matching hook, rolls the window if the oldest
+ * counted crash is > HOOK_CRASH_WINDOW_MS old, and if the count
+ * reaches HOOK_CRASH_THRESHOLD within the window, calls
+ * MH_DisableHook on the target. Safe to call with any target
+ * pointer (unknown targets are no-op). */
+static void hook_crash_bump(void *target, const char *label) {
+    int idx = hook_registry_index(target);
+    if (idx < 0) return;
+    hook_reg_t *r = &g_hook_registry[idx];
+    if (r->auto_disabled) return;   /* already disabled — nothing to do */
+    ULONGLONG now = GetTickCount64();
+    /* Roll window if oldest counted crash is stale. */
+    ULONGLONG first = r->first_crash_ms;
+    if (first == 0 || (now - first) > HOOK_CRASH_WINDOW_MS) {
+        InterlockedExchange64((volatile LONG64 *)&r->first_crash_ms,
+                              (LONG64)now);
+        InterlockedExchange(&r->crash_count, 1);
+        return;
+    }
+    LONG c = InterlockedIncrement(&r->crash_count);
+    if (c >= HOOK_CRASH_THRESHOLD) {
+        /* Trip: attempt to disable this specific hook. Race-safe via
+         * auto_disabled compare-and-set — only ONE thread should call
+         * MH_DisableHook. */
+        if (InterlockedCompareExchange(&r->auto_disabled, 1, 0) == 0) {
+            MH_STATUS s = MH_DisableHook(target);
+            hook_diag("hook AUTO-DISABLED %s (%s) after %ld crashes/60s -> MH_STATUS=%d",
+                      r->name ? r->name : "?",
+                      label ? label : "?",
+                      (long)c, (int)s);
+        }
+    }
 }
 
 /* Early forward decl — hook_diag is defined further down (its body
@@ -383,6 +462,7 @@ static LONG __fastcall Detour_COverlayContextPresent(
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         /* Silently swallow — DWM crash = user desktop dies. */
         hook_diag("Detour_Present: caught exception in body");
+        hook_crash_bump(g_ht_present, "Present body");
     }
 
     InterlockedDecrement(&g_present_depth);
@@ -429,6 +509,7 @@ static BOOL __fastcall Detour_DisplayPresentNeeded(void *pThis) {
         if (g_orig_pn1) orig_result = g_orig_pn1(pThis);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         hook_diag("PN1: exception in orig — passing through FALSE");
+        hook_crash_bump(g_ht_pn1, "PN1 orig");
         return FALSE;
     }
 
@@ -437,7 +518,9 @@ static BOOL __fastcall Detour_DisplayPresentNeeded(void *pThis) {
     /* BYPASSIFY EXACT PATTERN: schedule next composition immediately. */
     __try {
         if (g_schedule_composition) g_schedule_composition(0, -1);
-    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        hook_crash_bump(g_ht_pn1, "PN1 SCP");
+    }
 
     /* AddDirtyRect DISABLED — CRASHED DWM in test 2026-07-05.
      * Root cause not fully understood: probably the pThis captured from
@@ -460,6 +543,7 @@ static BOOL __fastcall Detour_LegacyPresentNeeded(void *pThis) {
         if (g_orig_pn2) orig_result = g_orig_pn2(pThis);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         hook_diag("PN2: exception in orig — passing through FALSE");
+        hook_crash_bump(g_ht_pn2, "PN2 orig");
         return FALSE;
     }
 
@@ -467,7 +551,9 @@ static BOOL __fastcall Detour_LegacyPresentNeeded(void *pThis) {
 
     __try {
         if (g_schedule_composition) g_schedule_composition(0, -1);
-    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        hook_crash_bump(g_ht_pn2, "PN2 SCP");
+    }
 
     /* AddDirtyRect DISABLED — see PN1 detour comment above. */
     return TRUE;
@@ -497,6 +583,7 @@ static LONG __fastcall Detour_DisplayPresent(void *pThis) {
         return g_orig_present_display ? g_orig_present_display(pThis) : 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         hook_diag("DisplayPresent: caught exception in orig");
+        hook_crash_bump(g_ht_present_display, "DisplayPresent");
         return 0;
     }
 }
@@ -506,6 +593,7 @@ static LONG __fastcall Detour_LegacyPresent(void *pThis) {
         return g_orig_present_legacy ? g_orig_present_legacy(pThis) : 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         hook_diag("LegacyPresent: caught exception in orig");
+        hook_crash_bump(g_ht_present_legacy, "LegacyPresent");
         return 0;
     }
 }
@@ -564,6 +652,7 @@ static LONG __fastcall Detour_CWindowNode_RenderContent(
         if (g_orig_rc_window) ret = g_orig_rc_window(pThis, pDrawCtx, pResult);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         hook_diag("RC[Window]: caught exception in orig");
+        hook_crash_bump(g_ht_rc_window, "RC[Window] orig");
     }
 
     if (captured_this_call) {
@@ -597,6 +686,7 @@ static LONG __fastcall Detour_CVisual_RenderContent(
         if (g_orig_rc_visual) ret = g_orig_rc_visual(pThis, pDrawCtx, pResult);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         hook_diag("RC[Visual]: caught exception in orig");
+        hook_crash_bump(g_ht_rc_visual, "RC[Visual] orig");
     }
 
     if (captured_this_call) {
@@ -655,6 +745,7 @@ static void __fastcall Detour_AddDirtyRect_Display(void *pThis, const float *rec
         if (g_orig_adr_display) g_orig_adr_display(pThis, rect);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         hook_diag("ADR[Display]: caught exception in orig");
+        hook_crash_bump(g_ht_adr_display, "ADR[Display] orig");
     }
 }
 
@@ -679,6 +770,7 @@ static void __fastcall Detour_AddDirtyRect_Legacy(void *pThis, const float *rect
         if (g_orig_adr_legacy) g_orig_adr_legacy(pThis, rect);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         hook_diag("ADR[Legacy]: caught exception in orig");
+        hook_crash_bump(g_ht_adr_legacy, "ADR[Legacy] orig");
     }
 }
 
@@ -726,6 +818,7 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
         slog_writef("payload.log", "Present hooked @ %p", target);
         hook_diag("hooks: Present hooked");
         hook_registry_add(target, "Present");
+        g_ht_present = target;
     }
 
     /* ── 2. CDDisplayRenderTarget::PresentNeeded ── (Bypassify wake trick) */
@@ -737,6 +830,7 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
             slog_writef("payload.log", "PresentNeeded1 hooked @ %p", target);
             hook_diag("hooks: PresentNeeded1 hooked");
             hook_registry_add(target, "PN1");
+            g_ht_pn1 = target;
         } else {
             slog_writef("payload.log", "PresentNeeded1 hook FAILED s=%d", s);
             hook_diag("hooks: PresentNeeded1 FAILED");
@@ -754,6 +848,7 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
             slog_writef("payload.log", "PresentNeeded2 hooked @ %p", target);
             hook_diag("hooks: PresentNeeded2 hooked");
             hook_registry_add(target, "PN2");
+            g_ht_pn2 = target;
         } else {
             slog_writef("payload.log", "PresentNeeded2 hook FAILED s=%d", s);
             hook_diag("hooks: PresentNeeded2 FAILED");
@@ -841,6 +936,7 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
             slog_writef("payload.log", "DisplayRT::Present hooked @ %p", target);
             hook_diag("hooks: DisplayRT::Present hooked");
             hook_registry_add(target, "DispPresent");
+            g_ht_present_display = target;
         } else {
             slog_writef("payload.log", "DisplayRT::Present hook FAILED s=%d", s);
         }
@@ -853,6 +949,7 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
             slog_writef("payload.log", "LegacyRT::Present hooked @ %p", target);
             hook_diag("hooks: LegacyRT::Present hooked");
             hook_registry_add(target, "LegPresent");
+            g_ht_present_legacy = target;
         } else {
             slog_writef("payload.log", "LegacyRT::Present hook FAILED s=%d", s);
         }
@@ -880,6 +977,7 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
             slog_writef("payload.log", "CWindowNode::RenderContent hooked @ %p (capture stealth)", target);
             hook_diag("hooks: RC[Window] hooked (capture stealth ARMED)");
             hook_registry_add(target, "RC_Window");
+            g_ht_rc_window = target;
         } else {
             slog_writef("payload.log", "CWindowNode::RenderContent hook FAILED s=%d", s);
         }
@@ -892,6 +990,7 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
             slog_writef("payload.log", "CVisual::RenderContent hooked @ %p (capture stealth)", target);
             hook_diag("hooks: RC[Visual] hooked (capture stealth ARMED)");
             hook_registry_add(target, "RC_Visual");
+            g_ht_rc_visual = target;
         } else {
             slog_writef("payload.log", "CVisual::RenderContent hook FAILED s=%d", s);
         }
@@ -912,6 +1011,7 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
             slog_writef("payload.log", "ADR[Display] hooked @ %p (RE MODE)", target);
             hook_diag("hooks: ADR[Display] hooked (logging mode)");
             hook_registry_add(target, "ADR_Disp");
+            g_ht_adr_display = target;
         }
     }
     if (off->addDirtyRectLegacy) {
@@ -922,6 +1022,7 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
             slog_writef("payload.log", "ADR[Legacy] hooked @ %p (RE MODE)", target);
             hook_diag("hooks: ADR[Legacy] hooked (logging mode)");
             hook_registry_add(target, "ADR_Leg");
+            g_ht_adr_legacy = target;
         }
     }
 
