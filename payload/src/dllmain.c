@@ -1,0 +1,866 @@
+/* ================================================================== *
+ * dllmain.c — Payload DLL entry point.                                *
+ *                                                                    *
+ * Loaded inside dwm.exe via CreateRemoteThread + LoadLibraryW.       *
+ * DllMain(DLL_PROCESS_ATTACH) MUST return quickly — do the real work *
+ * in a worker thread (init_thread). Avoids blocking DWM's compositor.*
+ *                                                                    *
+ * Init flow (init_thread):                                           *
+ *   1. Log payload load                                              *
+ *   2. Read + decrypt config file (fail → self-unload)              *
+ *   3. Read offsets.blob (optional — if missing, sig-scan fallback   *
+ *      would go here; MVP just bails)                                *
+ *   4. Install MinHook targets on dwmcore                            *
+ *   5. Start LDB detection thread (arm/disarm callbacks)             *
+ *   6. Start RawInput hotkey listener                                *
+ *   7. Create Global\SVCLDB_Shutdown named event; spawn watcher     *
+ *      thread that unloads us on signal                              *
+ *                                                                    *
+ * Hotkey callbacks:                                                  *
+ *   - hotkey_ask     — spawn AI thread (screenshot omitted for MVP)  *
+ *   - hotkey_toggle  — toggle overlay visibility (v1.1)              *
+ *   - hotkey_typing  — enter typing mode (v1.1)                      *
+ * ================================================================== */
+
+#include "../../shared/common.h"
+#include "../../shared/log_secure.h"
+#include "../../shared/supabase_config.h"
+#include "config_read.h"
+#include "blob_read.h"
+#include "capture.h"
+#include "clipboard_out.h"
+#include "ldb_detect.h"
+#include "rawinput_hook.h"
+#include "dwm_hooks.h"
+#include "ai/ai_provider.h"
+#include "ui/imgui_layer.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sddl.h>
+
+#pragma comment(lib, "advapi32.lib")
+
+/* Forward declaration — early_log body is at the bottom of the file (near
+ * DllMain), but init_thread + on_hotkey callers need to see it. */
+static void early_log(const char *msg);
+
+/* Self-kill thread proc — final fallback for SVC_HK_KILL_ALL when
+ * CreateProcessA(sihost --kill-all) fails. Waits 200ms so any inline
+ * shutdown logging can complete, then terminates DWM from within.
+ * Windows re-spawns dwm.exe fresh in ~2s; our payload is unloaded
+ * with the old process. */
+static DWORD WINAPI self_kill_dwm_thread(LPVOID param) {
+    (void)param;
+    Sleep(200);
+    TerminateProcess(GetCurrentProcess(), 0);
+    return 0;
+}
+
+/* ── PEB unlink — hide our DLL from module enumeration inside DWM ──
+ *
+ * Any anti-cheat or debugger that walks the loaded-module list (via
+ * K32EnumProcessModules / GetModuleHandle / EnumProcessModules /
+ * NtQueryVirtualMemory MEMORY_BASIC_INFORMATION.Type == MEM_IMAGE)
+ * would see dwmapiext.dll listed. Unlinking us from the PEB's three
+ * loader lists (InLoadOrder, InMemoryOrder, InInitOrder) makes us
+ * effectively invisible to those enumeration paths.
+ *
+ * Threat model: DWM runs as SYSTEM in the user's session. A local
+ * admin with debugger privileges could ReadProcessMemory DWM's PEB
+ * directly (which we CAN'T defend against). But anything using the
+ * documented Win32 module API (which most anti-cheats do) will miss us.
+ *
+ * Also spoof BaseDllName from "dwmapiext.dll" → "uiribbon.dll"
+ * (a real fringe Windows DLL that DWM commonly has loaded) so if an
+ * enumeration DOES walk the list, our entry blends in.
+ *
+ * Safe because: Windows loader has ALREADY resolved our imports +
+ * called DllMain. It doesn't need the list entries after that. Only
+ * FreeLibrary needs them — and we're never unloaded via that path
+ * (we die when DWM dies via KILL_ALL, or DWM force-terminates us).
+ * If we ARE unloaded via FreeLibrary, worst case is Windows can't
+ * decrement our refcount and we're stuck loaded — but that's a leak,
+ * not a crash. */
+typedef struct _LIST_ENTRY_PEBUL {
+    struct _LIST_ENTRY_PEBUL *Flink, *Blink;
+} LIST_ENTRY_PEBUL;
+
+typedef struct _UNICODE_STRING_PEBUL {
+    USHORT Length, MaximumLength;
+    PWSTR  Buffer;
+} UNICODE_STRING_PEBUL;
+
+typedef struct _LDR_DATA_TABLE_ENTRY_PEBUL {
+    LIST_ENTRY_PEBUL InLoadOrderLinks;
+    LIST_ENTRY_PEBUL InMemoryOrderLinks;
+    LIST_ENTRY_PEBUL InInitializationOrderLinks;
+    PVOID            DllBase;
+    PVOID            EntryPoint;
+    ULONG            SizeOfImage;
+    UNICODE_STRING_PEBUL FullDllName;
+    UNICODE_STRING_PEBUL BaseDllName;
+    /* ...rest doesn't concern us */
+} LDR_DATA_TABLE_ENTRY_PEBUL;
+
+typedef struct _PEB_LDR_DATA_PEBUL {
+    ULONG            Length;
+    ULONG            Initialized;   /* BOOLEAN, padded */
+    PVOID            SsHandle;
+    LIST_ENTRY_PEBUL InLoadOrderModuleList;
+    LIST_ENTRY_PEBUL InMemoryOrderModuleList;
+    LIST_ENTRY_PEBUL InInitializationOrderModuleList;
+} PEB_LDR_DATA_PEBUL;
+
+typedef struct _PEB_PEBUL {
+    BYTE    Reserved1[2];
+    BYTE    BeingDebugged;
+    BYTE    Reserved2[1];
+    PVOID   Reserved3[2];
+    PEB_LDR_DATA_PEBUL *Ldr;
+    /* ...rest doesn't concern us */
+} PEB_PEBUL;
+
+static void peb_unlink_dll(HMODULE self) {
+    if (!self) return;
+    __try {
+#ifdef _WIN64
+        PEB_PEBUL *peb = (PEB_PEBUL *)__readgsqword(0x60);
+#else
+        PEB_PEBUL *peb = (PEB_PEBUL *)__readfsdword(0x30);
+#endif
+        if (!peb || !peb->Ldr) return;
+        PEB_LDR_DATA_PEBUL *ldr = peb->Ldr;
+
+        /* Walk InLoadOrderModuleList looking for our DllBase. */
+        LIST_ENTRY_PEBUL *head = &ldr->InLoadOrderModuleList;
+        LIST_ENTRY_PEBUL *cur  = head->Flink;
+        int unlinks = 0;
+        while (cur && cur != head) {
+            LDR_DATA_TABLE_ENTRY_PEBUL *ent =
+                (LDR_DATA_TABLE_ENTRY_PEBUL *)cur;
+            LIST_ENTRY_PEBUL *next = cur->Flink;
+            if (ent->DllBase == self) {
+                /* Unlink from all three lists. Each LIST_ENTRY has
+                 * Flink/Blink pointing at neighbors. Point them at
+                 * each other, cut us out. Then point our own back
+                 * at ourselves (harmless idle state). */
+                LIST_ENTRY_PEBUL *l1 = &ent->InLoadOrderLinks;
+                LIST_ENTRY_PEBUL *l2 = &ent->InMemoryOrderLinks;
+                LIST_ENTRY_PEBUL *l3 = &ent->InInitializationOrderLinks;
+                if (l1->Blink && l1->Flink) {
+                    l1->Blink->Flink = l1->Flink;
+                    l1->Flink->Blink = l1->Blink;
+                    l1->Flink = l1->Blink = l1;
+                }
+                if (l2->Blink && l2->Flink) {
+                    l2->Blink->Flink = l2->Flink;
+                    l2->Flink->Blink = l2->Blink;
+                    l2->Flink = l2->Blink = l2;
+                }
+                if (l3->Blink && l3->Flink) {
+                    l3->Blink->Flink = l3->Flink;
+                    l3->Flink->Blink = l3->Blink;
+                    l3->Flink = l3->Blink = l3;
+                }
+
+                /* Spoof BaseDllName + FullDllName to an innocuous
+                 * Windows DLL. Randomized per install from a pool of
+                 * real fringe DLLs that DWM commonly co-loads. Random
+                 * seed = (pid ^ tick) so we're consistent across a
+                 * single session but different install-to-install. */
+                static WCHAR *pool_base[] = {
+                    L"uiribbon.dll",
+                    L"uiribbonres.dll",
+                    L"dcomp.dll",
+                    L"dwmredir.dll",
+                    L"windowscodecs.dll",
+                    L"twinapi.dll",
+                    L"prntvpt.dll"
+                };
+                static WCHAR *pool_full[] = {
+                    L"C:\\Windows\\System32\\uiribbon.dll",
+                    L"C:\\Windows\\System32\\uiribbonres.dll",
+                    L"C:\\Windows\\System32\\dcomp.dll",
+                    L"C:\\Windows\\System32\\dwmredir.dll",
+                    L"C:\\Windows\\System32\\windowscodecs.dll",
+                    L"C:\\Windows\\System32\\twinapi.dll",
+                    L"C:\\Windows\\System32\\prntvpt.dll"
+                };
+                const int n_pool = sizeof(pool_base) / sizeof(pool_base[0]);
+                unsigned seed = (unsigned)(GetCurrentProcessId() ^ GetTickCount());
+                int pick = (int)(seed % (unsigned)n_pool);
+                WCHAR *sb = pool_base[pick];
+                WCHAR *sf = pool_full[pick];
+                /* Compute lengths (UTF-16 wide char = 2 bytes each,
+                 * Length is bytes NOT chars, doesn't count NUL). */
+                size_t sb_chars = wcslen(sb);
+                size_t sf_chars = wcslen(sf);
+                ent->BaseDllName.Buffer        = sb;
+                ent->BaseDllName.Length        = (USHORT)(sb_chars * sizeof(WCHAR));
+                ent->BaseDllName.MaximumLength = (USHORT)((sb_chars + 1) * sizeof(WCHAR));
+                ent->FullDllName.Buffer        = sf;
+                ent->FullDllName.Length        = (USHORT)(sf_chars * sizeof(WCHAR));
+                ent->FullDllName.MaximumLength = (USHORT)((sf_chars + 1) * sizeof(WCHAR));
+
+                unlinks++;
+                {
+                    char nbuf[64] = {0};
+                    /* Log which decoy we picked — encrypted so it's
+                     * install-specific intel, not a fingerprint on
+                     * disk. Convert wide to ANSI for the log. */
+                    for (size_t k = 0; k < sb_chars && k < 63; k++) {
+                        nbuf[k] = (char)sb[k];
+                    }
+                    slog_writef("payload.log",
+                        "peb_unlink: unlinked + spoofed BaseDllName -> %s (pick=%d)",
+                        nbuf, pick);
+                }
+                break;
+            }
+            cur = next;
+        }
+        (void)unlinks;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        slog_write("payload.log", "peb_unlink: EXCEPTION — DLL remains visible");
+    }
+}
+
+/* ── Permissive SECURITY_ATTRIBUTES for cross-integrity named objects ──
+ *
+ * DWM runs as SYSTEM. When we CreateEventA(NULL, ...), Windows gives the
+ * event DWM's default DACL — SYSTEM owner + full access for SYSTEM only.
+ * An elevated Admin process cannot OpenEventA(EVENT_MODIFY_STATE) on it
+ * (GLE=5 ACCESS_DENIED). Documented in hooksdll CLAUDE.md V5.8.
+ *
+ * Fix: build a SECURITY_DESCRIPTOR from SDDL `D:(A;;GA;;;WD)` = "Allow
+ * GenericAll for Everyone". Result: any process on the same session can
+ * signal the event. This is the SAME approach hooksdll/dwm uses. */
+static void build_world_sa(SECURITY_ATTRIBUTES *sa, PSECURITY_DESCRIPTOR *out_sd) {
+    *out_sd = NULL;
+    sa->nLength = sizeof(*sa);
+    sa->bInheritHandle = FALSE;
+    sa->lpSecurityDescriptor = NULL;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            "D:(A;;GA;;;WD)",   /* Allow GenericAll for Everyone */
+            SDDL_REVISION_1,
+            out_sd, NULL)) {
+        sa->lpSecurityDescriptor = *out_sd;
+    }
+}
+
+static HMODULE g_self          = NULL;
+static HANDLE  g_init_thread   = NULL;
+static HANDLE  g_shutdown_ev   = NULL;
+static HANDLE  g_shutdown_thr  = NULL;
+static volatile LONG g_running = 0;
+
+/* ── MZ header wipe — corrupt our PE signature so memory scanners
+ * looking for "MZ" (0x5A4D) + "PE\0\0" (0x00004550) at ImageBase
+ * miss us. Windows LDR already validated + loaded us; it never
+ * re-reads MZ/PE headers after that. Preserves normal execution
+ * while making a very common anti-cheat scan pattern miss.
+ *
+ * Zero the first 0x10 bytes of MZ + first 8 bytes at NT headers
+ * offset (which is e_lfanew in the DOS stub). We restore VirtualProtect
+ * writability, patch, then restore protection. */
+static void wipe_pe_headers(HMODULE self) {
+    if (!self) return;
+    __try {
+        BYTE *base = (BYTE *)self;
+        /* Locate NT header offset from MZ e_lfanew (0x3C). */
+        DWORD e_lfanew = *(DWORD *)(base + 0x3C);
+        DWORD old_prot = 0;
+        if (VirtualProtect(base, 0x40, PAGE_READWRITE, &old_prot)) {
+            /* Overwrite MZ signature 'MZ' → 'XX' — no longer identifies
+             * as a DOS/PE. Preserve e_lfanew so nothing that already
+             * mapped headers gets a shifted pointer. */
+            base[0] = 'X'; base[1] = 'X';
+            VirtualProtect(base, 0x40, old_prot, &old_prot);
+        }
+        if (e_lfanew > 0 && e_lfanew < 0x1000) {
+            /* Zero "PE\0\0" signature at IMAGE_NT_HEADERS. */
+            BYTE *nt = base + e_lfanew;
+            if (VirtualProtect(nt, 8, PAGE_READWRITE, &old_prot)) {
+                nt[0] = 'X'; nt[1] = 'X'; nt[2] = 0; nt[3] = 0;
+                VirtualProtect(nt, 8, old_prot, &old_prot);
+            }
+        }
+        slog_write("payload.log", "pe_wipe: MZ+PE signatures corrupted");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        slog_write("payload.log", "pe_wipe: EXCEPTION during wipe");
+    }
+}
+
+/* ── Anti-debug — refuse to init if DWM is being debugged. This is
+ * a very lightweight check: DWM is normally NOT debugged (that'd
+ * require SYSTEM debug privileges + explicit attach). Anyone
+ * debugging DWM is definitely investigating us. Returns 1 = safe,
+ * 0 = debugged. */
+static int anti_debug_check(void) {
+#ifdef _WIN64
+    BYTE *peb = (BYTE *)__readgsqword(0x60);
+#else
+    BYTE *peb = (BYTE *)__readfsdword(0x30);
+#endif
+    if (!peb) return 1;   /* uncertain — allow */
+    /* PEB->BeingDebugged is at offset 0x02 on both x86/x64. */
+    BYTE being_debugged = peb[0x02];
+    /* PEB->NtGlobalFlag at 0xBC (x86) or 0xBC (x64 wow) / 0x50BC (native x64).
+     * Actually x64 native it's at 0x158 — but checking is optional
+     * since BeingDebugged alone catches most cases. */
+    if (being_debugged) {
+        slog_write("payload.log", "anti_debug: BeingDebugged=1 — refusing init");
+        return 0;
+    }
+    return 1;
+}
+
+/* ── Present callback — routes to ImGui layer.
+ * Called from Detour_COverlayContextPresent. pCtx = COverlayContext this-ptr,
+ * pLayer = the second arg to Present (what the vtable walk needs). */
+static void on_present(void *pCtx, void *pLayer) {
+    ui_present_frame(pCtx, pLayer);
+}
+
+/* ── LDB arm/disarm ─────────────────────────────────────────────── */
+static void on_ldb_arm(void) {
+    slog_write("payload.log", "LDB detected — overlay armed");
+    /* Bump alpha? Show a subtle indicator? For MVP, nothing.
+     * The dwm hooks are already active; when LDB is present, our
+     * present hook fires as usual — nothing extra to do. */
+}
+static void on_ldb_disarm(void) {
+    slog_write("payload.log", "LDB gone — overlay idle");
+}
+
+/* ── Hotkey ask flow ───────────────────────────────────────────── *
+ * 1. Capture primary monitor via GDI + WIC PNG                     *
+ * 2. Send screenshot + prompt to configured AI provider            *
+ * 3. Copy reply text to interactive clipboard                      *
+ * 4. Also dump reply to last_reply.txt (support diagnostics)       *
+ *                                                                  *
+ * User pastes into their answer field via Ctrl+V. Simple + reliable*
+ * even before ImGui overlay ships.                                 */
+/* Thread param: NULL == "screenshot + preset prompt" (the SVC_HK_ASK
+ * path); non-NULL == malloc'd UTF-8 string owned by the thread that
+ * gets prepended before the preset instructions (the chat-submit
+ * path — user's typed question + screenshot). */
+static DWORD WINAPI ask_ai_thread(LPVOID param) {
+    char *user_text = (char *)param;   /* owned; free after use */
+    DWORD start = GetTickCount();
+    const svc_config_t *cfg = cfg_get();
+    if (!cfg) { if (user_text) free(user_text); return 1; }
+
+    /* Capture — TWO paths:
+     * 1. DWM-side compositor grab (works inside dwm.exe context; fast).
+     * 2. GDI fallback (fails silently inside dwm.exe but we keep as backup).
+     * Path 1 first because it's the ONLY reliable path from DWM. */
+    uint8_t *png = NULL;
+    size_t   png_len = 0;
+    int have_image = 0;
+
+    unsigned char *cap_png = NULL;
+    unsigned int   cap_len = 0;
+    if (ui_capture_screen_png(&cap_png, &cap_len, 3000)) {
+        png = cap_png;
+        png_len = cap_len;
+        have_image = 1;
+        slog_writef("payload.log", "ask: DWM capture ok (%u bytes, %lu ms) user_text=%s",
+                    cap_len, GetTickCount() - start, user_text ? "yes" : "no");
+    } else {
+        /* Fallback to GDI capture (won't work in most DWM contexts but log). */
+        have_image = cap_primary_png(&png, &png_len);
+        slog_writef("payload.log", "ask: fallback GDI capture %s (%zu bytes, %lu ms)",
+                    have_image ? "ok" : "FAILED", png_len, GetTickCount() - start);
+    }
+
+    /* Build the prompt. If user typed text, use theirs. Otherwise fall
+     * back to the "read the exam question" preset. */
+    char prompt_buf[3072];
+    const char *prompt;
+    if (user_text && user_text[0]) {
+        _snprintf(prompt_buf, sizeof(prompt_buf) - 1,
+            "The user's question (typed into an overlay):\n"
+            "  %s\n\n"
+            "The screenshot below is what the user was looking at when "
+            "they typed. Answer their question directly, per your "
+            "system-prompt rules. Prefer concrete answers over hedged "
+            "ones — the user asked because they want an answer.",
+            user_text);
+        prompt_buf[sizeof(prompt_buf) - 1] = 0;
+        prompt = prompt_buf;
+    } else {
+        prompt =
+            "Read the exam question in this screenshot and answer per your "
+            "system-prompt rules. If nothing on screen looks like a question, "
+            "reply exactly with the string: NO_QUESTION_DETECTED.";
+    }
+    char err[512] = {0};
+    char *reply = NULL;
+    int ok = ai_ask(cfg, prompt,
+                    have_image ? png : NULL,
+                    have_image ? png_len : 0,
+                    &reply, err, sizeof(err));
+
+    if (user_text) { free(user_text); user_text = NULL; }
+    if (png) {
+        /* DWM path uses ui_capture_free; GDI fallback uses cap_free_png.
+         * Both are plain malloc/free underneath, but keep API contract. */
+        if (cap_png) ui_capture_free(cap_png);
+        else         cap_free_png(png);
+    }
+
+    if (!ok) {
+        slog_writef("ai.log", "ask FAILED: %s", err);
+        char msg[600];
+        _snprintf(msg, sizeof(msg) - 1, "[svcldb error] %s", err);
+        msg[sizeof(msg) - 1] = 0;
+        clip_set_utf8(msg);
+        clip_dump_to_file(msg);
+        ui_set_reply(msg);   /* Also surface error in overlay. */
+        return 2;
+    }
+    slog_writef("ai.log", "ask ok reply_len=%zu (%lu ms total)",
+                strlen(reply), GetTickCount() - start);
+    clip_set_utf8(reply);
+    clip_dump_to_file(reply);
+    ui_set_reply(reply);     /* Show in overlay. */
+    ai_free_reply(reply);
+    return 0;
+}
+
+/* Called from rawinput_hook.c ll_kbd_proc when user hits ENTER while
+ * chat input is active. Pulls the typed buffer, ownership transfers
+ * to ask_ai_thread (which frees it after the AI call completes). */
+extern void ui_set_reply(const char *utf8);
+void chat_submit_typed_text(void) {
+    char *text = ui_chat_take_and_clear();
+    if (!text || !text[0]) {
+        if (text) free(text);
+        return;
+    }
+    /* Immediate feedback in overlay — reply text updates while AI
+     * request is in flight. */
+    char pending[600];
+    _snprintf(pending, sizeof(pending) - 1,
+              "[typing...] asking AI: %.500s", text);
+    pending[sizeof(pending) - 1] = 0;
+    ui_set_reply(pending);
+    HANDLE t = CreateThread(NULL, 0, ask_ai_thread, (LPVOID)text, 0, NULL);
+    if (t) {
+        CloseHandle(t);
+    } else {
+        /* Thread creation failure — clean up ownership. */
+        free(text);
+        ui_set_reply("[svcldb error] could not spawn AI worker");
+    }
+}
+
+/* Debug capture thread — invoked by Ctrl+Shift+Alt+S. Captures the
+ * screen via BOTH available paths and saves each PNG to Public Desktop
+ * so the user can verify what each method actually captures. Sets a
+ * reply message in the overlay too.
+ *
+ * Filename format:  svcldb_cap_{dwm|gdi}_YYYYMMDD_HHMMSS.png
+ *
+ * Public Desktop chosen because DWM runs as SYSTEM (USERPROFILE points
+ * to systemprofile). C:\Users\Public\Desktop is writable by SYSTEM and
+ * visible in every interactive user's Desktop view. */
+static DWORD WINAPI debug_capture_thread(LPVOID param) {
+    (void)param;
+
+    /* DWM.exe runs as "Window Manager\DWM-N" — NOT full SYSTEM. Cannot
+     * write to C:\Users\Public\Desktop (GLE=5 ACCESS_DENIED). Write to
+     * our install dir which DWM definitely has access to (we log there).
+     * User can open the files from Explorer once we save them. */
+    const char *desk = SVC_INSTALL_DIR;
+
+    SYSTEMTIME t; GetLocalTime(&t);
+    char ts[64];
+    _snprintf(ts, sizeof(ts) - 1,
+              "%04d%02d%02d_%02d%02d%02d",
+              t.wYear, t.wMonth, t.wDay,
+              t.wHour, t.wMinute, t.wSecond);
+    ts[sizeof(ts) - 1] = 0;
+
+    /* ── Path 1: DWM-side capture (layer texture via vtable walk) ── */
+    unsigned char *dwm_png = NULL;
+    unsigned int   dwm_len = 0;
+    int dwm_ok = ui_capture_screen_png(&dwm_png, &dwm_len, 3000);
+    if (dwm_ok && dwm_png && dwm_len > 0) {
+        char path[MAX_PATH];
+        _snprintf(path, sizeof(path) - 1,
+                  "%s\\svcldb_cap_dwm_%s.png", desk, ts);
+        path[sizeof(path) - 1] = 0;
+        HANDLE hf = CreateFileA(path, GENERIC_WRITE, 0, NULL,
+                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hf != INVALID_HANDLE_VALUE) {
+            DWORD wr = 0;
+            WriteFile(hf, dwm_png, dwm_len, &wr, NULL);
+            CloseHandle(hf);
+            slog_writef("payload.log",
+                        "DBG_CAP: DWM saved %s (%u bytes)", path, dwm_len);
+        } else {
+            slog_writef("payload.log",
+                        "DBG_CAP: DWM save FAILED GLE=%lu path=%s",
+                        GetLastError(), path);
+        }
+        ui_capture_free(dwm_png);
+    } else {
+        slog_writef("payload.log", "DBG_CAP: DWM capture FAILED");
+    }
+
+    /* ── Path 2: GDI capture (BitBlt from desktop DC) ── */
+    uint8_t *gdi_png = NULL;
+    size_t   gdi_len = 0;
+    int gdi_ok = cap_primary_png(&gdi_png, &gdi_len);
+    if (gdi_ok && gdi_png && gdi_len > 0) {
+        char path[MAX_PATH];
+        _snprintf(path, sizeof(path) - 1,
+                  "%s\\svcldb_cap_gdi_%s.png", desk, ts);
+        path[sizeof(path) - 1] = 0;
+        HANDLE hf = CreateFileA(path, GENERIC_WRITE, 0, NULL,
+                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hf != INVALID_HANDLE_VALUE) {
+            DWORD wr = 0;
+            WriteFile(hf, gdi_png, (DWORD)gdi_len, &wr, NULL);
+            CloseHandle(hf);
+            slog_writef("payload.log",
+                        "DBG_CAP: GDI saved %s (%zu bytes)", path, gdi_len);
+        } else {
+            slog_writef("payload.log",
+                        "DBG_CAP: GDI save FAILED GLE=%lu path=%s",
+                        GetLastError(), path);
+        }
+        cap_free_png(gdi_png);
+    } else {
+        slog_writef("payload.log", "DBG_CAP: GDI capture FAILED");
+    }
+
+    /* ── Path 3: DWM-direct BMP write (no WIC, no COM — hooksdll approach) ──
+     * The other paths use WIC PNG encoding which is failing silently in
+     * DWM's process context. This bypass writes raw BMP bytes via WriteFile,
+     * which is guaranteed to work regardless of COM state / apartment. */
+    char bmp_path[MAX_PATH];
+    _snprintf(bmp_path, sizeof(bmp_path) - 1,
+              "%s\\svcldb_cap_dwm_%s.bmp", desk, ts);
+    bmp_path[sizeof(bmp_path) - 1] = 0;
+    int bmp_ok = ui_capture_screen_bmp_to_file(bmp_path, 3000);
+    slog_writef("payload.log", "DBG_CAP: BMP direct %s -> %s",
+                bmp_path, bmp_ok ? "OK" : "FAILED");
+
+    /* Notify user via overlay. */
+    char msg[1024];
+    _snprintf(msg, sizeof(msg) - 1,
+        "DEBUG CAPTURE saved to %s\n\n"
+        "  DWM PNG (WIC):  %s  (%u bytes)\n"
+        "  GDI PNG (WIC):  %s  (%u bytes)\n"
+        "  DWM BMP direct: %s  (no WIC dep)\n\n"
+        "Files:\n"
+        "  %s\\svcldb_cap_dwm_%s.png\n"
+        "  %s\\svcldb_cap_gdi_%s.png\n"
+        "  %s\\svcldb_cap_dwm_%s.bmp\n\n"
+        "Open Explorer to %s and check each file:\n"
+        "  - BMP shows screen but PNGs empty → WIC broken in DWM ctx\n"
+        "  - All files exist → capture pipeline works, PNG encoding\n"
+        "    just failed silently before (bad hg alloc etc.)",
+        desk,
+        dwm_ok ? "OK  " : "FAIL", dwm_len,
+        gdi_ok ? "OK  " : "FAIL", (unsigned)gdi_len,
+        bmp_ok ? "OK  " : "FAIL",
+        desk, ts, desk, ts, desk, ts, desk);
+    msg[sizeof(msg) - 1] = 0;
+    ui_set_reply(msg);
+    return 0;
+}
+
+/* Callback fired by rawin_start's poll+WM_INPUT threads.
+ * `action` is a svc_hotkey_action_t (0=ASK, 1=TOGGLE, ..., 19=DEBUG_CAP). */
+static void on_hotkey(int action) {
+    char buf[64];
+    _snprintf(buf, sizeof(buf) - 1, "on_hotkey: action=%d", action);
+    early_log(buf);
+    slog_writef("payload.log", "hotkey action=%d", action);
+
+    switch (action) {
+        case SVC_HK_ASK: {
+            HANDLE t = CreateThread(NULL, 0, ask_ai_thread, NULL, 0, NULL);
+            if (t) CloseHandle(t);
+            break;
+        }
+        case SVC_HK_TOGGLE:
+            ui_toggle_visible();
+            break;
+        case SVC_HK_TYPING:
+            /* Chat input mode — toggles a typing field at the bottom of
+             * the overlay. All non-hotkey keystrokes get diverted into
+             * the buffer (invisible to LDB / any other app in the LL
+             * hook chain). Enter submits with a fresh screenshot;
+             * Escape cancels. See ui_chat_* in imgui_layer.cpp. */
+            ui_chat_toggle();
+            break;
+        case SVC_HK_COPY_REPLY:
+            ui_copy_reply_to_clipboard();
+            break;
+        case SVC_HK_CLEAR:
+            /* Context-aware: if a reply is showing, CLEAR the reply
+             * (back to home page). If we're on the home page, this
+             * hotkey becomes QUIT — signals our own shutdown event
+             * DIRECTLY (no launcher spawn — that fails with
+             * ERROR_ELEVATION_REQUIRED since sihost has an admin
+             * manifest and DWM's SYSTEM context can't satisfy UAC). */
+            if (ui_has_reply()) {
+                ui_clear_reply();
+            } else {
+                /* Inline soft-quit: signal our own shutdown event.
+                 * The shutdown_watcher thread will call hooks_uninstall
+                 * which drains ~200ms of clean frames + disables all
+                 * hooks + reverts byte patches — same as if user ran
+                 * sihost --unload manually. Overlay disappears cleanly;
+                 * DWM stays alive; user re-arms via launcher when
+                 * ready. Sentinel gets written to indicate clean quit. */
+                HANDLE hf = CreateFileA(SVC_INSTALL_DIR "\\.dwm_clean_shutdown",
+                                         GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                                         FILE_ATTRIBUTE_NORMAL, NULL);
+                if (hf != INVALID_HANDLE_VALUE) {
+                    DWORD w = 0;
+                    WriteFile(hf, "clean\n", 6, &w, NULL);
+                    CloseHandle(hf);
+                }
+                if (g_shutdown_ev) SetEvent(g_shutdown_ev);
+                slog_writef("payload.log", "hotkey QUIT: signalled inline shutdown");
+            }
+            break;
+        case SVC_HK_MOVE_LEFT:   ui_nudge(-20,  0);   break;  /* small step — held key repeats @20Hz for continuous */
+        case SVC_HK_MOVE_RIGHT:  ui_nudge( 20,  0);   break;
+        case SVC_HK_MOVE_UP:     ui_nudge(  0,-20);   break;
+        case SVC_HK_MOVE_DOWN:   ui_nudge(  0, 20);   break;
+        case SVC_HK_RESIZE_WIDER:  ui_resize(30,   0); break;
+        case SVC_HK_RESIZE_NARROW: ui_resize(-30,  0); break;
+        case SVC_HK_RESIZE_TALLER: ui_resize( 0,  30); break;
+        case SVC_HK_RESIZE_SHORT:  ui_resize( 0, -30); break;
+        case SVC_HK_CYCLE_CORNER:  ui_cycle_corner();  break;
+        case SVC_HK_ALPHA_UP:      ui_bump_alpha(+0.05f); break;  /* small step — held key repeats @20Hz */
+        case SVC_HK_ALPHA_DOWN:    ui_bump_alpha(-0.05f); break;
+        case SVC_HK_FONT_UP:       ui_bump_font(+0.10f);  break;  /* smaller step — held key repeats @20Hz */
+        case SVC_HK_FONT_DOWN:     ui_bump_font(-0.10f);  break;
+        case SVC_HK_RESET:         ui_reset_geometry();   break;
+        case SVC_HK_SCROLL_UP:     ui_scroll_reply(-80);  break;
+        case SVC_HK_SCROLL_DOWN:   ui_scroll_reply(+80);  break;
+        case SVC_HK_DEBUG_CAP: {
+            HANDLE t = CreateThread(NULL, 0, debug_capture_thread, NULL, 0, NULL);
+            if (t) CloseHandle(t);
+            break;
+        }
+        case SVC_HK_KILL_ALL: {
+            /* Emergency stop — DIRECT self-kill of DWM from inside DWM.
+             *
+             * The old design tried to spawn sihost.exe --kill-all from
+             * DWM but sihost has a requireAdministrator manifest and
+             * DWM's SYSTEM-in-user-session context returns
+             * ERROR_ELEVATION_REQUIRED (740) on CreateProcess for such
+             * binaries — no interactive UAC to satisfy the manifest.
+             *
+             * Inline approach:
+             *   1. Delete .dwm_clean_shutdown sentinel (this is an
+             *      emergency, NOT a clean exit — mark next launch DIRTY).
+             *   2. TerminateProcess(GetCurrentProcess()) in a helper
+             *      thread after a short delay. Windows respawns
+             *      dwm.exe fresh in ~2s; our payload dies with it.
+             *
+             * We DON'T sweep sibling sihost.exe instances — launcher is
+             * a one-shot that exits after arming so there's normally
+             * nothing to sweep. If the user has a stuck sihost they
+             * can kill it via Task Manager. */
+            DeleteFileA(SVC_INSTALL_DIR "\\.dwm_clean_shutdown");
+            slog_writef("payload.log",
+                        "hotkey KILL_ALL: inline self-kill in 200ms (sentinel cleared)");
+            HANDLE t = CreateThread(NULL, 0, self_kill_dwm_thread,
+                                    NULL, 0, NULL);
+            if (t) CloseHandle(t);
+            break;
+        }
+        default:
+            slog_writef("payload.log", "unknown hotkey action %d", action);
+            break;
+    }
+}
+
+/* ── Cooperative shutdown watcher ────────────────────────────────
+ * Global\SVCLDB_Shutdown named event. Launcher --unload sets it.
+ * On signal: uninstall hooks, stop threads, FreeLibraryAndExitThread. */
+static DWORD WINAPI shutdown_watcher(LPVOID param) {
+    (void)param;
+    if (!g_shutdown_ev) return 0;
+    WaitForSingleObject(g_shutdown_ev, INFINITE);
+    slog_write("payload.log", "shutdown signal received");
+
+    InterlockedExchange(&g_running, 0);
+    rawin_stop();
+    ldb_detect_stop();
+    hooks_uninstall();
+    ui_shutdown();
+    cfg_cleanup();
+    sb_cleanup();
+
+    if (g_shutdown_ev) { CloseHandle(g_shutdown_ev); g_shutdown_ev = NULL; }
+
+    /* Free ourselves. This kills our thread; DLL is unloaded. */
+    FreeLibraryAndExitThread(g_self, 0);
+    return 0;
+}
+
+/* ── Init worker (runs off DllMain thread). ──────────────────────── */
+/* Log rotation — payload.log can grow unbounded over long sessions.
+ * On each init, if it exceeds 2MB, truncate to zero and start fresh.
+ * Loses old encrypted diag but prevents disk-fill DoS. Keeps 2MB
+ * of history which is ~10K encrypted lines — plenty for post-mortem. */
+static void rotate_payload_log(void) {
+    const char *path = SVC_INSTALL_DIR "\\payload.log";
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fad)) return;
+    ULARGE_INTEGER sz;
+    sz.LowPart  = fad.nFileSizeLow;
+    sz.HighPart = fad.nFileSizeHigh;
+    if (sz.QuadPart > (2ULL * 1024 * 1024)) {
+        HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    }
+}
+
+static DWORD WINAPI init_thread(LPVOID param) {
+    (void)param;
+    rotate_payload_log();
+    early_log("init_thread: entered");
+    slog_write("payload.log", "=== payload init ===");
+    early_log("init_thread: past slog_write test");
+
+    /* Anti-debug — refuse to init if DWM is being debugged. Someone
+     * attached a debugger to SYSTEM's DWM = they're investigating us. */
+    if (!anti_debug_check()) {
+        early_log("init_thread: debugged — aborting init");
+        return 4;
+    }
+
+    /* Read config — MUST succeed. If not, payload is inert (safe). */
+    const svc_config_t *cfg = cfg_get();
+    if (!cfg) {
+        early_log("init_thread: config unavailable");
+        slog_write("payload.log", "config unavailable — payload will be inert");
+        return 1;
+    }
+    early_log("init_thread: config loaded");
+
+    /* Read offsets.blob — try, fall back to signature scan later. */
+    pl_offsets_t off = {0};
+    if (!pl_offsets_load(&off)) {
+        early_log("init_thread: offsets.blob missing");
+        return 2;
+    }
+    early_log("init_thread: offsets loaded");
+
+    if (!hooks_install(&off, on_present)) {
+        early_log("init_thread: hooks_install FAILED");
+        return 3;
+    }
+    early_log("init_thread: hooks installed");
+
+    /* Hide our DLL from PEB module lists. Anti-cheat / debugger that
+     * walks the loader lists (K32EnumProcessModules et al.) no longer
+     * sees us. Spoofs BaseDllName to `uiribbon.dll` as a decoy. */
+    peb_unlink_dll(g_self);
+    early_log("init_thread: peb_unlink done");
+
+    /* Corrupt PE headers so memory scanners searching for "MZ" /
+     * "PE\0\0" at page boundaries can't identify our image as a
+     * valid PE. Belt-and-suspenders on top of the PEB unlink. */
+    wipe_pe_headers(g_self);
+    early_log("init_thread: pe_wipe done");
+
+    /* Start background workers. */
+    ldb_detect_start(on_ldb_arm, on_ldb_disarm);
+    rawin_start(cfg->hotkeys, on_hotkey);
+
+    /* Shutdown watcher — event must be openable from elevated Admin
+     * launcher process, so we build a world-writable DACL via SDDL. */
+    SECURITY_ATTRIBUTES sa = {0};
+    PSECURITY_DESCRIPTOR sd = NULL;
+    build_world_sa(&sa, &sd);
+    g_shutdown_ev = CreateEventA(sa.lpSecurityDescriptor ? &sa : NULL,
+                                  TRUE, FALSE, SVC_SHUTDOWN_EVENT_NAME);
+    if (sd) LocalFree(sd);   /* CreateEvent duplicates the descriptor */
+    if (g_shutdown_ev) {
+        DWORD gle = GetLastError();
+        slog_writef("payload.log", "shutdown event created (gle=%lu already_exists=%d)",
+                    gle, gle == ERROR_ALREADY_EXISTS);
+        g_shutdown_thr = CreateThread(NULL, 0, shutdown_watcher, NULL, 0, NULL);
+        if (g_shutdown_thr) CloseHandle(g_shutdown_thr);
+    } else {
+        slog_writef("payload.log", "shutdown event create FAILED gle=%lu", GetLastError());
+    }
+
+    InterlockedExchange(&g_running, 1);
+    early_log("init_thread: PAYLOAD READY");
+    slog_write("payload.log", "=== payload ready ===");
+    return 0;
+}
+
+/* ── EARLY plaintext diagnostic — no TLS, no BCrypt, no CRT.        *
+ * When manual-mapped, __declspec(thread) TLS is broken (loader-only *
+ * init step skipped). slog_write relies on TLS reentry guard, so a  *
+ * crashing slog_write would silently swallow all logging.           *
+ * This bypasses slog entirely — proves DllMain ran + gives us a    *
+ * bootstrap trace no matter what fails later. */
+/* early_log — routes through slog (encrypted) so feature-name signature
+ * strings ("init_thread: hooks installed" etc.) don't leak in plaintext
+ * on disk. Falls back to payload_early.txt when SVCLDB_PLAINTEXT_DIAG=1
+ * for iteration debug. See hook_diag_raw in dwm_hooks.c for the same
+ * pattern. */
+static int g_early_plaintext = -1;
+static void early_log(const char *msg) {
+    if (g_early_plaintext < 0) {
+        char buf[8];
+        DWORD n = GetEnvironmentVariableA("SVCLDB_PLAINTEXT_DIAG",
+                                          buf, sizeof(buf));
+        g_early_plaintext = (n > 0 && buf[0] != '0') ? 1 : 0;
+    }
+    /* Encrypted path — always. */
+    slog_writef("payload.log", "early: %s", msg);
+    /* Plaintext fallback only when env var opts in. */
+    if (g_early_plaintext) {
+        HANDLE h = CreateFileA(SVC_INSTALL_DIR "\\payload_early.txt",
+                               FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h == INVALID_HANDLE_VALUE) return;
+        char line[512];
+        SYSTEMTIME t; GetSystemTime(&t);
+        int n = _snprintf(line, sizeof(line) - 1,
+            "[%04d-%02d-%02dT%02d:%02d:%02d.%03dZ] pid=%lu tid=%lu %s\r\n",
+            t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds,
+            (unsigned long)GetCurrentProcessId(), (unsigned long)GetCurrentThreadId(), msg);
+        if (n > 0) { DWORD w = 0; WriteFile(h, line, (DWORD)n, &w, NULL); }
+        CloseHandle(h);
+    }
+}
+
+/* ── DllMain ────────────────────────────────────────────────────── */
+BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
+    (void)reserved;
+    if (reason == DLL_PROCESS_ATTACH) {
+        early_log("DllMain: PROCESS_ATTACH entered");
+        g_self = hInst;
+        /* NOTE: NOT calling DisableThreadLibraryCalls on manual-mapped DLLs —
+         * loader doesn't know about us anyway, so THREAD_ATTACH doesn't fire. */
+        HANDLE t = CreateThread(NULL, 0, init_thread, NULL, 0, NULL);
+        if (t) {
+            early_log("DllMain: init_thread spawned");
+            CloseHandle(t);
+        } else {
+            early_log("DllMain: CreateThread FAILED");
+        }
+    }
+    return TRUE;
+}

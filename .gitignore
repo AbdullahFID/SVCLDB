@@ -1,0 +1,39 @@
+# Build outputs
+build/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.pch
+*.map
+*.res
+*.tlog
+*.log
+
+# Ephemeral runtime files (per-machine, not source)
+.keepalive
+.dwm_clean_shutdown
+overlay_state.bin
+payload_early.txt
+payload.log
+ai.log
+launcher.log
+
+# Local secrets / per-install artifacts
+_log_key.h
+_log_key.js
+config.dat
+offsets.blob
+state.dat
+
+# IDE / OS junk
+.vs/
+.vscode/
+*.suo
+*.user
+Thumbs.db
+.DS_Store
+
+# Node modules (if any test scripts use them)
+node_modules/
