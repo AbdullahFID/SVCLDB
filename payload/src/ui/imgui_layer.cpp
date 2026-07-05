@@ -845,6 +845,15 @@ static void wake_dwm_composition(void) {
     }
 }
 
+/* When set, draw_chat_window skips ALL rendering for the next N
+ * frames — used to ensure our capture path grabs a CLEAN layer
+ * texture (no overlay pixels from the CURRENT frame OR persistent
+ * pixels from the PREVIOUS frame's overlay draw). Otherwise the AI
+ * receives a screenshot containing its own prior reply in the
+ * overlay — confusing feedback that degrades answer quality on
+ * follow-up asks. */
+static volatile LONG g_hide_frames_for_capture = 0;
+
 extern "C" int ui_capture_screen_png(unsigned char **png_out, unsigned int *len_out,
                                      unsigned int timeout_ms) {
     if (!png_out || !len_out) return 0;
@@ -856,6 +865,10 @@ extern "C" int ui_capture_screen_png(unsigned char **png_out, unsigned int *len_
         if (!g_cap_done_ev) { diag("capture: CreateEvent failed %lu", GetLastError()); return 0; }
     }
     ResetEvent(g_cap_done_ev);
+    /* Hide the overlay for the next 3 frames so the layer texture
+     * settles to app-only pixels before the capture. 3 frames covers
+     * the vsync + PN pipeline latency on 60/120/144 Hz displays. */
+    InterlockedExchange(&g_hide_frames_for_capture, 3);
     InterlockedExchange(&g_cap_request, 1);
 
     /* Poke DWM once immediately, then again every 100 ms until we're done.
@@ -2299,6 +2312,12 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
 }
 
 static void draw_chat_window(UINT screen_w, UINT screen_h) {
+    /* If a capture is pending, skip drawing so the layer texture stays
+     * app-only. The capture path in ui_present_frame ALSO defers the
+     * capture until g_hide_frames_for_capture reaches 0 — by then
+     * multiple frames have composed without our overlay and prior
+     * overlay pixels have been overwritten by the underlying app. */
+    if (g_hide_frames_for_capture > 0) return;
     ensure_cs();
     EnterCriticalSection(&g_ui_cs);
     bool visible = g_visible;
@@ -2674,26 +2693,31 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
         dev->GetImmediateContext(&ctx);
         if (!ctx) { dev->Release(); return; }
 
-        /* CAPTURE-FIRST: if the AI worker requested a screenshot, grab the
-         * fully-composited frame BEFORE we render our overlay onto it.
-         * The rtv's underlying texture is the layer backbuffer — but we
-         * need the actual ID3D11Texture2D pointer. Re-walk the layer's
-         * vtable one more time to get a fresh reference. */
-        if (g_cap_request) {
+        /* CAPTURE-FIRST: if the AI worker requested a screenshot, grab
+         * the layer BUT ONLY AFTER the hide-frames counter has drained
+         * to 0. Hide-frames is set by ui_capture_screen_png to 3 —
+         * during those frames we skip both capture AND overlay draw
+         * so the layer texture is composed by DWM WITHOUT our overlay
+         * pixels, giving the capture a clean app-only view. When it
+         * hits 0 we perform the capture on the settled clean layer. */
+        if (g_cap_request && g_hide_frames_for_capture == 0) {
             ID3D11Texture2D *cap_tex = get_backbuffer_texture(pLayer);
             if (cap_tex) {
                 try_perform_capture(dev, ctx, cap_tex, w, h, fmt);
                 cap_tex->Release();
             }
         }
-
-        /* Same for BMP-direct capture (no WIC dependency). */
-        if (g_bmp_request) {
+        if (g_bmp_request && g_hide_frames_for_capture == 0) {
             ID3D11Texture2D *cap_tex = get_backbuffer_texture(pLayer);
             if (cap_tex) {
                 try_perform_bmp_capture(dev, ctx, cap_tex, w, h, fmt);
                 cap_tex->Release();
             }
+        }
+        /* Decrement hide counter once per Present cycle. When it hits
+         * 0, the next Present will capture + resume drawing overlay. */
+        if (g_hide_frames_for_capture > 0) {
+            InterlockedDecrement(&g_hide_frames_for_capture);
         }
 
         if (!g_imgui_inited) {

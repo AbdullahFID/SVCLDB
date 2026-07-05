@@ -253,6 +253,133 @@ If Cursor/Claude launches subagents in this repo, they MUST use `claude-4.6-sonn
 
 ---
 
+## 2026-07-05 (evening) — v3 chat rewrite (AI + UI overhaul)
+
+Major coordinated overhaul of the AI + UI layers. This is the AUTHORITATIVE state; prior handoffs (`HANDOFF_STEALTH_NIGHT_*` + `HANDOFF_UX_POLISH_*`) still hold for the stealth invariants but the CHAT UI + AI-provider details in them are superseded.
+
+### AI provider layer (`payload/src/ai/ai_provider.{h,c}` full rewrite)
+
+Tier tables verified against 2026-07 provider pricing pages:
+
+| Provider | STRONG | MEDIUM | CHEAP |
+|---|---|---|---|
+| OpenAI | `o3` (deep reasoning + vision, $10/$40, 200K) | `gpt-5.5` (balanced + vision, $5/$30, 272K) | `gpt-4o-mini` (fast + vision, $0.15/$0.60, 128K) |
+| Anthropic | `claude-opus-4-8` (best coding, $5/$25, 1M) | `claude-sonnet-5` (balanced, $3/$15, 1M) | `claude-haiku-4-5` (fast, $1/$5, 200K) |
+| Google | `gemini-2.5-pro` (deep reasoning, 1M) | `gemini-2.5-flash` (balanced, 1M) | `gemini-2.5-flash-lite` (cheapest, 1M) |
+| OpenRouter | ← user-picked → | ← user-picked → | ← user-picked (default `openrouter/free`) |
+
+User cycles tiers via `Ctrl+Alt+M`, providers via `Ctrl+Shift+Alt+P`. Custom tier honors `cfg->model` verbatim (any specific slug).
+
+Key API contracts (per 2026-07 web verification):
+- **OpenAI**: `/v1/chat/completions` with `max_completion_tokens` for GPT-5 family (max_tokens deprecated for reasoning), `reasoning_effort` for o-series + GPT-5. Content: text before image (`detail: high` on image).
+- **Anthropic**: `/v1/messages` with `thinking: {type: adaptive}` + `output_config: {effort}` for Fable/Opus/Sonnet (always-on adaptive), `thinking: {type: enabled, budget_tokens}` for Haiku (extended). System prompt as typed array with `cache_control: ephemeral` (90% discount).
+- **Google**: `generateContent` (SSE via `streamGenerateContent?alt=sse`) with `thinkingLevel` for Gemini 3.x (MINIMAL/LOW/MEDIUM/HIGH) and `thinkingBudget: -1` for 2.5.x (MUTUALLY EXCLUSIVE per docs).
+- **OpenRouter**: OpenAI-compat `/api/v1/chat/completions` with unified `reasoning: {effort}` (silently ignored by non-reasoning models). Handles 402 (insufficient credits), 429 (rate-limited).
+
+All providers use TEXT-BEFORE-IMAGE content ordering (Anthropic + OpenAI docs both explicit that this yields measurably better vision accuracy).
+
+Streaming via `ai_ask_streaming` — uses existing `whreq_post_stream` (SSE-aware WinHTTP), parses per-provider delta frames (`data: {json}` lines, `[DONE]` sentinel), calls user chunk-callback per token + done-callback with full reply.
+
+Retry with exponential backoff: 3 attempts, 800ms → 1.6s → 3.2s, on 429 or 5xx.
+
+Friendly error surface: `12175 SECURE_FAILURE`, `401 invalid_api_key`, `429 rate_limit`, `404 model_not_found` all get actionable guidance in the reply bubble (suggests hotkey to cycle tier/provider).
+
+### Chat UI (`payload/src/ui/imgui_layer.{h,cpp}` full rewrite)
+
+**Chat message model** — ring buffer of last 64 messages. Each has role (USER=0 / AI=1), monotonic id, pending flag, text (heap-alloc, auto-grow). Fully thread-safe (`g_chat_msgs_cs`).
+
+**Bubble rendering** — user's explicit request: "distinct like right for your messages left for ai messages"
+- **USER**: right-aligned, BRIGHT BLUE bg `(0.22, 0.42, 0.75)`, `"You"` label right-aligned inside, 70% width
+- **AI**: left-aligned, DARK bg `(0.06, 0.09, 0.14)` with border, `"AI"` label left, 92% width, `md_render`'d text
+- Both auto-resize height, 12px border radius, 14px padding
+
+**Status bar** (top of overlay): `OpenAI | MEDIUM | gpt-5.5 | STREAM` format shows current provider/tier/model/streaming state live. Updated when cycling via hotkey.
+
+**Pending / streaming state**: AI bubble shows animated `• • • Thinking` indicator when empty, blinking bar cursor `▊` while chunks are still arriving.
+
+**Markdown-lite renderer** (`md_render*`):
+- Fenced code blocks ```` ```lang ... ``` ```` → dark tinted child with mono font + `copy` button + language label
+- Display math `\[..\]` and `$$..$$` → violet tinted child with mono font + `copy` button
+- Headings `# ` / `## ` / `### ` → larger font + accent color per level
+- Bullet lists `- item` / `* item` / `• item` → bullet char + indent
+- Numbered lists `1. item` etc.
+- Inline markers (`**bold**` / `*italic*` / `` `code` ``) — STRIPPED from prose so no raw asterisks in the render
+- Everything else → TextWrapped prose with paragraph-merging
+
+### Hotkeys (28 total slots, up from 23)
+
+Priority (never change): `Ctrl+Alt+G` toggle, `Ctrl+Shift+Alt+K` emergency stop.
+
+New in v3:
+- `Ctrl+Alt+N` NEW_CHAT — wipe entire chat history
+- `Ctrl+Alt+M` CYCLE_TIER — STRONG → MEDIUM → CHEAP → STRONG
+- `Ctrl+Shift+Alt+P` CYCLE_PROVIDER — OpenAI → Anthropic → Google → OpenRouter → OA
+- `Ctrl+Alt+Enter` REGENERATE — re-ask last user turn
+- `Ctrl+Shift+Alt+T` STREAM_TOGGLE — flip SSE streaming on/off
+
+### Security (log key + dev-log strip)
+
+**Master key ROTATED to dual-half + salt derivation.** Prior flat 32-byte key (`7a9e...9d48`) invalidated. New scheme in `shared/log_key.c`:
+
+```
+uint8_t SVCLDB_KEY_MATERIAL_A[32] = { ...random... };
+uint8_t SVCLDB_KEY_MATERIAL_B[32] = { ...random... };
+uint8_t SVCLDB_KEY_SALT[32]       = { ...random... };
+uint8_t SVCLDB_LOG_KEY[32]        = {0};   /* filled at slog_init */
+```
+
+Derivation at `slog_init` in `shared/log_secure.c`:
+```
+working_key = SHA256((MATERIAL_A XOR MATERIAL_B) || SALT)
+```
+
+Result: `5919246238e69eaf9ab65a4e15bf075141af7189fd5071aee7886505d01551c5`. Saved to `.log_master_key.hex` at repo root (gitignored) for `decrypt-logs.js --key <hex>`.
+
+**Rationale for the SHA256 KDF wrapper:**
+1. Bytesearch for a contiguous 32-byte key run in the binary fails — the material lives as 2 separate 32-byte arrays + salt in different `.rodata` regions.
+2. Reversing requires understanding the SHA256((A XOR B) || SALT) derivation formula, not just extracting bytes.
+3. Rotating any of the 3 materials invalidates all prior logs — forward secrecy on rebuild.
+4. Only WE (with the source + gitignored hex file) can decrypt customer-supplied logs.
+
+**Production log strip** — `SVCLDB_PRODUCTION_BUILD 1` macro in `shared/common.h` compiles out the `DWM_EXT_TRACE` plaintext-fallback paths at all 4 diag call sites (dllmain / dwm_hooks / rawinput_hook / imgui_layer). Production binary NEVER writes plaintext regardless of env vars. `payload_early.txt` = 2 bytes always.
+
+### Capture stealth: overlay-contamination fix
+
+**Problem** discovered during E2E test: when user hit `Ctrl+Shift+Space` for a screenshot-ask, the layer texture DWM had settled to still contained PREVIOUS-frame overlay pixels (DWM layer persistence). So the AI received a shot showing its own prior reply → confused answers on follow-up asks.
+
+**Fix**: `g_hide_frames_for_capture` volatile flag set to 3 when `ui_capture_screen_png` is called. `draw_chat_window` skips draw while flag > 0. `try_perform_capture` is DEFERRED until flag reaches 0 (i.e. the layer has settled without overlay for 3 vsync cycles ≈ 50ms). Then capture runs on a truly clean app-only layer.
+
+### Config format changes (`shared/config_types.h`)
+
+- Added `tier` (default MEDIUM) — cycled via hotkey, not persisted from env
+- Added `streaming_enabled` (default 1) — cycled via hotkey
+- `SVC_HK_COUNT` bumped 23 → 28 for new hotkey slots
+
+### Live-verified with real OpenAI key
+
+- `ai.log`: `stream ok reply_len=436` on Kepler-3rd-law test (chat mode)
+- Fibonacci code test: full response with `python` code block + copy button + bullet list explaining O(n) vs O(2^n) + sanity check
+- Screenshot ask (`Ctrl+Shift+Space` on blank desktop): `NO_QUESTION_DETECTED` — confirms prompt priority contract works
+- Cycle model: STRONG→MEDIUM→CHEAP each pushes a `[tier changed] OpenAI | X | model` toast in chat + updates status bar
+- `System.Drawing.Bitmap.CopyFromScreen` with overlay visible + rendering → zero overlay pixels in shot (capture stealth intact)
+- `(Get-Process dwm).Modules | ? { $_.ModuleName -like '*dwmapi*ext*' }` → empty (PEB unlink intact)
+- `payload_early.txt` = 2 bytes (encrypted-only invariant holds)
+
+### Hard invariants added in v3 (DO NOT REGRESS)
+
+1. **Message model is a ring buffer of size 64.** Never grow unbounded — OOM under long sessions.
+2. **USER bubbles MUST be right-aligned with blue bg + "You" label.** AI bubbles MUST be left-aligned with dark bg + "AI" label. Never merge into a single style — the visual distinction IS the UX contract.
+3. **`SVCLDB_PRODUCTION_BUILD 1` in common.h is default ON.** Never ship with 0. Env-var check for plaintext-fallback becomes DEAD CODE at compile time when this is 1.
+4. **Working key = SHA256((A XOR B) || SALT).** Never revert to flat 32-byte scheme. Any rotation must update BOTH `shared/log_key.c` AND the pre-computed `.log_master_key.hex` (gitignored) at repo root.
+5. **Content ordering across ALL AI providers is TEXT-BEFORE-IMAGE.** Never reverse — measurable vision accuracy loss.
+6. **Anthropic system prompt in typed array with `cache_control: ephemeral`.** Never inline as a string param — loses 90% cache discount on repeat solves.
+7. **Google Gemini 3.x uses `thinkingLevel`, 2.5.x uses `thinkingBudget: -1`, NEVER both.** 400 error if you send both per Google docs.
+8. **`max_completion_tokens` for gpt-5.x reasoning family, `max_tokens` for gpt-4o legacy.** The `is_openai_reasoning_model` helper routes correctly.
+9. **`g_hide_frames_for_capture` must be checked in BOTH `draw_chat_window` AND `ui_present_frame` (capture path).** Skipping either side breaks the clean-layer contract.
+10. **Streaming callback (`on_done`) OWNS the `full_reply` string.** Must call `ai_free_reply` after use. Never leak.
+
+---
+
 ## 2026-07-05 (afternoon) — Bypassify parity + AI response polish
 
 Two-track work shipped:
