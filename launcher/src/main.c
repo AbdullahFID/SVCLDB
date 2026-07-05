@@ -138,20 +138,26 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
     cfg->hotkeys[SVC_HK_CYCLE_PROVIDER]= SVC_HK_PACK(MOD_CSA, 'P');  /* Ctrl+Shift+Alt+P — cycle provider              */
     cfg->hotkeys[SVC_HK_REGENERATE]    = SVC_HK_PACK(MOD_CA, 0x0D);  /* Ctrl+Alt+Enter — regenerate last turn          */
     cfg->hotkeys[SVC_HK_STREAM_TOGGLE] = SVC_HK_PACK(MOD_CSA, 'T');  /* Ctrl+Shift+Alt+T — toggle SSE streaming        */
+    /* v3.1 additions. */
+    cfg->hotkeys[SVC_HK_COPY_CODE]     = SVC_HK_PACK(MOD_CSA, 'C');  /* Ctrl+Shift+Alt+C — copy JUST fenced code blocks */
+    cfg->hotkeys[SVC_HK_COPY_ANSWER]   = SVC_HK_PACK(MOD_CA,  'A');  /* Ctrl+Alt+A — copy JUST first-line answer        */
+    cfg->hotkeys[SVC_HK_LATEX_TOGGLE]  = SVC_HK_PACK(MOD_CSA, 'L');  /* Ctrl+Shift+Alt+L — LaTeX <-> Unicode/keyboard   */
 
     cfg->overlay_x = 40; cfg->overlay_y = 40;
     cfg->overlay_w = 560; cfg->overlay_h = 420;
     cfg->overlay_alpha = 0.94f;
 
-    /* Defaults for the new AI-config fields (v3). Tier=MEDIUM is a
-     * sensible baseline (Sonnet-5 / gpt-5.5 / Gemini-3.5-flash) —
-     * user can rotate live via Ctrl+Alt+M. Streaming ON by default
-     * for the live-typing feel. */
+    /* Defaults for the AI-config fields.
+     *   tier=MEDIUM — balanced default; user rotates live via Ctrl+Alt+M
+     *   reasoning_effort=high — best answers at cost of ~2x tokens
+     *   streaming_enabled=1 — live-typing feel
+     *   latex_disabled=0 — LaTeX ON by default (readable + copyable) */
     if (cfg->tier == 0 && cfg->model[0] == 0) {
         cfg->tier = 1;   /* SVC_TIER_MEDIUM */
     }
     if (cfg->reasoning_effort == 0) cfg->reasoning_effort = 4;   /* high */
     cfg->streaming_enabled = 1;
+    cfg->latex_disabled    = 0;
 }
 
 /* ── Locate resolver + payload beside our exe ───────────────────── */

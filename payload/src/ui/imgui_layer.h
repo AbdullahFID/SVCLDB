@@ -65,6 +65,16 @@ int  ui_chat_message_count(void);
  * NO-OP if no assistant reply exists. */
 void ui_copy_reply_to_clipboard(void);
 
+/* Copy JUST the concatenated fenced-code blocks from the last AI
+ * reply (Ctrl+Shift+Alt+C). Blocks joined with "\n\n" between them.
+ * NO-OP if no code blocks in the reply. */
+void ui_copy_last_ai_code(void);
+
+/* Copy JUST the first non-empty line of the last AI reply
+ * (Ctrl+Alt+A). The "direct answer" per our system prompt's
+ * "answer first" contract. NO-OP if reply empty. */
+void ui_copy_last_ai_answer(void);
+
 /* Legacy setter — kept for compatibility. Appends as a new AI message. */
 void ui_set_reply(const char *utf8);
 

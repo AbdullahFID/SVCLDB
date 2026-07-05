@@ -253,6 +253,108 @@ If Cursor/Claude launches subagents in this repo, they MUST use `claude-4.6-sonn
 
 ---
 
+## 2026-07-05 (late evening) — v3.1 code-full-width + copy-modes + LaTeX toggle
+
+Iteration on the v3 chat rewrite (below) per user feedback:
+> "code (like when the ai ouputs code) needs to be showin fully not in a sepertae compact box... there should be a way to copy the full response and the repsonse of JUST the code for example or JUST the direct answer or what not... there should be a toggle to elkt you NOT use LATEX injecting a prompt indciaitng to the ai they must ue standard sumbols for math stuff... my enteprise key def has gpt 5... u should be able to scroll on x-direction aswell not just y"
+
+### Model tier update (per user's enterprise-key access)
+
+Verified via `GET /v1/models` — enterprise key has full GPT-5.x family + o-series through o3-pro.
+
+| Provider | STRONG | MEDIUM | CHEAP |
+|---|---|---|---|
+| OpenAI | `gpt-5.5-pro` ($30/$180, 272K) | `gpt-5.5` ($5/$30, 272K) | `gpt-5-mini` ($0.25/$2, 272K) |
+| Anthropic | `claude-opus-4-8` (NOT Fable) | `claude-sonnet-5` | `claude-haiku-4-5` |
+| Google | `gemini-3.1-pro-preview` | `gemini-3.5-flash` | `gemini-2.5-flash-lite` |
+| OpenRouter | user-picked (default `openrouter/free`) | | |
+
+### Full-width code + math block rendering
+
+Prior implementation used nested `BeginChild` with its own scrollbar → nested-scroll trap where user couldn't smoothly scroll a long response with a code block in it. Rewritten as `md_render_tinted_block` using ImDrawList background rectangle + inline TextUnformatted. No BeginChild, no nested scrollbar. The parent chat pane (X + Y) handles ALL scrolling.
+
+Applied to BOTH:
+- Fenced code blocks (dark bg + blue border + "python"/"js"/etc. label + copy button)
+- Display math (dark violet bg + violet border + "math" label + copy button)
+
+### Bubble rendering — no nested children
+
+Same fix applied to `draw_chat_bubble` via `ImDrawListSplitter` two-channel technique:
+1. Split draw list into 2 channels
+2. Render label + body on channel 1 (foreground)
+3. Compute rect from cursor start/end
+4. Backfill bg + border on channel 0 (background)
+5. Merge channels — bg appears BEHIND text without needing a BeginChild
+
+Result: user + AI bubbles are pure ImDrawList rectangles. Parent scroll handles overflow. Long code fits full-width inside the AI bubble without any nested scrollbar.
+
+### X-axis scroll enabled
+
+Chat pane now uses `ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_AlwaysVerticalScrollbar`. Long code lines / long math expressions no longer clip off the right edge — user scrolls horizontally.
+
+### 3 copy modes
+
+- `Ctrl+Alt+C` — copy FULL last AI reply (existing behavior)
+- `Ctrl+Shift+Alt+C` — copy JUST the concatenated fenced code blocks (extracted via ` ```lang...``` ` parse, joined with `\n\n`)
+- `Ctrl+Alt+A` — copy JUST the first-line "direct answer" (strips leading whitespace + backticks/asterisks from the leading line)
+
+All 3 verified live: `15! = 1,307,674,368,000` (23 chars answer), `is_palindrome = s == s[::-1]` (28 chars code), full markdown (~250 chars).
+
+### `ui_chat_append_message` no longer clobbers last-reply snapshot
+
+Previously, ANY AI message (including system toasts like `[tier changed]` or debug capture text) overwrote `g_last_reply_snapshot`. Result: after hitting Ctrl+Shift+Alt+S (debug capture), the "copy last reply" hotkey would copy the capture-report text instead of the real answer.
+
+Fix: only `ui_chat_set_reply_of_pending` updates the snapshot. That's the finalization path for real AI answers. System messages (`ui_chat_append_message`) don't touch it.
+
+### LaTeX toggle (`Ctrl+Shift+Alt+L`)
+
+New `cfg->latex_disabled` flag. When set, `materialize_default_system` appends an OVERRIDE section to the system prompt instructing the AI to use Unicode/keyboard math instead of LaTeX commands:
+
+- `\frac{a}{b}` → `(a)/(b)`
+- `x^{2}` → `x^2` or `x²`
+- `\sqrt{x}` → `sqrt(x)` or `√x`
+- `\int_a^b` → `∫[a..b]` or word form
+- `\sum_{i=1}^n` → `Σ[i=1..n]` or word form
+- `\pi/\theta/\Delta` → `pi/theta/Delta` or `π/θ/Δ`
+- No `$..$`, `\[..\]`, `\begin{}`, `\end{}` — fenced code still fine
+
+Live-verified: with toggle OFF, AI returns `3/(x + 2) = 5/(x - 1)` and `x ≠ -2, 1` (Unicode ≠, no LaTeX anywhere).
+
+### Smarter system prompt — DISPLAY CONSTRAINTS section
+
+New section in `SVCLDB_DEFAULT_SYSTEM_PROMPT` (`payload/src/ai/ai_provider.c`) explicitly telling the AI:
+- WHAT renders (fenced code blocks with copy button, display math with copy button, headings, bullet lists, numbered lists, Unicode)
+- WHAT DOES NOT render (HTML, images, links, tables, bold/italic markers get stripped)
+- Optimal patterns for math / code / MCQ (concrete examples)
+
+This eliminates guesswork — the AI now KNOWS the constraints of the renderer.
+
+### 3 new hotkeys (28 → 30 slots + LaTeX)
+
+| Hotkey | Action |
+|---|---|
+| `Ctrl+Alt+A` | Copy answer only (first line) |
+| `Ctrl+Shift+Alt+C` | Copy code only |
+| `Ctrl+Shift+Alt+L` | Toggle LaTeX on/off |
+
+### Files touched in v3.1
+
+- `payload/src/ai/ai_provider.c` — tier tables + DISPLAY CONSTRAINTS section + `materialize_default_system` LaTeX override + `append_system` helper
+- `payload/src/ui/imgui_layer.{h,cpp}` — `md_render_tinted_block` (draw-list bg approach), `draw_chat_bubble` (ImDrawListSplitter no-BeginChild), chat pane x-scroll, `ui_copy_last_ai_code` + `_answer` API, snapshot ownership fix
+- `payload/src/dllmain.c` — new hotkey handlers (SVC_HK_COPY_CODE, SVC_HK_COPY_ANSWER, SVC_HK_LATEX_TOGGLE)
+- `shared/config_types.h` — 3 new hotkey slots + `latex_disabled` field
+- `launcher/src/main.c` — default hotkey bindings + `latex_disabled = 0` default
+
+### Hard invariants added in v3.1 (DO NOT REGRESS)
+
+1. **NO nested BeginChild inside the chat pane.** Bubbles, code blocks, math blocks all use ImDrawList direct-render with background rects. This is what makes the ONE parent scroll work across the whole reply.
+2. **`ui_chat_append_message` MUST NOT update `g_last_reply_snapshot`.** Only `ui_chat_set_reply_of_pending` does. This preserves the "last real reply" for Ctrl+Alt+C/A/Shift+C targeting.
+3. **Chat pane has `ImGuiWindowFlags_HorizontalScrollbar`.** Never remove — long code lines / math expressions rely on it.
+4. **`latex_disabled` prompt override is APPENDED to the base system prompt, not replaced.** The subject-matter rules still apply; only the notation style changes.
+5. **Copy modes strip inline markers** (`**`, `*`, `` ` ``) before writing to clipboard so pasted text is clean plaintext.
+
+---
+
 ## 2026-07-05 (evening) — v3 chat rewrite (AI + UI overhaul)
 
 Major coordinated overhaul of the AI + UI layers. This is the AUTHORITATIVE state; prior handoffs (`HANDOFF_STEALTH_NIGHT_*` + `HANDOFF_UX_POLISH_*`) still hold for the stealth invariants but the CHAT UI + AI-provider details in them are superseded.

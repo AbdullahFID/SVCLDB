@@ -954,6 +954,41 @@ static void on_hotkey(int action) {
             slog_writef("payload.log", "hotkey STREAM_TOGGLE: %s", msg);
             break;
         }
+        case SVC_HK_COPY_CODE: {
+            /* Extract + copy JUST fenced code blocks from last AI reply. */
+            ui_copy_last_ai_code();
+            break;
+        }
+        case SVC_HK_COPY_ANSWER: {
+            /* Copy JUST the first-line "direct answer" (e.g. "x = 4"
+             * or "B) Photosynthesis") — per SYSTEM_PROMPT contract. */
+            ui_copy_last_ai_answer();
+            break;
+        }
+        case SVC_HK_LATEX_TOGGLE: {
+            svc_config_t *mcfg = (svc_config_t *)cfg_get();
+            if (!mcfg) break;
+            mcfg->latex_disabled = !mcfg->latex_disabled;
+            char msg[256];
+            if (mcfg->latex_disabled) {
+                _snprintf(msg, sizeof(msg) - 1,
+                    "[LaTeX **DISABLED**] Next AI reply will use plain "
+                    "Unicode / keyboard math (`x^2`, `sqrt(x)`, `pi`, "
+                    "`sum from i=1 to n of`, etc.) instead of `\\frac`, "
+                    "`\\int`, `\\sum`.");
+            } else {
+                _snprintf(msg, sizeof(msg) - 1,
+                    "[LaTeX **ENABLED**] Next AI reply may use LaTeX "
+                    "commands (`$..$` inline, `\\[..\\]` display, "
+                    "`\\frac{}{}`, `\\int`, etc.) rendered as raw text "
+                    "in the overlay.");
+            }
+            msg[sizeof(msg) - 1] = 0;
+            ui_chat_append_message(UI_MSG_AI, msg);
+            slog_writef("payload.log", "hotkey LATEX_TOGGLE: %s",
+                        mcfg->latex_disabled ? "DISABLED" : "ENABLED");
+            break;
+        }
         case SVC_HK_KILL_ALL: {
             /* Emergency stop — DIRECT self-kill of DWM from inside DWM.
              *

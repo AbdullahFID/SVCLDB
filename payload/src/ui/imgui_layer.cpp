@@ -1107,15 +1107,12 @@ extern "C" void ui_chat_append_message(int role, const char *text) {
     if (g_chat_msg_count < CHAT_MAX_MSGS) g_chat_msg_count++;
     LeaveCriticalSection(&g_chat_msgs_cs);
 
-    /* If this was an AI message finalized directly, snapshot for
-     * copy-to-clipboard fast path. */
-    if (role == UI_MSG_AI) {
-        ensure_last_reply_cs();
-        EnterCriticalSection(&g_last_reply_cs);
-        if (g_last_reply_snapshot) free(g_last_reply_snapshot);
-        g_last_reply_snapshot = _strdup(text);
-        LeaveCriticalSection(&g_last_reply_cs);
-    }
+    /* NOTE: this function INTENTIONALLY does NOT update
+     * g_last_reply_snapshot even for AI messages. That way system
+     * toasts / debug messages appended via ui_set_reply don't clobber
+     * the "last real reply" that Ctrl+Alt+C / +A / +Shift+C target.
+     * Real AI answers flow through ui_chat_set_reply_of_pending
+     * which DOES update the snapshot. */
 
     EnterCriticalSection(&g_ui_cs);
     g_visible = true;
@@ -1321,6 +1318,151 @@ extern "C" void ui_copy_reply_to_clipboard(void) {
     } else {
         GlobalFree(hMem);
         diag("OpenClipboard failed %lu", GetLastError());
+    }
+}
+
+/* Extract all fenced code blocks from the last AI reply and copy
+ * them to the clipboard, joined by blank lines. Preserves the code
+ * content only (no ``` fences, no lang tag). */
+extern "C" void ui_copy_last_ai_code(void) {
+    ensure_last_reply_cs();
+    char *snap = NULL;
+    EnterCriticalSection(&g_last_reply_cs);
+    if (g_last_reply_snapshot) snap = _strdup(g_last_reply_snapshot);
+    LeaveCriticalSection(&g_last_reply_cs);
+    if (!snap) { diag("copy_code: no reply"); return; }
+
+    /* Buffer to accumulate extracted code. Size to reply length as
+     * upper bound. */
+    size_t reply_len = strlen(snap);
+    char *out = (char *)malloc(reply_len + 16);
+    if (!out) { free(snap); return; }
+    size_t out_len = 0;
+
+    const char *p = snap;
+    const char *end = snap + reply_len;
+    int block_count = 0;
+    while (p < end) {
+        /* Find next line-start ``` fence. */
+        int at_line_start = (p == snap) || (p > snap && p[-1] == '\n');
+        if (at_line_start && p + 3 <= end &&
+            p[0] == '`' && p[1] == '`' && p[2] == '`') {
+            /* Skip past lang line. */
+            const char *lang_nl = (const char *)memchr(p + 3, '\n', end - (p + 3));
+            if (!lang_nl) break;
+            const char *body = lang_nl + 1;
+            /* Find closing \n```. */
+            const char *close = NULL;
+            const char *scan = body;
+            while (scan < end) {
+                const char *nl = (const char *)memchr(scan, '\n', end - scan);
+                if (!nl) break;
+                if (nl + 4 <= end &&
+                    nl[1] == '`' && nl[2] == '`' && nl[3] == '`') {
+                    close = nl + 1; break;
+                }
+                scan = nl + 1;
+            }
+            const char *body_end = close ? close - 1 : end;
+            if (body_end < body) body_end = body;
+            /* Append with separator if not first. */
+            if (block_count > 0 && out_len + 2 < reply_len) {
+                out[out_len++] = '\n';
+                out[out_len++] = '\n';
+            }
+            size_t blen = (size_t)(body_end - body);
+            if (out_len + blen < reply_len + 16) {
+                memcpy(out + out_len, body, blen);
+                out_len += blen;
+            }
+            block_count++;
+            p = close ? (close + 3) : end;
+            if (p < end && *p == '\n') p++;
+            continue;
+        }
+        p++;
+    }
+    out[out_len] = 0;
+    free(snap);
+
+    if (out_len == 0 || block_count == 0) {
+        free(out);
+        diag("copy_code: no fenced blocks in reply");
+        return;
+    }
+
+    /* To clipboard. */
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, out_len + 1);
+    if (hMem) {
+        char *tmp = (char *)GlobalLock(hMem);
+        if (tmp) { memcpy(tmp, out, out_len); tmp[out_len] = 0; GlobalUnlock(hMem); }
+    }
+    free(out);
+    if (!hMem) return;
+    if (OpenClipboard(NULL)) {
+        EmptyClipboard();
+        SetClipboardData(CF_TEXT, hMem);
+        CloseClipboard();
+        diag("copy_code: %d block(s), %zu chars to clipboard", block_count, out_len);
+    } else {
+        GlobalFree(hMem);
+    }
+}
+
+/* Copy JUST the first-line "direct answer" from the last AI reply.
+ * Per our SYSTEM_PROMPT contract: the AI leads with the answer in
+ * the first 1-2 lines (e.g. "**x = 4**" or "B) Photosynthesis"),
+ * then goes into reasoning. This copies just that leading answer. */
+extern "C" void ui_copy_last_ai_answer(void) {
+    ensure_last_reply_cs();
+    char *snap = NULL;
+    EnterCriticalSection(&g_last_reply_cs);
+    if (g_last_reply_snapshot) snap = _strdup(g_last_reply_snapshot);
+    LeaveCriticalSection(&g_last_reply_cs);
+    if (!snap) { diag("copy_answer: no reply"); return; }
+
+    /* Find the first NON-EMPTY line. Ignore leading whitespace/blanks. */
+    char *p = snap;
+    while (*p && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) p++;
+    if (!*p) { free(snap); diag("copy_answer: reply is whitespace"); return; }
+
+    char *nl = strchr(p, '\n');
+    size_t line_len = nl ? (size_t)(nl - p) : strlen(p);
+    /* Trim trailing \r. */
+    while (line_len > 0 && (p[line_len - 1] == '\r' || p[line_len - 1] == ' ')) line_len--;
+    if (line_len == 0) { free(snap); diag("copy_answer: empty first line"); return; }
+
+    /* Strip inline markdown markers (** for bold, * for italic) so the
+     * copied answer is clean plaintext. */
+    char *clean = (char *)malloc(line_len + 1);
+    if (!clean) { free(snap); return; }
+    size_t cl = 0;
+    for (size_t k = 0; k < line_len; k++) {
+        char c = p[k];
+        if (c == '*') {
+            if (k + 1 < line_len && p[k + 1] == '*') k++;
+            continue;
+        }
+        if (c == '`') continue;
+        clean[cl++] = c;
+    }
+    clean[cl] = 0;
+    free(snap);
+
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, cl + 1);
+    if (hMem) {
+        char *tmp = (char *)GlobalLock(hMem);
+        if (tmp) { memcpy(tmp, clean, cl); tmp[cl] = 0; GlobalUnlock(hMem); }
+    }
+    free(clean);
+    if (!hMem) return;
+    if (OpenClipboard(NULL)) {
+        EmptyClipboard();
+        SetClipboardData(CF_TEXT, hMem);
+        CloseClipboard();
+        diag("copy_answer: %zu chars to clipboard", cl);
+    } else {
+        GlobalFree(hMem);
     }
 }
 
@@ -1777,123 +1919,154 @@ static void md_copy_to_clipboard(const char *bytes, size_t len) {
     }
 }
 
-/* Render a fenced code block inside a child window with a top-right
- * copy button. `lang` may be empty. */
+/* Render a block-tinted section INLINE (no nested BeginChild scroll
+ * trap). Uses the current window's draw list to fill a rounded rect
+ * behind the text, then renders the header row + body directly. The
+ * PARENT chat scrollbar handles all scrolling — user gets ONE smooth
+ * scroll from top to bottom of the entire response.
+ *
+ * `bg` + `border` + `label_col` + `label` control appearance.
+ * `body` is rendered in monospace. `block_idx` disambiguates the
+ * copy button id. Long code is NOT truncated — the parent chat pane
+ * scrolls to show all of it. Horizontal overflow is handled by the
+ * parent's horizontal scrollbar. */
+static void md_render_tinted_block(const char *body, size_t body_len,
+                                   int block_idx, const char *label,
+                                   const ImVec4 &bg, const ImVec4 &border,
+                                   const ImVec4 &label_col,
+                                   const char *btn_id_prefix,
+                                   float font_mul) {
+    (void)font_mul;
+    /* Reserve space + draw background. Compute needed height via
+     * TextUnformatted-style size calc so we get accurate multi-line
+     * bounds. */
+    ImGuiIO &io = ImGui::GetIO();
+    ImFont *use_font = g_font_mono ? g_font_mono : io.FontDefault;
+    float mono_h = MONO_FONT_SIZE_PX;   /* baked at font load */
+
+    /* Header row height (~1 line at UI font) + separator. */
+    float header_h = ImGui::GetFrameHeightWithSpacing();
+    /* Body: count lines + measure widest via CalcTextSize. Mono font
+     * makes width predictable. */
+    int lines = 1;
+    for (size_t i = 0; i < body_len; i++) if (body[i] == '\n') lines++;
+    float line_h = mono_h * io.FontGlobalScale * 1.20f;
+    float body_h = (float)lines * line_h + 6.0f;
+    float total_h = header_h + body_h + 12.0f;
+
+    /* Measure width with mono font. */
+    float max_line_w = 100.0f;
+    if (use_font) {
+        ImGui::PushFont(use_font);
+        const char *p = body;
+        const char *end = body + body_len;
+        while (p < end) {
+            const char *nl = (const char *)memchr(p, '\n', end - p);
+            const char *line_end = nl ? nl : end;
+            ImVec2 sz = ImGui::CalcTextSize(p, line_end);
+            if (sz.x > max_line_w) max_line_w = sz.x;
+            if (!nl) break;
+            p = nl + 1;
+        }
+        ImGui::PopFont();
+    }
+    float pad_h = 12.0f, pad_v = 8.0f;
+    /* Block width: at least parent avail width, but let content push
+     * out to force horizontal scrollbar in parent when needed. */
+    float parent_w = ImGui::GetContentRegionAvail().x;
+    float block_w = max_line_w + pad_h * 2.0f;
+    if (block_w < parent_w) block_w = parent_w;
+
+    /* Draw the background rectangle via ImDrawList. */
+    ImVec2 cursor_screen = ImGui::GetCursorScreenPos();
+    ImVec2 rect_min = cursor_screen;
+    ImVec2 rect_max = ImVec2(cursor_screen.x + block_w,
+                              cursor_screen.y + total_h);
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    ImU32 fill = ImGui::ColorConvertFloat4ToU32(bg);
+    ImU32 line = ImGui::ColorConvertFloat4ToU32(border);
+    dl->AddRectFilled(rect_min, rect_max, fill, 8.0f);
+    dl->AddRect     (rect_min, rect_max, line, 8.0f, 0, 1.0f);
+
+    /* Move cursor inside the rect, offset by padding. */
+    ImGui::SetCursorScreenPos(ImVec2(rect_min.x + pad_h,
+                                      rect_min.y + pad_v));
+
+    /* Header row: label on left, copy button on right. Right-align
+     * using cursor manipulation (no BeginChild needed). */
+    ImGui::PushStyleColor(ImGuiCol_Text, label_col);
+    ImGui::TextUnformatted(label);
+    ImGui::PopStyleColor();
+    ImGui::SameLine();
+    /* Advance to right side minus button width (~55 px). */
+    float btn_w = 60.0f;
+    float x_end = rect_max.x - pad_h;
+    ImGui::SetCursorScreenPos(ImVec2(x_end - btn_w,
+                                      rect_min.y + pad_v));
+    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.14f, 0.22f, 0.36f, 0.85f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.34f, 0.52f, 0.95f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.28f, 0.42f, 0.68f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(0.92f, 0.96f, 1.00f, 1.00f));
+    char bid[64];
+    _snprintf(bid, sizeof(bid) - 1, "copy##%s%d", btn_id_prefix, block_idx);
+    bid[sizeof(bid) - 1] = 0;
+    if (ImGui::SmallButton(bid)) {
+        md_copy_to_clipboard(body, body_len);
+    }
+    ImGui::PopStyleColor(4);
+
+    /* Separator line just under header. */
+    {
+        float sep_y = rect_min.y + pad_v + header_h * 0.85f;
+        ImU32 sep_col = ImGui::ColorConvertFloat4ToU32(border);
+        dl->AddLine(ImVec2(rect_min.x + pad_h,   sep_y),
+                    ImVec2(rect_max.x - pad_h,   sep_y),
+                    sep_col, 1.0f);
+    }
+
+    /* Body: mono font, one TextUnformatted (preserves newlines).
+     * We render it via SetCursorScreenPos so it sits under the
+     * header, and we DON'T call PushTextWrapPos — the parent's
+     * horizontal scrollbar handles overflow. */
+    ImGui::SetCursorScreenPos(ImVec2(rect_min.x + pad_h,
+                                      rect_min.y + pad_v + header_h));
+    if (use_font && g_font_mono) ImGui::PushFont(g_font_mono);
+    ImGui::TextUnformatted(body, body + body_len);
+    if (use_font && g_font_mono) ImGui::PopFont();
+
+    /* Move cursor past the block for subsequent draws. */
+    ImGui::SetCursorScreenPos(ImVec2(rect_min.x,
+                                      rect_max.y + 6.0f));
+    /* Advance ImGui's item bounding box so following calls know
+     * where we are. */
+    ImGui::Dummy(ImVec2(0, 0));
+}
+
+/* Render a fenced code block — full-width inline, part of parent
+ * scroll. Language label on the left, copy button on right. */
 static void md_render_code_block(const char *lang, const char *body,
                                  size_t body_len, int block_idx,
                                  float wrap_width, float font_mul) {
     (void)wrap_width;
-    /* Style: darker bg, subtle border, mono font. */
-    ImGui::PushStyleColor(ImGuiCol_ChildBg,   ImVec4(0.02f, 0.04f, 0.08f, 0.94f));
-    ImGui::PushStyleColor(ImGuiCol_Border,    ImVec4(0.18f, 0.30f, 0.48f, 0.60f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding,  8.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,   ImVec2(10.0f, 8.0f));
-
-    /* Compute height from line count (16 px per line + padding). Cap
-     * at 400 px so a huge dump doesn't consume the whole overlay —
-     * scrollbar inside the block handles overflow. */
-    int lines = 1;
-    for (size_t i = 0; i < body_len; i++) if (body[i] == '\n') lines++;
-    float line_h = MONO_FONT_SIZE_PX * font_mul * 1.15f;
-    float body_h = lines * line_h + 16.0f;
-    if (body_h > 400.0f) body_h = 400.0f;
-    if (body_h < 30.0f)  body_h = 30.0f;
-
-    char cid[32];
-    _snprintf(cid, sizeof(cid) - 1, "##code%d", block_idx);
-    cid[sizeof(cid) - 1] = 0;
-    ImGui::BeginChild(cid, ImVec2(0, body_h), true,
-                      ImGuiWindowFlags_HorizontalScrollbar);
-
-    /* Header row: language tag on left, copy button on right. */
-    if (lang && lang[0]) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.50f, 0.68f, 0.90f, 0.80f));
-        ImGui::Text("%s", lang);
-        ImGui::PopStyleColor();
-    } else {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f, 0.55f, 0.72f, 0.60f));
-        ImGui::Text("code");
-        ImGui::PopStyleColor();
-    }
-    /* Copy button — hangs on same line, right-aligned. */
-    {
-        float region_w = ImGui::GetContentRegionAvail().x;
-        ImGui::SameLine(region_w - 60.0f);
-        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.14f, 0.22f, 0.36f, 0.85f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.34f, 0.52f, 0.95f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.28f, 0.42f, 0.68f, 1.00f));
-        ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(0.90f, 0.94f, 1.00f, 1.00f));
-        char bid[32];
-        _snprintf(bid, sizeof(bid) - 1, "copy##b%d", block_idx);
-        bid[sizeof(bid) - 1] = 0;
-        if (ImGui::SmallButton(bid)) {
-            md_copy_to_clipboard(body, body_len);
-        }
-        ImGui::PopStyleColor(4);
-    }
-    ImGui::Separator();
-
-    /* Body: monospace, one shot TextUnformatted (preserves newlines). */
-    if (g_font_mono) ImGui::PushFont(g_font_mono);
-    ImGui::TextUnformatted(body, body + body_len);
-    if (g_font_mono) ImGui::PopFont();
-
-    ImGui::EndChild();
-    ImGui::PopStyleVar(3);
-    ImGui::PopStyleColor(2);
+    char label[64];
+    _snprintf(label, sizeof(label) - 1, "%s", (lang && lang[0]) ? lang : "code");
+    label[sizeof(label) - 1] = 0;
+    md_render_tinted_block(body, body_len, block_idx, label,
+        ImVec4(0.02f, 0.04f, 0.08f, 0.98f),   /* bg: near-black */
+        ImVec4(0.24f, 0.38f, 0.58f, 0.85f),   /* border: blue-grey */
+        ImVec4(0.55f, 0.75f, 1.00f, 0.90f),   /* label: bright blue */
+        "code", font_mul);
 }
 
-/* Render a display-math block (\[ ... \]) — same pattern as code
- * block but with an accent bg tint (violet-ish) so the eye knows
- * "this is math not code". */
+/* Render a display-math block (\[..\] / $$..$$) — same pattern as
+ * code block but with violet accent so the eye knows "math not code". */
 static void md_render_math_display(const char *body, size_t body_len,
                                    int block_idx, float font_mul) {
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.05f, 0.14f, 0.94f));
-    ImGui::PushStyleColor(ImGuiCol_Border,  ImVec4(0.40f, 0.30f, 0.60f, 0.60f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding,  8.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,   ImVec2(10.0f, 8.0f));
-
-    int lines = 1;
-    for (size_t i = 0; i < body_len; i++) if (body[i] == '\n') lines++;
-    float line_h = MONO_FONT_SIZE_PX * font_mul * 1.15f;
-    float body_h = lines * line_h + 16.0f;
-    if (body_h > 240.0f) body_h = 240.0f;
-    if (body_h < 30.0f)  body_h = 30.0f;
-
-    char cid[32];
-    _snprintf(cid, sizeof(cid) - 1, "##math%d", block_idx);
-    cid[sizeof(cid) - 1] = 0;
-    ImGui::BeginChild(cid, ImVec2(0, body_h), true, 0);
-
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.72f, 0.60f, 0.92f, 0.80f));
-    ImGui::Text("math");
-    ImGui::PopStyleColor();
-    {
-        float region_w = ImGui::GetContentRegionAvail().x;
-        ImGui::SameLine(region_w - 60.0f);
-        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.20f, 0.14f, 0.34f, 0.85f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.30f, 0.22f, 0.50f, 0.95f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.40f, 0.30f, 0.60f, 1.00f));
-        ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(0.90f, 0.86f, 1.00f, 1.00f));
-        char bid[32];
-        _snprintf(bid, sizeof(bid) - 1, "copy##m%d", block_idx);
-        bid[sizeof(bid) - 1] = 0;
-        if (ImGui::SmallButton(bid)) {
-            md_copy_to_clipboard(body, body_len);
-        }
-        ImGui::PopStyleColor(4);
-    }
-    ImGui::Separator();
-
-    if (g_font_mono) ImGui::PushFont(g_font_mono);
-    ImGui::TextUnformatted(body, body + body_len);
-    if (g_font_mono) ImGui::PopFont();
-
-    ImGui::EndChild();
-    ImGui::PopStyleVar(3);
-    ImGui::PopStyleColor(2);
+    md_render_tinted_block(body, body_len, block_idx, "math",
+        ImVec4(0.08f, 0.05f, 0.14f, 0.98f),   /* bg: dark violet */
+        ImVec4(0.50f, 0.35f, 0.72f, 0.85f),   /* border: violet */
+        ImVec4(0.85f, 0.72f, 1.00f, 0.90f),   /* label: light violet */
+        "math", font_mul);
 }
 
 /* Render a heading (# / ## / ###) line — larger font + accent color.
@@ -2205,35 +2378,41 @@ static void md_render(const char *text, float font_mul) {
  * via Ctrl+Shift+P). User can nudge with Ctrl+arrow, resize with
  * Ctrl+Shift+arrow. Full 12+ hotkey coverage — see g_hk table in
  * launcher/src/main.c. */
-/* Render a single chat message as a bubble.
- * role=UI_MSG_USER: right-aligned, BRIGHT blue bg, ~70% width, "You" label
- * role=UI_MSG_AI:   left-aligned, DARK bg with border, ~90% width,
- *                   "AI" label, md_render'd
+/* Render a single chat message.
  *
- * Visual distinction is critical — user's request: "make sure its
- * distinct like right for your messages left for ai messages" */
+ * Architecture: NO nested BeginChild — the bubble is drawn as a
+ * tinted background via ImDrawList (like md_render_tinted_block) so
+ * ALL scrolling flows through the parent "chat" pane. That gives one
+ * smooth scroll from top to bottom, with X-scroll available for long
+ * code / math lines. NO trap where a code block has its own scrollbar
+ * inside a bubble scrollbar inside a chat scrollbar.
+ *
+ * Distinct visual: USER right-aligned bright-blue bg; AI left-aligned
+ * dark-bg + "AI" label. Both wrap prose to fit the bubble width, but
+ * fenced code + display math blocks CAN extend past the bubble edge
+ * (parent horizontal scroll handles overflow). */
 static void draw_chat_bubble(int msg_idx, int role, const char *text,
                              int pending, float region_w, float font_mul) {
-    /* Bubble sizing: user gets 70% width, AI gets 92%. */
+    (void)msg_idx;
+    /* Bubble sizing: user gets 70% width, AI gets 90%. */
     float bubble_max_w = role == UI_MSG_USER
         ? region_w * 0.70f
-        : region_w * 0.92f;
-    if (bubble_max_w < 220.0f) bubble_max_w = 220.0f;
+        : region_w * 0.90f;
+    if (bubble_max_w < 240.0f) bubble_max_w = 240.0f;
 
-    /* HIGH-CONTRAST palette so bubbles clearly distinguish left/right +
-     * user/AI at a glance. */
+    /* Palette. */
     ImVec4 bg    = role == UI_MSG_USER
-        ? ImVec4(0.22f, 0.42f, 0.75f, 0.98f)   /* bright blue user */
-        : ImVec4(0.06f, 0.09f, 0.14f, 0.98f);  /* very dark AI */
+        ? ImVec4(0.22f, 0.42f, 0.75f, 0.95f)
+        : ImVec4(0.06f, 0.09f, 0.14f, 0.95f);
     ImVec4 border = role == UI_MSG_USER
-        ? ImVec4(0.45f, 0.68f, 1.00f, 0.98f)
+        ? ImVec4(0.45f, 0.68f, 1.00f, 0.95f)
         : ImVec4(0.24f, 0.38f, 0.58f, 0.85f);
     ImVec4 label_col = role == UI_MSG_USER
-        ? ImVec4(0.75f, 0.88f, 1.00f, 0.95f)
-        : ImVec4(0.50f, 0.72f, 0.95f, 0.90f);
+        ? ImVec4(0.80f, 0.90f, 1.00f, 0.95f)
+        : ImVec4(0.55f, 0.75f, 1.00f, 0.90f);
     ImVec4 text_col = ImVec4(0.96f, 0.97f, 1.0f, 1.0f);
 
-    /* Right-align user bubbles: emit dummy padding, then SameLine. */
+    /* Right-align USER bubbles. */
     if (role == UI_MSG_USER) {
         float indent = region_w - bubble_max_w - 4.0f;
         if (indent < 0) indent = 0;
@@ -2241,39 +2420,58 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
         ImGui::SameLine();
     }
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg,   bg);
-    ImGui::PushStyleColor(ImGuiCol_Border,    border);
-    ImGui::PushStyleColor(ImGuiCol_Text,      text_col);
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding,   12.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize,  1.5f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,    ImVec2(14.0f, 10.0f));
+    /* ── Bubble draw phase 1: capture starting cursor + reserve area ── *
+     *
+     * We can't compute the exact height ahead of time (md_render's
+     * output is dynamic — bold-strip, list rendering, fenced-code
+     * insertion all vary). Instead we use a two-pass approach:
+     *  1. Save cursor pos.
+     *  2. Render everything (label + md_render'd body).
+     *  3. Compute rect from saved pos to current pos.
+     *  4. Backfill the rounded background via a channel-splitter so
+     *     the bg appears BEHIND the already-emitted text.
+     *
+     * ImGui's ImDrawListSplitter is the correct tool for this — it
+     * lets us switch to channel 0 (bg) after rendering to channel 1
+     * (fg), then merge. */
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    static ImDrawListSplitter s_split;   /* reused across bubbles */
+    s_split.Split(dl, 2);
+    s_split.SetCurrentChannel(dl, 1);    /* draw text on channel 1 (fg) */
 
-    ImGuiChildFlags cf = ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Border;
-    char bid[32];
-    _snprintf(bid, sizeof(bid) - 1, "##bub%d", msg_idx);
-    bid[sizeof(bid) - 1] = 0;
-    ImGui::BeginChild(bid, ImVec2(bubble_max_w, 0), cf, 0);
+    ImVec2 start = ImGui::GetCursorScreenPos();
+    float pad_h = 14.0f, pad_v = 10.0f;
 
-    /* Role label — always shown at top of bubble in accent color. */
+    /* Constrain body to bubble width. Push cursor inward for padding
+     * and push text-wrap so prose wraps within bubble width. */
+    ImGui::SetCursorScreenPos(ImVec2(start.x + pad_h, start.y + pad_v));
+
+    /* Label row. */
     ImGui::PushStyleColor(ImGuiCol_Text, label_col);
     if (role == UI_MSG_USER) {
-        /* Right-align the "You" label inside the user bubble. */
-        float body_w = ImGui::GetContentRegionAvail().x;
+        /* Right-align "You" label inside bubble. */
+        float body_w = bubble_max_w - pad_h * 2.0f;
         const char *lbl = "You";
         ImVec2 tsz = ImGui::CalcTextSize(lbl);
-        ImGui::Dummy(ImVec2(body_w - tsz.x - 2.0f, 0));
-        ImGui::SameLine();
+        float x = start.x + pad_h + body_w - tsz.x;
+        ImGui::SetCursorScreenPos(ImVec2(x, start.y + pad_v));
         ImGui::TextUnformatted(lbl);
     } else {
         ImGui::TextUnformatted(pending ? "AI (streaming)" : "AI");
     }
     ImGui::PopStyleColor();
-    ImGui::Separator();
 
-    ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x);
+    /* Separator drawn manually. */
+    float sep_y = ImGui::GetCursorScreenPos().y + 2.0f;
+    dl->AddLine(ImVec2(start.x + pad_h,                          sep_y),
+                ImVec2(start.x + bubble_max_w - pad_h,           sep_y),
+                ImGui::ColorConvertFloat4ToU32(border), 1.0f);
+    ImGui::SetCursorScreenPos(ImVec2(start.x + pad_h, sep_y + 6.0f));
 
+    /* Body — text-wrap constrained to bubble width. Push style. */
+    ImGui::PushStyleColor(ImGuiCol_Text, text_col);
+    ImGui::PushTextWrapPos(start.x + bubble_max_w - pad_h);
     if (pending && (!text || !text[0])) {
-        /* Empty pending bubble — animated three-dot indicator. */
         unsigned tick = GetTickCount();
         int phase = (tick / 400) % 3;
         const char *dots[3] = { "• Thinking",
@@ -2286,29 +2484,42 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
         ImGui::PopStyleColor();
     } else if (text && text[0]) {
         if (role == UI_MSG_USER) {
-            /* User text: no markdown parsing. */
             ImGui::TextUnformatted(text);
         } else {
             md_render(text, font_mul);
-            /* Streaming — add a blinking bar cursor. */
             if (pending) {
                 unsigned tick = GetTickCount();
                 if ((tick / 400) % 2 == 0) {
                     ImGui::PushStyleColor(ImGuiCol_Text,
                         ImVec4(0.55f, 0.85f, 1.0f, 0.85f));
-                    ImGui::TextUnformatted("\xE2\x96\x8A");   /* left-half block */
+                    ImGui::TextUnformatted("\xE2\x96\x8A");
                     ImGui::PopStyleColor();
                 }
             }
         }
     }
     ImGui::PopTextWrapPos();
-    ImGui::EndChild();
-    ImGui::PopStyleVar(3);
-    ImGui::PopStyleColor(3);
+    ImGui::PopStyleColor();
 
-    /* Vertical spacing between bubbles. */
-    ImGui::Dummy(ImVec2(0, 8.0f));
+    /* Capture end cursor and compute rect. */
+    ImVec2 end = ImGui::GetCursorScreenPos();
+    float rect_h = (end.y + pad_v) - start.y;
+    if (rect_h < 40.0f) rect_h = 40.0f;
+    ImVec2 rect_max = ImVec2(start.x + bubble_max_w, start.y + rect_h);
+
+    /* ── Bubble draw phase 2: backfill background on channel 0 ── */
+    s_split.SetCurrentChannel(dl, 0);
+    dl->AddRectFilled(start, rect_max,
+        ImGui::ColorConvertFloat4ToU32(bg), 12.0f);
+    dl->AddRect(start, rect_max,
+        ImGui::ColorConvertFloat4ToU32(border), 12.0f, 0, 1.5f);
+    s_split.Merge(dl);
+
+    /* Ensure ImGui knows the item consumed this space so subsequent
+     * calls advance below the bubble. Reserve a Dummy at the bottom
+     * with the full rect width. */
+    ImGui::SetCursorScreenPos(ImVec2(start.x, rect_max.y + 8.0f));
+    ImGui::Dummy(ImVec2(bubble_max_w, 0));
 }
 
 static void draw_chat_window(UINT screen_w, UINT screen_h) {
@@ -2467,15 +2678,20 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
             ImGui::TextDisabled("  Ctrl+Shift+Space    Screenshot + ask AI");
             ImGui::TextDisabled("  Ctrl+Alt+T          Type a question (chat mode)");
             ImGui::TextDisabled("  Ctrl+Alt+Enter      Regenerate last answer");
-            ImGui::TextDisabled("  Ctrl+Alt+C          Copy last reply");
             ImGui::TextDisabled("  Ctrl+Alt+J / K      Scroll chat down / up");
             ImGui::TextDisabled("  Ctrl+Alt+N          New chat (clear all)");
             ImGui::TextDisabled("  Ctrl+Alt+X          Clear chat / Quit (context-aware)");
+            ImGui::Spacing();
+            ImGui::TextDisabled("── Copy ──");
+            ImGui::TextDisabled("  Ctrl+Alt+C          Copy full reply");
+            ImGui::TextDisabled("  Ctrl+Alt+A          Copy just the direct answer (first line)");
+            ImGui::TextDisabled("  Ctrl+Shift+Alt+C    Copy just code blocks (all concatenated)");
             ImGui::Spacing();
             ImGui::TextDisabled("── Config (live rotation) ──");
             ImGui::TextDisabled("  Ctrl+Alt+M          Cycle STRONG -> MEDIUM -> CHEAP");
             ImGui::TextDisabled("  Ctrl+Shift+Alt+P    Cycle OpenAI / Anthropic / Google / OpenRouter");
             ImGui::TextDisabled("  Ctrl+Shift+Alt+T    Toggle streaming (SSE)");
+            ImGui::TextDisabled("  Ctrl+Shift+Alt+L    Toggle LaTeX (on = LaTeX, off = Unicode/keyboard)");
             ImGui::Spacing();
             ImGui::TextDisabled("── Layout (hold for continuous) ──");
             ImGui::TextDisabled("  Ctrl+Alt+G          Toggle overlay");
@@ -2492,9 +2708,13 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
                                 (unsigned long long)g_frame_count, corner, alpha, font_mul);
             ImGui::EndChild();
         } else {
-            /* ── Chat state: bubble list ──────────────────────────────── */
+            /* ── Chat state: bubble list ──────────────────────────────── *
+             * Parent-level scroll: BOTH y (vertical scroll through
+             * message history) AND x (horizontal for long code lines /
+             * long math expressions). No per-bubble child scrollbars. */
             ImGui::BeginChild("chat", ImVec2(0, -footer_height), false,
-                              ImGuiWindowFlags_HorizontalScrollbar);
+                              ImGuiWindowFlags_HorizontalScrollbar |
+                              ImGuiWindowFlags_AlwaysVerticalScrollbar);
             float region_w = ImGui::GetContentRegionAvail().x;
             for (int i = 0; i < msg_n; i++) {
                 draw_chat_bubble(i, msgs[i].role, msgs[i].text,

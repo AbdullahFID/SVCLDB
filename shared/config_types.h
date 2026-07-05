@@ -49,6 +49,7 @@ typedef struct {
     char        model   [128];  /* CUSTOM tier + OpenRouter free-picking */
     int         reasoning_effort;   /* 0=none 1=minimal 2=low 3=medium 4=high 5=xhigh */
     int         streaming_enabled;  /* 1 = SSE stream reply into chat */
+    int         latex_disabled;     /* 1 = tell AI to use Unicode/keyboard math instead of LaTeX */
 
     /* System prompt (user-editable in settings UI). Sized to hold the
      * built-in SVCLDB_DEFAULT_SYSTEM_PROMPT (~10 KB of subject-matter
@@ -104,6 +105,11 @@ typedef enum {
                                  * we picked Ctrl+Shift+Alt+P — 3-mod safe) */
     SVC_HK_REGENERATE    = 26,  /* Re-ask last user turn (Ctrl+Alt+Enter)  */
     SVC_HK_STREAM_TOGGLE = 27,  /* Toggle SSE streaming (Ctrl+Shift+Alt+T) */
+
+    /* v3.1 additions (2026-07-05 evening) */
+    SVC_HK_COPY_CODE     = 28,  /* Copy JUST code blocks (Ctrl+Shift+Alt+C)*/
+    SVC_HK_COPY_ANSWER   = 29,  /* Copy JUST first-line answer (Ctrl+Alt+A)*/
+    SVC_HK_LATEX_TOGGLE  = 30,  /* Toggle LaTeX vs Unicode (Ctrl+Shift+Alt+L)*/
 
     SVC_HK_COUNT
 } svc_hotkey_action_t;

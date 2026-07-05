@@ -69,15 +69,74 @@ static const char SVCLDB_DEFAULT_SYSTEM_PROMPT[] =
 "Comment the non-obvious lines. Explanation goes ABOVE or BELOW the block, "
 "not inside.\n"
 "\n"
-"For MATH: use $..$ for inline math, \\[..\\] for display, ```math for step-\n"
-"by-step derivations. Prefer standard LaTeX notation (x^2, \\frac{a}{b}, "
-"\\int, \\sum) — the overlay renders LaTeX with a mono font so it's readable "
-"and copyable.\n"
+"═══════════════════════════════════════════════════════════════════\n"
+"DISPLAY CONSTRAINTS (READ CAREFULLY — the overlay renderer is CUSTOM)\n"
+"═══════════════════════════════════════════════════════════════════\n"
 "\n"
-"MARKDOWN SUPPORT: the overlay renders fenced code blocks with a copy button, "
-"display math blocks with a copy button, headings (# / ## / ###), bulleted "
-"lists (- item), numbered lists (1. item), inline code (`x`), bold (**text**), "
-"and italic (*text*). Use these to structure your answer readably.\n"
+"The student's overlay renders your reply in a compact ImGui pane. It's\n"
+"NOT a full markdown renderer. Here's EXACTLY what works and doesn't:\n"
+"\n"
+"WHAT RENDERS (use these freely):\n"
+"  - Fenced code blocks: ```lang\\n...code...\\n``` — gets monospace font,\n"
+"    dark background tint, top-right 'copy' button, syntax preserved.\n"
+"    ALWAYS specify a language tag (python/js/c/sql/bash/none) so the\n"
+"    label is meaningful.\n"
+"  - Display math: \\[ ... \\] OR $$ ... $$  — gets mono font, violet-\n"
+"    tinted background block, top-right 'copy' button. Content shown as\n"
+"    RAW LaTeX (NOT typeset visually) but readable to a student who\n"
+"    knows LaTeX syntax and copyable to Wolfram/paper.\n"
+"  - Inline math: $ ... $ OR \\( ... \\)  — flows in prose as raw LaTeX.\n"
+"  - Headings: `# H1`, `## H2`, `### H3` (larger font + accent color).\n"
+"  - Bullet lists: `- item` or `* item` or `• item`.\n"
+"  - Numbered lists: `1. item`, `2. item`, ...\n"
+"  - Unicode symbols pass through: √ π ∑ ∫ ≠ ≤ ≥ ± × ÷ ² ³ → ⇌ ↑ ↓ Δ θ α β\n"
+"\n"
+"WHAT DOES NOT RENDER (avoid these — will appear as raw text):\n"
+"  - HTML: `<div>`, `<img>`, `<a href>`, `<br>` — DO NOT USE.\n"
+"  - Images: `![alt](url)` — DO NOT USE (only local render, no image fetch).\n"
+"  - Links: `[text](url)` — appears as raw brackets/parens, no click.\n"
+"  - Markdown tables (`| col | col |`) — no table rendering; use plain\n"
+"    text with fixed spacing OR a fenced ```text block for alignment.\n"
+"  - Bold `**text**` and italic `*text*` markers are STRIPPED from prose\n"
+"    on render (the ** and * chars disappear but the text stays). So\n"
+"    they're fine to use — just don't rely on visual emphasis.\n"
+"  - HTML entities like `&amp;` — pass through as literal text.\n"
+"  - Code fences must be at LINE START (preceded by \\n or at text start).\n"
+"    Mid-line ``` won't trigger the code block renderer.\n"
+"\n"
+"OPTIMAL PATTERN for math problems:\n"
+"  Answer: **x = 4**\n"
+"  \\[ 2x + 5 = 13 \\]\n"
+"  \\[ 2x = 8 \\]\n"
+"  \\[ x = 4 \\]\n"
+"  units check: dimensionless ✓\n"
+"\n"
+"OPTIMAL PATTERN for code problems:\n"
+"  Answer: use `s[::-1]` — Python string slicing with step -1.\n"
+"  ```python\n"
+"  def reverse(s: str) -> str:\n"
+"      return s[::-1]\n"
+"  ```\n"
+"  - Time: O(n), space: O(n) (new string).\n"
+"  - Test: `reverse('abc') == 'cba'` ✓\n"
+"\n"
+"OPTIMAL PATTERN for MCQ:\n"
+"  **B) Photosynthesis**\n"
+"  - A wrong: cellular respiration is oxidative not reductive.\n"
+"  - C wrong: transpiration is water movement, not carbon fixation.\n"
+"  - D wrong: fermentation happens without light input.\n"
+"\n"
+"═══════════════════════════════════════════════════════════════════\n"
+"MARKDOWN QUICK REFERENCE\n"
+"═══════════════════════════════════════════════════════════════════\n"
+"\n"
+"For CODE questions: full working code inside a fenced block ```language...```. "
+"Comment the non-obvious lines. Explanation goes ABOVE or BELOW the block, "
+"not inside.\n"
+"\n"
+"For MATH: use $..$ or \\(..\\) for inline math, \\[..\\] or $$..$$ for "
+"display, ```math for step-by-step derivations. Prefer standard LaTeX "
+"notation (x^2, \\frac{a}{b}, \\int, \\sum, \\sqrt{}, ^, _).\n"
 "\n"
 "═══════════════════════════════════════════════════════════════════\n"
 "SUBJECT-MATTER RULES (apply the one matching the screenshot)\n"
@@ -272,25 +331,17 @@ static const char SVCLDB_DEFAULT_SYSTEM_PROMPT[] =
  * Reference: https://openrouter.ai/docs/guides/routing/routers/free-router
  */
 
-/* OpenAI tiers. Model choice reflects 2026-07 access reality:
- *   - gpt-5.5-pro: aspirational (per pricing page); many keys don't
- *     yet have access — we prefer o3 which is universally accessible
- *     AND reasoning-capable.
- *   - gpt-5.5: works for most keys in 2026; falls back to gpt-4o if
- *     the key is older.
- *   - gpt-4o-mini: universally available since May 2024, cheap +
- *     vision + fast.
- * Users can pin any specific model by setting cfg->tier=CUSTOM
- * (SVC_TIER_CUSTOM) and cfg->model="whatever-you-want". */
+/* OpenAI tiers (verified 2026-07-05 against user's enterprise key via
+ * GET /v1/models). All 5.5 family + o3 pro accessible. */
 static const svc_model_tier_t OPENAI_TIERS[SVC_TIER_COUNT] = {
-    { "o3",           "STRONG (o3)",           "Deep reasoning + vision, $10/$40 per 1M tok, 200K ctx",       1, 1, 32768 },
+    { "gpt-5.5-pro",  "STRONG (gpt-5.5-pro)",  "Frontier reasoning + vision, $30/$180 per 1M tok, 272K ctx",  1, 1, 32768 },
     { "gpt-5.5",      "MEDIUM (gpt-5.5)",      "Balanced flagship + vision, $5/$30 per 1M tok, 272K ctx",     1, 1, 16384 },
-    { "gpt-4o-mini",  "CHEAP  (gpt-4o-mini)",  "Fast + affordable + vision, $0.15/$0.60 per 1M tok, 128K",    1, 0,  8192 },
+    { "gpt-5-mini",   "CHEAP  (gpt-5-mini)",   "Fast + affordable + vision, $0.25/$2 per 1M tok, 272K ctx",   1, 1,  8192 },
     { NULL,           "CUSTOM",                "user-specified model",                                          0, 0,  8192 },
 };
 
-/* Anthropic tiers. Opus-4-8 + Sonnet-5 + Haiku-4-5 are all GA
- * (verified against platform.claude.com/docs/models/overview 2026-07). */
+/* Anthropic tiers. Per user request: opus-4-8 NOT fable-5 (too expensive).
+ * All 3 tiers verified against platform.claude.com/docs/models/overview. */
 static const svc_model_tier_t ANTHROPIC_TIERS[SVC_TIER_COUNT] = {
     { "claude-opus-4-8",   "STRONG (Opus 4.8)",  "Best coding + reasoning, $5/$25, 1M ctx, adaptive thinking", 1, 1, 12288 },
     { "claude-sonnet-5",   "MEDIUM (Sonnet 5)",  "Balanced workhorse, $3/$15, 1M ctx, adaptive thinking",       1, 1,  8192 },
@@ -298,13 +349,15 @@ static const svc_model_tier_t ANTHROPIC_TIERS[SVC_TIER_COUNT] = {
     { NULL,                "CUSTOM",             "user-specified model",                                          0, 0,  6144 },
 };
 
-/* Google Gemini tiers. 2.5 family = GA; 3.x is preview/rolling out.
- * We pick the highest-GA tier to avoid `model not found` for older keys. */
+/* Google Gemini tiers. STRONG = gemini-3.1-pro-preview (frontier
+ * multimodal). MEDIUM = gemini-3.5-flash (Pro-level at Flash cost —
+ * per Google docs "near-Pro intelligence at Flash-tier cost/speed").
+ * CHEAP = gemini-2.5-flash-lite (GA, lowest latency). */
 static const svc_model_tier_t GOOGLE_TIERS[SVC_TIER_COUNT] = {
-    { "gemini-2.5-pro",        "STRONG (Gemini 2.5 Pro)",    "Deep reasoning + multimodal, 1M ctx",                       1, 1, 12288 },
-    { "gemini-2.5-flash",      "MEDIUM (Gemini 2.5 Flash)",  "Balanced fast intelligence, 1M ctx",                        1, 1,  8192 },
-    { "gemini-2.5-flash-lite", "CHEAP  (Gemini 2.5 Flash-L)","Cheapest tier, low-latency high-throughput, 1M ctx",        1, 0,  4096 },
-    { NULL,                    "CUSTOM",                     "user-specified model",                                        0, 0,  4096 },
+    { "gemini-3.1-pro-preview", "STRONG (Gemini 3.1 Pro)",   "Frontier reasoning + multimodal, 1M ctx",           1, 1, 12288 },
+    { "gemini-3.5-flash",       "MEDIUM (Gemini 3.5 Flash)", "Near-Pro intelligence at Flash cost, 1M ctx",       1, 1,  8192 },
+    { "gemini-2.5-flash-lite",  "CHEAP  (Gemini 2.5 Flash-L)","Cheapest, low-latency high-throughput, 1M ctx",    1, 0,  4096 },
+    { NULL,                     "CUSTOM",                     "user-specified model",                              0, 0,  4096 },
 };
 
 /* OpenRouter is special: user picks the model. The "tier" concept
@@ -811,10 +864,26 @@ static int extract_google_reply(const char *body, char **out_reply) {
 
 /* ── Effective config resolution ────────────────────────────────── */
 
+/* Append text to eff_cfg->system_prompt (bounded by buffer size). */
+static void append_system(svc_config_t *eff_cfg, const char *tail) {
+    if (!tail || !tail[0]) return;
+    size_t cur = strlen(eff_cfg->system_prompt);
+    size_t cap = sizeof(eff_cfg->system_prompt) - 1;
+    if (cur >= cap) return;
+    size_t rem = cap - cur;
+    strncat(eff_cfg->system_prompt, tail, rem);
+    eff_cfg->system_prompt[cap] = 0;
+}
+
 /* Fill in default system_prompt if empty. Also enforce tier-based
  * model resolution — for CUSTOM tier we honor cfg->model verbatim;
  * otherwise we'd write a tier's model_id (but we return via the
- * separate model_id lookup, not overwriting cfg). */
+ * separate model_id lookup, not overwriting cfg).
+ *
+ * When cfg->latex_disabled is set, appends an OVERRIDE section that
+ * instructs the AI to use plain-keyboard + Unicode math notation
+ * instead of LaTeX. Preserves the base prompt so the discipline-
+ * specific rules still apply. */
 static void materialize_default_system(svc_config_t *eff_cfg) {
     if (eff_cfg->system_prompt[0] == 0 ||
         strcmp(eff_cfg->system_prompt, "DEFAULT") == 0) {
@@ -823,6 +892,37 @@ static void materialize_default_system(svc_config_t *eff_cfg) {
         size_t take = (need < maxb) ? need : maxb;
         memcpy(eff_cfg->system_prompt, SVCLDB_DEFAULT_SYSTEM_PROMPT, take);
         eff_cfg->system_prompt[take] = 0;
+    }
+
+    if (eff_cfg->latex_disabled) {
+        append_system(eff_cfg,
+            "\n\n"
+            "═══════════════════════════════════════════════════════════════════\n"
+            "LATEX DISABLED — USE KEYBOARD/UNICODE ONLY (OVERRIDE)\n"
+            "═══════════════════════════════════════════════════════════════════\n"
+            "\n"
+            "The student has disabled LaTeX rendering. Switch math notation:\n"
+            "\n"
+            "  * INSTEAD OF `\\frac{a}{b}`  USE  `(a)/(b)` or `a / b`\n"
+            "  * INSTEAD OF `x^{2}`         USE  `x^2` or `x²` (Unicode superscript)\n"
+            "  * INSTEAD OF `\\sqrt{x}`     USE  `sqrt(x)` or `√x`\n"
+            "  * INSTEAD OF `\\int_a^b`     USE  `integral from a to b of` (word form)\n"
+            "                              OR   `∫[a..b]` (Unicode)\n"
+            "  * INSTEAD OF `\\sum_{i=1}^n` USE  `sum from i=1 to n of` or `Σ[i=1..n]`\n"
+            "  * INSTEAD OF `\\pi`          USE  `pi` or `π`\n"
+            "  * INSTEAD OF `\\theta`       USE  `theta` or `θ`\n"
+            "  * INSTEAD OF `\\Delta`       USE  `Delta` or `Δ`\n"
+            "  * INSTEAD OF `\\alpha \\beta`USE  `alpha beta` or `α β`\n"
+            "  * INSTEAD OF `\\approx`      USE  `≈`\n"
+            "  * INSTEAD OF `\\leq \\geq`   USE  `<= >=` or `≤ ≥`\n"
+            "  * INSTEAD OF `\\neq`         USE  `!=` or `≠`\n"
+            "  * INSTEAD OF `\\pm`          USE  `+/-` or `±`\n"
+            "\n"
+            "NEVER use $..$, $$..$$, \\[..\\], \\(..\\), \\begin{}, \\end{},\n"
+            "\\frac{}{}, \\sqrt{}, \\int, \\sum — the overlay will show them\n"
+            "as raw text with backslashes visible, which looks broken.\n"
+            "\n"
+            "Fenced code blocks are STILL fine — ```python...``` etc.\n");
     }
 }
 
