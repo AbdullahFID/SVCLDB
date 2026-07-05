@@ -33,8 +33,11 @@ typedef struct {
     char        model   [128];
     int         reasoning_effort;   /* 0=none 1=minimal 2=low 3=medium 4=high 5=xhigh */
 
-    /* System prompt (user-editable in settings UI). */
-    char        system_prompt[8192];
+    /* System prompt (user-editable in settings UI). Sized to hold the
+     * built-in SVCLDB_DEFAULT_SYSTEM_PROMPT (~10 KB of subject-matter
+     * expertise ported from hooksdll/lumio/src/autosolver.js) plus
+     * headroom for user overrides. */
+    char        system_prompt[16384];
 
     /* Hotkeys (packed: (mod << 16) | vk; mod: 1=ctrl 2=shift 4=alt).
      * Slot index matches svc_hotkey_action_t enum below. Zero = unbound.

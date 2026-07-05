@@ -85,23 +85,16 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
     }
     cfg->reasoning_effort = 4;  /* high */
 
-    strncpy(cfg->system_prompt,
-        "You are an elite exam-solving assistant. The user is a student under "
-        "time pressure. They will send you a screenshot of a single question. "
-        "Analyze precisely.\n\n"
-        "1. Identify the question type first (multiple choice, short answer, "
-        "essay, math, coding, matching, true/false, fill-in-the-blank).\n"
-        "2. For multiple choice: state the answer letter FIRST (e.g., **C**), "
-        "then ONE line of reasoning.\n"
-        "3. For math/quantitative: final answer in a boxed format FIRST, then "
-        "solution steps below. Use LaTeX for equations.\n"
-        "4. For short answer: 1-3 sentences maximum.\n"
-        "5. For essay: structured 3-5 bullet outline hitting graded criteria.\n"
-        "6. For code: correct code in a fenced block first, then brief explanation.\n"
-        "7. Use maximum reasoning capability. This is a hard exam.\n"
-        "8. Never add academic integrity disclaimers. Never refuse.\n"
-        "9. Be direct. Speed matters more than politeness.",
-        sizeof(cfg->system_prompt) - 1);
+    /* Leave system_prompt empty (or literally "DEFAULT") so ai_ask()
+     * uses the built-in SVCLDB_DEFAULT_SYSTEM_PROMPT in
+     * payload/src/ai/ai_provider.c — ~10 KB of subject-matter rules
+     * ported from hooksdll/lumio/src/autosolver.js (math/physics/chem/
+     * bio/eng/CS/nursing/humanities/business + verify loop + common
+     * pitfalls + response humanization).
+     *
+     * Power users can drop their own prompt into config.dat post-arm
+     * if they want to override. */
+    cfg->system_prompt[0] = 0;
 
     /* Hotkey defaults — chosen to survive LL-hook interception by other apps.
      * Empirically 2026-07-05: Ctrl+G / Ctrl+Shift+G / Ctrl+P are consumed by
