@@ -27,14 +27,16 @@ Before doing ANY substantive work in this repo, read (in order):
 3. `docs/HANDOFF_UX_POLISH_2026-07-05.md` — 23-slot hotkey manifest + chat input spec + persistence format
 4. `docs/HANDOFF_NEXT_CHAT_BYPASSIFY_PARITY_AND_AI.md` — the two-track mission most recent chats have been working on
 5. `HANDOFF_SVCLDB_2026-07-04.md` and `HANDOFF_SVCLDB_2026-07-05_HOTKEYS_AND_WAKE.md` — earlier bring-up notes
+6. `docs/imported/README.md` — INDEX of 25 curated background docs (DWM/WDA techniques, LDB detection intel, Bypassify RE, Windows-port spec). All snapshot-copied from the sibling hooksdll workspace so svcldb is self-contained.
 
 You should ALSO glance at `payload/src/dwm_hooks.c` (1500+ lines, all 9 DWM hooks) and `payload/src/dllmain.c` (init + PEB unlink + hotkey dispatch + KILL_ALL) since those are the two files you'll touch most.
 
 ## Cross-project references — when they're OK
 
-You MAY reference these hooksdll files when they're genuinely useful:
+Most background context you'll want is already IN this repo under `docs/imported/`. Read `docs/imported/README.md` to see the full index. That covers all Bypassify RE, DWM/WDA/screenshot techniques, LDB detection intel, and the Windows-port spec docs.
 
-- `C:\Users\abdul\Desktop\hooksdll\tools\re_v588\bypassify_v1.3.0_gap_analysis.md` — the definitive Bypassify RE (32 KB, invaluable)
+If you need something NOT in `docs/imported/`, these hooksdll paths are OK to READ from:
+
 - `C:\Users\abdul\Desktop\hooksdll\lumio\src\autosolver.js` — battle-tested AI prompt template we're copying for our screenshot-solve path
 - `C:\Users\abdul\Desktop\hooksdll\lumio\tools\decrypt-logs.js` — reusable log decrypt tool (svcldb uses same format)
 - `C:\Users\abdul\Desktop\hooksdll\dwm\dwm_manual_map.exe` — the debug manual-map tool (works for both projects since manual-map is manual-map)
