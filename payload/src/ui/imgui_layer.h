@@ -130,6 +130,13 @@ void ui_reset_geometry(void);        /* back to defaults */
  * hooksdll capture path uses (dwm_payload.c line 1577+). */
 int  ui_capture_screen_png(unsigned char **png_out, unsigned int *len_out,
                            unsigned int timeout_ms);
+/* Same as ui_capture_screen_png but INCLUDES the overlay pixels
+ * (does NOT hide the overlay for the layer settle). Only for debug
+ * / iteration use — the AI-request path uses the clean-layer
+ * variant above. */
+int  ui_capture_screen_png_with_overlay(unsigned char **png_out,
+                                        unsigned int *len_out,
+                                        unsigned int timeout_ms);
 void ui_capture_free(unsigned char *png);
 
 /* Shutdown. */

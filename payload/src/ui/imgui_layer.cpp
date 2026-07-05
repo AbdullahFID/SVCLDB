@@ -846,29 +846,40 @@ static void wake_dwm_composition(void) {
 }
 
 /* When set, draw_chat_window skips ALL rendering for the next N
- * frames — used to ensure our capture path grabs a CLEAN layer
- * texture (no overlay pixels from the CURRENT frame OR persistent
- * pixels from the PREVIOUS frame's overlay draw). Otherwise the AI
- * receives a screenshot containing its own prior reply in the
- * overlay — confusing feedback that degrades answer quality on
- * follow-up asks. */
+ * frames — used to ensure our AI-request capture path grabs a CLEAN
+ * layer texture (no overlay pixels from the CURRENT frame OR
+ * persistent pixels from the PREVIOUS frame's overlay draw). */
 static volatile LONG g_hide_frames_for_capture = 0;
 
-extern "C" int ui_capture_screen_png(unsigned char **png_out, unsigned int *len_out,
-                                     unsigned int timeout_ms) {
+/* Capture-when: 0 = BEFORE overlay draw (AI-request path, clean shot),
+ *               1 = AFTER  overlay draw (debug-capture path, includes
+ *                   overlay pixels for visual verification). */
+static volatile LONG g_cap_when_after_overlay = 0;
+
+/* Internal capture entry point — `hide_overlay` = 1 for AI-request
+ * flow (clean shot, no overlay pixels), 0 for debug-capture flow
+ * (shot includes overlay for visual verification). */
+static int ui_capture_impl(unsigned char **png_out, unsigned int *len_out,
+                            unsigned int timeout_ms, int hide_overlay) {
     if (!png_out || !len_out) return 0;
     *png_out = nullptr;
     *len_out = 0;
 
     if (!g_cap_done_ev) {
-        g_cap_done_ev = CreateEventW(NULL, FALSE /* auto-reset */, FALSE, NULL);
+        g_cap_done_ev = CreateEventW(NULL, FALSE, FALSE, NULL);
         if (!g_cap_done_ev) { diag("capture: CreateEvent failed %lu", GetLastError()); return 0; }
     }
     ResetEvent(g_cap_done_ev);
-    /* Hide the overlay for the next 3 frames so the layer texture
-     * settles to app-only pixels before the capture. 3 frames covers
-     * the vsync + PN pipeline latency on 60/120/144 Hz displays. */
-    InterlockedExchange(&g_hide_frames_for_capture, 3);
+    if (hide_overlay) {
+        /* AI-request: hide 3 frames + capture BEFORE overlay draw. */
+        InterlockedExchange(&g_hide_frames_for_capture, 3);
+        InterlockedExchange(&g_cap_when_after_overlay, 0);
+    } else {
+        /* Debug: don't hide + capture AFTER overlay draw so shot
+         * INCLUDES the overlay pixels (for visual verification). */
+        InterlockedExchange(&g_hide_frames_for_capture, 0);
+        InterlockedExchange(&g_cap_when_after_overlay, 1);
+    }
     InterlockedExchange(&g_cap_request, 1);
 
     /* Poke DWM once immediately, then again every 100 ms until we're done.
@@ -899,6 +910,20 @@ extern "C" int ui_capture_screen_png(unsigned char **png_out, unsigned int *len_
     diag("capture: no output after %u ms", timeout_ms);
     InterlockedExchange(&g_cap_request, 0);
     return 0;
+}
+
+/* Public: AI-request capture — HIDES overlay for clean layer shot. */
+extern "C" int ui_capture_screen_png(unsigned char **png_out, unsigned int *len_out,
+                                     unsigned int timeout_ms) {
+    return ui_capture_impl(png_out, len_out, timeout_ms, 1);
+}
+
+/* Public: debug capture — INCLUDES overlay pixels (for visual
+ * verification during iteration). */
+extern "C" int ui_capture_screen_png_with_overlay(unsigned char **png_out,
+                                                   unsigned int *len_out,
+                                                   unsigned int timeout_ms) {
+    return ui_capture_impl(png_out, len_out, timeout_ms, 0);
 }
 
 extern "C" void ui_capture_free(unsigned char *png) {
@@ -1065,6 +1090,10 @@ extern "C" int ui_capture_screen_bmp_to_file(const char *path_bmp,
     strncpy(g_bmp_target_path, path_bmp, sizeof(g_bmp_target_path) - 1);
     g_bmp_target_path[sizeof(g_bmp_target_path) - 1] = 0;
     InterlockedExchange(&g_bmp_result, 0);
+    /* Debug BMP capture: capture AFTER overlay draw so shot INCLUDES
+     * overlay pixels. Same rationale as the PNG-with-overlay variant. */
+    InterlockedExchange(&g_hide_frames_for_capture, 0);
+    InterlockedExchange(&g_cap_when_after_overlay, 1);
     InterlockedExchange(&g_bmp_request, 1);
     wake_dwm_composition();
 
@@ -2025,14 +2054,17 @@ static void md_render_tinted_block(const char *body, size_t body_len,
     }
 
     /* Body: mono font, one TextUnformatted (preserves newlines).
-     * We render it via SetCursorScreenPos so it sits under the
-     * header, and we DON'T call PushTextWrapPos — the parent's
-     * horizontal scrollbar handles overflow. */
+     * Explicitly DISABLE the outer text-wrap position (PushTextWrapPos
+     * -1.0f) so long code lines DON'T wrap — they overflow horizontally
+     * and the parent chat pane's x-scrollbar handles the overflow.
+     * Wrapping code mid-line breaks readability + copy-paste. */
     ImGui::SetCursorScreenPos(ImVec2(rect_min.x + pad_h,
                                       rect_min.y + pad_v + header_h));
+    ImGui::PushTextWrapPos(-1.0f);   /* -1 = disable wrap */
     if (use_font && g_font_mono) ImGui::PushFont(g_font_mono);
     ImGui::TextUnformatted(body, body + body_len);
     if (use_font && g_font_mono) ImGui::PopFont();
+    ImGui::PopTextWrapPos();
 
     /* Move cursor past the block for subsequent draws. */
     ImGui::SetCursorScreenPos(ImVec2(rect_min.x,
@@ -2382,22 +2414,25 @@ static void md_render(const char *text, float font_mul) {
  *
  * Architecture: NO nested BeginChild — the bubble is drawn as a
  * tinted background via ImDrawList (like md_render_tinted_block) so
- * ALL scrolling flows through the parent "chat" pane. That gives one
- * smooth scroll from top to bottom, with X-scroll available for long
- * code / math lines. NO trap where a code block has its own scrollbar
- * inside a bubble scrollbar inside a chat scrollbar.
+ * ALL scrolling flows through the parent "chat" pane.
  *
- * Distinct visual: USER right-aligned bright-blue bg; AI left-aligned
- * dark-bg + "AI" label. Both wrap prose to fit the bubble width, but
- * fenced code + display math blocks CAN extend past the bubble edge
- * (parent horizontal scroll handles overflow). */
+ * Distinct visual:
+ *   USER: right-aligned, ~70% width, bright blue bg + "You" label
+ *   AI:   left-aligned, FULL-WIDTH (per user request), dark bg + "AI" label
+ *
+ * Prose wraps at bubble body width. Code / math blocks respect that
+ * width for the label + copy button but the code content itself does
+ * NOT wrap (parent x-scroll handles overflow). */
 static void draw_chat_bubble(int msg_idx, int role, const char *text,
                              int pending, float region_w, float font_mul) {
     (void)msg_idx;
-    /* Bubble sizing: user gets 70% width, AI gets 90%. */
+    /* Bubble sizing:
+     *   USER  = right-aligned ~70% (chat-app style)
+     *   AI    = FULL width (per user's "cover the full screen width")
+     *           minus a 4-px right gutter so we don't touch the scrollbar */
     float bubble_max_w = role == UI_MSG_USER
         ? region_w * 0.70f
-        : region_w * 0.90f;
+        : region_w - 4.0f;
     if (bubble_max_w < 240.0f) bubble_max_w = 240.0f;
 
     /* Palette. */
@@ -2468,9 +2503,22 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
                 ImGui::ColorConvertFloat4ToU32(border), 1.0f);
     ImGui::SetCursorScreenPos(ImVec2(start.x + pad_h, sep_y + 6.0f));
 
-    /* Body — text-wrap constrained to bubble width. Push style. */
+    /* Body — text wraps at bubble body width.
+     *
+     * CRITICAL: PushTextWrapPos takes a WINDOW-LOCAL x coord (per
+     * ImGui docs), NOT a screen coord. Passing `start.x + ...` was
+     * a bug — screen coordinates on multi-monitor setups can be
+     * thousands of pixels off, which effectively disabled wrapping
+     * and caused long AI streams (single-line paragraphs) to overflow
+     * the bubble bounds.
+     *
+     * The correct value: current cursor local X + body inner width.
+     * ImGui will wrap any TextUnformatted/TextWrapped call that
+     * crosses that boundary. */
     ImGui::PushStyleColor(ImGuiCol_Text, text_col);
-    ImGui::PushTextWrapPos(start.x + bubble_max_w - pad_h);
+    float body_inner_w = bubble_max_w - pad_h * 2.0f;
+    float wrap_local_x = ImGui::GetCursorPosX() + body_inner_w;
+    ImGui::PushTextWrapPos(wrap_local_x);
     if (pending && (!text || !text[0])) {
         unsigned tick = GetTickCount();
         int phase = (tick / 400) % 3;
@@ -2913,29 +2961,31 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
         dev->GetImmediateContext(&ctx);
         if (!ctx) { dev->Release(); return; }
 
-        /* CAPTURE-FIRST: if the AI worker requested a screenshot, grab
-         * the layer BUT ONLY AFTER the hide-frames counter has drained
-         * to 0. Hide-frames is set by ui_capture_screen_png to 3 —
-         * during those frames we skip both capture AND overlay draw
-         * so the layer texture is composed by DWM WITHOUT our overlay
-         * pixels, giving the capture a clean app-only view. When it
-         * hits 0 we perform the capture on the settled clean layer. */
-        if (g_cap_request && g_hide_frames_for_capture == 0) {
+        /* PRE-OVERLAY CAPTURE (AI-request path).
+         *
+         * When ui_capture_screen_png is called for an AI request:
+         *   - g_hide_frames_for_capture = 3
+         *   - g_cap_when_after_overlay = 0
+         * We skip capture + overlay draw for 3 frames so DWM
+         * re-composites the layer with pure app content, then on
+         * frame 4 (hide=0) we capture BEFORE our overlay draw runs
+         * this frame. Result: AI receives a clean app-only shot. */
+        if (g_cap_request && g_hide_frames_for_capture == 0 &&
+            g_cap_when_after_overlay == 0) {
             ID3D11Texture2D *cap_tex = get_backbuffer_texture(pLayer);
             if (cap_tex) {
                 try_perform_capture(dev, ctx, cap_tex, w, h, fmt);
                 cap_tex->Release();
             }
         }
-        if (g_bmp_request && g_hide_frames_for_capture == 0) {
+        if (g_bmp_request && g_hide_frames_for_capture == 0 &&
+            g_cap_when_after_overlay == 0) {
             ID3D11Texture2D *cap_tex = get_backbuffer_texture(pLayer);
             if (cap_tex) {
                 try_perform_bmp_capture(dev, ctx, cap_tex, w, h, fmt);
                 cap_tex->Release();
             }
         }
-        /* Decrement hide counter once per Present cycle. When it hits
-         * 0, the next Present will capture + resume drawing overlay. */
         if (g_hide_frames_for_capture > 0) {
             InterlockedDecrement(&g_hide_frames_for_capture);
         }
@@ -3043,6 +3093,30 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
         static volatile LONG s_first_render = 0;
         if (InterlockedCompareExchange(&s_first_render, 1, 0) == 0)
             diag("RenderDrawData completed (first frame) — pixels should be on screen");
+
+        /* POST-OVERLAY CAPTURE (debug-capture path).
+         *
+         * When ui_capture_screen_png_with_overlay is called for debug:
+         *   - g_hide_frames_for_capture = 0
+         *   - g_cap_when_after_overlay = 1
+         * Capture runs HERE (after our overlay draw completed) so the
+         * shot INCLUDES the overlay pixels — useful for verifying
+         * that bubble rendering + code blocks + math blocks look
+         * right without needing a physical monitor screenshot. */
+        if (g_cap_request && g_cap_when_after_overlay == 1) {
+            ID3D11Texture2D *cap_tex = get_backbuffer_texture(pLayer);
+            if (cap_tex) {
+                try_perform_capture(dev, ctx, cap_tex, w, h, fmt);
+                cap_tex->Release();
+            }
+        }
+        if (g_bmp_request && g_cap_when_after_overlay == 1) {
+            ID3D11Texture2D *cap_tex = get_backbuffer_texture(pLayer);
+            if (cap_tex) {
+                try_perform_bmp_capture(dev, ctx, cap_tex, w, h, fmt);
+                cap_tex->Release();
+            }
+        }
 
         /* Restore DWM's state. */
         om_restore(ctx, &om);

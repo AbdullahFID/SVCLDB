@@ -708,7 +708,11 @@ static DWORD WINAPI debug_capture_thread(LPVOID param) {
     /* ── Path 1: DWM-side capture (layer texture via vtable walk) ── */
     unsigned char *dwm_png = NULL;
     unsigned int   dwm_len = 0;
-    int dwm_ok = ui_capture_screen_png(&dwm_png, &dwm_len, 3000);
+    /* Debug capture MUST include overlay pixels so we can visually
+     * verify rendering. The AI-request path uses the clean-layer
+     * variant (ui_capture_screen_png) which hides the overlay for 3
+     * frames. */
+    int dwm_ok = ui_capture_screen_png_with_overlay(&dwm_png, &dwm_len, 3000);
     if (dwm_ok && dwm_png && dwm_len > 0) {
         char path[MAX_PATH];
         _snprintf(path, sizeof(path) - 1,
