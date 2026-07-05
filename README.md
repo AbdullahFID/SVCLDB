@@ -50,3 +50,4 @@ Full architectural spec + threat model: see `docs/ARCHITECTURE.md` (produced
 during scaffolding). Key upstream reference for the Bypassify comparison:
 main hooksdll repo's `HANDOFF_LDB_DWM_ARCHITECTURE_2026-07-04.md` and
 `tools/re_v588/bypassify_v13_FINAL_TODO.md`.
+# SVCLDB
