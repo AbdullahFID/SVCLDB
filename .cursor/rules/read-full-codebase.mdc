@@ -1,0 +1,17 @@
+---
+description: Defines what "read full codebase" means in this repo (includes all memories + Claude Code past convos)
+alwaysApply: true
+---
+
+# "Read full codebase" means literally everything
+
+When the user says **"read full codebase"** (or "read the whole codebase", "read everything", etc.), they mean it **literally**. Do NOT just skim source files. You must also read and extract context from:
+
+1. **All source + config files** across the repo.
+2. **All memory / instruction files** written by me or by Claude Code, e.g. `CLAUDE.md`, `AGENTS.md`, every `HANDOFF_*.md`, `PLAN_*.md`, `*_AUDIT*.md`, `RE_*.md`, and any `.cursor/rules/*`.
+3. **Claude Code's past conversations and memories.** Claude Code was the primary agent on this project before Cursor. Its history lives outside the repo at:
+   - `C:\Users\abdul\.claude\projects\C--Users-abdul-Desktop-hooksdll\*.jsonl` — per-project conversation transcripts (the real "past convos").
+   - `C:\Users\abdul\.claude\history.jsonl` — global prompt history (large; grep it instead of reading whole).
+   - `C:\Users\abdul\.claude\CLAUDE.md` and project `CLAUDE.md` — persistent memories.
+
+Find those Claude Code transcripts/memories, extract what's relevant to the current task, and incorporate it. Prefer `grep`/sampling for the very large `.jsonl` files rather than reading them end-to-end.

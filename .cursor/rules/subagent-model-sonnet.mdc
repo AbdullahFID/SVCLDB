@@ -1,0 +1,39 @@
+---
+description: MANDATORY — every subagent / Task launch must use Sonnet, never Opus, Composer, GPT, or any other model
+alwaysApply: true
+---
+
+# MANDATORY: All subagents MUST use Sonnet
+
+When launching ANY subagent via the `Task` tool — `generalPurpose`, `explore`, `shell`, `browser-use`, `cursor-guide`, `ci-investigator`, `bugbot`, `security-review`, `best-of-n-runner`, or any future type — you **MUST** pass an explicit `model` parameter set to a Sonnet model slug.
+
+**NEVER** launch a subagent with:
+- `claude-opus-*` / `claude-4.5-opus-*` / `claude-4.6-opus-*` / `claude-opus-4-*` — Opus is causing issues, do not use it
+- `composer-2.5-fast` or any `composer-*` model
+- `gpt-5.3-codex-high-fast`, `gpt-5.5-medium`, or any `gpt-*` model
+- `claude-fable-*` or any other non-Sonnet family
+- The default (omitting `model`) is also forbidden — the parent's model is not guaranteed to be Sonnet, so always set it explicitly.
+
+**ALWAYS** use this Sonnet slug:
+- `claude-4.6-sonnet-medium-thinking` ← the only Sonnet slug currently available; use this every time
+
+If a newer Sonnet slug (e.g. `claude-4.7-sonnet-*`, `claude-5-sonnet-*`) appears in the available-models list, prefer the latest Sonnet. Never substitute a non-Sonnet model if Sonnet is unavailable — stop and tell the user instead.
+
+## Resume rule
+
+When using the `resume` parameter on `Task`, **do not** pass `model` — the resumed subagent reuses its prior model. This is the only exception. If you discover the prior model was non-Sonnet, do not resume; start a fresh subagent with the Sonnet slug instead.
+
+## Correct shape
+
+```
+Task(
+  subagent_type: "explore",
+  description: "...",
+  prompt: "...",
+  model: "claude-4.6-sonnet-medium-thinking"
+)
+```
+
+## Why
+
+The user has explicitly mandated Sonnet for every delegated step in this workspace (Opus was giving issues). Treat any non-Sonnet subagent launch as a hard error: stop, fix the model slug, retry. Do not rationalize using a different model "just for this one quick task" — the rule is absolute.
