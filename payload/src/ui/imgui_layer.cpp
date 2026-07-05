@@ -1730,6 +1730,22 @@ static void md_render(const char *text, float font_mul) {
             }
             /* No closer — fall through to plain */
         }
+        /* Display math $$...$$ (common MathJax dialect) */
+        if (p + 2 <= end && p[0] == '$' && p[1] == '$') {
+            const char *body = p + 2;
+            /* Find matching $$ */
+            const char *close = NULL;
+            for (const char *s = body; s + 2 <= end; s++) {
+                if (s[0] == '$' && s[1] == '$') { close = s; break; }
+            }
+            if (close) {
+                md_render_math_display(body, close - body, block_idx++,
+                                       font_mul);
+                p = close + 2;
+                continue;
+            }
+            /* No closer — fall through to plain */
+        }
         /* Consume plain text until next special marker. */
         const char *pt_end = p + 1;   /* at least 1 char forward */
         while (pt_end < end) {
@@ -1740,6 +1756,10 @@ static void md_render(const char *text, float font_mul) {
             }
             if (pt_end + 2 <= end &&
                 pt_end[0] == '\\' && pt_end[1] == '[') {
+                break;
+            }
+            if (pt_end + 2 <= end &&
+                pt_end[0] == '$' && pt_end[1] == '$') {
                 break;
             }
             pt_end++;
