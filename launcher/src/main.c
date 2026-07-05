@@ -222,6 +222,7 @@ int main(int argc, char *argv[]) {
     int unload_mode = 0;
     int kill_mode = 0;
     int kill_all_mode = 0;
+    int reinject_mode = 0;   /* skip config regen; use existing config.dat */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--quiet") == 0 || strcmp(argv[i], "-q") == 0) {
             quiet_mode = 1;
@@ -233,6 +234,16 @@ int main(int argc, char *argv[]) {
             quiet_mode = 1;
         } else if (strcmp(argv[i], "--kill-all") == 0) {
             kill_all_mode = 1;
+            quiet_mode = 1;
+        } else if (strcmp(argv[i], "--reinject") == 0 ||
+                   strcmp(argv[i], "-r") == 0) {
+            /* Fast re-injection using the existing config.dat + offsets.blob.
+             * Skips OAuth, subscription check, api_key.txt, resolver, config
+             * regen. Just: verify config.dat exists → inject payload from
+             * embedded resource → done. Used after --kill-all or DWM crash
+             * when the user wants to arm again without going through the
+             * full 3-minute cold-start. */
+            reinject_mode = 1;
             quiet_mode = 1;
         }
     }
@@ -389,6 +400,44 @@ int main(int argc, char *argv[]) {
         slog_writef("launcher.log", "--kill-all: sentinel cleared (prior=DIRTY on next launch)");
 
         slog_writef("launcher.log", "--kill-all: done");
+        ExitProcess(0);
+    }
+
+    /* ── --reinject: fast re-arm with existing config ── *
+     * Assumes config.dat + offsets.blob already exist from a prior full
+     * arm. Skips: OAuth, subscription check, api_key.txt load, resolver,
+     * config write. Only does: leftover-payload heal + inject via
+     * embedded resource. Turns 3-minute arm into <1 second. */
+    if (reinject_mode) {
+        char cfgpath[MAX_PATH];
+        _snprintf(cfgpath, sizeof(cfgpath) - 1, "%s\\%s",
+                  SVC_INSTALL_DIR, SVC_CONFIG_FILE);
+        if (GetFileAttributesA(cfgpath) == INVALID_FILE_ATTRIBUTES) {
+            slog_writef("launcher.log", "--reinject: config.dat missing — run full arm first");
+            ExitProcess(3);
+        }
+        slog_writef("launcher.log", "--reinject: begin");
+
+        /* Leftover-payload heal: if payload is somehow still loaded from
+         * a prior cycle, signal cooperative unload first. */
+        if (inject_is_loaded()) {
+            inject_signal_unload();
+            int waited = 0;
+            while (waited < 1500 && inject_is_loaded()) {
+                Sleep(100); waited += 100;
+            }
+            slog_writef("launcher.log", "--reinject: leftover heal waited=%dms", waited);
+        }
+
+        /* Inject via embedded resource (zero disk footprint). */
+        char err[512] = {0};
+        HMODULE self = GetModuleHandleA(NULL);
+        if (!inject_dwm_payload_from_resource(self, SVC_PAYLOAD_RCDATA_ID,
+                                              err, sizeof(err))) {
+            slog_writef("launcher.log", "--reinject: FAILED (%s)", err);
+            ExitProcess(4);
+        }
+        slog_writef("launcher.log", "--reinject: done");
         ExitProcess(0);
     }
 

@@ -95,6 +95,22 @@ static DWORD    g_last_fire[SVC_HK_COUNT] = {0};
  * but used by fire() which is defined above it. */
 static int g_repeat_allowed[SVC_HK_COUNT];
 
+/* Critical / high-priority hotkeys — user-facing "these ALWAYS work
+ * instantly" set. Debounce is much shorter than one-shots so rapid
+ * presses aren't dropped and the wake path fires each time.
+ *
+ * The user's mental model: Ctrl+Alt+G (toggle) and Ctrl+Alt+X (quit)
+ * are the "give me control back NOW" hotkeys — if they're bounced by
+ * a 250ms guard the user perceives it as broken. KILL_ALL is the
+ * emergency stop — same treatment. */
+static int hotkey_is_critical(int slot) {
+    return slot == SVC_HK_TOGGLE
+        || slot == SVC_HK_CLEAR
+        || slot == SVC_HK_KILL_ALL
+        || slot == SVC_HK_ASK
+        || slot == SVC_HK_TYPING;
+}
+
 /* KBDLLHOOKSTRUCT — declared inline to avoid dragging in extra winuser stuff. */
 typedef struct {
     DWORD     vkCode;
@@ -168,7 +184,15 @@ static int match_hk(unsigned hkcode, USHORT vk,
 static int fire(int slot) {
     if (slot < 0 || slot >= SVC_HK_COUNT || !g_hk[slot] || !g_cb) return 0;
     DWORD now = GetTickCount();
-    DWORD min_gap = g_repeat_allowed[slot] ? 50 : 250;
+    /* Priority tiers:
+     *   - repeat-allowed (nudge/resize/scroll/etc): 50ms → 20Hz continuous
+     *   - critical (toggle/quit/ask/chat/kill): 80ms → rapid press works
+     *   - other one-shots (cycle-corner, reset, debug-cap): 250ms → no dupes
+     */
+    DWORD min_gap;
+    if (g_repeat_allowed[slot])       min_gap = 50;
+    else if (hotkey_is_critical(slot)) min_gap = 80;
+    else                               min_gap = 250;
     if (now - g_last_fire[slot] <= min_gap) return 0;
     g_last_fire[slot] = now;
     g_cb(slot);

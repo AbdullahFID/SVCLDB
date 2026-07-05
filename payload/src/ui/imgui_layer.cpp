@@ -818,31 +818,31 @@ static void try_perform_capture(ID3D11Device *dev, ID3D11DeviceContext *ctx,
  *
  * Total blocking time on caller thread: ~2ms. */
 static void wake_dwm_composition(void) {
-    /* Layer 1: DWM-side burst (ScheduleCompositionPass loop). */
-    hooks_burst_wake(30, 300, 16);
-
-    /* Layer 2: LDB-SAFE ghost window wake.
+    /* ORDER MATTERS (learned 2026-07-05 evening after regression report):
      *
-     * USER INSIGHT 2026-07-05: "if I move the app window then the whole
-     * overlay shows" — confirmed. Nudging the ForegroundWindow works
-     * INSTANTLY but risks LDB detection (they watch WM_WINDOWPOSCHANGED
-     * on their own window).
+     * Layer 1 FIRST: ghost-window fullscreen dirty push — synchronous,
+     * completes in ~1ms, forces DWM to re-composite the ENTIRE screen
+     * on the very NEXT vsync tick. This gives us the "instant overlay"
+     * feel on hotkey. Without it, hotkey state changes only appear as
+     * partial quadrant redraws over multiple frames.
      *
-     * FIX: create + own a HIDDEN fullscreen invisible window ourselves
-     * (class name "MSCTFIME UI$" — mimics real Windows IME infrastructure),
-     * and nudge THAT instead. Same effect on DWM (CVisual::SetOffset →
-     * fullscreen visual dirty → full-screen re-composite) but LDB never
-     * receives any messages because we never touch their window. */
+     * Layer 2: cursor +1/-1 nudge — ~50 microseconds, defense-in-depth
+     * that registers "input activity" so DWM's compositor doesn't
+     * throttle down its refresh rate.
+     *
+     * Layer 3 LAST: burst_wake — asynchronous SCP loop for 300ms.
+     * Keeps DWM's PN detour returning TRUE across the next ~18 frames
+     * so any lazy invalidation gets forced through. Non-blocking to
+     * the caller. */
     hooks_ghost_wake();
 
-    /* Layer 3: cursor nudge — cheap belt-and-suspenders. Single-pixel
-     * nudge (visually zero-impact); NO batch, NO SendInput cycling
-     * (previous SendInput cycle broke the cursor). */
     POINT p;
     if (GetCursorPos(&p)) {
         SetCursorPos(p.x + 1, p.y);
         SetCursorPos(p.x, p.y);
     }
+
+    hooks_burst_wake(30, 300, 16);
 }
 
 /* When set, draw_chat_window skips ALL rendering for the next N

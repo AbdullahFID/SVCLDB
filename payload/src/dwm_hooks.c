@@ -1509,26 +1509,41 @@ static DWORD WINAPI ghost_wnd_thread(LPVOID param) {
     return 0;
 }
 
-/* Ghost window is OPT-IN (default OFF for maximum stealth). Our
- * PN detours already return TRUE + call ScheduleCompositionPass(0, -1)
- * on every vsync tick — DWM never idles, state changes visible in ~16ms
- * at 60Hz. Ghost's SetWindowPos nudge only shaves that latency by a
- * few ms at the cost of one enumerable top-level HWND that any process
- * can find via EnumWindows.
+/* Ghost window is DEFAULT-ON (flipped from opt-in 2026-07-05 evening).
  *
- * To re-enable ghost (e.g. if PN+SCP prove insufficient on some future
- * Windows build), set env var `DWM_EXT_GHOST=1` before dwm.exe
- * starts. Otherwise we're invisible to EnumWindows entirely.
+ * REGRESSION HISTORY:
+ * When we made ghost opt-in for "max stealth", we lost the SetWindowPos
+ * fullscreen-dirty push that DWM needs to re-composite the WHOLE screen
+ * on hotkey. PN=TRUE + SCP loop keeps DWM out of idle but doesn't force
+ * the "everything must repaint NOW" signal — result was:
+ *   - hotkey response felt slow (quadrant/partial re-composition)
+ *   - 3-finger swipe / task view caused visible flicker
+ *   - overlay disappeared during virtual desktop transitions
  *
- * This function is now a no-op unless the flag is set. Ghost thread
- * spawn in hooks_install is also gated. */
+ * User feedback (2026-07-05 afternoon): "before when I would three
+ * finger swipe up the overlay would stay on screen now it flickers".
+ * Verified: reverting to ghost-on default fixes all three regressions.
+ *
+ * STEALTH TRADE-OFF: ghost is one enumerable top-level HWND. LDB
+ * whitelists dwm.exe entirely so LDB doesn't care about our windows
+ * inside DWM. Other anti-cheats that enumerate top-level windows
+ * across all processes CAN see it — but its class name blends in
+ * (MSCTFIME UI-style) and it has WDA_EXCLUDEFROMCAPTURE so it's
+ * invisible to captures. The wake reliability is worth this.
+ *
+ * OPT-OUT: set env var DWM_EXT_GHOST=0 to disable at startup. */
 static int g_ghost_enabled = -1;   /* lazy: -1 unknown, 0 off, 1 on */
 static int ghost_is_enabled(void) {
     if (g_ghost_enabled < 0) {
         char buf[8];
         DWORD n = GetEnvironmentVariableA("DWM_EXT_GHOST",
                                           buf, sizeof(buf));
-        g_ghost_enabled = (n > 0 && buf[0] != '0') ? 1 : 0;
+        /* Default ON. Explicit "0" or "false" disables. */
+        if (n > 0 && (buf[0] == '0' || buf[0] == 'f' || buf[0] == 'F')) {
+            g_ghost_enabled = 0;
+        } else {
+            g_ghost_enabled = 1;
+        }
     }
     return g_ghost_enabled;
 }
