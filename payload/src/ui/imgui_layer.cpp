@@ -156,6 +156,19 @@ static bool             g_visible     = true;
 static bool             g_imgui_inited= false;
 static ULONGLONG        g_frame_count = 0;
 
+/* Fonts. Loaded in ImGui init path. g_font_ui = Segoe UI (sans-serif,
+ * matches Win11 UI), g_font_mono = Cascadia Mono / Consolas (fenced-
+ * code + math blocks). Both fall back to ImGui default (Proggy Clean)
+ * if loading fails — everything still renders, just smaller / uglier.
+ *
+ * Base size 16px @ 1x DPI. Runtime scaling happens via
+ * ImGuiIO::FontGlobalScale in draw_chat_window (screen_h/1080 factor
+ * × user font-size hotkey multiplier). */
+static ImFont *g_font_ui   = NULL;
+static ImFont *g_font_mono = NULL;
+#define UI_FONT_SIZE_PX    18.0f
+#define MONO_FONT_SIZE_PX  17.0f
+
 /* ---------- Geometry & style state (user-adjustable via hotkeys) ---------- *
  * `g_corner` cycles: 0=top-right (default), 1=top-left, 2=bottom-right,
  * 3=bottom-left. `g_offset_{x,y}` are user nudges from the corner anchor. */
@@ -1439,6 +1452,303 @@ static ID3D11RenderTargetView *get_or_create_rtv(ID3D11Device *dev,
     return rtv;
 }
 
+/* ── Markdown-lite renderer ─────────────────────────────────────
+ *
+ * The AI reply comes back as markdown (per our SVCLDB_DEFAULT_SYSTEM_
+ * PROMPT contract). We render:
+ *
+ *   ```lang            fenced code block: child with mono font + darker
+ *   ...                bg tint + top-right "copy" button.
+ *   ```
+ *
+ *   \[ ... \]          display math: child with mono font + subtle
+ *                      accent bg. Rendered as raw LaTeX (not visually
+ *                      typeset — full LaTeX render is out of scope,
+ *                      but $\frac{a}{b}$ is still readable + copyable).
+ *
+ *   $ ... $            inline math: rendered inline as normal text (no
+ *                      special styling — keeps line wrapping simple;
+ *                      raw LaTeX is readable in flow).
+ *
+ *   everything else    ImGui::TextWrapped
+ *
+ * All original bytes preserved. ui_copy_reply_to_clipboard copies the
+ * WHOLE reply. Per-block copy buttons copy just that block. */
+
+/* Copy a range of bytes to the clipboard. Called from the per-block
+ * copy button in fenced code / display math renderers. */
+static void md_copy_to_clipboard(const char *bytes, size_t len) {
+    if (!bytes || len == 0) return;
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, len + 1);
+    if (!hMem) return;
+    char *tmp = (char *)GlobalLock(hMem);
+    if (tmp) {
+        memcpy(tmp, bytes, len);
+        tmp[len] = 0;
+        GlobalUnlock(hMem);
+    }
+    if (OpenClipboard(NULL)) {
+        EmptyClipboard();
+        SetClipboardData(CF_TEXT, hMem);
+        CloseClipboard();
+        diag("md_copy: %zu chars", len);
+    } else {
+        GlobalFree(hMem);
+    }
+}
+
+/* Render a fenced code block inside a child window with a top-right
+ * copy button. `lang` may be empty. */
+static void md_render_code_block(const char *lang, const char *body,
+                                 size_t body_len, int block_idx,
+                                 float wrap_width, float font_mul) {
+    (void)wrap_width;
+    /* Style: darker bg, subtle border, mono font. */
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,   ImVec4(0.02f, 0.04f, 0.08f, 0.94f));
+    ImGui::PushStyleColor(ImGuiCol_Border,    ImVec4(0.18f, 0.30f, 0.48f, 0.60f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding,  8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,   ImVec2(10.0f, 8.0f));
+
+    /* Compute height from line count (16 px per line + padding). Cap
+     * at 400 px so a huge dump doesn't consume the whole overlay —
+     * scrollbar inside the block handles overflow. */
+    int lines = 1;
+    for (size_t i = 0; i < body_len; i++) if (body[i] == '\n') lines++;
+    float line_h = MONO_FONT_SIZE_PX * font_mul * 1.15f;
+    float body_h = lines * line_h + 16.0f;
+    if (body_h > 400.0f) body_h = 400.0f;
+    if (body_h < 30.0f)  body_h = 30.0f;
+
+    char cid[32];
+    _snprintf(cid, sizeof(cid) - 1, "##code%d", block_idx);
+    cid[sizeof(cid) - 1] = 0;
+    ImGui::BeginChild(cid, ImVec2(0, body_h), true,
+                      ImGuiWindowFlags_HorizontalScrollbar);
+
+    /* Header row: language tag on left, copy button on right. */
+    if (lang && lang[0]) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.50f, 0.68f, 0.90f, 0.80f));
+        ImGui::Text("%s", lang);
+        ImGui::PopStyleColor();
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f, 0.55f, 0.72f, 0.60f));
+        ImGui::Text("code");
+        ImGui::PopStyleColor();
+    }
+    /* Copy button — hangs on same line, right-aligned. */
+    {
+        float region_w = ImGui::GetContentRegionAvail().x;
+        ImGui::SameLine(region_w - 60.0f);
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.14f, 0.22f, 0.36f, 0.85f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.34f, 0.52f, 0.95f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.28f, 0.42f, 0.68f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(0.90f, 0.94f, 1.00f, 1.00f));
+        char bid[32];
+        _snprintf(bid, sizeof(bid) - 1, "copy##b%d", block_idx);
+        bid[sizeof(bid) - 1] = 0;
+        if (ImGui::SmallButton(bid)) {
+            md_copy_to_clipboard(body, body_len);
+        }
+        ImGui::PopStyleColor(4);
+    }
+    ImGui::Separator();
+
+    /* Body: monospace, one shot TextUnformatted (preserves newlines). */
+    if (g_font_mono) ImGui::PushFont(g_font_mono);
+    ImGui::TextUnformatted(body, body + body_len);
+    if (g_font_mono) ImGui::PopFont();
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar(3);
+    ImGui::PopStyleColor(2);
+}
+
+/* Render a display-math block (\[ ... \]) — same pattern as code
+ * block but with an accent bg tint (violet-ish) so the eye knows
+ * "this is math not code". */
+static void md_render_math_display(const char *body, size_t body_len,
+                                   int block_idx, float font_mul) {
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.05f, 0.14f, 0.94f));
+    ImGui::PushStyleColor(ImGuiCol_Border,  ImVec4(0.40f, 0.30f, 0.60f, 0.60f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding,  8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,   ImVec2(10.0f, 8.0f));
+
+    int lines = 1;
+    for (size_t i = 0; i < body_len; i++) if (body[i] == '\n') lines++;
+    float line_h = MONO_FONT_SIZE_PX * font_mul * 1.15f;
+    float body_h = lines * line_h + 16.0f;
+    if (body_h > 240.0f) body_h = 240.0f;
+    if (body_h < 30.0f)  body_h = 30.0f;
+
+    char cid[32];
+    _snprintf(cid, sizeof(cid) - 1, "##math%d", block_idx);
+    cid[sizeof(cid) - 1] = 0;
+    ImGui::BeginChild(cid, ImVec2(0, body_h), true, 0);
+
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.72f, 0.60f, 0.92f, 0.80f));
+    ImGui::Text("math");
+    ImGui::PopStyleColor();
+    {
+        float region_w = ImGui::GetContentRegionAvail().x;
+        ImGui::SameLine(region_w - 60.0f);
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.20f, 0.14f, 0.34f, 0.85f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.30f, 0.22f, 0.50f, 0.95f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.40f, 0.30f, 0.60f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(0.90f, 0.86f, 1.00f, 1.00f));
+        char bid[32];
+        _snprintf(bid, sizeof(bid) - 1, "copy##m%d", block_idx);
+        bid[sizeof(bid) - 1] = 0;
+        if (ImGui::SmallButton(bid)) {
+            md_copy_to_clipboard(body, body_len);
+        }
+        ImGui::PopStyleColor(4);
+    }
+    ImGui::Separator();
+
+    if (g_font_mono) ImGui::PushFont(g_font_mono);
+    ImGui::TextUnformatted(body, body + body_len);
+    if (g_font_mono) ImGui::PopFont();
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar(3);
+    ImGui::PopStyleColor(2);
+}
+
+/* Render a plain-text run with normal TextWrapped. If the run is
+ * empty, no-op. Trailing whitespace at the ends is preserved (matters
+ * for paragraph structure). */
+static void md_render_plain(const char *body, size_t body_len) {
+    if (body_len == 0) return;
+    /* Skip if all whitespace. */
+    int all_ws = 1;
+    for (size_t i = 0; i < body_len; i++) {
+        if (body[i] != ' ' && body[i] != '\t' && body[i] != '\n' &&
+            body[i] != '\r') { all_ws = 0; break; }
+    }
+    if (all_ws) {
+        /* Preserve blank line as a spacing hint if there are actual
+         * newlines. Empty output otherwise. */
+        int newlines = 0;
+        for (size_t i = 0; i < body_len; i++)
+            if (body[i] == '\n') newlines++;
+        if (newlines > 0) ImGui::Spacing();
+        return;
+    }
+    /* ImGui::TextWrapped takes a printf-like fmt — we want unformatted
+     * substring rendering. TextUnformatted supports range and
+     * respects PushTextWrapPos. */
+    ImGui::TextUnformatted(body, body + body_len);
+}
+
+/* Top-level markdown renderer. See file-level comment for the
+ * supported subset. */
+static void md_render(const char *text, float font_mul) {
+    if (!text || !text[0]) return;
+    const char *p = text;
+    const char *end = text + strlen(text);
+    int block_idx = 0;
+    while (p < end) {
+        /* Fenced code — MUST be at line start (after \n or at text
+         * head). Prevents accidental matches in prose that mentions
+         * triple-backtick. */
+        int at_line_start = (p == text) || (p > text && p[-1] == '\n');
+        if (at_line_start && p + 3 <= end &&
+            p[0] == '`' && p[1] == '`' && p[2] == '`') {
+            /* Extract optional language from the line after ``` */
+            const char *lang_start = p + 3;
+            const char *lang_nl = (const char *)memchr(lang_start, '\n',
+                                                        end - lang_start);
+            if (!lang_nl) {
+                /* No newline after fence — treat whole rest as code */
+                md_render_code_block("", lang_start, end - lang_start,
+                                     block_idx++, 0.0f, font_mul);
+                return;
+            }
+            /* Language token — trim whitespace. */
+            char lang[24] = {0};
+            size_t lang_raw_len = lang_nl - lang_start;
+            /* Strip leading + trailing whitespace. */
+            const char *ls = lang_start;
+            while (ls < lang_nl && (*ls == ' ' || *ls == '\t')) ls++;
+            const char *le = lang_nl;
+            while (le > ls && (le[-1] == ' ' || le[-1] == '\t' ||
+                               le[-1] == '\r')) le--;
+            size_t use = (size_t)(le - ls);
+            if (use > 23) use = 23;
+            if (use > 0) memcpy(lang, ls, use);
+            lang[use] = 0;
+            /* Reject languages > 20 chars — false-positive fence in
+             * prose (very rare but defensive). Fall through to plain. */
+            if (lang_raw_len > 20) {
+                /* Not a real fence — advance one char + continue. */
+                md_render_plain(p, 1);
+                p++;
+                continue;
+            }
+            /* Body starts after the \n after language. */
+            const char *body = lang_nl + 1;
+            /* Find closing ``` on its own line ("\n```"). */
+            const char *close = NULL;
+            const char *scan = body;
+            while (scan < end) {
+                const char *nl = (const char *)memchr(scan, '\n', end - scan);
+                if (!nl) break;
+                if (nl + 4 <= end &&
+                    nl[1] == '`' && nl[2] == '`' && nl[3] == '`') {
+                    close = nl + 1;   /* points at the first ` */
+                    break;
+                }
+                scan = nl + 1;
+            }
+            const char *body_end = close ? close - 1 : end;   /* -1 = don't include trailing \n */
+            if (body_end < body) body_end = body;
+            md_render_code_block(lang, body, body_end - body,
+                                 block_idx++, 0.0f, font_mul);
+            if (close) {
+                p = close + 3;   /* past the closing ``` */
+                if (p < end && *p == '\n') p++;
+            } else {
+                p = end;
+            }
+            continue;
+        }
+        /* Display math \[ ... \] */
+        if (p + 2 <= end && p[0] == '\\' && p[1] == '[') {
+            const char *body = p + 2;
+            /* Find matching \] */
+            const char *close = NULL;
+            for (const char *s = body; s + 2 <= end; s++) {
+                if (s[0] == '\\' && s[1] == ']') { close = s; break; }
+            }
+            if (close) {
+                md_render_math_display(body, close - body, block_idx++,
+                                       font_mul);
+                p = close + 2;
+                continue;
+            }
+            /* No closer — fall through to plain */
+        }
+        /* Consume plain text until next special marker. */
+        const char *pt_end = p + 1;   /* at least 1 char forward */
+        while (pt_end < end) {
+            int at_ls = (pt_end > text && pt_end[-1] == '\n');
+            if (at_ls && pt_end + 3 <= end &&
+                pt_end[0] == '`' && pt_end[1] == '`' && pt_end[2] == '`') {
+                break;
+            }
+            if (pt_end + 2 <= end &&
+                pt_end[0] == '\\' && pt_end[1] == '[') {
+                break;
+            }
+            pt_end++;
+        }
+        md_render_plain(p, pt_end - p);
+        p = pt_end;
+    }
+}
+
 /* ---------- Draw the chat overlay ---------- *
  * Polished dark chat panel. Position anchored to one of 4 corners (cycled
  * via Ctrl+Shift+P). User can nudge with Ctrl+arrow, resize with
@@ -1563,11 +1873,48 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
                                 (unsigned long long)g_frame_count, corner, alpha, font_mul);
             ImGui::EndChild();
         } else {
-            /* ── Reply state: scrollable answer text ──────────────────── */
+            /* ── Reply state: scrollable answer text ──────────────────── *
+             * Rendered via md_render (markdown-lite) — fenced code blocks
+             * get mono font + copy button, display math \[..\] gets its
+             * own accented block, plain prose flows through TextWrapped.
+             * ui_copy_reply_to_clipboard (Ctrl+Alt+C) still copies the
+             * entire raw reply text unchanged.
+             *
+             * Special case: [typing...] prefix means "AI request in
+             * flight". Render an animated 3-dot indicator + the caller
+             * prompt underneath instead of the raw string. */
             ImGui::BeginChild("reply", ImVec2(0, -footer_height), false,
                               ImGuiWindowFlags_HorizontalScrollbar);
             ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x);
-            ImGui::TextUnformatted(snapshot);
+
+            int is_pending = (sl >= 10 && memcmp(snapshot, "[typing...]", 11) == 0);
+            if (is_pending) {
+                /* Animated three-dot ("...") loading indicator. Phase
+                 * cycles once per 400ms with 3 dots visible one at a
+                 * time. Subtle accent color so user knows it's live. */
+                unsigned tick = GetTickCount();
+                int phase = (tick / 400) % 3;
+                const char *dots[3] = { "•  ", "• •  ", "• • •  " };
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.85f, 1.0f, 0.95f));
+                if (g_font_mono) ImGui::PushFont(g_font_mono);
+                ImGui::Text("%s Thinking", dots[phase]);
+                if (g_font_mono) ImGui::PopFont();
+                ImGui::PopStyleColor();
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+                /* Show the prompt they asked (after the [typing...]
+                 * prefix + " asking AI: ") in dim color. */
+                const char *tail = strstr(snapshot, "asking AI: ");
+                if (tail) {
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        ImVec4(0.60f, 0.68f, 0.82f, 0.75f));
+                    ImGui::TextWrapped("%s", tail + 11);
+                    ImGui::PopStyleColor();
+                }
+            } else {
+                md_render(snapshot, font_mul);
+            }
             ImGui::PopTextWrapPos();
 
             /* Consume any hotkey-injected scroll delta from ui_scroll_reply.
@@ -1797,6 +2144,55 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
             io.LogFilename  = nullptr;
             /* Use a big display size initially; will be overridden per-frame. */
             io.DisplaySize = ImVec2((float)w, (float)h);
+
+            /* Load fonts BEFORE ImGui_ImplDX11_Init — the backend
+             * builds the GPU font texture from IO.Fonts on first
+             * frame. Loading after that causes a missing-glyph texture.
+             *
+             * Font pick logic:
+             *   - UI font: Segoe UI (Win11 UI's native sans-serif)
+             *   - Mono font: Cascadia Mono → Consolas → fallback
+             *
+             * Failure is silent; ImGui default (Proggy Clean 13px)
+             * takes over. That's ugly but functional.
+             *
+             * Both fonts load with a merged glyph range covering ASCII
+             * + Latin extended (for accented chars in typed chat) +
+             * Greek+math symbols (α, β, π, θ, ±, ≤, ≥, →, ⇌, ∞, ∑, ∫).
+             * CJK is DELIBERATELY not loaded (adds 200+ MB to atlas). */
+            static const ImWchar RANGES_UI[] = {
+                0x0020, 0x00FF,   /* Basic Latin + Latin-1 Supplement */
+                0x0100, 0x024F,   /* Latin Extended-A + B */
+                0x0370, 0x03FF,   /* Greek (α β π θ ε λ etc.) */
+                0x2000, 0x22FF,   /* General punctuation + math ops   */
+                0x2500, 0x25FF,   /* Box drawing (bar chars for cursor) */
+                0x2190, 0x21FF,   /* Arrows (→ ← ↑ ↓ ⇌) */
+                0, 0
+            };
+            g_font_ui = io.Fonts->AddFontFromFileTTF(
+                "C:\\Windows\\Fonts\\segoeui.ttf", UI_FONT_SIZE_PX,
+                nullptr, RANGES_UI);
+            if (!g_font_ui) {
+                g_font_ui = io.Fonts->AddFontDefault();
+                diag("font: segoeui.ttf load FAILED, using default");
+            } else {
+                diag("font: UI = Segoe UI @ %.0fpx", UI_FONT_SIZE_PX);
+            }
+            /* Mono font — try Cascadia Mono, then Consolas. */
+            g_font_mono = io.Fonts->AddFontFromFileTTF(
+                "C:\\Windows\\Fonts\\CascadiaMono.ttf", MONO_FONT_SIZE_PX,
+                nullptr, RANGES_UI);
+            if (!g_font_mono) {
+                g_font_mono = io.Fonts->AddFontFromFileTTF(
+                    "C:\\Windows\\Fonts\\consola.ttf", MONO_FONT_SIZE_PX,
+                    nullptr, RANGES_UI);
+            }
+            if (!g_font_mono) {
+                g_font_mono = g_font_ui;   /* fall back to UI font */
+                diag("font: mono load FAILED, using UI font");
+            } else {
+                diag("font: mono OK @ %.0fpx", MONO_FONT_SIZE_PX);
+            }
 
             ImGui::StyleColorsDark();
 
