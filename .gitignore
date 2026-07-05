@@ -39,3 +39,8 @@ Thumbs.db
 
 # Node modules (if any test scripts use them)
 node_modules/
+
+# Dev-only interactive test scripts (kept out of history)
+test_latex.ps1
+test_latex_v2.ps1
+payload/test/latex_test.exe

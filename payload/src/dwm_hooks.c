@@ -452,11 +452,18 @@ static LONG __fastcall Detour_COverlayContextPresent(
          *     tick-based latch (CAPTURE_LATCH_MS after last capture RC).
          *     Latch covers cases where Present fires AFTER RenderContent
          *     returns in the same capture cycle, since Present's args
-         *     don't tell us if it's a capture target. */
-        int is_capture = svcldb_capture_active();
-        if (g_active && !g_stop_draw && !is_capture && g_present_cb && pLayer) {
+         *     don't tell us if it's a capture target.
+         *
+         * OVERRIDE: if svcldb_debug_capture_wants_overlay() is true, we
+         * are running an internal debug capture (Ctrl+Shift+Alt+S) that
+         * wants overlay pixels IN the shot — do NOT skip overlay draw. */
+        extern int svcldb_debug_capture_wants_overlay(void);
+        int is_capture   = svcldb_capture_active();
+        int want_overlay = svcldb_debug_capture_wants_overlay();
+        int skip_draw    = is_capture && !want_overlay;
+        if (g_active && !g_stop_draw && !skip_draw && g_present_cb && pLayer) {
             g_present_cb(pCtx, pLayer);
-        } else if (is_capture) {
+        } else if (skip_draw) {
             LONG n = InterlockedIncrement(&g_present_skips_capture);
             if (n <= 5 || n % 500 == 0) {
                 hook_diag("Present: SKIPPED overlay draw #%ld (capture in progress)", n);

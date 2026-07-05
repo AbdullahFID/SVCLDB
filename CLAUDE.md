@@ -355,6 +355,68 @@ This eliminates guesswork — the AI now KNOWS the constraints of the renderer.
 
 ---
 
+## 2026-07-05 (late evening) — v3.1.2 LaTeX-to-Unicode renderer + bubble padding + debug capture fix
+
+Three fixes shipped after user feedback: "add a little just a little padding at the start of sentences on the left, its hugging the [edge]" and `$O(n \log n)$` was showing as literal LaTeX instead of rendering.
+
+### 1. LaTeX-to-Unicode conversion at render time (`payload/src/ui/imgui_layer.cpp`)
+
+Added `latex_to_unicode(src, src_len, dst, dst_cap)` — a ~200-LoC token-level converter that walks input text and converts LaTeX commands to Unicode equivalents in-place. Called from:
+- `md_render_plain`'s `flush_para` — converts each paragraph before emitting so inline `$O(n \log n)$` becomes `O(n log n)` visible.
+- `md_render_math_display` — converts display-math block bodies before feeding to the tinted-block renderer.
+
+Coverage (~80 mappings):
+- **Delimiters**: `$..$`, `\(..\)`, `\[..\]`, `$$..$$` — stripped, content flows inline.
+- **Fractions**: `\frac{a}{b}` → `a/b`, with parens added if either side has operators or if denominator has letters (so `1/2a` becomes `1/(2a)` — resolves the ambiguity).
+- **Roots**: `\sqrt{x}` → `√x`, parens added for multi-char content.
+- **Super/subscript**: `^2 ^3` → `² ³` (Unicode 2/3), `^{...}` and `_{...}` → strip braces + recurse.
+- **Symbols**: `\pi \Delta \int \sum \infty \partial \nabla \forall \exists ...` → `π Δ ∫ ∑ ∞ ∂ ∇ ∀ ∃ ...` (30+ Greek + big-op + logic).
+- **Relations**: `\leq \geq \neq \pm \times \cdot \approx \equiv` → `≤ ≥ ≠ ± × · ≈ ≡` (14 relation/operator symbols).
+- **Functions**: `\log \ln \sin \cos \tan \exp \lim \max \min` — drop the backslash but preserve source's spacing.
+- **Arrows**: `\to \rightarrow \Rightarrow \leftarrow \Leftarrow \mapsto` → `→ ⇒ ← ⇐ ↦` (Unicode arrows).
+- **Whitespace commands**: `\, \; \: \! \left \right` → empty; adjacent source spaces collapsed to avoid doubles.
+- **Unknown commands** (e.g. `\mathbb`, `\text`): kept as-is with backslash so nothing silently disappears.
+
+**Space-handling contract**: converter NEVER swallows the space that follows a mapped command. If the LaTeX author wrote `\log n`, output is `log n`. If they wrote `\Theta(...)`, output is `Θ(...)`. This preserves visual separation without needing per-command "letter vs symbol" heuristics.
+
+**Copy-vs-render split**: the chat_msg's raw text (containing original LaTeX like `\Theta`) stays intact. Only the DISPLAY path calls `latex_to_unicode`. That means:
+- `Ctrl+Alt+C` (copy full reply) → raw LaTeX — perfect for pasting to Overleaf / ChatGPT / paper.
+- Display in overlay → readable Unicode.
+
+Best of both worlds. No user-facing config needed.
+
+**Unit tests**: `payload/test/latex_test.c` — 15 test cases. All passing. Test the exact user case (`$O(n \log n)$` → `O(n log n)`), plus theta (`$\Theta$` → `Θ`), fractions with recursive Unicode conversion (`\frac{-b \pm \sqrt{b^2 - 4ac}}{2a}` → `(-b ± √(b² - 4ac))/(2a)`), integrals, sums with sub/superscripts.
+
+### 2. Bubble padding bumped
+
+- `draw_chat_bubble`: horizontal padding 14→20 px, vertical 10→12. Text no longer hugs bubble edges.
+- `md_render_tinted_block`: horizontal padding 12→16 px, vertical 8→10. Code/math content has more breathing room from the block border.
+
+### 3. Debug capture (`Ctrl+Shift+Alt+S`) now includes overlay
+
+Before: debug capture went through the DWM Present hook which unconditionally skipped overlay draw when `svcldb_capture_active()` was true. That meant the debug shot showed the DESKTOP without our overlay — useless for verifying UI changes.
+
+After: added `svcldb_debug_capture_wants_overlay()` exported from imgui_layer.cpp, checked by the Present hook. When TRUE (during `ui_capture_screen_png_with_overlay` / `ui_capture_screen_bmp` cycles), the Present hook draws the overlay normally so it lands in the captured backbuffer.
+
+Live-verified: post-fix debug PNG shows the overlay at (600,60), 400x300, with the cheat sheet + status bar visible. Previously that same shot was just the raw desktop.
+
+### Files touched in v3.1.2
+
+- `payload/src/ui/imgui_layer.cpp` — `LATEX_MAP` table (~80 entries), `SUP_DIGITS[10]`, `latex_match_at`, `ltx_put*` helpers, `latex_to_unicode` (with recursive `\frac` / `\sqrt` / `^{}` / `_{}` handling), `flush_para` wired to converter, `md_render_math_display` wired, `svcldb_debug_capture_wants_overlay` export, bubble padding bump, tinted-block padding bump.
+- `payload/src/dwm_hooks.c` — Present detour checks the new "wants overlay" hook and short-circuits the skip logic.
+- `payload/test/latex_test.c` — 15 unit tests exercising the converter (standalone compilable, no ImGui dependency).
+
+### Hard invariants added in v3.1.2 (DO NOT REGRESS)
+
+1. **`latex_to_unicode` NEVER modifies chat_msg storage.** The RAW LaTeX text stays in `chat_msg.text` so copy hotkeys give original for Overleaf paste. Only the render path calls the converter.
+2. **Whitespace after mapped commands is PRESERVED.** Don't add a "consume trailing space after \command" rule — it breaks `\log n` → wants `log n`, would produce `logn`. Only EMPTY replacements (`\left`, `\,`, `\;`) consume adjacent whitespace to avoid doubles.
+3. **Denominator wrap in `\frac{a}{b}` triggers on: operators (+/-/space/*/), OR multi-token + contains letter.** This is what makes `1/2a` become `1/(2a)` (unambiguous) instead of the ambiguous `1/2a`.
+4. **Unknown LaTeX commands are PRESERVED with backslash.** `\mathbb{R}` → `\mathbbR` (braces stripped, cmd kept). Never silently drop — user needs to see something didn't convert.
+5. **`svcldb_debug_capture_wants_overlay` is checked in the Present hook FIRST**, before the general `svcldb_capture_active` skip. This is the ONLY place the overlay can be seen in a debug capture — do not remove this branch or debug shots become useless again.
+6. **Debug-capture-visible-overlay does NOT compromise stealth.** External capture (Snipping Tool, System.Drawing.Bitmap) still hits the RenderContent hooks + Present skip normally. The new branch only fires when `g_cap_when_after_overlay == 1` which is set exclusively by our own `ui_capture_screen_png_with_overlay` / `_bmp` internal debug paths.
+
+---
+
 ## 2026-07-05 (evening) — v3 chat rewrite (AI + UI overhaul)
 
 Major coordinated overhaul of the AI + UI layers. This is the AUTHORITATIVE state; prior handoffs (`HANDOFF_STEALTH_NIGHT_*` + `HANDOFF_UX_POLISH_*`) still hold for the stealth invariants but the CHAT UI + AI-provider details in them are superseded.
