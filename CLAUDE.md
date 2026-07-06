@@ -1,5 +1,164 @@
 ﻿# svcldb — Project Memory (Claude / Cursor)
 
+## 2026-07-06 (afternoon) — v5.0 CRITICAL FIX: DWM crash on 2nd inject via svchelper
+
+Users clicking "Inject Now" in the Electron UI after having previously
+injected in the same DWM session reliably crashed DWM with
+`0xc0000005 → 0xc000041d` (BEX64) — fault RIP inside the freed OLD
+payload region at slog_writef's offset. Reproduced live 2026-07-06
+1:00-1:19 PM EDT across multiple `--json-config`, `--reinject`, and
+manual inject cycles; verified DWM entered a fresh respawn each time.
+
+### The 3-layer root cause (bisected)
+
+The `launcher/src/inject.c` `sweep_stale_payload_regions()` function
+was aggressively `VirtualFreeEx(..., MEM_RELEASE)`ing every stale
+MEM_PRIVATE 500KB-2MB region in DWM whose shape matched our payload.
+It was designed to reclaim the ~700KB region every `--unload` cycle
+leaks (payload's `peb_unlink_dll` defeats LdrUnloadDll → payload
+can't `FreeLibraryAndExitThread` itself). BUT:
+
+**Layer 1 — `inject_is_loaded()` was blind to manual-mapped payloads.**
+It walked PEB.Ldr via `Module32FirstW` looking for `dwmapiext.dll`.
+Manual-mapped DLLs never touch PEB.Ldr, and our payload additionally
+does `peb_unlink_dll`, so the check ALWAYS returned 0. Downstream:
+
+- The `--json-config` handler's "leftover heal" branch
+  (`if (inject_is_loaded()) { inject_signal_unload(); wait; }`) never
+  fired. Old payload was never told to shut down.
+- Sweep proceeded blind, freeing OLD payload code memory while the
+  OLD payload's long-lived threads were still alive.
+
+**Layer 2 — `hook_integrity_thread` used non-interruptible `Sleep(10000)`.**
+Even after fixing Layer 1 (signal-unload before sweep), the OLD
+integrity thread would be mid-Sleep(10000) when hooks_uninstall
+tried to join it with a 500ms timeout. The wait TIMED OUT →
+hooks_uninstall proceeded → shutdown_watcher returned →
+FreeLibraryAndExitThread ran on the LAST thread but the integrity
+thread was STILL SLEEPING in code memory that was about to be freed.
+When Sleep returned, the CPU tried to fetch the next instruction
+from decommitted memory. Fixed by chunking the 10s wait into 200 ×
+50ms slices that re-check `g_integrity_running` each iteration.
+
+**Layer 3 — the sweep itself is fundamentally unsafe.**
+Even with (1) proper unload signal + wait + (2) fixed integrity
+thread + (3) `MEM_DECOMMIT` instead of `MEM_RELEASE` (to prevent
+Windows from re-handing the same VA to the new payload's
+`VirtualAllocEx`), DWM STILL crashed ~1-2s after the second payload
+became READY. Fault RIP was consistently inside the OLD (freed)
+region at slog_writef's offset (RVA 0x5462C-0x54ce0).
+
+Hypothesis: Windows holds kernel-side references into the payload's
+code region even after every OUR-thread has exited. Candidates:
+- Queued LL keyboard-hook callbacks (WH_KEYBOARD_LL — kernel table
+  keyed on hook handle, may retain pointer to our callback across
+  UnhookWindowsHookEx)
+- SetWinEventHook OUTOFCONTEXT dispatch queue (`ghost_fg_change_cb`
+  in keepalive)
+- ntdll thread cleanup stubs baked with references to our old code
+- MinHook's own slab pages (allocated separately, may have in-flight
+  trampoline executions during MH_Uninitialize)
+
+**Bisected 2026-07-06 13:19 EDT:** disabling the sweep entirely →
+2-cycle stress test survived 8+ seconds cleanly. Sweep re-enabled →
+crash within 1-2s of 2nd payload READY. Definitive proof.
+
+### What v5.0 shipped
+
+**`launcher/src/inject.c`**:
+- `inject_is_loaded()` rewritten to probe the payload's named
+  shutdown event (`OpenEventA(SYNCHRONIZE, ..., SVC_STR_SHUTDOWN_EVENT)`).
+  Works with manual-mapped/PEB-unlinked payloads because named kernel
+  objects live in the Global\ namespace, not per-process loader state.
+- New `wait_for_payload_teardown()` helper — signals the shutdown
+  event + polls every 50ms up to 1.5s for the event to disappear
+  (meaning shutdown_watcher fully drained + CloseHandled it).
+  Called unconditionally at the start of `manual_map_from_bytes`
+  BEFORE any memory touching. ~0ms fast path when no payload alive.
+- `sweep_stale_payload_regions()` now GATED behind
+  `SVCLDB_ALLOW_SWEEP` env var (default OFF). Existing users will
+  accumulate ~700KB of dead payload image per inject in DWM's
+  working set. Real-world: 1-2 live images typically. Acceptable.
+- Original `MEM_DECOMMIT` version of the sweep is preserved in the
+  function body for the SVCLDB_ALLOW_SWEEP=1 debug path.
+
+**`payload/src/dwm_hooks.c`**:
+- `hook_integrity_thread` — 10s wait rewritten as
+  `for (int slice = 0; slice < 200 && g_integrity_running; slice++)
+     Sleep(50);`. Wakes within 50ms of shutdown signal (was up to 10s
+  in the worst case). Costs 200 syscalls per 10s cycle — negligible.
+- `hooks_uninstall`'s integrity-thread join wait bumped 500ms → 2000ms
+  for headroom against SEH-wrapped hook probes during shutdown races.
+  Now logs `hooks_uninstall: integrity thread wait FAILED (wr=%lu)`
+  if the wait ever times out — a smoking gun for future regressions.
+
+### v5.0 hard invariants (DO NOT REGRESS)
+
+53. **`sweep_stale_payload_regions()` is DEFAULT-OFF.** Leaves the
+    old payload image intact after `--unload`. Never re-enable
+    without first proving that no kernel-side reference into the
+    old code region survives 2+ seconds post-full-teardown.
+    `SVCLDB_ALLOW_SWEEP=1` env var re-enables for debug only.
+54. **`inject_is_loaded()` MUST use the named shutdown event probe,
+    not PEB.Ldr walk.** Manual-mapped + PEB-unlinked payloads are
+    invisible to Module32FirstW. Any regression to Toolhelp walking
+    silently disables the leftover-heal branch and re-introduces
+    the class of crashes we just fixed.
+55. **Long-sleep threads MUST use interruptible waits OR chunked
+    polling.** `hook_integrity_thread` was the offender; any new
+    thread that does `Sleep(N)` where N > 100ms MUST either:
+      (a) use `WaitForSingleObject(shutdown_event, N)` (best), or
+      (b) chunk into `while (running) { for (int i=0; i<N/50; i++)
+          Sleep(50); if (!running) break; ... }` (acceptable).
+    hooks_uninstall's 2000ms wait is the safety net, but it's a
+    SAFETY NET, not a design contract — don't rely on it.
+56. **`wait_for_payload_teardown()` MUST run BEFORE any DWM memory
+    manipulation (allocate/free/protect) in the inject path.**
+    Currently at the top of `manual_map_from_bytes`. Even though
+    sweep is off, the safety barrier is still valuable: prevents
+    two payloads from racing during a `VirtualAllocEx + shellcode
+    inject` sequence into the same DWM.
+57. **Memory leak per inject cycle is EXPECTED (~700KB).** Users
+    typically inject once per session. Over 100 injects that's
+    ~70 MB in DWM working set — still under DWM's typical 200-500 MB.
+    Long-lived kiosk deployments should reboot weekly.
+58. **`hooks_uninstall` failure log is a REGRESSION CANARY.** The
+    `"integrity thread wait FAILED (wr=X)"` line means someone
+    reintroduced a non-interruptible sleep somewhere in the
+    integrity path. Grep production logs for it periodically.
+
+### Live-verified end-to-end (2026-07-06 13:20 EDT)
+
+- 2 back-to-back `--unload` + `--reinject` cycles → DWM stable for
+  8s+ each. Fault RIP inside old payload region: **0 occurrences**
+  (was 4/4 with sweep on).
+- `svchelper.exe` (Electron UI) fresh sign-in → Inject Now →
+  overlay renders, no crash. User-reported working state.
+- Windows Event Viewer `Application Error` events for `dwm.exe`
+  during the test window: zero.
+
+### Distribution status
+
+Production build (`SVCLDB_DEV_BYPASS_AUTH=0`) verified:
+- `build/payload/dwmapiext.dll` — no dev bypass string present
+- `build/launcher/sihost.exe` — sweep-gated on SVCLDB_ALLOW_SWEEP env
+- Grep of shipped binaries for `DEV BYPASS` / `SVCLDB_DEV_AUTH`:
+  zero matches (verified by pre-commit script).
+
+Fresh bundle at `Desktop\CloakGPTWindowsMaxStealth.zip` produced via
+`ui\tools\build-distribution.ps1`. Users receive:
+1. `CloakGPT/` folder with `svchelper.exe` + `resources/`
+2. `install-cloakgpt.ps1` (idempotent upgrader — kills stale
+   svchelper, freshens C bins, creates admin Desktop shortcut)
+
+Deployment: users drop the fresh zip on Desktop, right-click →
+Run with PowerShell on `install-cloakgpt.ps1`. Existing installs
+auto-upgrade because `main.js::ensureCBinariesInstalled` detects
+newer-bundled + different-sized C bins and uninjects the running
+old payload before overwriting.
+
+---
+
 ## 2026-07-06 (late evening) — v4.9 auth fix: "No active subscription" for LIFETIME users (HTTP 400 root cause)
 
 Users with genuine LIFETIME grants (in particular `ngm.ksa69@gmail.com`

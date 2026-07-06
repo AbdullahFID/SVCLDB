@@ -260,11 +260,35 @@ static void hook_diag(const char *fmt, ...);
  * to re-enable via MinHook (MH_EnableHook is idempotent-safe).
  *
  * Never crashes DWM — memcmp is wrapped in SEH, MH_EnableHook is
- * checked for success. Tamper hits logged for post-mortem analysis. */
+ * checked for success. Tamper hits logged for post-mortem analysis.
+ *
+ * CRITICAL — INTERRUPTIBLE SLEEP:
+ *   The old code used `Sleep(10000)` which is NOT cancellable. When
+ *   the payload's shutdown_watcher fired hooks_uninstall (which sets
+ *   g_integrity_running=0 + waits 500ms for this thread), the wait
+ *   TIMED OUT because we were mid-Sleep. hooks_uninstall proceeded
+ *   without us actually exiting, shutdown_watcher then called
+ *   FreeLibraryAndExitThread, launcher's next inject-cycle sweep
+ *   VirtualFreeEx'd the payload's code memory. When our Sleep
+ *   returned, the CPU tried to execute the next instruction —
+ *   which was in decommitted memory. HARD DWM CRASH.
+ *
+ *   Verified live 2026-07-06 13:10-13:17 EDT: multiple back-to-back
+ *   DWM crashes with fault RIP at RVA 0x5462C / 0x54CC0 (inside this
+ *   thread's post-Sleep return path).
+ *
+ *   Fix: chunk the 10s wait into 50ms Sleeps that re-check the flag
+ *   on each iteration. Total wall-clock is still ~10s under normal
+ *   operation, but shutdown drains within 50ms max. Cost is 200
+ *   syscalls per 10s cycle — negligible. No new globals/handles
+ *   required, works in a purely user-mode/manual-mapped context. */
 static DWORD WINAPI hook_integrity_thread(LPVOID param) {
     (void)param;
     while (g_integrity_running) {
-        Sleep(10000);
+        /* Sleep 10s in 50ms chunks so shutdown wakes us fast. */
+        for (int slice = 0; slice < 200 && g_integrity_running; slice++) {
+            Sleep(50);
+        }
         if (!g_integrity_running) break;
         LONG cnt = g_hook_reg_count;
         if (cnt > HOOK_INTEGRITY_MAX) cnt = HOOK_INTEGRITY_MAX;
@@ -1047,10 +1071,23 @@ void hooks_uninstall(void) {
     hook_diag("hooks_uninstall: entering — g_stop_draw set (Phase B: DRAINING)");
 
     /* Stop hook-integrity monitor before we start disabling hooks (else
-     * it'd see them being torn down and try to re-install mid-shutdown). */
+     * it'd see them being torn down and try to re-install mid-shutdown).
+     *
+     * WAIT MUST SUCCEED — see hook_integrity_thread docstring. The old
+     * 500ms wait was not enough (thread could be mid-`Sleep(10000)`
+     * and hooks_uninstall would time out + proceed while the thread
+     * was still alive in soon-to-be-freed code → DWM crash on next
+     * inject cycle's sweep. Fixed in v-next by chunking the thread's
+     * sleep into 50ms slices; wait budget bumped to 2s for headroom
+     * against slow SEH-wrapped `first = *(unsigned char*)r->target`
+     * probes during shutdown races. */
     InterlockedExchange(&g_integrity_running, 0);
     if (g_integrity_thread) {
-        WaitForSingleObject(g_integrity_thread, 500);
+        DWORD wr = WaitForSingleObject(g_integrity_thread, 2000);
+        if (wr != WAIT_OBJECT_0) {
+            hook_diag("hooks_uninstall: integrity thread wait FAILED "
+                      "(wr=%lu) — DWM crash likely on next inject", wr);
+        }
         CloseHandle(g_integrity_thread);
         g_integrity_thread = NULL;
     }

