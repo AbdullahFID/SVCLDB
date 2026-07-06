@@ -28,11 +28,18 @@ set SOURCES=^
  "%SHARED%\log_secure.c" "%SHARED%\log_key.c" ^
  "%SRC%\main.c"
 
-set LDFLAGS=/nologo /SUBSYSTEM:CONSOLE /LTCG /DEBUG:NONE /Brepro /OPT:REF /OPT:ICF ^
- /INCREMENTAL:NO /MANIFEST:NO ^
+REM  Hardening: /CETCOMPAT (hardware ROP defence),
+REM  /HIGHENTROPYVA /DYNAMICBASE /NXCOMPAT (ASLR + DEP),
+REM  /GUARD:CF (Control Flow Guard — safe here, no shellcode).
+REM  NOT using /DELAYLOAD:cgpt_dbghelp.dll because we explicitly
+REM  LoadLibraryA it from the resolver's own directory to control
+REM  which dbghelp version resolves (SDK version with symsrv support).
+set LDFLAGS=/nologo /SUBSYSTEM:CONSOLE /LTCG /DEBUG:NONE /Brepro ^
+ /OPT:REF /OPT:ICF /INCREMENTAL:NO /MANIFEST:NO ^
+ /HIGHENTROPYVA /DYNAMICBASE /NXCOMPAT /CETCOMPAT /GUARD:CF ^
  /OUT:"%BUILD%\%OUT_NAME%"
 
-cl %CFLAGS% /I "%SHARED%" /I "%SRC%" ^
+cl %CFLAGS% /I "%SHARED%" /I "%SRC%" /guard:cf ^
    %SOURCES% ^
    /link %LDFLAGS% ^
    kernel32.lib user32.lib advapi32.lib bcrypt.lib
@@ -43,5 +50,29 @@ del /q "%BUILD%\*.obj" 2>nul
 del /q "%BUILD%\*.pdb" 2>nul
 del /q "%BUILD%\*.exp" 2>nul
 del /q "%BUILD%\*.lib" 2>nul
+
+REM ── Copy dbghelp + symsrv from the Windows SDK next to the resolver.
+REM  The resolver LoadLibraryA's cgpt_dbghelp.dll from its own directory
+REM  so it can pick the SDK version (with symsrv.dll support) over the
+REM  limited System32 copy that ships with Windows itself.
+REM
+REM  If the SDK isn't installed, the resolver falls back to the System32
+REM  dbghelp.dll at runtime — which cannot download PDBs from Microsoft's
+REM  symbol server, so the offsets.blob resolution fails. Add the "Debugging
+REM  Tools for Windows" component of the Windows SDK if this warning fires.
+REM
+REM  IMPORTANT: variable value is quoted at SET time so the `(x86)` parens
+REM  inside the path don't confuse cmd.exe's block parser when we later
+REM  use `if exist "..." (...)` — verified 2026-07 (see build.bat log).
+set "SDK_DBG_DIR=C:\Program Files (x86)\Windows Kits\10\Debuggers\x64"
+if exist "%SDK_DBG_DIR%\dbghelp.dll" goto :HAVE_SDK
+echo === WARNING: Windows SDK Debuggers\x64 not found at %SDK_DBG_DIR% ===
+echo === Resolver will fall back to System32 dbghelp — PDB fetching may fail. ===
+goto :SIZE_ECHO
+:HAVE_SDK
+copy /y "%SDK_DBG_DIR%\dbghelp.dll" "%BUILD%\cgpt_dbghelp.dll" >nul
+copy /y "%SDK_DBG_DIR%\symsrv.dll"  "%BUILD%\symsrv.dll"       >nul
+echo === Copied cgpt_dbghelp.dll + symsrv.dll from Windows SDK ===
+:SIZE_ECHO
 
 for %%F in ("%BUILD%\%OUT_NAME%") do echo === Built %%F  (%%~zF bytes) ===

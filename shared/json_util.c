@@ -210,6 +210,87 @@ int json_first_array_object(const char *json,
     return 1;
 }
 
+/* ── String-aware structural scanners ────────────────────────────
+ *
+ * ROOT CAUSE FIX (2026-07-05 late night): AI-generated content that
+ * includes LaTeX like `\frac{T}{10}` contains literal `{` and `}`
+ * characters inside JSON string values. Any consumer that walks the
+ * JSON body counting `{`/`}` without tracking string state ends up
+ * treating those content-braces as structural, which corrupts the
+ * extracted object boundary.
+ *
+ * Concretely: an SSE stream chunk of `{"delta":{"content":"}"}}`
+ * has a NAIVE brace balance of `{` `{` `}` `}` `}` = imbalanced. The
+ * old parser would break at the FIRST `}` after the string open (i.e.
+ * inside the content), extracting `{"delta":{"content":"}` and
+ * failing json_get_str. Net effect: any LaTeX chunk containing `}`
+ * was silently dropped.
+ *
+ * These helpers are the canonical fix and MUST be used by every
+ * consumer that slices a nested JSON object/array out of a larger
+ * body. */
+
+/* Walk from *p* (adjusted forward to first `{`) to the matching `}`,
+ * respecting `"..."` string boundaries + `\`-escapes. Returns pointer
+ * one past the matching `}`, or NULL on malformed input. */
+const char *json_skip_object(const char *start) {
+    if (!start) return NULL;
+    const char *p = start;
+    while (*p && *p != '{') p++;
+    if (*p != '{') return NULL;
+    int depth = 0;
+    int in_string = 0;
+    while (*p) {
+        char c = *p;
+        if (in_string) {
+            if (c == '\\' && p[1]) { p += 2; continue; }
+            if (c == '"') in_string = 0;
+            p++;
+            continue;
+        }
+        if (c == '"') { in_string = 1; p++; continue; }
+        if (c == '{') { depth++; p++; continue; }
+        if (c == '}') {
+            depth--;
+            p++;
+            if (depth == 0) return p;
+            continue;
+        }
+        p++;
+    }
+    return NULL;
+}
+
+/* Same as json_skip_object but for `[...]` arrays. Handles both
+ * string escapes AND nested object/array bodies via json_skip_object. */
+const char *json_skip_array(const char *start) {
+    if (!start) return NULL;
+    const char *p = start;
+    while (*p && *p != '[') p++;
+    if (*p != '[') return NULL;
+    int depth = 0;
+    int in_string = 0;
+    while (*p) {
+        char c = *p;
+        if (in_string) {
+            if (c == '\\' && p[1]) { p += 2; continue; }
+            if (c == '"') in_string = 0;
+            p++;
+            continue;
+        }
+        if (c == '"') { in_string = 1; p++; continue; }
+        if (c == '[') { depth++; p++; continue; }
+        if (c == ']') {
+            depth--;
+            p++;
+            if (depth == 0) return p;
+            continue;
+        }
+        p++;
+    }
+    return NULL;
+}
+
 /* ─── Builder ────────────────────────────────────────────────────── */
 
 static int jb_ensure(json_builder_t *b, size_t extra) {

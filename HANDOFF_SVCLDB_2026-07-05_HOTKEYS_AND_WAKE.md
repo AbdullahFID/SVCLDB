@@ -1,4 +1,4 @@
-# HANDOFF: svcldb — hotkey reliability + DWM lazy-compose (2026-07-05)
+﻿# HANDOFF: svcldb — hotkey reliability + DWM lazy-compose (2026-07-05)
 
 ## Read this first, then follow instructions in "Your mission" verbatim
 
@@ -90,7 +90,7 @@ The user is exhausted. They said (verbatim, copy-paste for context):
 
 And:
 
-> **"the exe is this: C:\Users\abdul\Downloads\launchhere (1).exe"**
+> **"the exe is this: C:\Users\<you>\Downloads\launchhere (1).exe"**
 > **"again dont speculate literally RE see exactly what he does generate from that an idea and mimic it 1:1 bam simple done no extra work"**
 
 ### Step 1: Read the full codebase (per `.cursor/rules/read-full-codebase.mdc`)
@@ -101,7 +101,7 @@ And:
 - `HANDOFF_SVCLDB_2026-07-04.md` (this dir) — the prior session's handoff
 - This file (`HANDOFF_SVCLDB_2026-07-05_HOTKEYS_AND_WAKE.md`)
 - `svcldb/payload/src/dwm_hooks.c`, `svcldb/payload/src/ui/imgui_layer.cpp`, `svcldb/payload/src/rawinput_hook.c`, `svcldb/payload/src/dllmain.c`
-- Claude Code past transcripts at `C:\Users\abdul\.claude\projects\C--Users-abdul-Desktop-hooksdll\*.jsonl` — grep for `bypassify`, `SetCursorPos`, `PresentNeeded`, `ForceFullDirty`, `wake`, `compose`, `RedrawWindow`
+- Claude Code past transcripts at `C:\Users\<you>\.claude\projects\C--Users-<you>-Desktop-hooksdll\*.jsonl` — grep for `bypassify`, `SetCursorPos`, `PresentNeeded`, `ForceFullDirty`, `wake`, `compose`, `RedrawWindow`
 
 ### Step 2: Web-search the specific pattern
 
@@ -130,7 +130,7 @@ Binary locations:
 
 | Path | Size | What |
 |---|---|---|
-| `C:\Users\abdul\Downloads\launchhere (1).exe` | 3.6 MB | v1.3.0 launcher (self-extracts embedded DLLs to temp, injects into DWM, exits) |
+| `C:\Users\<you>\Downloads\launchhere (1).exe` | 3.6 MB | v1.3.0 launcher (self-extracts embedded DLLs to temp, injects into DWM, exits) |
 | `C:\Temp\bypassify_fresh\v13_new\resources\RT_RCDATA_id_101_lang_9.bin` | 815,616 B | **THE ACTUAL DWM PAYLOAD** — this is what gets injected into dwm.exe |
 | `C:\Temp\bypassify_fresh\v13_new\resources\RT_RCDATA_id_102_lang_9.bin` | 37,376 B | Probably injector shellcode |
 | `C:\Temp\bypassify_fresh\v13_new\resources\RT_RCDATA_id_103_lang_9.bin` | 424,304 B | ? |
@@ -189,33 +189,33 @@ Same as prior handoff — fast because dwm.exe auto-restarts in ~3s:
 ```powershell
 # 1. Edit payload source
 # 2. Build:
-cd C:\Users\abdul\Desktop\svcldb\payload; cmd /c build.bat
+cd C:\Users\<you>\Desktop\svcldb\payload; cmd /c build.bat
 
 # 3. Deploy (payload only; launcher rarely needs rebuilding once config is written):
-Copy-Item C:\Users\abdul\Desktop\svcldb\build\payload\dwmapiext.dll `
+Copy-Item C:\Users\<you>\Desktop\svcldb\build\payload\dwmapiext.dll `
           C:\ProgramData\WinAudioSvc\dwmapiext.dll -Force
 
 # 4. Restart DWM (auto-relaunches ~3s):
 Stop-Process -Name dwm -Force; Start-Sleep 3
 
 # 5. Inject via main-app's manual mapper (bypasses launcher OAuth entirely):
-& 'C:\Users\abdul\Desktop\hooksdll\dwm\dwm_manual_map.exe' `
+& 'C:\Users\<you>\Desktop\hooksdll\dwm\dwm_manual_map.exe' `
   'C:\ProgramData\WinAudioSvc\dwmapiext.dll'
 
 # 6. Check diag (plaintext, always works):
 Get-Content C:\ProgramData\WinAudioSvc\payload_early.txt
 
 # 7. Check encrypted logs:
-node C:\Users\abdul\Desktop\svcldb\deploy\decrypt_logs.js payload.log 30
-node C:\Users\abdul\Desktop\svcldb\deploy\decrypt_logs.js ai.log 20
+node C:\Users\<you>\Desktop\svcldb\deploy\decrypt_logs.js payload.log 30
+node C:\Users\<you>\Desktop\svcldb\deploy\decrypt_logs.js ai.log 20
 ```
 
 For a fresh full pipeline (rewrites config with new format after launcher
 changes):
 
 ```powershell
-cd C:\Users\abdul\Desktop\svcldb\launcher; cmd /c build.bat
-Copy-Item C:\Users\abdul\Desktop\svcldb\build\launcher\sihost.exe `
+cd C:\Users\<you>\Desktop\svcldb\launcher; cmd /c build.bat
+Copy-Item C:\Users\<you>\Desktop\svcldb\build\launcher\sihost.exe `
           C:\ProgramData\WinAudioSvc\sihost.exe -Force
 & C:\ProgramData\WinAudioSvc\sihost.exe --quiet   # session valid → no OAuth
 ```

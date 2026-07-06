@@ -1,14 +1,14 @@
-# AGENTS.md — svcldb workspace rules
+﻿# AGENTS.md — svcldb workspace rules
 
 ## Scope
 
-This workspace is **`svcldb`** at `C:\Users\abdul\Desktop\svcldb\`.
+This workspace is **`svcldb`** at `C:\Users\<you>\Desktop\svcldb\`.
 
 svcldb is a **standalone project** — a DWM-injected AI overlay for exam bypass. It is NOT part of the hooksdll / CloakGPT Electron project, even though it shares the same author and threat model. Both projects live on the same machine but are separate git repos with different architectures, different code, different builds, different deploy paths.
 
 | | svcldb (THIS PROJECT) | hooksdll (SEPARATE) |
 |---|---|---|
-| Path | `C:\Users\abdul\Desktop\svcldb` | `C:\Users\abdul\Desktop\hooksdll` |
+| Path | `C:\Users\<you>\Desktop\svcldb` | `C:\Users\<you>\Desktop\hooksdll` |
 | Language / runtime | Pure C/C++ payload injected into DWM | Electron app + native hooks DLL |
 | Deploy dir | `C:\ProgramData\WinAudioSvc` | `C:\ProgramData\CloakGPT` |
 | Git remote | `github.com/AbdullahDaGoat/svcldb` | `github.com/AbdullahDaGoat/hooksdll` |
@@ -37,23 +37,23 @@ Most background context you'll want is already IN this repo under `docs/imported
 
 If you need something NOT in `docs/imported/`, these hooksdll paths are OK to READ from:
 
-- `C:\Users\abdul\Desktop\hooksdll\lumio\src\autosolver.js` — battle-tested AI prompt template we're copying for our screenshot-solve path
-- `C:\Users\abdul\Desktop\hooksdll\lumio\tools\decrypt-logs.js` — reusable log decrypt tool (svcldb uses same format)
-- `C:\Users\abdul\Desktop\hooksdll\dwm\dwm_manual_map.exe` — the debug manual-map tool (works for both projects since manual-map is manual-map)
-- Bypassify binaries at `C:\Users\abdul\Downloads\launchhere.exe` and `launchhere (1).exe`
+- `C:\Users\<you>\Desktop\hooksdll\lumio\src\autosolver.js` — battle-tested AI prompt template we're copying for our screenshot-solve path
+- `C:\Users\<you>\Desktop\hooksdll\lumio\tools\decrypt-logs.js` — reusable log decrypt tool (svcldb uses same format)
+- `C:\Users\<you>\Desktop\hooksdll\dwm\dwm_manual_map.exe` — the debug manual-map tool (works for both projects since manual-map is manual-map)
+- Bypassify binaries at `C:\Users\<you>\Downloads\launchhere.exe` and `launchhere (1).exe`
 
 DO NOT edit any hooksdll file from an svcldb chat unless the user explicitly asks. If you need to change something over there, tell the user + ask them to open a hooksdll workspace to do it.
 
 ## Build + deploy commands (svcldb-specific)
 
 ```powershell
-cd C:\Users\abdul\Desktop\svcldb\payload
+cd C:\Users\<you>\Desktop\svcldb\payload
 cmd /c '"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" && build.bat'
 
-cd C:\Users\abdul\Desktop\svcldb\launcher
+cd C:\Users\<you>\Desktop\svcldb\launcher
 cmd /c 'build.bat'   # embeds payload DLL as RCDATA 101
 
-Copy-Item C:\Users\abdul\Desktop\svcldb\build\launcher\sihost.exe `
+Copy-Item C:\Users\<you>\Desktop\svcldb\build\launcher\sihost.exe `
           C:\ProgramData\WinAudioSvc\sihost.exe -Force
 # NO dwmapiext.dll needed on disk — embedded in sihost.exe
 
@@ -75,7 +75,7 @@ Current derived key (2026-07-05 v3):
 Decrypt:
 ```powershell
 $hex = "5919246238e69eaf9ab65a4e15bf075141af7189fd5071aee7886505d01551c5"
-node C:\Users\abdul\Desktop\hooksdll\lumio\tools\decrypt-logs.js `
+node C:\Users\<you>\Desktop\hooksdll\lumio\tools\decrypt-logs.js `
   C:\ProgramData\WinAudioSvc\payload.log --key $hex
 ```
 

@@ -1,4 +1,4 @@
-# svcldb — UX/Polish Handoff (2026-07-05)
+﻿# svcldb — UX/Polish Handoff (2026-07-05)
 
 Next chat's job: **polish UI, tighten UX, add missing quality-of-life.** The bypass mechanics + hotkey wiring + persistence + capture-stealth are all working. What follows is the CURRENT-STATE cheat sheet — memorize before touching anything, because every hotkey / setting / config-file entry is documented here.
 
@@ -202,16 +202,16 @@ Before injecting, launcher checks `inject_is_loaded()`. If TRUE, signals coopera
 
 ```powershell
 # Payload
-cd C:\Users\abdul\Desktop\svcldb\payload
+cd C:\Users\<you>\Desktop\svcldb\payload
 cmd /c '"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" && build.bat'
 
 # Launcher
-cd C:\Users\abdul\Desktop\svcldb\launcher
+cd C:\Users\<you>\Desktop\svcldb\launcher
 cmd /c 'build.bat'
 
 # Deploy
-Copy-Item C:\Users\abdul\Desktop\svcldb\build\payload\dwmapiext.dll  C:\ProgramData\WinAudioSvc\dwmapiext.dll  -Force
-Copy-Item C:\Users\abdul\Desktop\svcldb\build\launcher\sihost.exe    C:\ProgramData\WinAudioSvc\sihost.exe    -Force
+Copy-Item C:\Users\<you>\Desktop\svcldb\build\payload\dwmapiext.dll  C:\ProgramData\WinAudioSvc\dwmapiext.dll  -Force
+Copy-Item C:\Users\<you>\Desktop\svcldb\build\launcher\sihost.exe    C:\ProgramData\WinAudioSvc\sihost.exe    -Force
 
 # Kill + rearm (config gets rewritten each --quiet with the current default bindings)
 & C:\ProgramData\WinAudioSvc\sihost.exe --kill-all

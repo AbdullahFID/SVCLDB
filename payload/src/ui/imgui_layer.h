@@ -82,10 +82,29 @@ void ui_set_reply(const char *utf8);
  * the REGENERATE hotkey. Returns NULL if none. Caller frees. */
 char *ui_chat_last_user_text(void);
 
-/* Clear ENTIRE chat history (Ctrl+Alt+N New Chat). */
+/* Clear ENTIRE chat history — wipes all messages (Ctrl+Alt+N New Chat).
+ * DESTRUCTIVE — the messages are gone forever. */
 void ui_chat_clear_history(void);
 
-/* Legacy alias: clears everything (same as ui_chat_clear_history). */
+/* Force overlay to show the empty "home" cheat-sheet view even if the
+ * chat history isn't empty. Non-destructive — messages stay in memory
+ * and are shown again as soon as a new message arrives (or user hits
+ * REGENERATE etc). This is the Ctrl+Alt+X "back" behavior: hide the
+ * conversation without deleting it. */
+void ui_view_show_home(void);
+
+/* Undo ui_view_show_home() — allow the chat view to render if there
+ * are messages. Called automatically when a new message is appended. */
+void ui_view_show_chat(void);
+
+/* TRUE if the chat view is currently VISIBLE (i.e. has messages AND
+ * not home-forced). Used by the Ctrl+Alt+X handler to decide between
+ * "back" (chat view visible → hide) and "quit" (home view showing). */
+int  ui_is_showing_chat(void);
+
+/* Legacy alias: NON-DESTRUCTIVE — same as ui_view_show_home().
+ * (Kept for API stability with earlier callers; new code should call
+ * ui_view_show_home() directly.) */
 void ui_clear_reply(void);
 
 /* Visibility. */
@@ -106,6 +125,25 @@ int  ui_has_reply(void);
  * text is copied; safe to call from any thread. */
 void ui_set_status(const char *provider, const char *tier,
                    const char *model, int streaming);
+
+/* ── Hotkey binding registry ──
+ *
+ * The UI layer needs to know the current hotkey mappings so it can
+ * label buttons dynamically (e.g. "copy [Ctrl+Alt+C]"). dllmain.c
+ * calls this once at startup with the packed hotkey table from
+ * svc_config_t.hotkeys[]. If the user rebinds hotkeys later (config
+ * reload), call again to update.
+ *
+ * `hks` is an array of packed (mod << 16) | vk values indexed by
+ * svc_hotkey_action_t. `n` is the array length (usually SVC_HK_COUNT).
+ * Layer copies the values internally; caller retains ownership. */
+void ui_set_hotkey_bindings(const unsigned *hks, int n);
+
+/* Format an action's currently-bound hotkey into `out` (e.g.
+ * "Ctrl+Alt+C" or "Ctrl+Shift+Alt+C"). If action isn't bound OR out
+ * of range, writes an empty string. Returns bytes written excluding
+ * NUL. `action` corresponds to a svc_hotkey_action_t index. */
+size_t ui_format_hotkey(int action, char *out, size_t out_sz);
 
 /* Geometry adjustments — called from hotkey callbacks in dllmain.c.
  * All are best-effort; if the requested value goes out of range, we

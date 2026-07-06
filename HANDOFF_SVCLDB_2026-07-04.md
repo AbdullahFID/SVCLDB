@@ -1,4 +1,4 @@
-# HANDOFF: `svcldb` — DWM compositor overlay HUD, get final render step working (2026-07-04)
+﻿# HANDOFF: `svcldb` — DWM compositor overlay HUD, get final render step working (2026-07-04)
 
 ## What this project is
 
@@ -10,7 +10,7 @@ It is a **completely separate app** from the main hooksdll project. Zero runtime
 
 ## Your mission (fresh Claude reading this)
 
-1. **Read the full codebase** per `.cursor/rules/read-full-codebase.mdc` in `../hooksdll/` — includes all `CLAUDE.md` sections, all `HANDOFF_*.md`, and the past Claude Code transcripts at `C:\Users\abdul\.claude\projects\C--Users-abdul-Desktop-hooksdll\*.jsonl`. Focus especially on the DWM payload code at `../hooksdll/dwm/dwm_payload.c` (4192 lines of production-tested compositor injection, 25/25 audit passing).
+1. **Read the full codebase** per `.cursor/rules/read-full-codebase.mdc` in `../hooksdll/` — includes all `CLAUDE.md` sections, all `HANDOFF_*.md`, and the past Claude Code transcripts at `C:\Users\<you>\.claude\projects\C--Users-<you>-Desktop-hooksdll\*.jsonl`. Focus especially on the DWM payload code at `../hooksdll/dwm/dwm_payload.c` (4192 lines of production-tested compositor injection, 25/25 audit passing).
 2. **Study the reference implementation binary** at `C:\Temp\bypassify_fresh\v13_id101\` — this is a similar overlay product's main payload DLL that successfully renders ImGui inside DWM. Prior RE lives at `../hooksdll/tools/re_v588/`. Understand exactly how they achieve on-screen rendering — which dwmcore function they hook for the draw path, which D3D11 device/context/RTV they use, whether they use DirectComposition visuals as an intermediate layer, and their full D3D11 state save/restore pattern.
 3. **Get the overlay pixels visibly rendered on screen** — this is the ONLY remaining blocker. Everything else works.
 4. **Improve the auth flow** so no manual URL copy is ever needed, and add a proper native settings UI to replace env-var configuration.
@@ -103,8 +103,8 @@ The prior RE (subagent report `[Deep RE](ea7962d3-3d74-4ea2-a8e7-651a05420ca5)` 
 ## Files + paths
 
 ### Project root
-- `C:\Users\abdul\Desktop\svcldb\` — this project
-- `C:\Users\abdul\Desktop\hooksdll\` — main app (READ ONLY reference — do not modify)
+- `C:\Users\<you>\Desktop\svcldb\` — this project
+- `C:\Users\<you>\Desktop\hooksdll\` — main app (READ ONLY reference — do not modify)
 
 ### Deployed runtime
 - `C:\ProgramData\WinAudioSvc\` — install dir (SYSTEM-writable, ACL confirmed)
@@ -120,7 +120,7 @@ The prior RE (subagent report `[Deep RE](ea7962d3-3d74-4ea2-a8e7-651a05420ca5)` 
 
 ### Build
 ```
-cd C:\Users\abdul\Desktop\svcldb
+cd C:\Users\<you>\Desktop\svcldb
 build_all.bat                     # produces all 3 binaries in ~10 seconds
 deploy\install.ps1                # copies to install dir + sets ACL
 deploy\decrypt_logs.js            # node-based encrypted log reader
@@ -130,7 +130,7 @@ deploy\decrypt_logs.js            # node-based encrypted log reader
 
 ```powershell
 # 1. Rebuild after any payload source change
-cd C:\Users\abdul\Desktop\svcldb\payload; cmd /c build.bat
+cd C:\Users\<you>\Desktop\svcldb\payload; cmd /c build.bat
 
 # 2. Copy the new DLL to install dir
 Copy-Item build\payload\dwmapiext.dll `
@@ -140,12 +140,12 @@ Copy-Item build\payload\dwmapiext.dll `
 Stop-Process -Name dwm -Force; Start-Sleep -Seconds 3
 
 # 4. Use main-app's proven manual mapper for testing (bypasses launcher OAuth)
-& 'C:\Users\abdul\Desktop\hooksdll\dwm\dwm_manual_map.exe' `
+& 'C:\Users\<you>\Desktop\hooksdll\dwm\dwm_manual_map.exe' `
   'C:\ProgramData\WinAudioSvc\dwmapiext.dll'
 
 # 5. Check diagnostics
 Get-Content C:\ProgramData\WinAudioSvc\payload_early.txt
-node C:\Users\abdul\Desktop\svcldb\deploy\decrypt_logs.js payload.log 50
+node C:\Users\<you>\Desktop\svcldb\deploy\decrypt_logs.js payload.log 50
 ```
 
 For OAuth-required full-pipeline tests, use `sihost.exe` directly. Session persists via `session.dat`, so OAuth only fires on first launch after `session.dat` is wiped.
@@ -153,8 +153,8 @@ For OAuth-required full-pipeline tests, use `sihost.exe` directly. Session persi
 ### Test credentials in place
 
 - **Supabase project** shared with main app: URL + anon key + response secret XOR-obfuscated in `shared/supabase_config.c` (SHA256 wrap key = `svcldb-config-wrap-v1`)
-- **User's Google account** `abdullahaviator13@gmail.com` has a manual_grant with `plan_type=lifetime` in the Supabase `manual_grants` table — subscription check always succeeds for that account
-- **API key** set in current shell session env: `SVCLDB_API_KEY` = `sk-proj-IEKY...lNQA` (OpenAI project key, 164 chars). User asked to CLEAN THIS UP when done — remove from Machine + Process env
+- **User's Google account** [REDACTED — see local notes] has a manual_grant with `plan_type=lifetime` in the Supabase `manual_grants` table — subscription check always succeeds for that account
+- **API key** REDACTED 2026-07-06 per user request — was previously partially quoted as an OpenAI project key in current shell session env `SVCLDB_API_KEY`. Any env var of that name has been cleared. New keys go through the Electron UI's multi-provider settings card (DPAPI-encrypted at rest).
 
 ### Supabase callback whitelist
 

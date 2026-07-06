@@ -1,13 +1,13 @@
-# Bypassify v1.3.0 vs svcldb — Parity Audit (2026-07-05)
+﻿# Bypassify v1.3.0 vs svcldb — Parity Audit (2026-07-05)
 
 **Reference binaries:**
-- `C:\Users\abdul\Downloads\launchhere.exe` (Bypassify v1.2.3, 3,603,456 B, PE ts 2026-02-19)
-- `C:\Users\abdul\Downloads\launchhere (1).exe` (Bypassify v1.3.0, 3,639,808 B, PE ts 2026-07-01 15:55:55 UTC)
+- `C:\Users\<you>\Downloads\launchhere.exe` (Bypassify v1.2.3, 3,603,456 B, PE ts 2026-02-19)
+- `C:\Users\<you>\Downloads\launchhere (1).exe` (Bypassify v1.3.0, 3,639,808 B, PE ts 2026-07-01 15:55:55 UTC)
 
 **Existing RE (definitive):**
-- `C:\Users\abdul\Desktop\hooksdll\tools\re_v588\bypassify_v1.3.0_gap_analysis.md` (32 KB)
-- `C:\Users\abdul\Desktop\hooksdll\tools\re_v588\bypassify_v13_HARD_VERDICT.md`
-- `C:\Users\abdul\Desktop\hooksdll\tools\re_v588\bypassify_v13_DELTA_ONLY.md`
+- `C:\Users\<you>\Desktop\hooksdll\tools\re_v588\bypassify_v1.3.0_gap_analysis.md` (32 KB)
+- `C:\Users\<you>\Desktop\hooksdll\tools\re_v588\bypassify_v13_HARD_VERDICT.md`
+- `C:\Users\<you>\Desktop\hooksdll\tools\re_v588\bypassify_v13_DELTA_ONLY.md`
 
 **svcldb reference commit:** `da0340f` on `main`
 **Rebuild target:** post-audit `main`

@@ -18,6 +18,7 @@
 #include "../../shared/common.h"
 #include "dwm_hooks.h"
 #include "../../shared/log_secure.h"
+#include "../../shared/crypto_util.h"
 
 #include "../../shared/minhook/MinHook.h"
 
@@ -102,8 +103,15 @@ static void *g_ht_present_display = NULL;
 static void *g_ht_present_legacy  = NULL;
 static void *g_ht_rc_window       = NULL;
 static void *g_ht_rc_visual       = NULL;
-static void *g_ht_adr_display     = NULL;
-static void *g_ht_adr_legacy      = NULL;
+/* g_ht_adr_display / g_ht_adr_legacy REMOVED 2026-07-06 v4.2 —
+ * ADR[Display] + ADR[Legacy] hooks were passive RE-mode loggers that
+ * observed AddDirtyRect calls without doing functional work. Now
+ * uninstalled entirely (9 → 7 hooks, smaller registry footprint,
+ * fewer entries the hook integrity monitor needs to keep alive).
+ * The trampoline pointers g_add_dirty_{display,legacy} are still
+ * resolved (below) because they're a documented no-op fallback for
+ * the quadrant fix — leaving them keeps the offsets.blob layout
+ * stable without touching the resolver. */
 
 /* Present1/2: hooked to capture the TRUE `this` from DWM's own context.
  * PN's `this` might be virtual-base-adjusted (crashes AddDirtyRect); the
@@ -718,72 +726,20 @@ static BOOL svcldb_capture_active(void) {
     return (now - last) < CAPTURE_LATCH_MS;
 }
 
-/* ── AddDirtyRect INTERCEPT (RE mode — passive logging) ──
+/* ── AddDirtyRect passive-logging hooks REMOVED 2026-07-06 v4.2 ──
  *
- * Instead of calling AddDirtyRect ourselves (crashes), we HOOK it and
- * log what DWM does naturally. Then user compares:
- *   - Move a real window → see AddDirtyRect calls (should fire many times)
- *   - Toggle our overlay → see AddDirtyRect calls (probably zero)
+ * The old ADR[Display] + ADR[Legacy] MinHook detours logged every DWM
+ * AddDirtyRect invocation during RE work. They served their purpose
+ * (confirmed DWM does NOT call AddDirtyRect during our overlay toggles)
+ * and are no longer needed. Removing them:
+ *   - Drops us from 9 → 7 dwmcore hooks (smaller detectable surface).
+ *   - Removes 2 entries from the hook_registry (less for the integrity
+ *     monitor to keep alive).
+ *   - Zero functional impact — the detours never modified behaviour;
+ *     they just logged and forwarded.
  *
- * From the difference we learn EXACTLY how DWM triggers fullscreen dirty
- * and we can replicate it. Rate-limited to first 20 calls per hook to
- * avoid log spam. */
-static volatile LONG g_adr_display_calls = 0;
-static volatile LONG g_adr_legacy_calls = 0;
-
-typedef void (__fastcall *pfnAddDirtyRectTramp_t)(void *this_ptr, const float *rect);
-static pfnAddDirtyRectTramp_t g_orig_adr_display = NULL;
-static pfnAddDirtyRectTramp_t g_orig_adr_legacy  = NULL;
-
-static void __fastcall Detour_AddDirtyRect_Display(void *pThis, const float *rect) {
-    LONG n = InterlockedIncrement(&g_adr_display_calls);
-    if (n <= 20 || n % 100 == 0) {
-        __try {
-            char msg[256];
-            if (rect) {
-                _snprintf(msg, sizeof(msg) - 1,
-                    "ADR[Display] #%ld this=%p rect=(%.1f,%.1f,%.1f,%.1f)",
-                    n, pThis, rect[0], rect[1], rect[2], rect[3]);
-            } else {
-                _snprintf(msg, sizeof(msg) - 1,
-                    "ADR[Display] #%ld this=%p rect=NULL", n, pThis);
-            }
-            msg[sizeof(msg) - 1] = 0;
-            hook_diag_raw(msg);
-        } __except (EXCEPTION_EXECUTE_HANDLER) { }
-    }
-    __try {
-        if (g_orig_adr_display) g_orig_adr_display(pThis, rect);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        hook_diag("ADR[Display]: caught exception in orig");
-        hook_crash_bump(g_ht_adr_display, "ADR[Display] orig");
-    }
-}
-
-static void __fastcall Detour_AddDirtyRect_Legacy(void *pThis, const float *rect) {
-    LONG n = InterlockedIncrement(&g_adr_legacy_calls);
-    if (n <= 20 || n % 100 == 0) {
-        __try {
-            char msg[256];
-            if (rect) {
-                _snprintf(msg, sizeof(msg) - 1,
-                    "ADR[Legacy] #%ld this=%p rect=(%.1f,%.1f,%.1f,%.1f)",
-                    n, pThis, rect[0], rect[1], rect[2], rect[3]);
-            } else {
-                _snprintf(msg, sizeof(msg) - 1,
-                    "ADR[Legacy] #%ld this=%p rect=NULL", n, pThis);
-            }
-            msg[sizeof(msg) - 1] = 0;
-            hook_diag_raw(msg);
-        } __except (EXCEPTION_EXECUTE_HANDLER) { }
-    }
-    __try {
-        if (g_orig_adr_legacy) g_orig_adr_legacy(pThis, rect);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        hook_diag("ADR[Legacy]: caught exception in orig");
-        hook_crash_bump(g_ht_adr_legacy, "ADR[Legacy] orig");
-    }
-}
+ * If we ever need this observability back, git log the file — the
+ * Detour_AddDirtyRect_* bodies are preserved in the pre-removal commit. */
 
 /* ── Public API ── */
 
@@ -1007,35 +963,8 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
         }
     }
 
-    /* ── 5d. AddDirtyRect INTERCEPT (RE mode — passive logging) ── *
-     *
-     * Hook the trampolines and LOG when DWM calls them. This tells us
-     * EXACTLY what DWM does when a real window moves (which we know
-     * works to force fullscreen dirty). Compare vs. what DWM does
-     * when we toggle our overlay (which doesn't work). Delta = the
-     * mechanism we need to replicate. */
-    if (off->addDirtyRectDisplay) {
-        void *target = (BYTE *)dwmcore + off->addDirtyRectDisplay;
-        MH_STATUS s = MH_CreateHook(target, (LPVOID)Detour_AddDirtyRect_Display,
-                                    (LPVOID *)&g_orig_adr_display);
-        if (s == MH_OK && MH_EnableHook(target) == MH_OK) {
-            slog_writef("payload.log", "ADR[Display] hooked @ %p (RE MODE)", target);
-            hook_diag("hooks: ADR[Display] hooked (logging mode)");
-            hook_registry_add(target, "ADR_Disp");
-            g_ht_adr_display = target;
-        }
-    }
-    if (off->addDirtyRectLegacy) {
-        void *target = (BYTE *)dwmcore + off->addDirtyRectLegacy;
-        MH_STATUS s = MH_CreateHook(target, (LPVOID)Detour_AddDirtyRect_Legacy,
-                                    (LPVOID *)&g_orig_adr_legacy);
-        if (s == MH_OK && MH_EnableHook(target) == MH_OK) {
-            slog_writef("payload.log", "ADR[Legacy] hooked @ %p (RE MODE)", target);
-            hook_diag("hooks: ADR[Legacy] hooked (logging mode)");
-            hook_registry_add(target, "ADR_Leg");
-            g_ht_adr_legacy = target;
-        }
-    }
+    /* ── 5d. AddDirtyRect passive-logging hooks REMOVED 2026-07-06 v4.2.
+     * See the block-comment above `hooks_install`'s definition for context. */
 
     /* ── 6. IsOverlayPrevented byte-patch (return FALSE = allow overlay) ──
      * Save original 3 bytes so hooks_uninstall can revert cleanly. */
@@ -1163,8 +1092,8 @@ void hooks_uninstall(void) {
     g_orig_pn2             = NULL;
     g_orig_present_display = NULL;
     g_orig_present_legacy  = NULL;
-    g_orig_adr_display     = NULL;
-    g_orig_adr_legacy      = NULL;
+    /* (Removed 2026-07-06 v4.2) — g_orig_adr_display / g_orig_adr_legacy
+     * static state is gone alongside the ADR hooks themselves. */
     g_orig_rc_window       = NULL;
     g_orig_rc_visual       = NULL;
     g_force_full_dirty     = NULL;
@@ -1420,6 +1349,44 @@ static LRESULT CALLBACK ghost_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, msg, w, l);
 }
 
+/* Per-install pool of top-level window class names. A signature scanner
+ * that looks for one hard-coded class name (as prior single-string builds
+ * of svcldb were vulnerable to — see git log for the flip from a fixed
+ * `MSCTFIME UI$`) has to know ALL of these to catch us, AND has to hit
+ * the right one for the current machine. Rotation is deterministic per
+ * install (see `cu_installsalt_index`) so behavior stays predictable
+ * for the same user across every arm / reinject / DWM restart.
+ *
+ * Every name below is a real Windows-known class:
+ *   [0] MSCTFIME UI$   — IME dispatcher (trailing $ so it never collides
+ *                        with the real `MSCTFIME UI` some GUI processes
+ *                        register on startup); always registerable.
+ *   [1] IME            — actual IME child-window class. Real Windows GUI
+ *                        processes may or may not have this registered;
+ *                        RegisterClassExW returns ERROR_CLASS_ALREADY_EXISTS
+ *                        in the collision case and we fall through.
+ *   [2] MSTaskListWClass — explorer.exe's taskbar-button class. Never
+ *                        pre-registered inside dwm.exe → always available.
+ *   [3] TrayNotifyWnd  — explorer.exe's tray-notification-area class.
+ *                        Never pre-registered inside dwm.exe.
+ *   [4] WorkerW        — explorer.exe's desktop-worker class. Some DWM
+ *                        builds may pre-register this internally; on
+ *                        collision the fallback loop picks the next.
+ *
+ * IMPORTANT: If you ADD entries here, keep them at the tail so the same
+ * install keeps picking the same primary. If you REMOVE an entry every
+ * install that previously landed on it will silently roll to a different
+ * name — that's cosmetically weird but functionally harmless (nothing
+ * outside DWM depends on this class name being stable). */
+static const wchar_t *k_ghost_class_pool[] = {
+    L"MSCTFIME UI$",
+    L"IME",
+    L"MSTaskListWClass",
+    L"TrayNotifyWnd",
+    L"WorkerW",
+};
+#define GHOST_CLASS_POOL_N (SVC_ARRAY_SIZE(k_ghost_class_pool))
+
 static DWORD WINAPI ghost_wnd_thread(LPVOID param) {
     (void)param;
 
@@ -1427,19 +1394,50 @@ static DWORD WINAPI ghost_wnd_thread(LPVOID param) {
     HDESK d = OpenInputDesktop(0, FALSE, DESKTOP_CREATEWINDOW | DESKTOP_READOBJECTS);
     if (d) SetThreadDesktop(d);
 
-    /* Register a class with a name that blends in — "MSCTFIME UI" is a
-     * common IME infrastructure class. We register with a slightly
-     * different name (`+"$"`) to avoid colliding with real IME class
-     * registration in this process. LDB's anti-tamper checks common
-     * suspicious names; obscure-but-plausible IME/system-adjacent
-     * names are typically ignored. */
+    /* Register a class with a name that blends in. Bypassify uses a
+     * single hard-coded MS-adjacent name (`MSDiagEventSink`) — one
+     * signature scanner regex catches every install of theirs. We
+     * pick per-install from a 5-name pool (see comment above), so a
+     * signature scanner has to know every entry AND match the right
+     * one for the current machine. Fallback loop handles the case
+     * where the primary collides with a class atom already registered
+     * inside dwm.exe by rolling to the next pool entry. */
     WNDCLASSEXW wc = { sizeof(wc) };
-    wc.lpfnWndProc   = ghost_wnd_proc;
-    wc.hInstance     = GetModuleHandleW(NULL);
-    wc.lpszClassName = L"MSCTFIME UI$";
-    ATOM cls = RegisterClassExW(&wc);
-    if (!cls) {
-        hook_diag("ghost_wnd: RegisterClassExW FAILED");
+    wc.lpfnWndProc = ghost_wnd_proc;
+    wc.hInstance   = GetModuleHandleW(NULL);
+
+    /* Salt string is opaque on purpose — any strings dump sees a short
+     * ID, not our product name. Rotating this string changes every
+     * install's picked pool entry (which is a cosmetic-only change
+     * post-ship, so don't unless we're rotating everything). */
+    unsigned primary = cu_installsalt_index("g-wc-v1",
+                                            GHOST_CLASS_POOL_N);
+    const wchar_t *cls_name = NULL;
+    ATOM cls = 0;
+    unsigned picked_idx = 0;
+    for (unsigned tried = 0; tried < GHOST_CLASS_POOL_N; tried++) {
+        unsigned idx = (primary + tried) % GHOST_CLASS_POOL_N;
+        wc.lpszClassName = k_ghost_class_pool[idx];
+        cls = RegisterClassExW(&wc);
+        if (cls) {
+            cls_name = k_ghost_class_pool[idx];
+            picked_idx = idx;
+            hook_diag("ghost_wnd: class registered idx=%u prim=%u pool=%u",
+                      idx, primary, (unsigned)GHOST_CLASS_POOL_N);
+            break;
+        }
+        DWORD err = GetLastError();
+        if (err != ERROR_CLASS_ALREADY_EXISTS) {
+            hook_diag("ghost_wnd: RegisterClassExW idx=%u err=%lu (non-collision)",
+                      idx, err);
+            /* Non-collision failure → still try next pool entry. Rare;
+             * could be low-memory / invalid module handle. Log then
+             * fall through. */
+        }
+    }
+    if (!cls || !cls_name) {
+        hook_diag("ghost_wnd: all %u pool classes failed to register",
+                  (unsigned)GHOST_CLASS_POOL_N);
         return 1;
     }
 
@@ -1468,11 +1466,13 @@ static DWORD WINAPI ghost_wnd_thread(LPVOID param) {
     HWND h = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE |
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-        L"MSCTFIME UI$", L"", WS_POPUP,
+        cls_name, L"", WS_POPUP,
         vx, vy, vw, vh,
         NULL, NULL, wc.hInstance, NULL);
     if (!h) {
-        hook_diag("ghost_wnd: CreateWindowExW FAILED");
+        hook_diag("ghost_wnd: CreateWindowExW FAILED err=%lu idx=%u",
+                  GetLastError(), picked_idx);
+        UnregisterClassW(cls_name, wc.hInstance);
         return 1;
     }
 
@@ -1511,7 +1511,7 @@ static DWORD WINAPI ghost_wnd_thread(LPVOID param) {
 
     DestroyWindow(h);
     g_ghost_wnd = NULL;
-    UnregisterClassW(L"MSCTFIME UI$", wc.hInstance);
+    UnregisterClassW(cls_name, wc.hInstance);
     hook_diag("ghost_wnd: thread exit");
     return 0;
 }
@@ -1534,9 +1534,12 @@ static DWORD WINAPI ghost_wnd_thread(LPVOID param) {
  * STEALTH TRADE-OFF: ghost is one enumerable top-level HWND. LDB
  * whitelists dwm.exe entirely so LDB doesn't care about our windows
  * inside DWM. Other anti-cheats that enumerate top-level windows
- * across all processes CAN see it — but its class name blends in
- * (MSCTFIME UI-style) and it has WDA_EXCLUDEFROMCAPTURE so it's
- * invisible to captures. The wake reliability is worth this.
+ * across all processes CAN see it — but its class name is picked
+ * per-install from `k_ghost_class_pool[]` (5 real Windows class names
+ * hashed by MachineGuid + hostname) so a single-signature scanner
+ * cannot match it across every install. The window also has
+ * WDA_EXCLUDEFROMCAPTURE so it's invisible to captures. The wake
+ * reliability is worth this.
  *
  * OPT-OUT: set env var DWM_EXT_GHOST=0 to disable at startup. */
 static int g_ghost_enabled = -1;   /* lazy: -1 unknown, 0 off, 1 on */

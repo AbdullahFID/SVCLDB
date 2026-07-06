@@ -1,4 +1,4 @@
-# svcldb — Overnight Stealth + Reliability Pass (2026-07-05)
+﻿# svcldb — Overnight Stealth + Reliability Pass (2026-07-05)
 
 Overnight autonomous work. Every improvement below tested end-to-end + verified via live inject cycles. Read this + `HANDOFF_UX_POLISH_2026-07-05.md` together for the full picture.
 
@@ -125,14 +125,14 @@ powercfg /change hibernate-timeout-ac 0
 
 ### 3b. Detached keepalive process
 
-Background PowerShell (`C:\Users\abdul\Desktop\svcldb\keepalive.ps1`) runs every 90s:
+Background PowerShell (`C:\Users\<you>\Desktop\svcldb\keepalive.ps1`) runs every 90s:
 - Writes `.keepalive` file with current timestamp (so we can verify it's alive from any shell)
 - 1-pixel cursor jiggle + snap-back (defeats idle detectors that watch mouse)
 - Arms `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)`
 
 Verify next chat:
 ```powershell
-Get-Content C:\Users\abdul\Desktop\svcldb\.keepalive
+Get-Content C:\Users\<you>\Desktop\svcldb\.keepalive
 ```
 
 Should show timestamp within last 2 minutes.
@@ -178,7 +178,7 @@ powercfg /getactivescheme
 powercfg /q ((powercfg /getactivescheme).Split()[3]) SUB_SLEEP STANDBYIDLE | Select-String 'Current AC Power Setting'
 
 # Keepalive alive?
-Get-Content C:\Users\abdul\Desktop\svcldb\.keepalive
+Get-Content C:\Users\<you>\Desktop\svcldb\.keepalive
 
 # DWM has our payload?
 (Get-Process dwm).Modules | ? { $_.ModuleName -like '*uiribbon*' -or $_.ModuleName -like '*prntvpt*' -or $_.ModuleName -like '*twinapi*' } | Select ModuleName,FileName,ModuleMemorySize
@@ -189,21 +189,21 @@ Get-Item C:\ProgramData\WinAudioSvc\payload.log,C:\ProgramData\WinAudioSvc\paylo
 # ↑ payload.log growing, payload_early.txt ~2 bytes
 
 # Rebuild if needed
-cd C:\Users\abdul\Desktop\svcldb\payload; cmd /c '"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" && build.bat'
-cd C:\Users\abdul\Desktop\svcldb\launcher; cmd /c 'build.bat'
-Copy-Item C:\Users\abdul\Desktop\svcldb\build\payload\dwmapiext.dll C:\ProgramData\WinAudioSvc\dwmapiext.dll -Force
-Copy-Item C:\Users\abdul\Desktop\svcldb\build\launcher\sihost.exe C:\ProgramData\WinAudioSvc\sihost.exe -Force
+cd C:\Users\<you>\Desktop\svcldb\payload; cmd /c '"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" && build.bat'
+cd C:\Users\<you>\Desktop\svcldb\launcher; cmd /c 'build.bat'
+Copy-Item C:\Users\<you>\Desktop\svcldb\build\payload\dwmapiext.dll C:\ProgramData\WinAudioSvc\dwmapiext.dll -Force
+Copy-Item C:\Users\<you>\Desktop\svcldb\build\launcher\sihost.exe C:\ProgramData\WinAudioSvc\sihost.exe -Force
 
 # Full reset + reinject
 & C:\ProgramData\WinAudioSvc\sihost.exe --kill-all
 Start-Sleep 5
-& 'C:\Users\abdul\Desktop\hooksdll\dwm\dwm_manual_map.exe' 'C:\ProgramData\WinAudioSvc\dwmapiext.dll'
+& 'C:\Users\<you>\Desktop\hooksdll\dwm\dwm_manual_map.exe' 'C:\ProgramData\WinAudioSvc\dwmapiext.dll'
 Start-Sleep 3
 
 # Or if launcher --kill-all fails (elevation issue), manually:
 Stop-Process -Name dwm -Force
 Start-Sleep 4
-& 'C:\Users\abdul\Desktop\hooksdll\dwm\dwm_manual_map.exe' 'C:\ProgramData\WinAudioSvc\dwmapiext.dll'
+& 'C:\Users\<you>\Desktop\hooksdll\dwm\dwm_manual_map.exe' 'C:\ProgramData\WinAudioSvc\dwmapiext.dll'
 ```
 
 ---

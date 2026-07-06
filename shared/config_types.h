@@ -32,7 +32,23 @@ typedef enum {
     SVC_TIER_COUNT  = 4,
 } svc_tier_t;
 
+/* Wire-format magic + schema version. The Electron UI stamps these into
+ * every config it writes. The payload's cfg_read validates BOTH so that
+ * an older/stripped/malformed config.dat is rejected before any downstream
+ * code reads a field.
+ *
+ * Bump SVC_CONFIG_SCHEMA_VERSION on any layout change (add-only). Old
+ * configs cleanly fail via cu_wrap_decrypt's plen != sizeof(svc_config_t)
+ * check when a field is added — this magic is defence-in-depth. */
+#define SVC_CONFIG_MAGIC             0x53564C43u  /* 'SVLC' little-endian */
+#define SVC_CONFIG_SCHEMA_VERSION    5u   /* v5 added 4 per-provider api_key fields */
+
 typedef struct {
+    /* ── v4 header: written by Electron UI / launcher --json-config.
+     * Payload validates both fields before touching anything else. */
+    uint32_t    magic;                 /* MUST == SVC_CONFIG_MAGIC              */
+    uint32_t    schema_version;        /* MUST == SVC_CONFIG_SCHEMA_VERSION     */
+
     /* Auth (payload uses this to prove subscription validity via periodic
      * re-check against Supabase — attacker can't just extract config
      * and use it without a valid token). */
@@ -43,9 +59,12 @@ typedef struct {
      * When tier != CUSTOM, ai_provider.c resolves model_id from the
      * tier table (ignores `model` field). When tier == CUSTOM, uses
      * `model` verbatim. Live rotation via Ctrl+Alt+M / Ctrl+Alt+P. */
-    int         provider;       /* svc_provider_t */
+    int         provider;       /* svc_provider_t — currently-active provider */
     int         tier;           /* svc_tier_t; default MEDIUM */
-    char        api_key [512];
+    char        api_key [512];  /* legacy shared key (v3 and earlier).
+                                 * v4+: still used as override if non-empty.
+                                 * v5+: prefer api_key_<provider> when this
+                                 *      is empty. */
     char        model   [128];  /* CUSTOM tier + OpenRouter free-picking */
     int         reasoning_effort;   /* 0=none 1=minimal 2=low 3=medium 4=high 5=xhigh */
     int         streaming_enabled;  /* 1 = SSE stream reply into chat */
@@ -66,6 +85,30 @@ typedef struct {
     int         overlay_x, overlay_y;
     int         overlay_w, overlay_h;
     float       overlay_alpha;
+
+    /* ── v4 handshake fields: Electron/launcher populate BEFORE writing
+     * this struct. Payload's init_thread computes the expected token and
+     * refuses to install hooks if it doesn't match. See
+     * shared/handshake.h for the derivation contract. */
+    uint8_t     handshake_token[32];   /* HMAC-SHA256 output — see handshake.h */
+    long long   handshake_epoch_day;   /* floor(unix_time / 86400) at gen time */
+    char        handshake_hwid[80];    /* HWID Electron used to derive token   */
+
+    /* ── v5 per-provider API keys (2026-07-06). Enables cross-provider
+     * failover: on 429/5xx/rate_limit from the active provider, ai_provider
+     * tries each remaining provider that has a non-empty key.
+     *
+     * Population order in ai_provider.c:
+     *   1. Legacy `api_key` field above (backward-compat override)
+     *   2. api_key_<provider> for the active provider
+     *   3. Empty → skip / error / try next in fallback chain
+     *
+     * Written by launcher --json-config from the Electron settings card
+     * (one input per provider). */
+    char        api_key_openai    [512];
+    char        api_key_anthropic [512];
+    char        api_key_google    [512];
+    char        api_key_openrouter[512];
 } svc_config_t;
 
 /* Hotkey action identifiers — index into svc_config_t.hotkeys[].
@@ -110,6 +153,9 @@ typedef enum {
     SVC_HK_COPY_CODE     = 28,  /* Copy JUST code blocks (Ctrl+Shift+Alt+C)*/
     SVC_HK_COPY_ANSWER   = 29,  /* Copy JUST first-line answer (Ctrl+Alt+A)*/
     SVC_HK_LATEX_TOGGLE  = 30,  /* Toggle LaTeX vs Unicode (Ctrl+Shift+Alt+L)*/
+
+    /* v4.5 (2026-07-06) — Stop an in-flight AI response. */
+    SVC_HK_STOP_GEN      = 31,  /* Abort current stream (Ctrl+Alt+S)      */
 
     SVC_HK_COUNT
 } svc_hotkey_action_t;

@@ -93,6 +93,60 @@ void ai_free_reply(char *reply);
  * Returned pointer is static storage; do not free. */
 const char *ai_default_system_prompt(void);
 
+/* ── Test an API key ──
+ *
+ * Hits the provider's cheapest "list models" endpoint with the given key.
+ * Returns the HTTP status (200 = valid, 401/403 = bad key, 429 = valid
+ * but rate-limited, 5xx = provider-side issue). Fills out_latency_ms
+ * with round-trip time when the roundtrip succeeded.
+ *
+ * Fast — 6s cap. Doesn't consume any tokens (models list is free).
+ * Safe to call from a UI thread as a diagnostic check.
+ *
+ * Returns 1 iff the HTTP roundtrip completed (status may still be non-2xx),
+ * 0 on transport failure (err populated). */
+int ai_test_key(int provider, const char *api_key,
+                unsigned *out_status, unsigned *out_latency_ms,
+                char *err, size_t err_sz);
+
+/* Pick the effective API key for a given provider from the config.
+ * Order:
+ *   1. cfg->api_key (legacy shared field) if non-empty
+ *   2. cfg->api_key_<provider>
+ * Returns NULL if no usable key. Never returns an empty string.
+ *
+ * Exposed for the fallback loop in ai_ask / ai_ask_streaming and for
+ * the UI's local "which providers can I fall back to?" query. */
+const char *ai_pick_provider_key(const svc_config_t *cfg, int provider);
+
+/* Return non-zero if the model_id names a "reasoning-heavy" model that
+ * routinely produces long silences between SSE chunks and therefore
+ * needs the extended (15-min) receive timeout. Matches o3*, gpt-5.5-pro,
+ * claude-opus-4*, gemini-3.*-pro*. */
+int ai_is_reasoning_model(const char *model_id);
+
+/* ── User-triggered stream abort ──
+ *
+ * Sets a process-wide flag that ai_ask_streaming's chunk callback
+ * checks on every incoming SSE token. When set, the WinHTTP read loop
+ * returns non-zero from the callback → WinHTTP tears down the request
+ * cleanly → on_done fires with a friendly "stopped by user" message.
+ *
+ * The flag is auto-cleared at the START of every ai_ask / ai_ask_streaming
+ * call so a stale abort from before doesn't poison a fresh request.
+ *
+ * Bound to Ctrl+Alt+S by default (SVC_HK_STOP_GEN). Safe to call from
+ * any thread — uses InterlockedExchange. */
+void ai_request_abort(void);
+
+/* Zero the abort flag. Called implicitly at the start of each request
+ * but exposed for tests + explicit reset paths. */
+void ai_clear_abort(void);
+
+/* Non-zero if the abort flag is currently set. Used by both the C
+ * stream callback and the UI's "show cancel button" state check. */
+int  ai_abort_requested(void);
+
 #ifdef __cplusplus
 }
 #endif

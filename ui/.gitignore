@@ -1,0 +1,20 @@
+# pnpm
+node_modules/
+
+# Only ignore npm/yarn lockfiles — commit pnpm-lock.yaml for reproducible builds.
+package-lock.json
+yarn.lock
+
+npm-debug.log*
+pnpm-debug.log*
+
+# Protected-build intermediates
+src-build/
+src-original/
+
+# electron-builder output
+dist/
+
+# Runtime junk
+.DS_Store
+Thumbs.db

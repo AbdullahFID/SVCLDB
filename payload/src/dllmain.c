@@ -25,6 +25,7 @@
 #include "../../shared/common.h"
 #include "../../shared/log_secure.h"
 #include "../../shared/supabase_config.h"
+#include "../../shared/handshake.h"
 #include "config_read.h"
 #include "blob_read.h"
 #include "capture.h"
@@ -32,6 +33,7 @@
 #include "ldb_detect.h"
 #include "rawinput_hook.h"
 #include "dwm_hooks.h"
+#include "sub_check.h"
 #include "ai/ai_provider.h"
 #include "ui/imgui_layer.h"
 
@@ -293,6 +295,102 @@ static void wipe_pe_headers(HMODULE self) {
     }
 }
 
+/* ── Downgrade own PE sections from RWX (initial VirtualAllocEx state)
+ * to per-section image-like protections. This is the biggest single
+ * stealth-hardening we can do from Ring 3 against memory scanners
+ * like Moneta / pe-sieve / EDR RWX-flag classifiers.
+ *
+ * Backstory: the launcher's manual_map_from_bytes allocates our whole
+ * image via VirtualAllocEx(PAGE_EXECUTE_READWRITE). After DllMain
+ * finishes we no longer need the "W" bit on our .text section — but
+ * the entire ~600KB region stays RWX by default. Every user-mode
+ * memory scanner (Moneta, pe-sieve, MappedImagesDetector, faultline)
+ * treats RWX + MEM_PRIVATE as a high-severity IOC.
+ *
+ * Post-init we walk our IMAGE_SECTION_HEADER table and VirtualProtect
+ * each section to match what a loader-mapped image would look like:
+ *   IMAGE_SCN_MEM_EXECUTE + !WRITE  → PAGE_EXECUTE_READ
+ *   IMAGE_SCN_MEM_WRITE   + !EXECUTE → PAGE_READWRITE
+ *   IMAGE_SCN_MEM_READ    + !WRITE   → PAGE_READONLY
+ *
+ * The memory Type field stays MEM_PRIVATE (only phantom-hollowing
+ * would flip that to MEM_IMAGE, which itself has known detections).
+ * But we drop the RWX signal, which is the single strongest IOC for
+ * "code allocated at runtime" heuristics.
+ *
+ * SAFE ordering: called AFTER hooks_install (MinHook has already
+ * placed trampolines and detour relays into its own separate memory
+ * pool — its bytes aren't in our .text). Also after wipe_pe_headers
+ * (which uses its own VirtualProtect toggling and doesn't care about
+ * final state). Also after all writable-init globals have been
+ * populated. */
+static void downgrade_own_sections(HMODULE self) {
+    if (!self) return;
+    __try {
+        BYTE *base = (BYTE *)self;
+        /* Read e_lfanew — safe because wipe_pe_headers only overwrote
+         * the MZ signature at [0..1] and the PE\0\0 signature at
+         * base+e_lfanew, NOT the DOS-stub e_lfanew field at [0x3C]
+         * nor the IMAGE_FILE_HEADER / IMAGE_OPTIONAL_HEADER /
+         * IMAGE_SECTION_HEADER tables after it. */
+        DWORD e_lfanew = *(DWORD *)(base + 0x3C);
+        if (e_lfanew == 0 || e_lfanew >= 0x1000) {
+            slog_writef("payload.log",
+                        "vp_downgrade: bad e_lfanew=%lu — skipping", e_lfanew);
+            return;
+        }
+        IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)(base + e_lfanew);
+        IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+        WORD nsec = nt->FileHeader.NumberOfSections;
+        int downgraded = 0, skipped = 0;
+        for (WORD i = 0; i < nsec && i < 32; i++) {
+            DWORD chars = sec[i].Characteristics;
+            void *addr  = base + sec[i].VirtualAddress;
+            SIZE_T sz   = sec[i].Misc.VirtualSize;
+            if (sz == 0) { skipped++; continue; }
+            DWORD want;
+            if (chars & IMAGE_SCN_MEM_EXECUTE) {
+                /* Very rarely a compiler emits an RWX section (e.g.
+                 * ancient toolchains for hot-patchable code). We
+                 * respect that request rather than break the section,
+                 * but this path is basically dead in modern MSVC. */
+                want = (chars & IMAGE_SCN_MEM_WRITE)
+                     ? PAGE_EXECUTE_READWRITE
+                     : PAGE_EXECUTE_READ;
+            } else if (chars & IMAGE_SCN_MEM_WRITE) {
+                want = PAGE_READWRITE;
+            } else if (chars & IMAGE_SCN_MEM_READ) {
+                want = PAGE_READONLY;
+            } else {
+                /* No permissions set at all — leave as-is. */
+                skipped++;
+                continue;
+            }
+            DWORD old_prot = 0;
+            if (VirtualProtect(addr, sz, want, &old_prot)) {
+                downgraded++;
+            } else {
+                skipped++;
+            }
+        }
+        /* Also downgrade the PE-header page itself to R/O. Our whole-file
+         * layout starts with the DOS + NT headers (SizeOfHeaders bytes,
+         * usually 0x400) — those don't need to be writable or executable
+         * post-init. Belt-and-suspenders on top of the section walk. */
+        DWORD hdr_sz = nt->OptionalHeader.SizeOfHeaders;
+        if (hdr_sz > 0 && hdr_sz < 0x2000) {
+            DWORD op = 0;
+            (void)VirtualProtect(base, hdr_sz, PAGE_READONLY, &op);
+        }
+        slog_writef("payload.log",
+                    "vp_downgrade: %d/%u sections downgraded, %d skipped "
+                    "(RWX MEM_PRIVATE fingerprint reduced)",
+                    downgraded, (unsigned)nsec, skipped);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        slog_write("payload.log", "vp_downgrade: exception — leaving RWX");
+    }
+}
+
 /* ── Anti-debug — refuse to init if DWM is being debugged. DWM is
  * normally NOT debugged (that'd require SYSTEM debug privileges +
  * explicit attach). Anyone debugging DWM is definitely investigating
@@ -459,6 +557,18 @@ static void ai_stream_done_handler(int ok, const char *full_reply, size_t reply_
         /* Enhance error messages so the user knows what to do next. */
         const char *e = err ? err : "unknown";
         char msg[1024];
+        if (strstr(e, "stopped by user")) {
+            /* v4.5: Ctrl+Alt+S abort. Any partial text that already
+             * streamed is preserved because ui_chat_stream_append kept
+             * appending as tokens arrived. We just tack on a suffix +
+             * finalize (clears the typing indicator). If NOTHING had
+             * streamed yet, the suffix stands alone as a clean message. */
+            static const char SUFFIX[] = "\n\n_(stopped by user via Ctrl+Alt+S)_";
+            ui_chat_stream_append(ctx->msg_id, SUFFIX, sizeof(SUFFIX) - 1);
+            ui_chat_finalize_pending(ctx->msg_id);
+            slog_write("ai.log", "stream stopped by user hotkey");
+            return;
+        }
         if (strstr(e, "12175") || strstr(e, "SECURE_FAILURE")) {
             _snprintf(msg, sizeof(msg) - 1,
                 "**Model not accessible.** WinHTTP dropped the connection.\n\n"
@@ -969,6 +1079,18 @@ static void on_hotkey(int action) {
             ui_copy_last_ai_answer();
             break;
         }
+        case SVC_HK_STOP_GEN: {
+            /* v4.5: user-requested abort of an in-flight AI stream.
+             * Sets a process-wide flag ai_provider polls per SSE chunk.
+             * Safe to press even when no request is running (no-op). */
+            ai_request_abort();
+            ui_chat_append_message(UI_MSG_AI,
+                "[STOP] Aborting in-flight response. If a partial reply "
+                "was already streamed it will be finalized; otherwise the "
+                "AI bubble will show 'stopped by user'.");
+            slog_writef("payload.log", "hotkey STOP_GEN: abort requested");
+            break;
+        }
         case SVC_HK_LATEX_TOGGLE: {
             svc_config_t *mcfg = (svc_config_t *)cfg_get();
             if (!mcfg) break;
@@ -1039,6 +1161,7 @@ static DWORD WINAPI shutdown_watcher(LPVOID param) {
     InterlockedExchange(&g_running, 0);
     rawin_stop();
     ldb_detect_stop();
+    sub_check_stop();
     hooks_uninstall();
     ui_shutdown();
     cfg_cleanup();
@@ -1093,6 +1216,34 @@ static DWORD WINAPI init_thread(LPVOID param) {
     }
     early_log("init_thread: config loaded");
 
+    /* ── Handshake gate (v4 schema) ────────────────────────────────────
+     * Verify the Electron UI produced a valid HMAC token for THIS box +
+     * a recent day. Prevents CLI-only bypass of the login flow: sihost
+     * or any custom loader that ships config.dat without a valid token
+     * (or with a stale one) is refused injection here. See
+     * shared/handshake.h for the derivation contract. */
+    if (cfg->magic != SVC_CONFIG_MAGIC ||
+        cfg->schema_version != SVC_CONFIG_SCHEMA_VERSION) {
+        slog_writef("payload.log",
+                    "handshake: bad config header magic=%08x ver=%u (expect %08x/%u)",
+                    (unsigned)cfg->magic, (unsigned)cfg->schema_version,
+                    (unsigned)SVC_CONFIG_MAGIC, (unsigned)SVC_CONFIG_SCHEMA_VERSION);
+        early_log("init_thread: config header rejected — re-run CloakGPT.exe");
+        return 5;
+    }
+    if (!handshake_verify(cfg->access_token, cfg->handshake_hwid,
+                          cfg->handshake_token)) {
+        slog_writef("payload.log",
+                    "handshake: token INVALID — refusing to install hooks. "
+                    "day=%lld access_len=%zu hwid_len=%zu (Electron UI login required)",
+                    (long long)cfg->handshake_epoch_day,
+                    strnlen(cfg->access_token, sizeof(cfg->access_token)),
+                    strnlen(cfg->handshake_hwid, sizeof(cfg->handshake_hwid)));
+        early_log("init_thread: HANDSHAKE FAILED — payload inert");
+        return 5;
+    }
+    early_log("init_thread: handshake ok");
+
     /* Read offsets.blob — try, fall back to signature scan later. */
     pl_offsets_t off = {0};
     if (!pl_offsets_load(&off)) {
@@ -1119,9 +1270,22 @@ static DWORD WINAPI init_thread(LPVOID param) {
     wipe_pe_headers(g_self);
     early_log("init_thread: pe_wipe done");
 
+    /* Downgrade our whole image from initial RWX to per-section image-
+     * like protections (.text→RX, .data→RW, .rdata→RO). Removes the
+     * single strongest IOC used by user-mode memory scanners against
+     * manually-mapped code. See downgrade_own_sections() docstring. */
+    downgrade_own_sections(g_self);
+    early_log("init_thread: sections downgraded");
+
     /* Start background workers. */
     ldb_detect_start(on_ldb_arm, on_ldb_disarm);
     rawin_start(cfg->hotkeys, on_hotkey);
+
+    /* Push hotkey bindings to UI so buttons show mapped hotkeys
+     * (e.g. "Copy full [Ctrl+Alt+C]"). Fires once at arm; if user
+     * later rebinds via config edit, they need to re-arm anyway. */
+    ui_set_hotkey_bindings(cfg->hotkeys,
+                           sizeof(cfg->hotkeys) / sizeof(cfg->hotkeys[0]));
 
     /* Shutdown watcher — event must be openable from elevated Admin
      * launcher process, so we build a world-writable DACL via SDDL. */
@@ -1144,6 +1308,11 @@ static DWORD WINAPI init_thread(LPVOID param) {
     /* Push status badge (provider/tier/model + streaming flag) so it
      * shows in the overlay's top strip right on first frame. */
     refresh_status_badge(cfg);
+
+    /* Runtime subscription re-check. Independent of Electron UI —
+     * self-unloads within ~30 min of the sub going inactive even if
+     * the UI is closed. See payload/src/sub_check.h. */
+    sub_check_start();
 
     InterlockedExchange(&g_running, 1);
     early_log("init_thread: PAYLOAD READY");

@@ -48,6 +48,24 @@ int json_has_nonempty_array_or_object(const char *json);
 int json_first_array_object(const char *json,
                             const char **object_start, const char **object_end);
 
+/* Given a pointer at (or just before) an opening `{`, walk to the matching
+ * `}` while RESPECTING JSON string boundaries + escapes. Returns pointer
+ * ONE PAST the matching `}` (i.e. the length of the object is
+ * `return - start`), or NULL if the object is unterminated / malformed.
+ *
+ * This is the CORRECT way to slice a nested JSON object out of a larger
+ * body — the naive "count { and }" approach fails when the object
+ * contains string values that themselves contain `{` or `}` characters
+ * (extremely common for AI content that includes LaTeX / code / etc.).
+ *
+ * If `start` doesn't point at `{`, the function scans forward until it
+ * finds one (or hits end-of-buffer). */
+const char *json_skip_object(const char *start);
+
+/* Same, but for arrays: given a pointer at (or just before) `[`, walk
+ * to the matching `]`. Returns pointer just past `]` or NULL. */
+const char *json_skip_array(const char *start);
+
 /* ── JSON builder ─────────────────────────────────────────────────── */
 typedef struct {
     char  *buf;

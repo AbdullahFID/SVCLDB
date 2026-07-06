@@ -59,6 +59,7 @@ set SOURCES=^
  "%SHARED%\base64.c" "%SHARED%\hwid.c" ^
  "%SHARED%\winhttp_util.c" "%SHARED%\json_util.c" ^
  "%SHARED%\crypto_util.c" "%SHARED%\supabase_config.c" ^
+ "%SHARED%\handshake.c" ^
  "%SRC%\oauth.c" "%SRC%\license.c" ^
  "%SRC%\inject.c" "%SRC%\config_write.c" ^
  "%SRC%\main.c"
@@ -93,11 +94,22 @@ REM    /DEBUG:NONE + /EMITPOGODB:NO  — no debug info, no PDB path leaks
 REM    /Brepro                       — deterministic timestamps
 REM    /HIGHENTROPYVA + /DYNAMICBASE — 64-bit ASLR
 REM    /NXCOMPAT                     — DEP
-REM    /GUARD:CF                     — Control Flow Guard (launcher CAN use
-REM                                    CFG since it goes through normal
-REM                                    Windows LDR; unlike our payload)
+REM    /CETCOMPAT                    — Intel CET Shadow Stack. Hardware ROP
+REM                                    defence. Safe for normal-loader
+REM                                    binaries like the launcher (the
+REM                                    manual-map shellcode runs in DWM's
+REM                                    own thread with DWM's shadow stack).
 REM    /MERGE:.rdata=.text           — section merge; harder for RE
 REM    /OPT:REF + /OPT:ICF           — dead code + identical-func merge
+REM
+REM  /DELAYLOAD hides security-related imports from a static IAT scan:
+REM    winhttp / bcrypt / ws2_32 tell an analyst "this thing talks TLS +
+REM    does crypto + opens sockets". Delay-loaded imports show up in the
+REM    IDD (image delay directory) instead of the main IAT — most static
+REM    scanners look at IAT first. First call to any function in these
+REM    DLLs pays a ~1ms resolution cost; every call after is direct.
+REM    delayimp.lib provides the __delayLoadHelper2 stub.
+REM
 REM  DO NOT merge .pdata — x64 SEH depends on it.
 REM  DO NOT use /OPT:ICF — folds identical empty functions like
 REM  shellcode_loader_end into other empty funcs, breaking the
@@ -105,16 +117,17 @@ REM  "shellcode_loader...shellcode_loader_end" contiguous-bytes
 REM  assumption. Only /OPT:REF is safe.
 REM  DO NOT use /GUARD:CF — see CFLAGS comment above. Shellcode runs
 REM  inside dwm.exe and would fail CFG bitmap validation.
-set LDFLAGS=/nologo /SUBSYSTEM:CONSOLE /LTCG /DEBUG:NONE /Brepro /OPT:REF /OPT:NOICF ^
- /INCREMENTAL:NO /MANIFEST:NO ^
- /HIGHENTROPYVA /DYNAMICBASE /NXCOMPAT /GUARD:NO ^
+set LDFLAGS=/nologo /SUBSYSTEM:CONSOLE /LTCG /DEBUG:NONE /Brepro ^
+ /OPT:REF /OPT:NOICF /INCREMENTAL:NO /MANIFEST:NO ^
+ /HIGHENTROPYVA /DYNAMICBASE /NXCOMPAT /GUARD:NO /CETCOMPAT ^
+ /DELAYLOAD:winhttp.dll /DELAYLOAD:bcrypt.dll /DELAYLOAD:ws2_32.dll ^
  /OUT:"%BUILD%\%OUT_NAME%"
 
 cl %CFLAGS% /I "%SHARED%" /I "%SRC%" ^
    %SOURCES% ^
    "%BUILD%\launcher.res" ^
    /link %LDFLAGS% ^
-   kernel32.lib user32.lib advapi32.lib bcrypt.lib winhttp.lib ws2_32.lib shell32.lib
+   kernel32.lib user32.lib advapi32.lib bcrypt.lib winhttp.lib ws2_32.lib shell32.lib delayimp.lib
 
 if errorlevel 1 (
   echo [!] Link failed.

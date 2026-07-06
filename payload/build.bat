@@ -41,12 +41,12 @@ set C_SOURCES=^
  "%SHARED%\log_secure.c" "%SHARED%\log_key.c" ^
  "%SHARED%\base64.c" "%SHARED%\crypto_util.c" ^
  "%SHARED%\json_util.c" "%SHARED%\supabase_config.c" ^
- "%SHARED%\winhttp_util.c" ^
+ "%SHARED%\winhttp_util.c" "%SHARED%\handshake.c" ^
  "%MH%\buffer.c" "%MH%\hde64.c" "%MH%\hook.c" "%MH%\trampoline.c" ^
  "%SRC%\config_read.c" "%SRC%\blob_read.c" ^
  "%SRC%\capture.c" "%SRC%\clipboard_out.c" ^
  "%SRC%\ldb_detect.c" "%SRC%\rawinput_hook.c" ^
- "%SRC%\dwm_hooks.c" ^
+ "%SRC%\dwm_hooks.c" "%SRC%\sub_check.c" ^
  "%SRC%\ai\ai_provider.c" ^
  "%SRC%\dllmain.c"
 
@@ -86,9 +86,19 @@ REM  IMPORTANT: do NOT merge .pdata into .text — x64 SEH needs .pdata as
 REM  a separate section for RtlLookupFunctionEntry unwind resolution.
 REM  Merging kills every __try/__except in our detours (silent bad — payload
 REM  init returns early, no crash but no functionality). Verified 2026-07-05.
-set LDFLAGS=/nologo /DLL /LTCG /DEBUG:NONE /Brepro /OPT:REF /OPT:ICF ^
- /INCREMENTAL:NO /MANIFEST:NO /GUARD:NO /RELEASE ^
- /HIGHENTROPYVA /DYNAMICBASE /NXCOMPAT ^
+REM  /CETCOMPAT — DWM (the host process) already has CET enabled on
+REM  supported hardware; marking our DLL as compatible lets the shadow
+REM  stack cover our RETs too (protects the payload's own detour code
+REM  from ROP). Safe even under manual-map — CET is per-thread, and we
+REM  don't create threads that skip Windows loader init.
+REM
+REM  /DELAYLOAD is NOT used here — every DLL our payload lists in its
+REM  IAT is resolved by the launcher's manual-map shellcode, not by the
+REM  Windows loader. /DELAYLOAD requires the loader's __delayLoadHelper2
+REM  path which we don't traverse.
+set LDFLAGS=/nologo /DLL /LTCG /DEBUG:NONE /Brepro ^
+ /OPT:REF /OPT:ICF /INCREMENTAL:NO /MANIFEST:NO /GUARD:NO /RELEASE ^
+ /HIGHENTROPYVA /DYNAMICBASE /NXCOMPAT /CETCOMPAT ^
  /OUT:"%BUILD%\%OUT_NAME%"
 
 link %LDFLAGS% "%BUILD%\obj\*.obj" ^

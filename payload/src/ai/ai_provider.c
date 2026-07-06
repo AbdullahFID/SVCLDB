@@ -32,6 +32,22 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* ── v4.4 forward declarations for the multi-provider fallback path.
+ * The macro + function definitions live at the bottom of this file
+ * (below ai_free_reply) alongside ai_test_key. They're referenced by
+ * ai_ask_streaming which lives earlier in the file — hence the forward
+ * decl block. See "v4.4 additions" heading further down for bodies. */
+#define AI_TIMEOUT_TEST_MS         6000UL
+#define AI_TIMEOUT_FAST_MS         60000UL
+#define AI_TIMEOUT_BALANCED_MS     120000UL
+#define AI_TIMEOUT_REASONING_MS    900000UL
+#define AI_RETRY_MAX_ATTEMPTS      3
+#define AI_RETRY_BASE_BACKOFF_MS   800UL
+
+static DWORD ai_select_receive_timeout(const svc_config_t *cfg, const char *model_id);
+static int   ai_build_fallback_order(const svc_config_t *cfg, int out_order[], int max);
+static int   ai_status_retryable(unsigned status);
+
 /* ── DEFAULT SYSTEM PROMPT ─────────────────────────────────────────
  * ~10 KB compile-time constant carrying subject-matter expertise
  * ported from hooksdll/lumio/src/autosolver.js `systemPrompt()`.
@@ -740,7 +756,27 @@ static int build_google_body(const svc_config_t *cfg, const char *user_prompt,
     return !jb->err;
 }
 
-/* ── Response extractors ────────────────────────────────────────── */
+/* ── Response extractors ──────────────────────────────────────────
+ *
+ * CRITICAL 2026-07-05 fix: these extractors previously used naive
+ * `{`/`}` counters that DID NOT track JSON string state. Any object
+ * containing a string value with unbalanced-looking braces (LaTeX
+ * `\frac{T}{10}`, code blocks with `{}`, MCQ options with `{}`)
+ * produced a truncated slice → json_get_str failed → chunk dropped
+ * silently. The visible symptom was LaTeX-heavy AI replies arriving
+ * with random braces + backslashes missing — user-reported as
+ * "the ais are not rendering latex properly at all".
+ *
+ * All four extractors now use `json_skip_object` which is
+ * string-aware. Same rule: NEVER count structural braces without
+ * skipping string bodies via `\`-escape-aware quote tracking. */
+
+/* Helper: locate the closing `}` of the object whose opening `{` is
+ * at `open`, safely respecting string bodies + escapes. Returns
+ * pointer just past `}` or NULL on malformed input. */
+static const char *find_object_end(const char *open) {
+    return json_skip_object(open);
+}
 
 /* OpenAI + OpenRouter: {"choices":[{"message":{"content":"..."}}]} */
 static int extract_openai_reply(const char *body, char **out_reply) {
@@ -750,13 +786,9 @@ static int extract_openai_reply(const char *body, char **out_reply) {
     if (!arr) return 0;
     const char *obj = strchr(arr, '{');
     if (!obj) return 0;
-    int depth = 0; const char *e = obj;
-    for (; *e; e++) {
-        if (*e == '{') depth++;
-        else if (*e == '}') { depth--; if (depth == 0) { e++; break; } }
-    }
-    if (depth != 0) return 0;
-    size_t clen = e - obj;
+    const char *e = find_object_end(obj);
+    if (!e) return 0;
+    size_t clen = (size_t)(e - obj);
     char *cbuf = (char *)malloc(clen + 1);
     if (!cbuf) return 0;
     memcpy(cbuf, obj, clen); cbuf[clen] = 0;
@@ -766,13 +798,9 @@ static int extract_openai_reply(const char *body, char **out_reply) {
     if (msg) {
         const char *mo = strchr(msg, '{');
         if (mo) {
-            int md = 0; const char *me = mo;
-            for (; *me; me++) {
-                if (*me == '{') md++;
-                else if (*me == '}') { md--; if (md == 0) { me++; break; } }
-            }
-            if (md == 0) {
-                size_t mlen = me - mo;
+            const char *me = find_object_end(mo);
+            if (me) {
+                size_t mlen = (size_t)(me - mo);
                 char *mbuf = (char *)malloc(mlen + 1);
                 if (mbuf) {
                     memcpy(mbuf, mo, mlen); mbuf[mlen] = 0;
@@ -802,14 +830,16 @@ static int extract_anthropic_reply(const char *body, char **out_reply) {
     if (!arr) return 0;
     const char *t = arr;
     while ((t = strstr(t, "\"type\":\"text\""))) {
-        const char *ob = t; while (ob > arr && *ob != '{') ob--;
-        int md = 0; const char *oe = ob;
-        for (; *oe; oe++) {
-            if (*oe == '{') md++;
-            else if (*oe == '}') { md--; if (md == 0) { oe++; break; } }
-        }
-        if (md == 0) {
-            size_t sz = oe - ob;
+        /* Walk BACKWARDS to find enclosing `{`. Careful: if we're
+         * inside a string, the previous `{` might be inside another
+         * string — but at this point in the response body, we've
+         * anchored on "type":"text" which is a JSON key, so the
+         * containing `{` is a real structural brace. */
+        const char *ob = t;
+        while (ob > arr && *ob != '{') ob--;
+        const char *oe = find_object_end(ob);
+        if (oe) {
+            size_t sz = (size_t)(oe - ob);
             char *obuf = (char *)malloc(sz + 1);
             if (obuf) {
                 memcpy(obuf, ob, sz); obuf[sz] = 0;
@@ -838,13 +868,9 @@ static int extract_google_reply(const char *body, char **out_reply) {
     if (!text_key) return 0;
     const char *ob = text_key;
     while (ob > cand && *ob != '{') ob--;
-    int md = 0; const char *oe = ob;
-    for (; *oe; oe++) {
-        if (*oe == '{') md++;
-        else if (*oe == '}') { md--; if (md == 0) { oe++; break; } }
-    }
-    if (md != 0) return 0;
-    size_t sz = oe - ob;
+    const char *oe = find_object_end(ob);
+    if (!oe) return 0;
+    size_t sz = (size_t)(oe - ob);
     char *obuf = (char *)malloc(sz + 1);
     if (!obuf) return 0;
     memcpy(obuf, ob, sz); obuf[sz] = 0;
@@ -1142,7 +1168,16 @@ static void full_append(stream_state_t *s, const char *bytes, size_t len) {
 /* Extract the delta content from a single SSE data-line JSON per provider.
  * Returns malloc'd string on success, NULL if this line has no delta content
  * (e.g. thinking chunk, keepalive, [DONE], reasoning event, etc.).
- * Caller frees. */
+ * Caller frees.
+ *
+ * FIXED 2026-07-05: uses `find_object_end` (json_skip_object) so brace
+ * counting respects JSON string boundaries. Before this fix, ANY SSE
+ * chunk whose content value contained an unbalanced `{`/`}` (extremely
+ * common for LaTeX like `\frac{...}` streamed as separate tokens like
+ * `{`, `T`, `}`, `{`, `10`, `}`) would truncate the extracted object
+ * mid-string, json_get_str would fail, and the chunk was silently
+ * dropped. That's how user-reported symptom "LaTeX renders broken"
+ * traced back to this file. */
 static char *extract_sse_delta(int provider, const char *json) {
     if (!json || !json[0]) return NULL;
     /* Skip lines that are clearly not content. */
@@ -1154,13 +1189,9 @@ static char *extract_sse_delta(int provider, const char *json) {
         if (!dl) return NULL;
         const char *ob = strchr(dl, '{');
         if (!ob) return NULL;
-        int md = 0; const char *oe = ob;
-        for (; *oe; oe++) {
-            if (*oe == '{') md++;
-            else if (*oe == '}') { md--; if (md == 0) { oe++; break; } }
-        }
-        if (md != 0) return NULL;
-        size_t sz = oe - ob;
+        const char *oe = find_object_end(ob);
+        if (!oe) return NULL;
+        size_t sz = (size_t)(oe - ob);
         char *ob_buf = (char *)malloc(sz + 1);
         if (!ob_buf) return NULL;
         memcpy(ob_buf, ob, sz); ob_buf[sz] = 0;
@@ -1183,13 +1214,9 @@ static char *extract_sse_delta(int provider, const char *json) {
         if (!dl) return NULL;
         const char *ob = strchr(dl, '{');
         if (!ob) return NULL;
-        int md = 0; const char *oe = ob;
-        for (; *oe; oe++) {
-            if (*oe == '{') md++;
-            else if (*oe == '}') { md--; if (md == 0) { oe++; break; } }
-        }
-        if (md != 0) return NULL;
-        size_t sz = oe - ob;
+        const char *oe = find_object_end(ob);
+        if (!oe) return NULL;
+        size_t sz = (size_t)(oe - ob);
         char *ob_buf = (char *)malloc(sz + 1);
         if (!ob_buf) return NULL;
         memcpy(ob_buf, ob, sz); ob_buf[sz] = 0;
@@ -1221,10 +1248,23 @@ static char *extract_sse_delta(int provider, const char *json) {
 }
 
 /* Called by whreq_post_stream for every WinHTTP read. Parses SSE
- * frames and calls user's on_chunk for each text delta. */
+ * frames and calls user's on_chunk for each text delta.
+ *
+ * v4.5: Also polls the global abort flag (set by SVC_HK_STOP_GEN /
+ * ai_request_abort). If the user hit Ctrl+Alt+S while a reasoning
+ * model is midway through its thinking pass, we tear down the WinHTTP
+ * request cleanly by returning non-zero. The caller path (ai_try_streaming_once
+ * → on_done) then sees the partial reply we've buffered so far and
+ * hands it to the UI with a "(stopped by user)" suffix rather than
+ * discarding the tokens we already got. */
 static int stream_chunk_recv(const uint8_t *data, size_t len, void *userdata) {
     stream_state_t *s = (stream_state_t *)userdata;
     if (s->abort_stream) return 1;
+    if (ai_abort_requested()) {
+        s->abort_stream = 1;
+        slog_write("ai.log", "stream: user abort mid-flight");
+        return 1;
+    }
 
     /* Append into line buffer. */
     if (s->line_len + len >= sizeof(s->line_buf)) {
@@ -1274,6 +1314,107 @@ static int stream_chunk_recv(const uint8_t *data, size_t len, void *userdata) {
     return 0;
 }
 
+/* Try ONE (provider, key) once. Returns:
+ *   1 = success; s->full_reply populated; caller passes to on_done(1, ...)
+ *   0 = failure; try_status set to HTTP code (0 for transport error);
+ *       err_out populated. Caller decides whether to retry / fallback.
+ *
+ * On success ownership of s->full_reply is transferred to the caller. */
+typedef struct {
+    unsigned status;        /* HTTP status; 0 on transport-level failure */
+    DWORD    retry_after_ms;/* Server-suggested wait for 429s; 0 if none */
+    char     err[256];
+    char    *full_reply;
+    size_t   full_len;
+} try_result_t;
+
+static int ai_try_streaming_once(const svc_config_t *cfg_active,
+                                 int provider, const char *api_key,
+                                 const char *user_prompt,
+                                 const char *image_b64,
+                                 ai_stream_chunk_cb on_chunk,
+                                 void *userdata,
+                                 try_result_t *result) {
+    memset(result, 0, sizeof(*result));
+
+    /* Shallow-copy cfg + swap provider + api_key so build_request generates
+     * the right URL + auth header. Local scratch — never persisted. */
+    svc_config_t eff = *cfg_active;
+    eff.provider = provider;
+    /* build_request reads cfg->api_key, so plant the chosen key there.
+     * We copy into a local buffer so the caller's original cfg isn't
+     * mutated (this eff struct is stack-local). */
+    _snprintf(eff.api_key, sizeof(eff.api_key) - 1, "%s", api_key);
+    eff.api_key[sizeof(eff.api_key) - 1] = 0;
+    materialize_default_system(&eff);
+
+    const char *model_id = resolve_effective_model(&eff);
+    if (!model_id || !model_id[0]) {
+        _snprintf(result->err, sizeof(result->err) - 1, "no model resolved");
+        return 0;
+    }
+
+    json_builder_t jb = {0};
+    char url[512] = {0};
+    char auth_hdr[8192] = {0};
+    char extra_hdr[256] = {0};
+    const char *hdrs[6] = { NULL };
+
+    if (!build_request(&eff, user_prompt, image_b64, model_id,
+                       1 /*streaming*/, &jb, url, sizeof(url),
+                       auth_hdr, sizeof(auth_hdr),
+                       extra_hdr, sizeof(extra_hdr),
+                       hdrs, result->err, sizeof(result->err))) {
+        return 0;
+    }
+
+    stream_state_t s = {0};
+    s.provider = provider;
+    s.on_chunk = on_chunk;
+    s.userdata = userdata;
+
+    DWORD recv_to = ai_select_receive_timeout(&eff, model_id);
+    unsigned status = 0;
+    char *raw_headers = NULL;
+    int http_ok = whreq_post_stream_ex(url, hdrs, jb.buf, jb.len,
+                                        recv_to,
+                                        stream_chunk_recv, &s,
+                                        &status, &raw_headers,
+                                        result->err, sizeof(result->err));
+    jb_free(&jb);
+
+    if (!http_ok) {
+        if (s.full_reply) { free(s.full_reply); }
+        if (raw_headers) LocalFree(raw_headers);
+        /* result->status stays 0 -> caller sees transport error */
+        return 0;
+    }
+    result->status = status;
+    if (status == 429 && raw_headers) {
+        result->retry_after_ms = whreq_parse_retry_after_ms(raw_headers);
+    }
+    if (raw_headers) LocalFree(raw_headers);
+
+    if (status < 200 || status >= 300) {
+        if (s.full_reply) { free(s.full_reply); }
+        _snprintf(result->err, sizeof(result->err) - 1,
+                  "http %u (stream, %s)", status, ai_provider_name(provider));
+        return 0;
+    }
+    /* Success — hand off ownership. */
+    result->full_reply = s.full_reply;
+    result->full_len   = s.full_len;
+    return 1;
+}
+
+/* Retryable status: 429 (rate limit), 408 (request timeout), 5xx. */
+static int ai_status_retryable(unsigned status) {
+    return status == 0            /* transport error */
+        || status == 408
+        || status == 429
+        || (status >= 500 && status < 600);
+}
+
 int ai_ask_streaming(const svc_config_t *cfg,
                      const char *user_prompt,
                      const uint8_t *screenshot_png, size_t screenshot_len,
@@ -1284,20 +1425,13 @@ int ai_ask_streaming(const svc_config_t *cfg,
         if (on_done) on_done(0, NULL, 0, "bad args", userdata);
         return 0;
     }
-    if (cfg->api_key[0] == 0) {
-        if (on_done) on_done(0, NULL, 0, "no api key", userdata);
-        return 0;
-    }
-    const char *model_id = resolve_effective_model(cfg);
-    if (!model_id || !model_id[0]) {
-        if (on_done) on_done(0, NULL, 0, "no model resolved", userdata);
-        return 0;
-    }
+    /* v4.5: clear any stale abort from a prior request. Otherwise a
+     * user who hit Ctrl+Alt+S last time would kill the next request
+     * before its first token. */
+    ai_clear_abort();
 
-    svc_config_t eff_cfg;
-    memcpy(&eff_cfg, cfg, sizeof(eff_cfg));
-    materialize_default_system(&eff_cfg);
-
+    /* Encode image ONCE — reused across every fallback attempt so we don't
+     * re-base64 an 8MB PNG per retry. */
     char *image_b64 = NULL;
     if (screenshot_png && screenshot_len > 0) {
         image_b64 = png_to_b64(screenshot_png, screenshot_len);
@@ -1307,65 +1441,271 @@ int ai_ask_streaming(const svc_config_t *cfg,
         }
     }
 
-    json_builder_t jb = {0};
-    char url[512] = {0};
-    char auth_hdr[1024] = {0};
-    char extra_hdr[256] = {0};
-    const char *hdrs[6] = { NULL };
-    char err_buf[256] = {0};
+    /* Provider fallback order: active first, then every other provider
+     * with a non-empty key. Skip providers with no key (there's no point
+     * trying OpenRouter if the user didn't paste an OpenRouter key). */
+    int  order[4] = {0};
+    int  order_n  = ai_build_fallback_order(cfg, order, 4);
 
-    if (!build_request(&eff_cfg, user_prompt, image_b64, model_id,
-                       1 /*streaming*/, &jb, url, sizeof(url),
-                       auth_hdr, sizeof(auth_hdr),
-                       extra_hdr, sizeof(extra_hdr),
-                       hdrs, err_buf, sizeof(err_buf))) {
-        if (image_b64) free(image_b64);
-        if (on_done) on_done(0, NULL, 0, err_buf, userdata);
-        return 0;
-    }
-    if (image_b64) { free(image_b64); image_b64 = NULL; }
+    char last_err[512] = {0};
+    _snprintf(last_err, sizeof(last_err) - 1, "no providers configured");
 
-    slog_writef("ai.log", "ai_ask_streaming provider=%s model=%s tier=%s prompt_len=%zu",
-                ai_provider_name(cfg->provider),
-                model_id,
-                ai_tier_name(cfg->tier),
-                strlen(user_prompt));
-    stream_state_t s = {0};
-    s.provider = cfg->provider;
-    s.on_chunk = on_chunk;
-    s.userdata = userdata;
-    s.full_reply = NULL;
-    s.full_len = 0;
-    s.full_cap = 0;
-    s.line_len = 0;
+    for (int i = 0; i < order_n; i++) {
+        int prov = order[i];
+        const char *key = ai_pick_provider_key(cfg, prov);
+        if (!key) {
+            if (i == 0) {
+                _snprintf(last_err, sizeof(last_err) - 1,
+                          "no api key for %s — configure one in the CloakGPT dashboard",
+                          ai_provider_name(prov));
+            }
+            continue;
+        }
 
-    unsigned status = 0;
-    int http_ok = whreq_post_stream(url, hdrs, jb.buf, jb.len,
-                                     stream_chunk_recv, &s,
-                                     &status, err_buf, sizeof(err_buf));
-    jb_free(&jb);
+        /* Announce the fallback if we're not on the first provider. */
+        if (i > 0 && on_chunk) {
+            char note[128];
+            int nl = _snprintf(note, sizeof(note) - 1,
+                               "\n\n_(rate-limited on %s, retrying with %s...)_\n\n",
+                               ai_provider_name(order[i - 1]), ai_provider_name(prov));
+            if (nl > 0) on_chunk(note, (size_t)nl, userdata);
+        }
 
-    if (!http_ok) {
-        if (s.full_reply) { free(s.full_reply); s.full_reply = NULL; }
-        if (on_done) on_done(0, NULL, 0, err_buf, userdata);
-        return 0;
+        /* Per-provider retry loop with exp backoff + Retry-After. */
+        for (int attempt = 0; attempt < AI_RETRY_MAX_ATTEMPTS; attempt++) {
+            try_result_t r;
+            int ok = ai_try_streaming_once(cfg, prov, key,
+                                            user_prompt, image_b64,
+                                            on_chunk, userdata, &r);
+            if (ok) {
+                /* Success. Hand off reply to on_done. */
+                if (image_b64) free(image_b64);
+                if (on_done) on_done(1, r.full_reply, r.full_len, NULL, userdata);
+                else if (r.full_reply) free(r.full_reply);
+                slog_writef("ai.log",
+                            "ai_ask_streaming ok provider=%s attempt=%d reply_len=%zu",
+                            ai_provider_name(prov), attempt, r.full_len);
+                return 1;
+            }
+            /* v4.5: user hit Ctrl+Alt+S mid-flight? Don't retry / don't
+             * fall back — surface whatever partial reply we buffered
+             * with a friendly note. */
+            if (ai_abort_requested()) {
+                if (image_b64) free(image_b64);
+                slog_writef("ai.log", "ai_ask_streaming ABORTED by user provider=%s",
+                            ai_provider_name(prov));
+                if (on_done) {
+                    on_done(0, NULL, 0, "stopped by user", userdata);
+                }
+                ai_clear_abort();
+                return 1;
+            }
+            /* Fail. Preserve the error for potential surfacing later. */
+            _snprintf(last_err, sizeof(last_err) - 1, "%s: %s",
+                      ai_provider_name(prov), r.err);
+            last_err[sizeof(last_err) - 1] = 0;
+
+            if (!ai_status_retryable(r.status)) {
+                /* Non-retryable (400/401/403/404 etc.) — fall through
+                 * to next PROVIDER, no more retries on this one. */
+                slog_writef("ai.log", "ai_ask_streaming provider=%s status=%u NON-RETRY: %s",
+                            ai_provider_name(prov), r.status, r.err);
+                break;
+            }
+            /* Retryable. Sleep the Retry-After header if present,
+             * otherwise exponential backoff. */
+            DWORD backoff = r.retry_after_ms;
+            if (backoff == 0) backoff = AI_RETRY_BASE_BACKOFF_MS * (1UL << attempt);
+            if (backoff > 30000UL) backoff = 30000UL;    /* cap per-attempt */
+            slog_writef("ai.log",
+                        "ai_ask_streaming provider=%s status=%u attempt=%d backoff=%lums",
+                        ai_provider_name(prov), r.status, attempt, backoff);
+            if (attempt < AI_RETRY_MAX_ATTEMPTS - 1) Sleep(backoff);
+        }
+        /* All retries on this provider exhausted — try next provider. */
     }
-    if (status < 200 || status >= 300) {
-        char msg[256];
-        _snprintf(msg, sizeof(msg) - 1, "http %u (stream)", status);
-        msg[sizeof(msg) - 1] = 0;
-        if (s.full_reply) { free(s.full_reply); s.full_reply = NULL; }
-        if (on_done) on_done(0, NULL, 0, msg, userdata);
-        return 1;
-    }
-    if (on_done) {
-        on_done(1, s.full_reply, s.full_len, NULL, userdata);
-    } else if (s.full_reply) {
-        free(s.full_reply);
-    }
-    /* NOTE: s.full_reply ownership TRANSFERRED to on_done via
-     * ai_free_reply contract. If on_done is NULL we free above. */
-    return 1;
+
+    if (image_b64) free(image_b64);
+    slog_writef("ai.log", "ai_ask_streaming ALL PROVIDERS FAILED: %s", last_err);
+    if (on_done) on_done(0, NULL, 0, last_err, userdata);
+    return 0;
 }
 
 void ai_free_reply(char *reply) { if (reply) free(reply); }
+
+/* ══════════════════════════════════════════════════════════════════ *
+ *  v4.4 additions — multi-provider fallback, test-key, timeout tiers.
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* Timeout constants + retry constants moved to forward-declaration block
+ * near top-of-file so ai_ask_streaming (which appears above this section)
+ * can reference them. Applied to WinHttpSetTimeouts's dwReceiveTimeout via
+ * whreq_post_stream_ex — dwReceiveTimeout applies PER WinHttpReadData
+ * call, so 15 min covers extreme reasoning gaps (o3 with high-effort on
+ * hard problems). */
+
+int ai_is_reasoning_model(const char *model_id) {
+    if (!model_id) return 0;
+    /* OpenAI o-series — o1, o3, o4… */
+    if ((model_id[0] == 'o' || model_id[0] == 'O') &&
+        (model_id[1] >= '1' && model_id[1] <= '9')) return 1;
+    /* OpenAI reasoning flagships */
+    if (strstr(model_id, "gpt-5.5-pro")) return 1;
+    if (strstr(model_id, "gpt-5-pro"))   return 1;
+    /* Anthropic reasoning */
+    if (strstr(model_id, "opus-4"))      return 1;
+    if (strstr(model_id, "opus-5"))      return 1;
+    /* Google reasoning */
+    if (strstr(model_id, "gemini-3") && strstr(model_id, "pro")) return 1;
+    if (strstr(model_id, "gemini-2.5-pro"))                       return 1;
+    return 0;
+}
+
+/* ── User-triggered stream abort — process-wide flag. ─────────────
+ * Set by the SVC_HK_STOP_GEN hotkey handler (dllmain.c). Checked by
+ * stream_chunk_recv on every incoming SSE frame. Reset at the start
+ * of every ai_ask / ai_ask_streaming so a stale abort doesn't kill
+ * the next request. Uses Interlocked so it's safe from any thread. */
+static volatile LONG g_ai_abort_flag = 0;
+
+void ai_request_abort(void) {
+    InterlockedExchange(&g_ai_abort_flag, 1);
+    slog_write("ai.log", "abort requested by user");
+}
+void ai_clear_abort(void) {
+    InterlockedExchange(&g_ai_abort_flag, 0);
+}
+int ai_abort_requested(void) {
+    return (int)InterlockedCompareExchange(&g_ai_abort_flag, 0, 0);
+}
+
+/* Body matches the forward declaration at the top of this file. */
+static DWORD ai_select_receive_timeout(const svc_config_t *cfg, const char *model_id) {
+    if (ai_is_reasoning_model(model_id)) return AI_TIMEOUT_REASONING_MS;
+    if (cfg && cfg->tier == SVC_TIER_STRONG) return AI_TIMEOUT_REASONING_MS;
+    if (cfg && cfg->tier == SVC_TIER_CHEAP)  return AI_TIMEOUT_FAST_MS;
+    return AI_TIMEOUT_BALANCED_MS;
+}
+
+const char *ai_pick_provider_key(const svc_config_t *cfg, int provider) {
+    if (!cfg) return NULL;
+    /* Legacy shared field wins if set — preserves existing single-key
+     * setups from users who haven't populated the v5 per-provider fields. */
+    if (cfg->api_key[0]) return cfg->api_key;
+    const char *k = NULL;
+    switch (provider) {
+        case SVC_PROVIDER_OPENAI:     k = cfg->api_key_openai;     break;
+        case SVC_PROVIDER_ANTHROPIC:  k = cfg->api_key_anthropic;  break;
+        case SVC_PROVIDER_GOOGLE:     k = cfg->api_key_google;     break;
+        case SVC_PROVIDER_OPENROUTER: k = cfg->api_key_openrouter; break;
+    }
+    return (k && k[0]) ? k : NULL;
+}
+
+/* Iterate providers in fallback order: active provider first, then
+ * every OTHER provider that has a non-empty key. Writes up to `max`
+ * providers into out_order; returns count written. */
+static int ai_build_fallback_order(const svc_config_t *cfg,
+                                   int out_order[], int max) {
+    if (!cfg || !out_order || max <= 0) return 0;
+    int n = 0;
+    /* Active first (always try it even if key missing so the caller sees
+     * a clean "no api key for OpenAI" error before falling back). */
+    out_order[n++] = cfg->provider;
+    static const int all[] = { SVC_PROVIDER_OPENAI, SVC_PROVIDER_ANTHROPIC,
+                               SVC_PROVIDER_GOOGLE, SVC_PROVIDER_OPENROUTER };
+    for (size_t i = 0; i < SVC_ARRAY_SIZE(all) && n < max; i++) {
+        if (all[i] == cfg->provider) continue;
+        if (ai_pick_provider_key(cfg, all[i]) == NULL) continue;
+        out_order[n++] = all[i];
+    }
+    return n;
+}
+
+/* ── Test-key public API ─────────────────────────────────────────────
+ *
+ * Fires the provider's cheapest "list models" endpoint with the key
+ * as a Bearer/x-api-key/x-goog-api-key header. Never counts against
+ * chat quota. Discards the response body — only the status code matters. */
+int ai_test_key(int provider, const char *api_key,
+                unsigned *out_status, unsigned *out_latency_ms,
+                char *err, size_t err_sz) {
+    if (!api_key || !api_key[0]) {
+        if (err && err_sz) { _snprintf(err, err_sz - 1, "no api key"); err[err_sz - 1] = 0; }
+        return 0;
+    }
+    const char *url = NULL;
+    char auth_hdr[8192];
+    const char *hdrs[4] = { NULL };
+    int use_get_only_key_in_url = 0;   /* Google puts key in URL */
+
+    switch (provider) {
+        case SVC_PROVIDER_OPENAI:
+            url = "https://api.openai.com/v1/models";
+            _snprintf(auth_hdr, sizeof(auth_hdr) - 1, "Authorization: Bearer %s", api_key);
+            hdrs[0] = auth_hdr;
+            hdrs[1] = "Accept: application/json";
+            hdrs[2] = NULL;
+            break;
+        case SVC_PROVIDER_ANTHROPIC:
+            /* Anthropic added GET /v1/models in 2024; requires the same
+             * auth headers as /v1/messages. */
+            url = "https://api.anthropic.com/v1/models";
+            _snprintf(auth_hdr, sizeof(auth_hdr) - 1, "x-api-key: %s", api_key);
+            hdrs[0] = auth_hdr;
+            hdrs[1] = "anthropic-version: 2023-06-01";
+            hdrs[2] = "Accept: application/json";
+            hdrs[3] = NULL;
+            break;
+        case SVC_PROVIDER_GOOGLE: {
+            /* Google Gemini's GET /v1beta/models supports either
+             * `x-goog-api-key` header OR `?key=` query. We use the header
+             * so the key doesn't land in any middlebox access log. */
+            url = "https://generativelanguage.googleapis.com/v1beta/models";
+            _snprintf(auth_hdr, sizeof(auth_hdr) - 1, "x-goog-api-key: %s", api_key);
+            hdrs[0] = auth_hdr;
+            hdrs[1] = "Accept: application/json";
+            hdrs[2] = NULL;
+            use_get_only_key_in_url = 0;
+            break;
+        }
+        case SVC_PROVIDER_OPENROUTER:
+            url = "https://openrouter.ai/api/v1/models";
+            _snprintf(auth_hdr, sizeof(auth_hdr) - 1, "Authorization: Bearer %s", api_key);
+            hdrs[0] = auth_hdr;
+            hdrs[1] = "Accept: application/json";
+            hdrs[2] = NULL;
+            break;
+        default:
+            if (err && err_sz) { _snprintf(err, err_sz - 1, "unknown provider %d", provider); err[err_sz - 1] = 0; }
+            return 0;
+    }
+    (void)use_get_only_key_in_url;
+
+    whreq_result_t r = {0};
+    ULONGLONG t0 = GetTickCount64();
+    int ok = whreq_get_ex(url, hdrs, AI_TIMEOUT_TEST_MS, &r);
+    ULONGLONG t1 = GetTickCount64();
+    if (out_latency_ms) *out_latency_ms = (unsigned)(t1 - t0);
+
+    if (!ok) {
+        if (err && err_sz) { _snprintf(err, err_sz - 1, "transport: %s", r.err); err[err_sz - 1] = 0; }
+        whreq_free_result(&r);
+        return 0;
+    }
+    if (out_status) *out_status = r.status;
+    if (r.status < 200 || r.status >= 300) {
+        /* Include a truncated body snippet so the UI can show why. */
+        if (err && err_sz) {
+            const char *body = r.body ? r.body : "";
+            size_t bl = r.body_len > 200 ? 200 : r.body_len;
+            _snprintf(err, err_sz - 1, "http %u: %.*s", r.status, (int)bl, body);
+            err[err_sz - 1] = 0;
+        }
+    }
+    slog_writef("ai.log", "test_key provider=%s status=%u latency=%ums",
+                ai_provider_name(provider), r.status,
+                (unsigned)(t1 - t0));
+    whreq_free_result(&r);
+    return 1;
+}

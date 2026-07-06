@@ -236,15 +236,28 @@ char *whreq_find_header(const char *headers_raw, const char *name) {
     return NULL;
 }
 
+/* Optional per-session receive-timeout override. do_request /
+ * whreq_post_stream call this AFTER req_open() so the value overrides
+ * the 20s default set inside req_open. Pass 0 to keep the default. */
+static void apply_receive_timeout(req_ctx_t *c, DWORD receive_timeout_ms) {
+    if (!c || !c->session || receive_timeout_ms == 0) return;
+    /* WinHttpSetTimeouts on an existing session — resolve/connect/send
+     * default is -1 = don't change. Only override dwReceiveTimeout so
+     * reasoning-model long streams don't drop between tokens. */
+    WinHttpSetTimeouts(c->session, -1, -1, -1, (int)receive_timeout_ms);
+}
+
 /* Perform request. body_len==0 = no body. */
-static int do_request(const wchar_t *method, const char *url,
-                      const char **headers, const void *body, size_t body_len,
-                      whreq_result_t *out) {
+static int do_request_ex(const wchar_t *method, const char *url,
+                         const char **headers, const void *body, size_t body_len,
+                         DWORD receive_timeout_ms,
+                         whreq_result_t *out) {
     req_ctx_t c;
     if (!req_open(&c, method, url, headers, out->err, sizeof(out->err))) {
         req_close(&c);
         return 0;
     }
+    apply_receive_timeout(&c, receive_timeout_ms);
     wchar_t *hdrs = build_headers(headers);
     LPCWSTR hdrs_send = hdrs ? hdrs : WINHTTP_NO_ADDITIONAL_HEADERS;
     DWORD   hdrs_len  = hdrs ? (DWORD)-1L : 0;
@@ -292,23 +305,47 @@ static int do_request(const wchar_t *method, const char *url,
 }
 
 int whreq_get(const char *url, const char **headers, whreq_result_t *out) {
+    return whreq_get_ex(url, headers, 0, out);
+}
+
+int whreq_get_ex(const char *url, const char **headers,
+                 DWORD receive_timeout_ms, whreq_result_t *out) {
     if (!out) return 0;
     memset(out, 0, sizeof(*out));
-    return do_request(L"GET", url, headers, NULL, 0, out);
+    return do_request_ex(L"GET", url, headers, NULL, 0, receive_timeout_ms, out);
 }
 
 int whreq_post(const char *url, const char **headers,
                const void *body, size_t body_len, whreq_result_t *out) {
+    return whreq_post_ex(url, headers, body, body_len, 0, out);
+}
+
+int whreq_post_ex(const char *url, const char **headers,
+                  const void *body, size_t body_len,
+                  DWORD receive_timeout_ms, whreq_result_t *out) {
     if (!out) return 0;
     memset(out, 0, sizeof(*out));
-    return do_request(L"POST", url, headers, body, body_len, out);
+    return do_request_ex(L"POST", url, headers, body, body_len, receive_timeout_ms, out);
 }
 
 int whreq_post_stream(const char *url, const char **headers,
                       const void *body, size_t body_len,
                       whreq_chunk_cb cb, void *userdata,
                       unsigned *out_status, char *out_err, size_t err_size) {
+    return whreq_post_stream_ex(url, headers, body, body_len,
+                                 0, cb, userdata,
+                                 out_status, NULL, out_err, err_size);
+}
+
+int whreq_post_stream_ex(const char *url, const char **headers,
+                         const void *body, size_t body_len,
+                         DWORD receive_timeout_ms,
+                         whreq_chunk_cb cb, void *userdata,
+                         unsigned *out_status,
+                         char **out_headers,
+                         char *out_err, size_t err_size) {
     if (!cb) return 0;
+    if (out_headers) *out_headers = NULL;
 
     req_ctx_t c;
     char err_local[256] = {0};
@@ -317,6 +354,7 @@ int whreq_post_stream(const char *url, const char **headers,
         req_close(&c);
         return 0;
     }
+    apply_receive_timeout(&c, receive_timeout_ms);
     wchar_t *hdrs = build_headers(headers);
     LPCWSTR hdrs_send = hdrs ? hdrs : WINHTTP_NO_ADDITIONAL_HEADERS;
     DWORD   hdrs_len  = hdrs ? (DWORD)-1L : 0;
@@ -341,6 +379,11 @@ int whreq_post_stream(const char *url, const char **headers,
         WINHTTP_HEADER_NAME_BY_INDEX, &status, &dwsize, WINHTTP_NO_HEADER_INDEX);
     if (out_status) *out_status = (unsigned)status;
 
+    /* Grab raw headers for the caller's Retry-After parse — but do it
+     * BEFORE any reads because some WinHTTP versions consume headers
+     * during body-drain in edge cases. */
+    if (out_headers) *out_headers = get_raw_headers(c.request);
+
     uint8_t buf[8192];
     for (;;) {
         DWORD avail = 0;
@@ -355,4 +398,33 @@ int whreq_post_stream(const char *url, const char **headers,
 
     req_close(&c);
     return 1;
+}
+
+/* Parse Retry-After. Handles:
+ *   - `retry-after-ms: 1234`         (OpenAI style — raw milliseconds)
+ *   - `retry-after: 5`               (RFC 7231 seconds)
+ *   - `retry-after: Wed, 21 Oct 2015 07:28:00 GMT`  (HTTP-date — treat as
+ *                                     fixed 30s fallback since we don't
+ *                                     ship a full RFC 7231 date parser)
+ * Returns milliseconds to wait, or 0 if absent / unparseable. */
+DWORD whreq_parse_retry_after_ms(const char *headers_raw) {
+    if (!headers_raw) return 0;
+    /* OpenAI's retry-after-ms is authoritative when present. */
+    char *v = whreq_find_header(headers_raw, "retry-after-ms");
+    if (v) {
+        DWORD ms = (DWORD)strtoul(v, NULL, 10);
+        LocalFree(v);
+        return ms;
+    }
+    v = whreq_find_header(headers_raw, "retry-after");
+    if (!v) return 0;
+    /* Numeric prefix? seconds. */
+    if (v[0] >= '0' && v[0] <= '9') {
+        DWORD s = (DWORD)strtoul(v, NULL, 10);
+        LocalFree(v);
+        return s * 1000UL;
+    }
+    /* HTTP-date — conservative default. */
+    LocalFree(v);
+    return 30 * 1000UL;
 }

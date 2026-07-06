@@ -21,6 +21,9 @@
 #include "../../shared/hwid.h"
 #include "../../shared/log_secure.h"
 #include "../../shared/supabase_config.h"
+#include "../../shared/handshake.h"
+#include "../../shared/crypto_util.h"
+#include "../../shared/json_util.h"
 #include "config_write.h"
 #include "inject.h"
 #include "license.h"
@@ -28,6 +31,7 @@
 
 #include <shellapi.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <tlhelp32.h>
 
@@ -51,6 +55,194 @@ static void die(const char *title, const char *msg) {
     MessageBoxA(NULL, msg, title, MB_ICONERROR | MB_OK);
     slog_writef("launcher.log", "die: %s: %s", title, msg);
     ExitProcess(1);
+}
+
+/* ── Handshake stamp ─────────────────────────────────────────────── *
+ * Populate the v4 magic / schema / handshake fields on a config struct
+ * about to be written. Used by BOTH the legacy env-var arm path (so
+ * `sihost --quiet` iteration keeps working for devs) and by the
+ * `--json-config` path when Electron didn't precompute a token itself.
+ *
+ * Idempotent: safe to call multiple times.
+ * Returns 1 iff handshake_compute succeeded. */
+static int stamp_handshake_and_magic(svc_config_t *cfg,
+                                     const char *access_token,
+                                     const char *hwid) {
+    cfg->magic          = SVC_CONFIG_MAGIC;
+    cfg->schema_version = SVC_CONFIG_SCHEMA_VERSION;
+    cfg->handshake_epoch_day = handshake_current_epoch_day();
+    _snprintf(cfg->handshake_hwid, sizeof(cfg->handshake_hwid) - 1, "%s", hwid ? hwid : "");
+    cfg->handshake_hwid[sizeof(cfg->handshake_hwid) - 1] = 0;
+    memset(cfg->handshake_token, 0, sizeof(cfg->handshake_token));
+    if (!access_token || !access_token[0] || !hwid || !hwid[0]) {
+        slog_writef("launcher.log",
+                    "handshake stamp: skipped — missing access_token or hwid "
+                    "(len at=%zu hwid=%zu)",
+                    access_token ? strlen(access_token) : 0,
+                    hwid ? strlen(hwid) : 0);
+        return 0;
+    }
+    int ok = handshake_compute(access_token, cfg->handshake_hwid,
+                               cfg->handshake_epoch_day,
+                               cfg->handshake_token);
+    if (!ok) {
+        slog_writef("launcher.log", "handshake stamp: compute FAILED");
+        return 0;
+    }
+    slog_writef("launcher.log",
+                "handshake stamp: ok day=%lld hwid=%.8s...",
+                (long long)cfg->handshake_epoch_day, cfg->handshake_hwid);
+    return 1;
+}
+
+/* ── Read entire file into a malloc'd buffer (NUL-terminated). ── */
+static char *slurp_file(const char *path, size_t *out_len) {
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    LARGE_INTEGER sz = {0};
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > 8 * 1024 * 1024) {
+        CloseHandle(h); return NULL;
+    }
+    char *buf = (char *)malloc((size_t)sz.QuadPart + 1);
+    if (!buf) { CloseHandle(h); return NULL; }
+    DWORD r = 0;
+    BOOL ok = ReadFile(h, buf, (DWORD)sz.QuadPart, &r, NULL);
+    CloseHandle(h);
+    if (!ok || r != (DWORD)sz.QuadPart) { free(buf); return NULL; }
+    buf[r] = 0;
+    if (out_len) *out_len = r;
+    return buf;
+}
+
+/* ── Parse a JSON handoff file from Electron into svc_config_t.
+ * The Electron UI writes a temporary JSON to disk (deleted immediately
+ * after read) containing:
+ *
+ *   {
+ *     "access_token": "eyJ...",
+ *     "token_expires_at": 1672531200,
+ *     "hwid": "SMBIOS-UUID",
+ *     "handshake_epoch_day": 19541,
+ *     "handshake_token_hex": "abc...deadbeef",   // 64 hex chars
+ *     "provider": 1,           // 1=OA 2=AN 3=GG 4=OR
+ *     "tier":     1,           // 0=STRONG 1=MED 2=CHEAP 3=CUSTOM
+ *     "api_key":  "sk-...",
+ *     "model":    "",
+ *     "reasoning_effort":  4,
+ *     "streaming_enabled": 1,
+ *     "latex_disabled":    0,
+ *     "system_prompt":     "",
+ *     "overlay_x":40, "overlay_y":40, "overlay_w":560, "overlay_h":420,
+ *     "overlay_alpha": 0.94,
+ *     "hotkeys_packed_csv": "196640,262215,..."   // 32 uints comma-sep
+ *   }
+ *
+ * On success: cfg is fully populated (including magic + handshake). We
+ * additionally VERIFY the handshake token before returning success, so a
+ * corrupt/tampered JSON is rejected here rather than at payload init.
+ *
+ * Returns 1 iff the JSON was well-formed AND the handshake verifies. */
+static int assemble_config_from_json(const char *json,
+                                     svc_config_t *cfg,
+                                     char *err, size_t err_sz) {
+    if (!json || !cfg) return 0;
+    memset(cfg, 0, sizeof(*cfg));
+
+    /* ── Required fields ────────────────────────────────────── */
+    if (!json_get_str(json, "access_token", cfg->access_token, sizeof(cfg->access_token))) {
+        _snprintf(err, err_sz - 1, "missing access_token"); return 0;
+    }
+    if (!json_get_str(json, "hwid", cfg->handshake_hwid, sizeof(cfg->handshake_hwid))) {
+        _snprintf(err, err_sz - 1, "missing hwid"); return 0;
+    }
+    char hex[80] = {0};
+    if (!json_get_str(json, "handshake_token_hex", hex, sizeof(hex))) {
+        _snprintf(err, err_sz - 1, "missing handshake_token_hex"); return 0;
+    }
+    if (cu_from_hex(hex, cfg->handshake_token, sizeof(cfg->handshake_token))
+            != (int)sizeof(cfg->handshake_token)) {
+        _snprintf(err, err_sz - 1, "handshake_token_hex wrong length (need 64 chars)");
+        return 0;
+    }
+    double n = 0;
+    if (!json_get_num(json, "handshake_epoch_day", &n)) {
+        _snprintf(err, err_sz - 1, "missing handshake_epoch_day"); return 0;
+    }
+    cfg->handshake_epoch_day = (long long)n;
+    if (json_get_num(json, "token_expires_at", &n)) cfg->token_expires_at = (long long)n;
+
+    /* v5 per-provider keys — populated by Electron from the 4-input
+     * settings card. At least ONE must be non-empty; the legacy
+     * cfg->api_key (single-key backward compat) is optional. */
+    json_get_str(json, "api_key_openai",     cfg->api_key_openai,     sizeof(cfg->api_key_openai));
+    json_get_str(json, "api_key_anthropic",  cfg->api_key_anthropic,  sizeof(cfg->api_key_anthropic));
+    json_get_str(json, "api_key_google",     cfg->api_key_google,     sizeof(cfg->api_key_google));
+    json_get_str(json, "api_key_openrouter", cfg->api_key_openrouter, sizeof(cfg->api_key_openrouter));
+    /* Legacy shared field — if UI sends it, prefer it. Otherwise fall
+     * through to per-provider keys inside ai_provider.c. */
+    json_get_str(json, "api_key", cfg->api_key, sizeof(cfg->api_key));
+
+    if (!cfg->api_key[0] && !cfg->api_key_openai[0] && !cfg->api_key_anthropic[0]
+        && !cfg->api_key_google[0] && !cfg->api_key_openrouter[0]) {
+        _snprintf(err, err_sz - 1, "no api key for any provider");
+        return 0;
+    }
+    if (json_get_num(json, "provider", &n)) cfg->provider = (int)n;
+    if (json_get_num(json, "tier",     &n)) cfg->tier     = (int)n;
+    json_get_str(json, "model", cfg->model, sizeof(cfg->model));
+    if (json_get_num(json, "reasoning_effort",  &n)) cfg->reasoning_effort  = (int)n;
+    if (json_get_num(json, "streaming_enabled", &n)) cfg->streaming_enabled = (int)n;
+    if (json_get_num(json, "latex_disabled",    &n)) cfg->latex_disabled    = (int)n;
+
+    /* system_prompt: allow empty (payload falls back to built-in). */
+    json_get_str(json, "system_prompt", cfg->system_prompt, sizeof(cfg->system_prompt));
+
+    /* overlay geometry (all optional — sensible defaults for missing fields) */
+    if (json_get_num(json, "overlay_x",     &n)) cfg->overlay_x = (int)n; else cfg->overlay_x = 40;
+    if (json_get_num(json, "overlay_y",     &n)) cfg->overlay_y = (int)n; else cfg->overlay_y = 40;
+    if (json_get_num(json, "overlay_w",     &n)) cfg->overlay_w = (int)n; else cfg->overlay_w = 560;
+    if (json_get_num(json, "overlay_h",     &n)) cfg->overlay_h = (int)n; else cfg->overlay_h = 420;
+    if (json_get_num(json, "overlay_alpha", &n)) cfg->overlay_alpha = (float)n; else cfg->overlay_alpha = 0.94f;
+
+    /* Hotkeys: CSV of packed uints. Missing / short → zeroed slots. */
+    char csv[2048] = {0};
+    if (json_get_str(json, "hotkeys_packed_csv", csv, sizeof(csv))) {
+        char *tok = csv;
+        for (int i = 0; i < 32 && *tok; i++) {
+            char *comma = strchr(tok, ',');
+            if (comma) *comma = 0;
+            cfg->hotkeys[i] = (unsigned)strtoul(tok, NULL, 10);
+            if (!comma) break;
+            tok = comma + 1;
+        }
+    }
+
+    /* Header + handshake sanity — MUST verify against the token we
+     * just decoded before we hand this to config_write. */
+    cfg->magic          = SVC_CONFIG_MAGIC;
+    cfg->schema_version = SVC_CONFIG_SCHEMA_VERSION;
+    if (!handshake_verify(cfg->access_token, cfg->handshake_hwid,
+                          cfg->handshake_token)) {
+        _snprintf(err, err_sz - 1,
+                  "handshake_token mismatch (day=%lld, hwid=%.8s..., "
+                  "did Electron/sihost use the same access_token?)",
+                  (long long)cfg->handshake_epoch_day, cfg->handshake_hwid);
+        return 0;
+    }
+    return 1;
+}
+
+/* Auto-detect provider from an API key's prefix. Returns provider enum
+ * or 0 if no match. Extracted for reuse between --json-config path
+ * and legacy env-var path. */
+static int detect_provider_from_key(const char *api_key) {
+    if (!api_key || !*api_key) return 0;
+    if (strncmp(api_key, "sk-ant-", 7) == 0) return SVC_PROVIDER_ANTHROPIC;
+    if (strncmp(api_key, "sk-or-",  6) == 0) return SVC_PROVIDER_OPENROUTER;
+    if (strncmp(api_key, "sk-",     3) == 0) return SVC_PROVIDER_OPENAI;
+    if (strncmp(api_key, "AIza",    4) == 0) return SVC_PROVIDER_GOOGLE;
+    return SVC_PROVIDER_OPENROUTER;   /* safe catch-all */
 }
 
 /* ── MVP settings flow: prompt via MessageBox / simple InputBox ─── *
@@ -142,6 +334,10 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
     cfg->hotkeys[SVC_HK_COPY_CODE]     = SVC_HK_PACK(MOD_CSA, 'C');  /* Ctrl+Shift+Alt+C — copy JUST fenced code blocks */
     cfg->hotkeys[SVC_HK_COPY_ANSWER]   = SVC_HK_PACK(MOD_CA,  'A');  /* Ctrl+Alt+A — copy JUST first-line answer        */
     cfg->hotkeys[SVC_HK_LATEX_TOGGLE]  = SVC_HK_PACK(MOD_CSA, 'L');  /* Ctrl+Shift+Alt+L — LaTeX <-> Unicode/keyboard   */
+    /* v4.5: stop an in-flight AI response. Ctrl+Alt+S = "stop". Free —
+     * no common app binds Ctrl+Alt+S (Ctrl+S alone is browser save,
+     * Ctrl+Alt+S has no default meaning in Chrome / Cursor / Office). */
+    cfg->hotkeys[SVC_HK_STOP_GEN]      = SVC_HK_PACK(MOD_CA,  'S');  /* Ctrl+Alt+S — abort current stream */
 
     cfg->overlay_x = 40; cfg->overlay_y = 40;
     cfg->overlay_w = 560; cfg->overlay_h = 420;
@@ -223,6 +419,8 @@ int main(int argc, char *argv[]) {
     int kill_mode = 0;
     int kill_all_mode = 0;
     int reinject_mode = 0;   /* skip config regen; use existing config.dat */
+    int json_config_mode = 0;
+    const char *json_config_path = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--quiet") == 0 || strcmp(argv[i], "-q") == 0) {
             quiet_mode = 1;
@@ -245,6 +443,16 @@ int main(int argc, char *argv[]) {
              * full 3-minute cold-start. */
             reinject_mode = 1;
             quiet_mode = 1;
+        } else if (strcmp(argv[i], "--json-config") == 0 && i + 1 < argc) {
+            /* Electron UI hand-off: read a temp JSON with the session +
+             * settings + handshake, write encrypted config.dat, run
+             * resolver, inject. Skips OAuth entirely (Electron did it).
+             * Path arg is consumed + should be deleted by Electron after
+             * we exit successfully. */
+            json_config_mode = 1;
+            json_config_path = argv[i + 1];
+            quiet_mode = 1;
+            i++;   /* consume the path arg */
         }
     }
 
@@ -403,6 +611,71 @@ int main(int argc, char *argv[]) {
         ExitProcess(0);
     }
 
+    /* ── --json-config: Electron UI handoff ── *
+     * Electron already authenticated the user + verified subscription +
+     * gathered API key + computed the handshake token. It wrote a temp
+     * JSON to the path we received. We: (1) parse JSON → svc_config_t,
+     * (2) verify handshake, (3) write encrypted config.dat, (4) run
+     * resolver, (5) inject payload from embedded resource, (6) delete
+     * the temp JSON so the plaintext secrets don't linger on disk. */
+    if (json_config_mode) {
+        slog_writef("launcher.log", "--json-config: reading %s", json_config_path);
+        size_t json_sz = 0;
+        char *json_body = slurp_file(json_config_path, &json_sz);
+        if (!json_body) {
+            slog_writef("launcher.log", "--json-config: slurp failed (GLE=%lu)", GetLastError());
+            ExitProcess(10);
+        }
+
+        svc_config_t cfg;
+        char perr[256] = {0};
+        int ok = assemble_config_from_json(json_body, &cfg, perr, sizeof(perr));
+        /* Zeroise + delete the plaintext JSON as soon as we've parsed it.
+         * Even on failure — never leak the access_token on disk. */
+        svc_secure_zero(json_body, json_sz);
+        free(json_body);
+        DeleteFileA(json_config_path);
+        if (!ok) {
+            slog_writef("launcher.log", "--json-config: parse/verify failed: %s", perr);
+            ExitProcess(11);
+        }
+
+        if (!config_write(&cfg)) {
+            svc_secure_zero(&cfg, sizeof(cfg));
+            slog_writef("launcher.log", "--json-config: config_write failed");
+            ExitProcess(12);
+        }
+        /* Wipe from stack — cfg.access_token + api_key are highly sensitive. */
+        svc_secure_zero(&cfg, sizeof(cfg));
+
+        /* Resolver — best effort (payload has sig-scan fallback). */
+        char rerr[512] = {0};
+        if (!run_resolver(rerr, sizeof(rerr))) {
+            slog_writef("launcher.log", "--json-config: resolver warn: %s", rerr);
+        }
+
+        /* Leftover-payload heal. */
+        if (inject_is_loaded()) {
+            inject_signal_unload();
+            int wait_ms = 0;
+            while (wait_ms < 1500 && inject_is_loaded()) {
+                Sleep(100); wait_ms += 100;
+            }
+            slog_writef("launcher.log", "--json-config: heal waited=%dms", wait_ms);
+        }
+
+        /* Inject via embedded resource. */
+        char ierr[512] = {0};
+        HMODULE self = GetModuleHandleA(NULL);
+        if (!inject_dwm_payload_from_resource(self, SVC_PAYLOAD_RCDATA_ID,
+                                              ierr, sizeof(ierr))) {
+            slog_writef("launcher.log", "--json-config: inject FAILED (%s)", ierr);
+            ExitProcess(13);
+        }
+        slog_writef("launcher.log", "--json-config: done");
+        ExitProcess(0);
+    }
+
     /* ── --reinject: fast re-arm with existing config ── *
      * Assumes config.dat + offsets.blob already exist from a prior full
      * arm. Skips: OAuth, subscription check, api_key.txt load, resolver,
@@ -537,6 +810,15 @@ int main(int argc, char *argv[]) {
         cfg.model[sizeof(cfg.model) - 1] = 0;
     }
 
+    /* ── 3.5. Stamp handshake + magic header (v4 schema). ──
+     * Without this the payload's cfg_get() gate rejects the config with
+     * "handshake FAILED". Keeps `sihost --quiet` (legacy CLI OAuth path)
+     * a functioning first-class dev-iteration tool alongside the Electron
+     * UI's --json-config path. */
+    if (!stamp_handshake_and_magic(&cfg, cfg.access_token, hwid)) {
+        die("Handshake stamp failed", "Could not derive login token — corrupt session?");
+    }
+
     /* ── 4. Write encrypted config. ── */
     if (!config_write(&cfg)) {
         die("Config write failed", "Could not save encrypted config.");
@@ -544,6 +826,39 @@ int main(int argc, char *argv[]) {
     /* Wipe secrets from stack after write. */
     svc_secure_zero(cfg.api_key, sizeof(cfg.api_key));
     svc_secure_zero(cfg.access_token, sizeof(cfg.access_token));
+    svc_secure_zero(cfg.handshake_token, sizeof(cfg.handshake_token));
+
+    /* Stealth-hardening (2026-07-06): the api_key.txt bootstrap file
+     * is now redundant — the user's key lives encrypted (AES-256-GCM,
+     * machine-bound wrap key) inside config.dat. Leaving the plaintext
+     * copy on disk is a user-liability item (any admin process can
+     * `Get-Content C:\ProgramData\WinAudioSvc\api_key.txt` and lift
+     * the OpenAI/Anthropic/Google key). Delete it now that we have a
+     * successfully-written encrypted config. On next launcher run the
+     * user's key is loaded from config.dat directly; if they need to
+     * rotate they can drop a fresh api_key.txt again — but between
+     * runs there's no plaintext copy sitting there.
+     *
+     * Best-effort — if delete fails (file locked / already gone /
+     * permission) we just log and continue. The encrypted config is
+     * already written so functional path is unaffected. */
+    {
+        char keypath[MAX_PATH];
+        _snprintf(keypath, sizeof(keypath) - 1, "%s\\api_key.txt", SVC_INSTALL_DIR);
+        keypath[sizeof(keypath) - 1] = 0;
+        DWORD attrs = GetFileAttributesA(keypath);
+        if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+            if (DeleteFileA(keypath)) {
+                slog_writef("launcher.log",
+                            "stealth: api_key.txt consumed + deleted "
+                            "(key now lives only in encrypted config.dat)");
+            } else {
+                slog_writef("launcher.log",
+                            "stealth: api_key.txt delete failed gle=%lu — "
+                            "manual cleanup recommended", GetLastError());
+            }
+        }
+    }
 
     /* ── 5. Run resolver (best-effort — payload has sig-scan fallback). ── */
     if (!run_resolver(err, sizeof(err))) {
