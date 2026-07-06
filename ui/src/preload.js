@@ -18,10 +18,14 @@ const EVENTS = new Set([
 
 contextBridge.exposeInMainWorld('svc', {
   license: {
-    load:        ()    => ipcRenderer.invoke('license:load'),
-    signIn:      ()    => ipcRenderer.invoke('license:sign-in'),
-    signOut:     ()    => ipcRenderer.invoke('license:sign-out'),
-    pendingUrl:  ()    => ipcRenderer.invoke('license:pending-url'),
+    load:         ()    => ipcRenderer.invoke('license:load'),
+    signIn:       ()    => ipcRenderer.invoke('license:sign-in'),
+    signOut:      ()    => ipcRenderer.invoke('license:sign-out'),
+    pendingUrl:   ()    => ipcRenderer.invoke('license:pending-url'),
+    /* v4.7: remove a device from user_devices (MAX_DEVICES=1 policy).
+     * Requires pendingAccessToken + pendingUserId because the caller
+     * hasn't completed a full login yet (device limit blocked it). */
+    removeDevice: (payload) => ipcRenderer.invoke('license:remove-device', payload),
   },
   on: (evt, cb) => {
     if (!EVENTS.has(evt) || typeof cb !== 'function') return () => {};
@@ -48,6 +52,24 @@ contextBridge.exposeInMainWorld('svc', {
      *   { ok, status, latency_ms, models?, err? }
      * Never charges tokens. 6s timeout. */
     test:  (provider, k)  => ipcRenderer.invoke('api-keys:test', provider, k),
+  },
+  /* v4.7: user-remappable hotkey overrides. */
+  hotkeys: {
+    /* Returns { defaults: [...], overrides: { [slotIndex]: packedUInt } }.
+     * defaults is the DEFAULT_HOTKEYS array from injector.js (32 slots
+     * indexed by svc_hotkey_action_t). overrides is the user's saved
+     * customizations — merged on top of defaults at inject time. */
+    load:  ()             => ipcRenderer.invoke('hotkeys:load'),
+    /* overrides: { [slotIndex]: packedUInt }. Any slot not present
+     * falls back to the default. */
+    save:  (overrides)    => ipcRenderer.invoke('hotkeys:save', overrides),
+    reset: ()             => ipcRenderer.invoke('hotkeys:reset'),
+  },
+  /* v4.7: first-run onboarding walkthrough. */
+  onboarding: {
+    get:      () => ipcRenderer.invoke('onboarding:get'),
+    complete: () => ipcRenderer.invoke('onboarding:complete'),
+    reset:    () => ipcRenderer.invoke('onboarding:reset'),
   },
   injector: {
     status:   ()      => ipcRenderer.invoke('injector:status'),

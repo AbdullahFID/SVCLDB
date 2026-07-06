@@ -30,6 +30,8 @@ const auth         = require('./license/auth');
 const storage      = require('./license/storage');
 const subscription = require('./license/subscription');
 const revalidation = require('./license/revalidation');
+const security     = require('./license/security');
+const registration = require('./license/registration');
 const injector     = require('./injector/injector');
 const { SVC_INSTALL_DIR } = require('./license/config');
 
@@ -343,6 +345,18 @@ function createWindow() {
 
 // ─── IPC ───────────────────────────────────────────────────────
 ipcMain.handle('license:load', async () => {
+  // 1. Security checks — anti-debug + proctor tool scan. If a debugger
+  //    is attached or a known RE tool is running, refuse to even try
+  //    to load a session. Payload's C-side anti-debug is still a safety
+  //    net at inject time; this catches earlier + gives the user a
+  //    friendly error instead of the C-side silent-refuse.
+  const secResult = await security.runChecks();
+  if (!secResult.ok) {
+    console.log('[main] security check FAILED:', secResult.reason);
+    return { session: null, subscription: null, clearReason: 'security_failed',
+             securityReason: secResult.reason };
+  }
+
   let { session, clearReason } = auth.loadSessionWithRecovery();
   if (!session) {
     currentSess = null; currentSub = null;
@@ -366,11 +380,35 @@ ipcMain.handle('license:load', async () => {
     }
   }
   currentSess = session;
+  const hwid = device.getCached()?.hardware_uuid || null;
   try {
     currentSub = await subscription.checkSubscription(session.access_token);
+    if (currentSub && currentSub.active) {
+      // Persist signed cache — offline-grace can serve this later.
+      subscription.attachSigToCache(currentSub, hwid);
+      storage.saveSubscriptionCache(currentSub);
+    }
   } catch (e) {
     console.log('[main] sub-check on load failed:', e.message);
-    currentSub = { active: null, plan: null, status: 'unknown', error: e.message };
+    // OFFLINE-GRACE FAST PATH: try signed cache before giving up.
+    let usedCache = false;
+    try {
+      const cached = storage.loadSubscriptionCache();
+      if (cached && subscription.verifySubCache(cached, hwid) &&
+          cached.active && cached._cachedAt) {
+        const ageMs = Date.now() - cached._cachedAt * 1000;
+        const { GRACE_PERIOD_MS } = require('./license/config');
+        if (ageMs < GRACE_PERIOD_MS) {
+          console.log(`[main] sub check offline; using signed cache ` +
+                      `(${Math.round(ageMs/1000)}s / ${GRACE_PERIOD_MS/1000}s grace)`);
+          currentSub = { ...cached, _fromCache: true, _cacheAgeMs: ageMs };
+          usedCache = true;
+        }
+      }
+    } catch {}
+    if (!usedCache) {
+      currentSub = { active: null, plan: null, status: 'unknown', error: e.message };
+    }
   }
   // If the sub check itself returned 401, that means EVEN the refreshed
   // token is bad → force a full re-login rather than showing an
@@ -378,20 +416,72 @@ ipcMain.handle('license:load', async () => {
   if (currentSub && currentSub.error && /http 401/.test(currentSub.error)) {
     console.log('[main] 401 on sub check even after refresh - forcing re-login');
     storage.clearSession();
+    storage.clearSubscriptionCache();
     currentSess = null; currentSub = null;
     revalidation.stop();
     return { session: null, subscription: null, clearReason: 'token_rejected' };
+  }
+  // If the account is SUSPENDED, don't kick to nosub — the renderer has
+  // a dedicated ban screen with the reason.
+  if (currentSub && currentSub.status === 'suspended') {
+    console.log('[main] SUSPENDED account on load — showing ban screen');
+    return _sessionDto();
   }
   if (currentSub && currentSub.active) startRevalidationLoop();
   return _sessionDto();
 });
 
 ipcMain.handle('license:sign-in', async () => {
+  // Same security gate as license:load — refuse to run OAuth if a
+  // debugger / RE tool is attached.
+  const secResult = await security.runChecks();
+  if (!secResult.ok) {
+    console.log('[main] sign-in blocked by security check:', secResult.reason);
+    return { error: secResult.reason, securityBlocked: true };
+  }
   try {
     const session = await auth.startOAuth();
     currentSess = session;
+
+    // Device registration + MAX_DEVICES enforcement.
+    // Fires BEFORE sub check so a user hitting the device limit gets
+    // the right error screen instead of the ambiguous "no subscription".
+    try {
+      const info = device.getCached() || (await device.collect());
+      const enf = await registration.enforceDeviceLimit(session, info);
+      if (!enf.ok && enf.reason === 'device_limit_exceeded') {
+        console.log('[main] sign-in blocked: device limit exceeded');
+        // Don't save session — user must remove an old device first.
+        currentSess = null;
+        return {
+          deviceLimitExceeded: true,
+          devices: enf.devices || [],
+          currentHwid: enf.currentHwid || null,
+          currentDeviceName: enf.currentDeviceName || 'This PC',
+          currentModel: enf.currentModel || null,
+          limit: enf.limit || 1,
+          _pendingSession: {
+            access_token: session.access_token,
+            user_id:      session.user_id,
+            email:        session.email,
+            display_name: session.display_name,
+            avatar_url:   session.avatar_url,
+            expires_at:   session.expires_at,
+          },
+        };
+      }
+      console.log('[main] device registration:', enf.action || 'ok');
+    } catch (e) {
+      console.log('[main] device registration threw:', e.message);
+    }
+
+    const hwid = device.getCached()?.hardware_uuid || null;
     try {
       currentSub = await subscription.checkSubscription(session.access_token);
+      if (currentSub && currentSub.active) {
+        subscription.attachSigToCache(currentSub, hwid);
+        storage.saveSubscriptionCache(currentSub);
+      }
     } catch (e) {
       currentSub = { active: null, plan: null, status: 'unknown', error: e.message };
     }
@@ -403,9 +493,30 @@ ipcMain.handle('license:sign-in', async () => {
   }
 });
 
+// v4.7: Device management — remove a device from user_devices so the
+// user can log in on a new machine (MAX_DEVICES=1 policy). Called from
+// the "Device limit reached" screen after user picks which old device
+// to unregister.
+//
+// Auth: uses the CURRENTLY-PENDING access_token from the aborted sign-in
+// (renderer passes it back via IPC), because currentSess is still null
+// at this point (login didn't complete).
+ipcMain.handle('license:remove-device', async (_e, { pendingAccessToken, pendingUserId, hardwareUuid }) => {
+  if (!pendingAccessToken || !pendingUserId || !hardwareUuid) {
+    return { ok: false, err: 'missing_params' };
+  }
+  const fakeSession = { access_token: pendingAccessToken, user_id: pendingUserId };
+  const r = await registration.deleteDevice(fakeSession, hardwareUuid);
+  return r;
+});
+
 ipcMain.handle('license:sign-out', async () => {
   revalidation.stop();
   storage.clearSession();
+  storage.clearSubscriptionCache();
+  // Sign-out also resets onboarding — next sign-in walks the user
+  // through the tutorial again. Matches hooksdll behaviour.
+  storage.resetOnboarding();
   currentSess = null; currentSub = null;
   // Also uninject on sign-out — a session-less user should not have
   // the payload running with their (now-invalid) config.
@@ -526,6 +637,19 @@ ipcMain.handle('injector:inject', async (_e, args) => {
   if (!hasAny) return { ok: false, err: 'At least one AI provider key is required.' };
 
   const hwid = (device.getCached()?.hardware_uuid) || (await device.collect()).hardware_uuid;
+
+  // v4.7: merge user hotkey overrides on top of DEFAULT_HOTKEYS. Overrides
+  // dict is { [slotIndex]: packedUInt } from the settings UI. Any slot the
+  // user has NOT customized keeps its default binding.
+  const hotkeys = [...injector.DEFAULT_HOTKEYS];
+  const overrides = storage.loadHotkeyOverrides();
+  for (const [k, v] of Object.entries(overrides || {})) {
+    const slot = parseInt(k, 10);
+    if (Number.isFinite(slot) && slot >= 0 && slot < hotkeys.length) {
+      hotkeys[slot] = v;
+    }
+  }
+
   const result = await injector.inject({
     session: currentSess,
     hwid,
@@ -538,6 +662,7 @@ ipcMain.handle('injector:inject', async (_e, args) => {
     streaming_enabled:(args && args.streaming_enabled),
     latex_disabled:   (args && args.latex_disabled),
     overlay:          (args && args.overlay),
+    hotkeys,
   });
   return result;
 });
@@ -554,6 +679,59 @@ ipcMain.handle('shell:open-external', (_e, url) => {
   if (!/^https?:\/\//i.test(url)) return false;
   shell.openExternal(url);
   return true;
+});
+
+// ─── Hotkey overrides (user customization) ─────────────────────
+// Renderer sends a dict { [slotIndex]: packedUInt } via hotkeys:save.
+// injector.js reads the current overrides via storage.loadHotkeyOverrides
+// and merges them into DEFAULT_HOTKEYS at inject time. Overrides
+// persist across launches via appData/hotkeys.json.
+ipcMain.handle('hotkeys:load', async () => {
+  const overrides = storage.loadHotkeyOverrides();
+  // Also return the defaults so the renderer knows the base binding to
+  // show alongside each override (or as the fallback if unset).
+  return {
+    defaults: injector.DEFAULT_HOTKEYS,
+    overrides,
+  };
+});
+
+ipcMain.handle('hotkeys:save', async (_e, overrides) => {
+  if (!overrides || typeof overrides !== 'object') return { ok: false, err: 'bad_overrides' };
+  // Sanitize: values must be integers 0..(2^24-1). Drop bogus entries.
+  const clean = {};
+  for (const [k, v] of Object.entries(overrides)) {
+    const slot = parseInt(k, 10);
+    const packed = (typeof v === 'number') ? v : parseInt(v, 10);
+    if (Number.isFinite(slot) && slot >= 0 && slot < 64 &&
+        Number.isFinite(packed) && packed >= 0 && packed < (1 << 24)) {
+      clean[slot] = packed;
+    }
+  }
+  const ok = storage.saveHotkeyOverrides(clean);
+  return { ok };
+});
+
+ipcMain.handle('hotkeys:reset', async () => {
+  storage.clearHotkeyOverrides();
+  return { ok: true };
+});
+
+// ─── Onboarding walkthrough ────────────────────────────────────
+// Renderer queries onboarding:get on splash → decides whether to show
+// the 12-step overlay before dashboard becomes visible.
+ipcMain.handle('onboarding:get', async () => {
+  return { complete: storage.isOnboardingComplete() };
+});
+
+ipcMain.handle('onboarding:complete', async () => {
+  const ok = storage.setOnboardingComplete();
+  return { ok };
+});
+
+ipcMain.handle('onboarding:reset', async () => {
+  storage.resetOnboarding();
+  return { ok: true };
 });
 
 // ─── Export encrypted logs for support ─────────────────────────
@@ -650,14 +828,33 @@ ipcMain.handle('logs:export', async () => {
 
 // ─── Runtime revalidation loop ─────────────────────────────────
 // Wired into every path that produces a valid, subscribed session. Polls
-// Supabase every hour. If subscription lapses or the user's account is
-// disabled server-side, immediately uninject + logout + push the renderer
-// back to the login screen with an explanation banner.
+// Supabase every hour (jittered ±20%). If subscription lapses or the
+// user's account is disabled server-side, immediately uninject + logout
+// + push the renderer back to the login screen with an explanation
+// banner. If the network is DOWN, uses the HMAC-signed sub cache to
+// stay active for up to GRACE_PERIOD_MS (3h) before hard lockout.
 function startRevalidationLoop() {
+  const _hwid = () => device.getCached()?.hardware_uuid || null;
   revalidation.start({
     getSession: () => currentSess,
     refreshFn:  async (s) => auth.refreshSession(s),
-    subCheckFn: async (t) => subscription.checkSubscription(t),
+    subCheckFn: async (t) => {
+      const r = await subscription.checkSubscription(t);
+      // Keep in-mem sub current so the dashboard reflects live state.
+      if (r && r.active) currentSub = r;
+      return r;
+    },
+    getHwid: _hwid,
+    loadSignedCache: (hwid) => {
+      const cached = storage.loadSubscriptionCache();
+      if (!cached) return null;
+      if (!subscription.verifySubCache(cached, hwid || _hwid())) return null;
+      return cached;
+    },
+    saveSignedCache: (sub) => {
+      subscription.attachSigToCache(sub, _hwid());
+      storage.saveSubscriptionCache(sub);
+    },
     onRefreshed: (newSess) => {
       currentSess = newSess;
       console.log('[main] session refreshed, new expiry',
@@ -666,15 +863,32 @@ function startRevalidationLoop() {
         mainWin.webContents.send('license:session-updated', _sessionDto());
       }
     },
-    onExpired: async (reason) => {
-      console.log('[main] LOCKOUT:', reason);
-      currentSess = null; currentSub = null;
+    onExpired: async (reason, extra) => {
+      console.log('[main] LOCKOUT:', reason, extra || '');
+      const wasSuspended = (reason === 'subscription_suspended');
+      const suspensionInfo = wasSuspended && extra ? {
+        suspension_reason: extra.suspension_reason || null,
+        suspended_at:      extra.suspended_at || null,
+      } : null;
+      // Preserve the session for the ban screen so the renderer can
+      // show the user's email + support link. Otherwise clear it.
+      const preservedSession = wasSuspended && currentSess ? {
+        email: currentSess.email,
+        display_name: currentSess.display_name,
+        avatar_url: currentSess.avatar_url,
+      } : null;
+      currentSess = null;
+      currentSub = wasSuspended
+        ? { active: false, status: 'suspended', ...suspensionInfo }
+        : null;
       storage.clearSession();
+      storage.clearSubscriptionCache();
       try { await injector.uninject(); }
       catch (e) { console.log('[main] auto-uninject failed:', e.message); }
       if (mainWin && !mainWin.isDestroyed()) {
-        mainWin.webContents.send('license:expired-lockout', { reason });
-        // Bring the window forward — user needs to see the lockout page.
+        mainWin.webContents.send('license:expired-lockout', {
+          reason, suspensionInfo, preservedSession,
+        });
         try { mainWin.show(); mainWin.focus(); } catch {}
       }
     },

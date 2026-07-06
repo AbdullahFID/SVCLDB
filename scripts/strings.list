@@ -1,0 +1,83 @@
+# strings.list — encrypted-string manifest
+#
+# Format: <ENUM_NAME>|<plaintext string>
+#
+# ENUM_NAME becomes SVC_STR_<ENUM_NAME> at call sites.
+# Blank lines + lines starting with # are ignored.
+# UTF-8 (no BOM); \n / \r / \t are NOT interpreted — write literals.
+#
+# Every string here gets XOR-encrypted at build time by
+# scripts/gen_str_enc.ps1 into shared/str_enc_generated.h. The runtime
+# in shared/str_enc.c decrypts them in-place at DllMain / main() start.
+#
+# ONLY add strings that would identify this project to a reverse engineer
+# looking at `strings dwmapiext.dll`. High-signal only — encrypting
+# generic format strings adds size without meaningful RE friction.
+
+# ─── Product identity ────────────────────────────────────────────
+PRODUCT_NAME|CloakGPT
+INSTALL_DIR_LEAKY|C:\ProgramData\WinAudioSvc
+SVCLDB_TOKEN|svcldb
+SVCLDB_API_KEY|SVCLDB_API_KEY
+
+# ─── Named event (unique DWM injection fingerprint) ─────────────
+SHUTDOWN_EVENT|Global\DwmCompositorShutdownRelease
+
+# ─── Payload init / hook signatures ─────────────────────────────
+PAYLOAD_INIT|=== payload init ===
+PAYLOAD_READY|=== payload ready ===
+HOOKS_INSTALLED|hooks_install: SUCCESS
+HOOKS_UNINSTALLED|hooks uninstalled
+HANDSHAKE_OK|init_thread: handshake ok
+HANDSHAKE_BAD_HEADER|handshake: bad config header magic=%08x ver=%u (expect %08x/%u)
+HANDSHAKE_TOKEN_INVALID|handshake: token INVALID - refusing to install hooks
+CONFIG_UNAVAIL|config unavailable - payload will be inert
+PEB_UNLINKED|peb_unlink: unlinked + spoofed BaseDllName -> %s (pick=%d)
+PE_WIPED|pe_wipe: MZ+PE signatures corrupted
+
+# ─── DWM hook function names (leak that we hook the compositor) ──
+HOOK_PRESENT|COverlayContext::Present hooked @ %p
+HOOK_DDPRESENT|CDDisplayRenderTarget::Present hooked @ %p
+HOOK_LEGACY_PRESENT|CLegacyRenderTarget::Present hooked @ %p
+HOOK_RC_WINDOW|CWindowNode::RenderContent hooked @ %p (capture stealth)
+HOOK_RC_VISUAL|CVisual::RenderContent hooked @ %p (capture stealth)
+HOOK_RC_WINDOW_FAIL|CWindowNode::RenderContent hook FAILED s=%d
+HOOK_RC_VISUAL_FAIL|CVisual::RenderContent hook FAILED s=%d
+HOOK_PN_DD|CDDisplayRenderTarget::PresentNeeded hooked @ %p
+HOOK_PN_LEGACY|CLegacyRenderTarget::PresentNeeded hooked @ %p
+
+# ─── AI provider headers (leak our AI integration) ───────────────
+AUTH_HEADER_FMT|Authorization: Bearer %s
+ANTHROPIC_VERSION|anthropic-version: 2023-06-01
+OPENAI_CHAT_URL|https://api.openai.com/v1/chat/completions
+ANTHROPIC_MSG_URL|https://api.anthropic.com/v1/messages
+GOOGLE_GEN_URL|https://generativelanguage.googleapis.com/v1beta/models
+OPENROUTER_URL|https://openrouter.ai/api/v1/chat/completions
+
+# ─── Model names (leak specific model choices) ───────────────────
+MODEL_GEMINI_FLASH_LITE|gemini-2.5-flash-lite
+MODEL_GEMINI_PRO|gemini-2.5-pro
+MODEL_GEMINI_3_PRO|gemini-3.1-pro-preview
+MODEL_GEMINI_3_FLASH|gemini-3.5-flash
+MODEL_OPENAI_GPT55|gpt-5.5
+MODEL_ANTHROPIC_OPUS|claude-opus-4-8
+
+# ─── Resolver PDB symbol names (leak dwmcore RE target) ──────────
+PDB_CVISUAL_RC|dwmcore!CVisual::RenderContent
+PDB_CWNODE_RC|dwmcore!CWindowNode::RenderContent
+
+# ─── User-facing error messages (leak internals) ─────────────────
+ERR_INVALID_KEY_HINT|**Invalid API key.** Cycle providers via Ctrl+Shift+Alt+P or add a key at the dashboard.
+ERR_RATE_LIMIT|**Rate limited.** Wait a minute or cycle to a cheaper tier with Ctrl+Alt+M.
+ERR_MODEL_UNAVAIL|**Model not available.** Cycle tier via Ctrl+Alt+M.
+NO_QUESTION|NO_QUESTION_DETECTED
+
+# ─── Sub-check messages ──────────────────────────────────────────
+SUBCHK_THREAD_UP|sub_check: thread up (jitter+backoff)
+SUBCHK_SELF_UNLOAD|sub_check: SELF-UNLOAD trigger (%s)
+SUBCHK_INACTIVE|subscription_inactive
+SUBCHK_NET_FAIL|too_many_network_failures
+
+# ─── Rawinput / hotkey signatures ────────────────────────────────
+RIN_CLASS|MSDiagEventSink
+RIN_REGISTERED|WM_HOTKEY fired slot=%d

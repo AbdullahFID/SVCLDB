@@ -26,6 +26,7 @@ set CFLAGS=/nologo /W3 /O2 /Oi /GS /Gy /MT /GL /DNDEBUG /D_CRT_SECURE_NO_WARNING
 
 set SOURCES=^
  "%SHARED%\log_secure.c" "%SHARED%\log_key.c" ^
+ "%SHARED%\str_enc.c" ^
  "%SRC%\main.c"
 
 REM  Hardening: /CETCOMPAT (hardware ROP defence),
@@ -50,6 +51,26 @@ del /q "%BUILD%\*.obj" 2>nul
 del /q "%BUILD%\*.pdb" 2>nul
 del /q "%BUILD%\*.exp" 2>nul
 del /q "%BUILD%\*.lib" 2>nul
+
+REM ── Astral-PE metadata scrub ── (see payload/build.bat for rationale)
+set ASTRAL="%ROOT%\_bin\Astral-PE.exe"
+if /I "%SVCLDB_SKIP_SCRUB%"=="1" (
+    echo === Astral-PE scrub SKIPPED ^(SVCLDB_SKIP_SCRUB=1^) ===
+    goto :AFTER_SCRUB
+)
+if not exist %ASTRAL% (
+    echo === Astral-PE not found at %ASTRAL% - skipping scrub ===
+    goto :AFTER_SCRUB
+)
+echo === Scrubbing %OUT_NAME% with Astral-PE ===
+%ASTRAL% "%BUILD%\%OUT_NAME%" -o "%BUILD%\%OUT_NAME%.scrubbed" >nul 2>nul
+if exist "%BUILD%\%OUT_NAME%.scrubbed" (
+    move /y "%BUILD%\%OUT_NAME%.scrubbed" "%BUILD%\%OUT_NAME%" >nul
+    echo === Scrub OK ===
+) else (
+    echo [!] Astral-PE scrub failed - shipping unscrubbed
+)
+:AFTER_SCRUB
 
 REM ── Copy dbghelp + symsrv from the Windows SDK next to the resolver.
 REM  The resolver LoadLibraryA's cgpt_dbghelp.dll from its own directory

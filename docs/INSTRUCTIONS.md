@@ -11,7 +11,6 @@ Inside `CloakGPTWindowsMaxStealth.zip`:
 
 ```
 CloakGPTWindowsMaxStealth.zip
-├── INSTRUCTIONS.md               ← this file (read this first)
 ├── install-cloakgpt.ps1          ← one-click installer (recommended)
 └── CloakGPT/                     ← the app folder
     ├── svchelper.exe             ← the launcher you double-click
@@ -20,7 +19,12 @@ CloakGPTWindowsMaxStealth.zip
     └── ... (Chromium runtime files, ~280 MB total)
 ```
 
-**Total size unzipped**: ~280 MB. Zip is ~90 MB.
+Setup instructions (this document) ship alongside the zip as
+`CloakGPT Setup Instructions.md`. If you download from our site the
+zip and this doc arrive together; if someone else forwarded you the
+zip, ask them for this doc too.
+
+**Total size unzipped**: ~280 MB. Zip is ~125 MB.
 
 ---
 
@@ -267,9 +271,9 @@ on the Dashboard.
 ### Something else weird
 - Click **Export logs** on the CloakGPT Dashboard. It creates
   `cloakgpt-logs-<timestamp>.zip` on your Desktop. **Email that zip
-  to support** — the logs inside are AES-256-GCM encrypted, we
-  decrypt them on our end. Zero PII leaves your machine in a readable
-  form.
+  to support** — the logs inside are securely encrypted and only the
+  CloakGPT team can read them. Zero personal info leaves your machine
+  in a readable form.
 
 ---
 
@@ -308,17 +312,17 @@ between versions.
 
 ## 10. Privacy note
 
-- Your **API keys** are stored encrypted with Windows DPAPI (per-user)
-  + AES-256-GCM (per-machine, HWID-bound). Never plaintext on disk.
+- Your **API keys** are securely encrypted and stay on this device.
+  Never stored in plain text.
 - Your **session token** (from Google login) is stored the same way.
   24-hour expiry — you re-sign-in daily.
 - **Nothing you type or screenshot is uploaded to us.** It goes
   directly from your machine to the AI provider (OpenAI, Anthropic,
   Google, or OpenRouter) whose key you configured. We can't read it.
-- **All logs** written by the app are AES-256-GCM encrypted with a
-  key only we have. When you send logs for support they arrive
-  encrypted — nobody on the wire (your ISP, email provider, etc.)
-  can read them.
+- **All logs** written by the app are securely encrypted so only the
+  CloakGPT team can read them. When you send logs for support they
+  arrive encrypted — nobody on the wire (your ISP, email provider,
+  etc.) can read them.
 - The app registers Windows Defender exclusions **for its own
   binaries only** — it does not disable Defender globally or exclude
   anything else on your system.

@@ -62,10 +62,10 @@ New-Item -ItemType Directory -Path $stagingApp | Out-Null
 # Copy the entire Electron dist folder into staging/CloakGPT/
 Copy-Item -Path (Join-Path $distDir '*') -Destination $stagingApp -Recurse -Force
 
-# Copy the INSTRUCTIONS.md into the ZIP top level so recipients see it
-# before they even extract svchelper.exe (Windows Explorer preview).
-Copy-Item -Path (Join-Path $docsDir 'INSTRUCTIONS.md') `
-          -Destination (Join-Path $stagingRoot 'INSTRUCTIONS.md') -Force
+# INSTRUCTIONS.md is NOT bundled into the zip anymore - the standalone
+# "CloakGPT Setup Instructions.md" on the Desktop is enough and keeping
+# a copy in the zip clutters what recipients see when they preview it.
+# Only ship install-cloakgpt.ps1 alongside the CloakGPT/ folder.
 Copy-Item -Path (Join-Path $repoRoot 'ui\tools\install-cloakgpt.ps1') `
           -Destination (Join-Path $stagingRoot 'install-cloakgpt.ps1') -Force
 

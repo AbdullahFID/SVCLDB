@@ -28,6 +28,30 @@ svcldb_test_openai.env
 config.dat
 offsets.blob
 state.dat
+api_key.txt
+.svchelper_install_secret
+ui_session.dat
+ui_api.dat
+ui_api_keys.dat
+ui_subscription.dat
+session.enc
+subscription.enc
+onboarding_complete.flag
+hotkeys.json
+str_diag.txt
+
+# Test / iteration artifacts (not source)
+# _bin/         — Astral-PE, ProcDump, other downloaded build-time tools
+# _screenshots/ — Local UI test screenshots taken during dev sessions
+# _crashes/     — ProcDump crash dumps captured during debugging
+_bin/
+_screenshots/
+_crashes/
+
+# Electron build outputs (Electron regenerates these on `pnpm run build`)
+ui/dist/
+ui/src-build/
+ui/src-original/
 
 # IDE / OS junk
 .vs/

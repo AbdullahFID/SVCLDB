@@ -8,6 +8,7 @@
 
 #include "../../shared/common.h"
 #include "../../shared/log_secure.h"
+#include "../../shared/str_enc.h"
 
 #include <stdio.h>
 #include <stdarg.h>
@@ -133,6 +134,7 @@ static uint64_t resolve(const char *sym) {
 }
 
 int main(void) {
+    svc_str_init();   /* decrypt SS() strings once at startup */
     log_line("=== resolver start ===");
     CreateDirectoryA(SVC_INSTALL_DIR, NULL);
     CreateDirectoryA(SYM_CACHE, NULL);
@@ -185,7 +187,7 @@ int main(void) {
     OffsetsBlob b = {0};
     log_line("Resolving 17 symbols:");
 
-    b.renderContent = resolve("dwmcore!CWindowNode::RenderContent");
+    b.renderContent = resolve(SS(SVC_STR_PDB_CWNODE_RC));
 
     b.isNormal = resolve("dwmcore!CVisual::IsNormal");
     if (!b.isNormal) b.isNormal = resolve_wild("dwmcore!*::IsNormal");
@@ -209,7 +211,7 @@ int main(void) {
     if (!b.finalCapture) b.finalCapture = resolve_wild("dwmcore!CWindowNode::*apture");
 
     b.scheduleComposition   = resolve("dwmcore!ScheduleCompositionPass");
-    b.cvisualRenderContent  = resolve("dwmcore!CVisual::RenderContent");
+    b.cvisualRenderContent  = resolve(SS(SVC_STR_PDB_CVISUAL_RC));
     b.cOverlayContextPresent= resolve("dwmcore!COverlayContext::Present");
     b.presentNeeded         = resolve("dwmcore!CDDisplayRenderTarget::PresentNeeded");
     b.forceFullDirty        = resolve("dwmcore!CCommonRegistryData::ForceFullDirtyRendering");

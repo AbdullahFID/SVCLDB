@@ -180,6 +180,14 @@ function buildJson(opts) {
   const ovr      = opts.overlay || {};
   const tokFields = handshake.buildTokenFields(opts.session.access_token, opts.hwid);
 
+  // v4.7: caller may pass a custom `hotkeys` array (main.js merges user
+  // overrides on top of DEFAULT_HOTKEYS before calling this). Falls
+  // back to defaults if omitted so tools that spawn inject() without
+  // going through main.js still work.
+  const hotkeys = Array.isArray(opts.hotkeys) && opts.hotkeys.length > 0
+    ? opts.hotkeys
+    : DEFAULT_HOTKEYS;
+
   const payload = {
     access_token:        opts.session.access_token || '',
     token_expires_at:    opts.session.expires_at || 0,
@@ -208,7 +216,7 @@ function buildJson(opts) {
     hwid:                tokFields.hwid,
     handshake_epoch_day: tokFields.handshake_epoch_day,
     handshake_token_hex: tokFields.handshake_token_hex,
-    hotkeys_packed_csv:  DEFAULT_HOTKEYS.join(','),
+    hotkeys_packed_csv:  hotkeys.join(','),
   };
   return payload;
 }

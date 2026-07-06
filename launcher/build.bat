@@ -60,6 +60,7 @@ set SOURCES=^
  "%SHARED%\winhttp_util.c" "%SHARED%\json_util.c" ^
  "%SHARED%\crypto_util.c" "%SHARED%\supabase_config.c" ^
  "%SHARED%\handshake.c" ^
+ "%SHARED%\str_enc.c" "%SHARED%\lazy_api.c" ^
  "%SRC%\oauth.c" "%SRC%\license.c" ^
  "%SRC%\inject.c" "%SRC%\config_write.c" ^
  "%SRC%\main.c"
@@ -140,5 +141,31 @@ del /q "%BUILD%\*.pdb" 2>nul
 del /q "%BUILD%\*.exp" 2>nul
 del /q "%BUILD%\*.lib" 2>nul
 del /q "%BUILD%\*.res" 2>nul
+
+REM ── Astral-PE metadata scrub ── nukes section names, Rich Header,
+REM  debug directory, timestamps, linker version. Applied AFTER link so
+REM  RCDATA (which points at build/payload/dwmapiext.dll) is already
+REM  embedded — this scrubs the OUTER container only, not the payload
+REM  inside. (The payload should be scrubbed by payload/build.bat before
+REM  the launcher build runs.)
+REM  Skip: set SVCLDB_SKIP_SCRUB=1.
+set ASTRAL="%ROOT%\_bin\Astral-PE.exe"
+if /I "%SVCLDB_SKIP_SCRUB%"=="1" (
+    echo === Astral-PE scrub SKIPPED ^(SVCLDB_SKIP_SCRUB=1^) ===
+    goto :AFTER_SCRUB
+)
+if not exist %ASTRAL% (
+    echo === Astral-PE not found at %ASTRAL% - skipping scrub ===
+    goto :AFTER_SCRUB
+)
+echo === Scrubbing %OUT_NAME% with Astral-PE ===
+%ASTRAL% "%BUILD%\%OUT_NAME%" -o "%BUILD%\%OUT_NAME%.scrubbed" >nul 2>nul
+if exist "%BUILD%\%OUT_NAME%.scrubbed" (
+    move /y "%BUILD%\%OUT_NAME%.scrubbed" "%BUILD%\%OUT_NAME%" >nul
+    echo === Scrub OK ===
+) else (
+    echo [!] Astral-PE scrub failed - shipping unscrubbed
+)
+:AFTER_SCRUB
 
 for %%F in ("%BUILD%\%OUT_NAME%") do echo === Built %%F  (%%~zF bytes) ===

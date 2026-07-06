@@ -74,6 +74,27 @@ extern "C" {
 #define SVCLDB_PRODUCTION_BUILD 1
 #endif
 
+/* ─── Dev bypass for auth (handshake + sub_check) ─── *
+ *
+ * When 1: init_thread SKIPS handshake_verify() + sub_check_start().
+ * Lets developers iterate on the payload without re-authenticating
+ * through the Electron UI every rebuild (which involves Google OAuth,
+ * subscription check, etc — painful for the ~30-second edit-compile-
+ * test cycle).
+ *
+ * Toggle at compile time via:
+ *   set SVCLDB_DEV_AUTH=1
+ *   build.bat            (build.bat maps env-var → /D flag)
+ *
+ * Default is 0 (production). MUST be removed / disabled before shipping.
+ * Grep pre-release:
+ *   Get-ChildItem payload,shared,launcher -Recurse -Include *.c,*.h,*.bat |
+ *     Select-String -Pattern 'SVCLDB_DEV_BYPASS|SVCLDB_DEV_AUTH'
+ * Must return zero SET matches (`#define ... 1` or `set SVCLDB_DEV_AUTH=1`). */
+#ifndef SVCLDB_DEV_BYPASS_AUTH
+#define SVCLDB_DEV_BYPASS_AUTH 0
+#endif
+
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(s) (((NTSTATUS)(s)) >= 0)
 #endif

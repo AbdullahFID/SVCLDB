@@ -26,6 +26,7 @@
 #include "../../shared/log_secure.h"
 #include "../../shared/supabase_config.h"
 #include "../../shared/handshake.h"
+#include "../../shared/str_enc.h"
 #include "config_read.h"
 #include "blob_read.h"
 #include "capture.h"
@@ -1195,9 +1196,15 @@ static void rotate_payload_log(void) {
 
 static DWORD WINAPI init_thread(LPVOID param) {
     (void)param;
+    /* Decrypt the smoking-gun string blob BEFORE any logging code runs.
+     * Idempotent + thread-safe — safe to call at DllMain-thread start.
+     * After this, SS(SVC_STR_XXX) returns plaintext pointers to strings
+     * that live encrypted-at-rest inside .rdata. See shared/str_enc.h. */
+    svc_str_init();
+
     rotate_payload_log();
     early_log("init_thread: entered");
-    slog_write("payload.log", "=== payload init ===");
+    slog_write("payload.log", SS(SVC_STR_PAYLOAD_INIT));
     early_log("init_thread: past slog_write test");
 
     /* Anti-debug — refuse to init if DWM is being debugged. Someone
@@ -1211,7 +1218,7 @@ static DWORD WINAPI init_thread(LPVOID param) {
     const svc_config_t *cfg = cfg_get();
     if (!cfg) {
         early_log("init_thread: config unavailable");
-        slog_write("payload.log", "config unavailable — payload will be inert");
+        slog_write("payload.log", SS(SVC_STR_CONFIG_UNAVAIL));
         return 1;
     }
     early_log("init_thread: config loaded");
@@ -1221,28 +1228,30 @@ static DWORD WINAPI init_thread(LPVOID param) {
      * a recent day. Prevents CLI-only bypass of the login flow: sihost
      * or any custom loader that ships config.dat without a valid token
      * (or with a stale one) is refused injection here. See
-     * shared/handshake.h for the derivation contract. */
+     * shared/handshake.h for the derivation contract.
+     *
+     * Dev bypass: `SVCLDB_DEV_BYPASS_AUTH=1` at compile time skips this
+     * gate for iteration convenience. See common.h — MUST be 0 before
+     * shipping. */
+#if SVCLDB_DEV_BYPASS_AUTH
+    early_log("init_thread: HANDSHAKE SKIPPED (SVCLDB_DEV_BYPASS_AUTH=1)");
+#else
     if (cfg->magic != SVC_CONFIG_MAGIC ||
         cfg->schema_version != SVC_CONFIG_SCHEMA_VERSION) {
-        slog_writef("payload.log",
-                    "handshake: bad config header magic=%08x ver=%u (expect %08x/%u)",
+        slog_writef("payload.log", SS(SVC_STR_HANDSHAKE_BAD_HEADER),
                     (unsigned)cfg->magic, (unsigned)cfg->schema_version,
                     (unsigned)SVC_CONFIG_MAGIC, (unsigned)SVC_CONFIG_SCHEMA_VERSION);
-        early_log("init_thread: config header rejected — re-run CloakGPT.exe");
+        early_log("init_thread: config header rejected");
         return 5;
     }
     if (!handshake_verify(cfg->access_token, cfg->handshake_hwid,
                           cfg->handshake_token)) {
-        slog_writef("payload.log",
-                    "handshake: token INVALID — refusing to install hooks. "
-                    "day=%lld access_len=%zu hwid_len=%zu (Electron UI login required)",
-                    (long long)cfg->handshake_epoch_day,
-                    strnlen(cfg->access_token, sizeof(cfg->access_token)),
-                    strnlen(cfg->handshake_hwid, sizeof(cfg->handshake_hwid)));
-        early_log("init_thread: HANDSHAKE FAILED — payload inert");
+        slog_write("payload.log", SS(SVC_STR_HANDSHAKE_TOKEN_INVALID));
+        early_log("init_thread: HANDSHAKE FAILED");
         return 5;
     }
-    early_log("init_thread: handshake ok");
+    early_log(SS(SVC_STR_HANDSHAKE_OK));
+#endif
 
     /* Read offsets.blob — try, fall back to signature scan later. */
     pl_offsets_t off = {0};
@@ -1293,7 +1302,7 @@ static DWORD WINAPI init_thread(LPVOID param) {
     PSECURITY_DESCRIPTOR sd = NULL;
     build_world_sa(&sa, &sd);
     g_shutdown_ev = CreateEventA(sa.lpSecurityDescriptor ? &sa : NULL,
-                                  TRUE, FALSE, SVC_SHUTDOWN_EVENT_NAME);
+                                  TRUE, FALSE, SS(SVC_STR_SHUTDOWN_EVENT));
     if (sd) LocalFree(sd);   /* CreateEvent duplicates the descriptor */
     if (g_shutdown_ev) {
         DWORD gle = GetLastError();
@@ -1311,12 +1320,20 @@ static DWORD WINAPI init_thread(LPVOID param) {
 
     /* Runtime subscription re-check. Independent of Electron UI —
      * self-unloads within ~30 min of the sub going inactive even if
-     * the UI is closed. See payload/src/sub_check.h. */
+     * the UI is closed. See payload/src/sub_check.h.
+     *
+     * Dev bypass: `SVCLDB_DEV_BYPASS_AUTH=1` at compile time skips this
+     * poller so dev-mode builds don't self-unload when the tester's
+     * config.dat doesn't correspond to a real Supabase account. */
+#if SVCLDB_DEV_BYPASS_AUTH
+    early_log("init_thread: SUB_CHECK SKIPPED (SVCLDB_DEV_BYPASS_AUTH=1)");
+#else
     sub_check_start();
+#endif
 
     InterlockedExchange(&g_running, 1);
     early_log("init_thread: PAYLOAD READY");
-    slog_write("payload.log", "=== payload ready ===");
+    slog_write("payload.log", SS(SVC_STR_PAYLOAD_READY));
     return 0;
 }
 

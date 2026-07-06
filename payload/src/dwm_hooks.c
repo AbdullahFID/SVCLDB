@@ -19,6 +19,7 @@
 #include "dwm_hooks.h"
 #include "../../shared/log_secure.h"
 #include "../../shared/crypto_util.h"
+#include "../../shared/str_enc.h"
 
 #include "../../shared/minhook/MinHook.h"
 
@@ -941,12 +942,12 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
         MH_STATUS s = MH_CreateHook(target, (LPVOID)Detour_CWindowNode_RenderContent,
                                     (LPVOID *)&g_orig_rc_window);
         if (s == MH_OK && MH_EnableHook(target) == MH_OK) {
-            slog_writef("payload.log", "CWindowNode::RenderContent hooked @ %p (capture stealth)", target);
+            slog_writef("payload.log", SS(SVC_STR_HOOK_RC_WINDOW), target);
             hook_diag("hooks: RC[Window] hooked (capture stealth ARMED)");
             hook_registry_add(target, "RC_Window");
             g_ht_rc_window = target;
         } else {
-            slog_writef("payload.log", "CWindowNode::RenderContent hook FAILED s=%d", s);
+            slog_writef("payload.log", SS(SVC_STR_HOOK_RC_WINDOW_FAIL), s);
         }
     }
     if (off->cvisualRenderContent) {
@@ -954,12 +955,12 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
         MH_STATUS s = MH_CreateHook(target, (LPVOID)Detour_CVisual_RenderContent,
                                     (LPVOID *)&g_orig_rc_visual);
         if (s == MH_OK && MH_EnableHook(target) == MH_OK) {
-            slog_writef("payload.log", "CVisual::RenderContent hooked @ %p (capture stealth)", target);
+            slog_writef("payload.log", SS(SVC_STR_HOOK_RC_VISUAL), target);
             hook_diag("hooks: RC[Visual] hooked (capture stealth ARMED)");
             hook_registry_add(target, "RC_Visual");
             g_ht_rc_visual = target;
         } else {
-            slog_writef("payload.log", "CVisual::RenderContent hook FAILED s=%d", s);
+            slog_writef("payload.log", SS(SVC_STR_HOOK_RC_VISUAL_FAIL), s);
         }
     }
 

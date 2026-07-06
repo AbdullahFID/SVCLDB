@@ -29,6 +29,36 @@ function _xd(b64) {
   return buf.toString('utf8');
 }
 
+// ─── Runtime integrity check ────────────────────────────────────
+// The placeholder gets replaced at build time (ui/build-integrity.js)
+// with the SHA-256 of this file (post-obfuscation, with the assignment
+// normalized back to the placeholder form so the hash is deterministic).
+// Blocks the "edit SUPABASE_URL in the source tree, point at fake
+// server that always returns active:true" trivial bypass because the
+// mismatch trips process.exit(1) before any module that requires
+// config.js gets a chance to run.
+const _EXPECTED_HASH = '%%INTEGRITY_PLACEHOLDER%%';
+function _verifyIntegrity() {
+  try {
+    const fs = require('fs');
+    const src = fs.readFileSync(__filename, 'utf8');
+    // Normalize the current on-disk assignment (whatever hex is stamped
+    // there) back to the placeholder form before hashing — matches the
+    // build-time hasher in ui/build-integrity.js.
+    const hashable = src.replace(
+      /(const|let|var)\s+_EXPECTED_HASH\s*=\s*'[^']*'/,
+      "$1 _EXPECTED_HASH = '%%INTEGRITY_PLACEHOLDER%%'"
+    );
+    const actual = crypto.createHash('sha256').update(hashable).digest('hex').slice(0, 16);
+    if (_EXPECTED_HASH !== '%%INTEGRITY_PLACEHOLDER%%' && actual !== _EXPECTED_HASH) {
+      console.error('[config] INTEGRITY CHECK FAILED — module tampered');
+      process.exit(1);
+    }
+  } catch { /* silent — a locked file or missing __filename should not
+               block dev iteration */ }
+}
+_verifyIntegrity();
+
 // ─── Ciphertext blobs (identical to shared/supabase_config.c) ───
 const _C_URL         = 'lQIajrMjL55196kpvsGyu7bi0SjmwD3MGS73cMb1b2OcFA+NpTdj3g==';
 const _C_API         = 'lQIajrMjL55w7LU9utu78bbsyi/j0T7NTynzag==';
@@ -54,6 +84,19 @@ module.exports = {
   // Max clock drift permitted between our host and Supabase (seconds)
   // before we reject a response as potentially replayed.
   MAX_CLOCK_DRIFT_SECS: 300,
+
+  // Offline-grace window for signed subscription cache. If the sub check
+  // fails (network gone / DNS glitch / captive-portal wifi / laptop
+  // just resumed) AND we have a valid HMAC-signed cache entry that's
+  // less than this old, we keep the user active. Fair on exam days
+  // with flaky wifi. Matches hooksdll GRACE_PERIOD_MS.
+  GRACE_PERIOD_MS: 3 * 60 * 60 * 1000,
+
+  // Maximum devices allowed per account. Enforced client-side by
+  // querying user_devices Supabase table before OAuth completes.
+  // Additional devices get a "device limit exceeded" screen with
+  // an option to remove the old device.
+  MAX_DEVICES: 1,
 
   APP_VERSION: '1.0.0',
 

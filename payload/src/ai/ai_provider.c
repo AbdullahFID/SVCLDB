@@ -27,6 +27,7 @@
 #include "../../../shared/json_util.h"
 #include "../../../shared/log_secure.h"
 #include "../../../shared/winhttp_util.h"
+#include "../../../shared/str_enc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -972,8 +973,8 @@ static int build_request(const svc_config_t *cfg, const char *user_prompt,
                 _snprintf(err, err_sz - 1, "openai json build failed");
                 return 0;
             }
-            _snprintf(url,      url_sz - 1,  "https://api.openai.com/v1/chat/completions");
-            _snprintf(auth_hdr, auth_sz - 1, "Authorization: Bearer %s", cfg->api_key);
+            _snprintf(url,      url_sz - 1,  "%s", SS(SVC_STR_OPENAI_CHAT_URL));
+            _snprintf(auth_hdr, auth_sz - 1, SS(SVC_STR_AUTH_HEADER_FMT), cfg->api_key);
             hdrs[0] = "Content-Type: application/json";
             hdrs[1] = auth_hdr;
             hdrs[2] = NULL;
@@ -984,8 +985,8 @@ static int build_request(const svc_config_t *cfg, const char *user_prompt,
                 _snprintf(err, err_sz - 1, "openrouter json build failed");
                 return 0;
             }
-            _snprintf(url,       url_sz - 1,   "https://openrouter.ai/api/v1/chat/completions");
-            _snprintf(auth_hdr,  auth_sz - 1,  "Authorization: Bearer %s", cfg->api_key);
+            _snprintf(url,       url_sz - 1,   "%s", SS(SVC_STR_OPENROUTER_URL));
+            _snprintf(auth_hdr,  auth_sz - 1,  SS(SVC_STR_AUTH_HEADER_FMT), cfg->api_key);
             _snprintf(extra_hdr, extra_sz - 1, "HTTP-Referer: https://localhost");
             hdrs[0] = "Content-Type: application/json";
             hdrs[1] = auth_hdr;
@@ -999,11 +1000,11 @@ static int build_request(const svc_config_t *cfg, const char *user_prompt,
                 _snprintf(err, err_sz - 1, "anthropic json build failed");
                 return 0;
             }
-            _snprintf(url,      url_sz - 1,  "https://api.anthropic.com/v1/messages");
+            _snprintf(url,      url_sz - 1,  "%s", SS(SVC_STR_ANTHROPIC_MSG_URL));
             _snprintf(auth_hdr, auth_sz - 1, "x-api-key: %s", cfg->api_key);
             hdrs[0] = "Content-Type: application/json";
             hdrs[1] = auth_hdr;
-            hdrs[2] = "anthropic-version: 2023-06-01";
+            hdrs[2] = SS(SVC_STR_ANTHROPIC_VERSION);
             hdrs[3] = NULL;
             break;
         case SVC_PROVIDER_GOOGLE:
@@ -1012,7 +1013,8 @@ static int build_request(const svc_config_t *cfg, const char *user_prompt,
                 return 0;
             }
             _snprintf(url, url_sz - 1,
-                      "https://generativelanguage.googleapis.com/v1beta/models/%s:%s",
+                      "%s/%s:%s",
+                      SS(SVC_STR_GOOGLE_GEN_URL),
                       model_id,
                       enable_streaming ? "streamGenerateContent?alt=sse" : "generateContent");
             _snprintf(auth_hdr, auth_sz - 1, "x-goog-api-key: %s", cfg->api_key);
@@ -1456,8 +1458,9 @@ int ai_ask_streaming(const svc_config_t *cfg,
         if (!key) {
             if (i == 0) {
                 _snprintf(last_err, sizeof(last_err) - 1,
-                          "no api key for %s — configure one in the CloakGPT dashboard",
-                          ai_provider_name(prov));
+                          "no api key for %s — configure one in the %s dashboard",
+                          ai_provider_name(prov),
+                          SS(SVC_STR_PRODUCT_NAME));
             }
             continue;
         }
