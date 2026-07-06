@@ -175,19 +175,81 @@ document.getElementById('copy-auth-url').addEventListener('click', async () => {
 
 // ─── No-subscription screen ────────────────────────────────────
 function _renderNoSub() {
-  document.getElementById('nosub-email').textContent = state.session?.email || '—';
+  const s = state.session || {};
+  const email = s.email || '';
+  const displayName = s.display_name || (email.split('@')[0]) || 'user';
+
+  document.getElementById('nosub-email').textContent = email || '(unknown account)';
   document.getElementById('nosub-device').textContent = shortenHwid(state.hwid);
+
+  const av = document.getElementById('nosub-avatar');
+  av.innerHTML = '';
+  if (s.avatar_url) {
+    const img = document.createElement('img');
+    img.src = s.avatar_url;
+    img.referrerPolicy = 'no-referrer';
+    img.onerror = () => { av.textContent = displayName.charAt(0).toUpperCase(); };
+    av.appendChild(img);
+  } else {
+    av.textContent = displayName.charAt(0).toUpperCase();
+  }
+
+  const sub = state.subscription || {};
+  const statusEl = document.getElementById('nosub-status');
+  if (sub.error) {
+    statusEl.innerHTML = `Couldn't reach license server: <b>${escapeHtml(sub.error)}</b>`;
+  } else {
+    statusEl.innerHTML = `Subscription status: <b>${escapeHtml(sub.status || 'not_found')}</b>`;
+  }
 }
+
 document.getElementById('btn-nosub-billing').addEventListener('click', () => {
-  window.svc.shell.openExternal('https://windows.cloakgpt.ca/billing');
+  window.svc.shell.openExternal('https://cloakgpt.ca/dashboard');
 });
-document.getElementById('btn-nosub-signout').addEventListener('click', async () => {
+
+document.getElementById('btn-nosub-retry').addEventListener('click', async () => {
+  showLoading('Re-checking subscription…', 'Querying Supabase for active grants + subscriptions.');
+  try {
+    const dto = await window.svc.license.load();
+    hideLoading();
+    if (!dto || !dto.session) {
+      state.session = null; state.subscription = null;
+      _renderLoginDeviceId();
+      showScreen('login');
+      toast('Signed out — please sign in again.', 'err');
+      return;
+    }
+    state.session = dto.session;
+    state.subscription = dto.subscription;
+    state.hwid = dto.hwid || state.hwid;
+    if (dto.subscription && dto.subscription.active) {
+      _renderDashboard();
+      showScreen('dashboard');
+      pollStatusLoop();
+      toast('Subscription active — welcome back.', 'ok');
+    } else {
+      _renderNoSub();
+      const why = (dto.subscription && dto.subscription.error) ? ` (${dto.subscription.error})` : '';
+      toast(`Still no active subscription${why}.`, 'err');
+    }
+  } catch (e) {
+    hideLoading();
+    toast(`Retry failed: ${e.message || e}`, 'err');
+  }
+});
+
+async function _doSignOutAndReturnToLogin() {
   showLoading('Signing out…');
   await window.svc.license.signOut();
   hideLoading();
   state.session = null; state.subscription = null;
   _renderLoginDeviceId();
   showScreen('login');
+}
+document.getElementById('btn-nosub-signout').addEventListener('click', _doSignOutAndReturnToLogin);
+document.getElementById('nosub-switch-account').addEventListener('click', (e) => {
+  e.preventDefault();
+  _doSignOutAndReturnToLogin();
 });
 
 // ─── Dashboard ─────────────────────────────────────────────────

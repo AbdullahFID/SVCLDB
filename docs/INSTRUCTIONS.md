@@ -1,4 +1,4 @@
-# CloakGPT — Setup Guide
+﻿# CloakGPT — Setup Guide
 
 Everything you need to install and run CloakGPT on Windows 10 or 11.
 Read once, top to bottom — takes ~5 minutes.
@@ -251,7 +251,7 @@ on the Dashboard.
   (drift = suspected replay attack, we reject the response).
 - Fix: sync your Windows clock (**Settings → Time & language → Date &
   time → Sync now**). If sub is actually inactive, renew it at
-  `windows.cloakgpt.ca/billing`.
+  `cloakgpt.ca/dashboard`.
 
 ### "AI answer is taking forever" (5+ minutes with no output)
 - You're using a reasoning model (o3, gpt-5.5-pro, Opus 4.8, Gemini

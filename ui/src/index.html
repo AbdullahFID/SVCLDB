@@ -78,22 +78,36 @@
       </div>
     </section>
 
-    <!-- ═══ No-subscription — inline mirror of the browser page ═══ -->
+    <!-- ═══ No-subscription card ═══ -->
     <section id="screen-nosub" class="screen">
       <div class="center-container">
-        <div class="card login-card">
-          <div class="logo-big" style="background:linear-gradient(135deg,#f59e0b,#fbbf24)">
-            <svg viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 9v4"/><path d="M12 17h.01"/>
+        <div class="card login-card card-warn">
+          <div class="logo-big">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 9v4"/>
+              <path d="M12 17h.01"/>
               <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
             </svg>
           </div>
-          <h1 style="background:linear-gradient(135deg,#ffffff 0%,#fcd34d 100%);-webkit-background-clip:text;background-clip:text;color:transparent">No active subscription</h1>
-          <p class="tagline">You're signed in as <b id="nosub-email">…</b>, but this Google account doesn't have an active CloakGPT subscription.</p>
-          <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:8px">
-            <button id="btn-nosub-billing" class="btn btn-primary">Get subscription</button>
+          <h1>No active subscription</h1>
+          <div class="identity-pill">
+            <div class="avatar" id="nosub-avatar">?</div>
+            <div class="email" id="nosub-email">&nbsp;</div>
+          </div>
+          <p class="tagline">This Google account doesn't have an active CloakGPT subscription. Grab one at <b>cloakgpt.ca/dashboard</b> or sign in with a different account.</p>
+          <div class="actions-row">
+            <button id="btn-nosub-billing" class="btn btn-primary">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+              Get subscription
+            </button>
+            <button id="btn-nosub-retry" class="btn btn-secondary">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+              Retry check
+            </button>
             <button id="btn-nosub-signout" class="btn btn-secondary">Sign out</button>
           </div>
+          <div class="status-line"><span class="dot"></span><span id="nosub-status">Subscription status: <b>not_found</b></span></div>
+          <p class="helper">Wrong Google account? <a id="nosub-switch-account">Sign out</a> and choose a different one on the next Google sign-in.</p>
           <div class="device-id" id="nosub-device"></div>
         </div>
       </div>

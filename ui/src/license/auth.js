@@ -1,4 +1,4 @@
-// ═══════════════════════════════════════════════════════════════
+﻿// ═══════════════════════════════════════════════════════════════
 // auth.js — Supabase PKCE OAuth via local HTTP callback + system browser.
 //
 // Adapted from hooksdll/lumio/src/license/auth.js. Kept the same
@@ -602,7 +602,7 @@ h1{font-size:24px;font-weight:600;margin-bottom:8px;letter-spacing:-.02em}
   </div>
   <div class="status-line fade-in-3"><span class="dot"></span>Subscription status: <b>${escapeHTML(statusLabel)}</b></div>
   <div class="actions fade-in-4">
-    <a href="https://windows.cloakgpt.ca/billing" class="btn btn-primary" target="_blank" rel="noopener">
+    <a href="https://cloakgpt.ca/dashboard" class="btn btn-primary" target="_blank" rel="noopener">
       <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
       Get subscription
     </a>

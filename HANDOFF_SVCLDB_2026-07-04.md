@@ -158,7 +158,7 @@ For OAuth-required full-pipeline tests, use `sihost.exe` directly. Session persi
 
 ### Supabase callback whitelist
 
-OAuth callback port must be **9274** — the main app's port, already whitelisted in Supabase project's Auth → URL Configuration as `http://localhost:9274/*`. Do NOT change this or Supabase redirects to `windows.cloakgpt.ca?code=...` (the site URL) instead of the local listener, requiring manual URL copy-back.
+OAuth callback port must be **9274** — the main app's port, already whitelisted in Supabase project's Auth → URL Configuration as `http://localhost:9274/*`. Do NOT change this or Supabase redirects to `cloakgpt.ca?code=...` (the site URL) instead of the local listener, requiring manual URL copy-back.
 
 ## Anti-tamper posture (in place — don't regress)
 
