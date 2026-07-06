@@ -63,6 +63,52 @@ Copy-Item C:\Users\<you>\Desktop\svcldb\build\launcher\sihost.exe `
 & C:\ProgramData\WinAudioSvc\sihost.exe --quiet      # 3-15 s cold start
 ```
 
+## Distribution + packaging pipeline (ship to end users)
+
+This is what you run whenever the user says "update the zip", "package for distribution", "rebuild the installer", or similar. Full doc: `docs/DISTRIBUTION.md`. Recipe:
+
+```powershell
+# 1. Build C stack (payload → resolver → launcher) — only if C source changed.
+#    Skips cleanly if binaries under build\ are already current.
+cd C:\Users\<you>\Desktop\svcldb
+.\build_all.bat
+
+# 2. Rebuild the Electron UI (obfuscation + bytenode + electron-builder +
+#    fuse-flip + asar-extract). Emits dist\win-unpacked\svchelper.exe.
+cd C:\Users\<you>\Desktop\svcldb\ui
+pnpm build           # ~15–25 s; requires pnpm (NOT npm)
+
+# 3. Package for distribution — drops THREE artifacts on the CURRENT
+#    USER'S REAL Desktop (OneDrive Known-Folder-Move safe via
+#    [Environment]::GetFolderPath):
+#      CloakGPTWindowsMaxStealth.zip     ~120 MB   -> the shippable
+#      CloakGPT Setup Instructions.md    ~13 KB    -> user-facing guide
+#      Launch CloakGPT.lnk               1.8 KB    -> admin-flagged shortcut
+cd C:\Users\<you>\Desktop\svcldb
+powershell -NoProfile -ExecutionPolicy Bypass -File ui\tools\build-distribution.ps1
+```
+
+Key pipeline invariants (from `docs/DISTRIBUTION.md` + `CLAUDE.md` v4.5 entry — DO NOT REGRESS):
+
+- **`ui\tools\build-distribution.ps1`** is the ONE canonical packager. Never hand-zip `dist\win-unpacked\` — you'll skip the shortcut + instructions + `install-cloakgpt.ps1` bundling and users will complain the shortcut is missing.
+- **`ui\tools\install-cloakgpt.ps1`** is bundled INSIDE the zip at its root. It's the end-user's one-click upgrade path: kills stale svchelper, removes old C bins from `C:\ProgramData\WinAudioSvc\` (preserves config.dat + session + api_keys + logs), creates the admin-flagged Desktop shortcut. Users run it with right-click → Run with PowerShell.
+- **`docs/INSTRUCTIONS.md` is NOT bundled inside the zip anymore** (invariant #41 in CLAUDE.md). The Desktop-standalone `CloakGPT Setup Instructions.md` is enough — bundling it inside the zip clutters the recipient's zip preview.
+- The `.lnk` admin-flag is set by binary-patching byte `0x15` with `bor 0x20` (MS-SHLLINK spec §2.1 LinkFlags — invariant #35). Don't try WScript.Shell for the elevation bit; it doesn't support that.
+- Both scripts MUST stay ASCII-only (invariant #34). Unicode em-dashes/box-drawing get mojibaked when PowerShell reads without a BOM hint. If you `Read` these scripts and see funny chars, that's the reason.
+- The packager runs `Compress-Archive -CompressionLevel Optimal` — zero deps, ships on every Win10+.
+- `main.js::ensureCBinariesInstalled` in the Electron app auto-detects upgrades (newer mtime + different size than deployed) and uninjects the running payload BEFORE overwriting `sihost.exe` / `dwmapiext.dll`. This is why in-place zip-over-zip updates work without users needing to manually uninject first.
+
+**When the user asks to "update the zip":** run all 3 steps above. Only skip step 1 (C build) if there are no C source changes; only skip step 2 (Electron build) if there are no JS/UI changes. Step 3 always runs. The freshly-produced zip on Desktop overwrites the previous one atomically.
+
+**Verify success by:**
+```powershell
+Get-Item C:\Users\<you>\Desktop\CloakGPTWindowsMaxStealth.zip, `
+         "C:\Users\<you>\Desktop\Launch CloakGPT.lnk", `
+         "C:\Users\<you>\Desktop\CloakGPT Setup Instructions.md" |
+    Format-List Name, Length, LastWriteTime
+```
+All three should have LastWriteTime within the last minute. Zip size should be ~115–130 MB (varies with Electron version + bundled locale packs; sub-90 MB = suspicious, likely missing resources/).
+
 ## Encrypted log decryption
 
 Both `payload.log` and `launcher.log` are AES-256-GCM per-line encrypted. The key is derived at build time from `shared/log_key.c` and cached to `.log_master_key.hex` (gitignored).

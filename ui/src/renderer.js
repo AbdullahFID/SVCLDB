@@ -268,8 +268,42 @@ function _renderNoSub() {
 
   const sub = state.subscription || {};
   const statusEl = document.getElementById('nosub-status');
-  if (sub.error) {
-    statusEl.innerHTML = `Couldn't reach license server: <b>${escapeHtml(sub.error)}</b>`;
+
+  // v4.9: structured error shape from subscription.js.
+  //   error.kind = 'http' | 'network' | 'schema' | 'clock_drift'
+  // Show a specific, actionable message per kind instead of dumping
+  // the internal message string (which used to include garbage like
+  // "subscriptions http 400" that customers can't act on).
+  if (sub && sub.error && typeof sub.error === 'object') {
+    const err = sub.error;
+    if (err.kind === 'schema') {
+      // PostgREST 42703 — server schema mismatch. This is OUR bug, not
+      // the user's. Different copy so support isn't flooded with
+      // "why is my subscription showing as inactive" tickets.
+      statusEl.innerHTML =
+        `<b>License server error</b> — the client is asking for a column ` +
+        `the server doesn't have. Please contact <b>support@cloakgpt.ca</b> ` +
+        `with the code <code>SCHEMA_${escapeHtml(err.endpoint || 'unknown')}_${err.statusCode || '?'}</code>. ` +
+        `This is not a subscription problem.`;
+    } else if (err.kind === 'network') {
+      statusEl.innerHTML =
+        `Couldn't reach the license server — check your internet connection and click <b>Retry check</b>.`;
+    } else if (err.kind === 'clock_drift') {
+      statusEl.innerHTML =
+        `System clock drift detected (${err.drift || '?'}s off). ` +
+        `Fix your Windows time settings (Settings → Time & Language → Date & time → Sync now) and click <b>Retry check</b>.`;
+    } else {
+      // Generic HTTP error (401 → we'd already be at login; 403 / 5xx / etc).
+      statusEl.innerHTML =
+        `License server returned HTTP <b>${err.statusCode || '?'}</b> on <b>${escapeHtml(err.endpoint || 'sub check')}</b>. ` +
+        `Click <b>Retry check</b>. If this persists, contact support.`;
+    }
+  } else if (sub && sub._fromCache) {
+    // We're serving offline-grace cache; show it as such so the user
+    // knows the network is off, not that their sub is inactive.
+    const ageMin = Math.floor((sub._cacheAgeMs || 0) / 60000);
+    statusEl.innerHTML =
+      `Using cached subscription (last verified ${ageMin} min ago) — will re-check when back online.`;
   } else {
     statusEl.innerHTML = `Subscription status: <b>${escapeHtml(sub.status || 'not_found')}</b>`;
   }
@@ -282,26 +316,31 @@ document.getElementById('btn-nosub-billing').addEventListener('click', () => {
 document.getElementById('btn-nosub-retry').addEventListener('click', async () => {
   showLoading('Re-checking subscription…', 'Querying Supabase for active grants + subscriptions.');
   try {
-    const dto = await window.svc.license.load();
+    // v4.9: use lightweight revalidate IPC instead of full license:load.
+    // Doesn't re-run security scans or session recovery — just re-hits
+    // Supabase with current token (refresh if needed).
+    const r = await window.svc.license.revalidate();
     hideLoading();
-    if (!dto || !dto.session) {
-      state.session = null; state.subscription = null;
-      _renderLoginDeviceId();
+    if (r && r.securityBlocked) {
+      showLoginError(r.err || 'Security check blocked re-validation.');
       showScreen('login');
-      toast('Signed out — please sign in again.', 'err');
       return;
     }
-    state.session = dto.session;
-    state.subscription = dto.subscription;
-    state.hwid = dto.hwid || state.hwid;
-    if (dto.subscription && dto.subscription.active) {
+    if (!r || !r.ok) {
+      const why = r && r.err ? ` (${_shortErr(r.err)})` : '';
+      toast(`Retry failed${why}.`, 'err');
+      return;
+    }
+    const sub = r.subscription;
+    state.subscription = sub;
+    if (sub && sub.active) {
       _renderDashboard();
       showScreen('dashboard');
       pollStatusLoop();
       toast('Subscription active — welcome back.', 'ok');
     } else {
       _renderNoSub();
-      const why = (dto.subscription && dto.subscription.error) ? ` (${dto.subscription.error})` : '';
+      const why = _describeSubError(sub);
       toast(`Still no active subscription${why}.`, 'err');
     }
   } catch (e) {
@@ -309,6 +348,24 @@ document.getElementById('btn-nosub-retry').addEventListener('click', async () =>
     toast(`Retry failed: ${e.message || e}`, 'err');
   }
 });
+
+// Format a subscription error for a brief toast message. Uses the same
+// structured error shape (from subscription.js v4.9).
+function _describeSubError(sub) {
+  if (!sub || !sub.error) return '';
+  const e = sub.error;
+  if (typeof e === 'string') return ` (${e})`;
+  if (e.kind === 'schema') return ` (server schema error — support code SCHEMA_${e.endpoint}_${e.statusCode})`;
+  if (e.kind === 'network') return ' (network unreachable)';
+  if (e.kind === 'clock_drift') return ` (clock drift ${e.drift}s)`;
+  return e.statusCode ? ` (HTTP ${e.statusCode})` : ` (${e.message || 'unknown'})`;
+}
+function _shortErr(e) {
+  if (!e) return '';
+  if (typeof e === 'string') return e.slice(0, 120);
+  if (e.message) return String(e.message).slice(0, 120);
+  return String(e).slice(0, 120);
+}
 
 async function _doSignOutAndReturnToLogin() {
   showLoading('Signing out…');
@@ -462,7 +519,28 @@ function _renderDeviceLimit(dto) {
       } else {
         b.disabled = false;
         b.textContent = 'Remove';
-        toast(`Remove failed: ${(r && r.err) || 'unknown error'}`, 'err');
+        // v4.9: server-side has NO DELETE RLS policy for authenticated
+        // users on user_devices. registration.deleteDevice returns
+        // needsSupportAction=true in that case. Show a longer, clearer
+        // message using a confirm dialog instead of a fleeting toast so
+        // the user has time to copy the support-contact instructions.
+        if (r && r.needsSupportAction) {
+          const supportMsg =
+            `Device removal isn't self-serve yet.\n\n` +
+            `Please email support@cloakgpt.ca with the subject:\n` +
+            `  "Remove device: ${(hwid || '').slice(0, 12)}..."\n\n` +
+            `Include your account email (${state.session?.email || '(sign-in email)'}). ` +
+            `We'll remove it within one business day so you can sign in on this PC.\n\n` +
+            `Click OK to copy the support email address to your clipboard.`;
+          if (confirm(supportMsg)) {
+            try {
+              navigator.clipboard.writeText('support@cloakgpt.ca');
+              toast('support@cloakgpt.ca copied to clipboard.', 'ok');
+            } catch { /* clipboard denied — fine, user knows the address */ }
+          }
+        } else {
+          toast(`Remove failed: ${(r && r.err) || 'unknown error'}`, 'err');
+        }
       }
     });
   }
@@ -888,9 +966,10 @@ if (window.svc && typeof window.svc.on === 'function') {
     clearInterval(_pollTimer);
     const reason = (info && info.reason) || 'unknown';
 
-    // SUSPENDED (chargeback / TOS ban) → dedicated ban screen. Preserve
-    // the session's email/avatar for display (main.js passes it back
-    // in preservedSession since currentSess is cleared before lockout).
+    // v4.9: server-side has no suspension concept anymore (see
+    // subscription.js header). The `subscription_suspended` branch is
+    // kept dormant below — it will never fire but if we ever add
+    // server-side suspensions it's ready.
     if (reason === 'subscription_suspended') {
       const preserved = info.preservedSession || {};
       state.session = {
@@ -918,6 +997,13 @@ if (window.svc && typeof window.svc.on === 'function') {
       msg = 'Your CloakGPT subscription is no longer active. The overlay has been unloaded. Please renew and sign in again.';
     } else if (reason.startsWith('too_many_failures')) {
       msg = 'Could not reach the license server after several attempts. The overlay has been unloaded for safety. Sign in again once you have a stable connection.';
+    } else if (reason === 'license_server_schema_error') {
+      // v4.9: PostgREST returned 42703 (column does not exist) — this is a
+      // client/server schema mismatch, not the user's fault. Show a
+      // support-contact message instead of the generic "renew subscription".
+      const err = info && info.serverError;
+      const code = err ? `SCHEMA_${err.endpoint || 'unknown'}_${err.statusCode || '?'}` : 'SCHEMA_UNKNOWN';
+      msg = `License server error — a schema mismatch is preventing verification. Please contact support@cloakgpt.ca with code ${code}. This is not a subscription problem; DO NOT renew.`;
     }
     showLoginError(msg);
     showScreen('login');

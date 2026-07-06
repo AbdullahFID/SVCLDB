@@ -363,12 +363,17 @@ ipcMain.handle('license:load', async () => {
     revalidation.stop();
     return { session: null, subscription: null, clearReason };
   }
+  const hwid = device.getCached()?.hardware_uuid || null;
+
   // v4.5.3: proactively refresh an expired (or about-to-expire) access
   // token BEFORE hitting Supabase. Supabase JWTs are 1h — if the user
   // quit + reopened after that window, the on-disk session has a stale
-  // access_token that gets 401'd on every REST query (sub check, RLS,
-  // everything). Refresh once; if that also fails, fall through to the
-  // sub check with the stale token so the UI still surfaces a real error.
+  // access_token that gets 401'd on every REST query.
+  //
+  // v4.9: on REFRESH failure due to NETWORK error, short-circuit into
+  // signed-cache offline-grace path instead of falling through to a
+  // sub check we know will also fail. Matches hooksdll behavior +
+  // avoids an extra failed request when we're offline.
   if (storage.isExpired(session) && session.refresh_token) {
     try {
       console.log('[main] access token expired on load - refreshing...');
@@ -377,10 +382,32 @@ ipcMain.handle('license:load', async () => {
                   new Date((session.expires_at || 0) * 1000).toISOString());
     } catch (e) {
       console.log('[main] refresh failed:', e.message);
+      // Network-error refresh failure → try signed cache before giving up.
+      const isNetworkErr = /fetch|network|timeout|ETIMEDOUT|ENOTFOUND|ECONNRESET|ECONNREFUSED|abort/i.test(e.message || '');
+      if (isNetworkErr) {
+        try {
+          const cached = storage.loadSubscriptionCache();
+          if (cached && subscription.verifySubCache(cached, hwid) &&
+              cached.active && cached._cachedAt) {
+            const ageMs = Date.now() - cached._cachedAt * 1000;
+            const { GRACE_PERIOD_MS } = require('./license/config');
+            if (ageMs < GRACE_PERIOD_MS) {
+              console.log(`[main] refresh offline; using signed cache ` +
+                          `(${Math.round(ageMs/1000)}s / ${GRACE_PERIOD_MS/1000}s grace)`);
+              currentSess = session;
+              currentSub = { ...cached, _fromCache: true, _cacheAgeMs: ageMs };
+              startRevalidationLoop();
+              return _sessionDto();
+            }
+          }
+        } catch (cacheErr) {
+          console.log('[main] refresh-offline cache load failed:', cacheErr.message);
+        }
+      }
+      // Fall through — the sub check will hit 401 which we handle below.
     }
   }
   currentSess = session;
-  const hwid = device.getCached()?.hardware_uuid || null;
   try {
     currentSub = await subscription.checkSubscription(session.access_token);
     if (currentSub && currentSub.active) {
@@ -407,25 +434,29 @@ ipcMain.handle('license:load', async () => {
       }
     } catch {}
     if (!usedCache) {
-      currentSub = { active: null, plan: null, status: 'unknown', error: e.message };
+      currentSub = {
+        active: null, plan: null, status: 'unknown',
+        error: { kind: 'network', message: e.message || String(e) },
+      };
     }
   }
-  // If the sub check itself returned 401, that means EVEN the refreshed
-  // token is bad → force a full re-login rather than showing an
-  // unrecoverable "no active subscription" screen.
-  if (currentSub && currentSub.error && /http 401/.test(currentSub.error)) {
+  // If the sub check hit 401, EVEN the refreshed token is bad → force
+  // full re-login rather than showing an unrecoverable "no active
+  // subscription" screen.
+  //
+  // v4.9: use structured error shape (checkSubscription now returns
+  // { error: { kind, statusCode, endpoint, ... } }) instead of the
+  // fragile /http 401/ regex on a stringly-typed field.
+  if (currentSub && currentSub.error &&
+      typeof currentSub.error === 'object' &&
+      currentSub.error.kind === 'http' &&
+      currentSub.error.statusCode === 401) {
     console.log('[main] 401 on sub check even after refresh - forcing re-login');
     storage.clearSession();
     storage.clearSubscriptionCache();
     currentSess = null; currentSub = null;
     revalidation.stop();
     return { session: null, subscription: null, clearReason: 'token_rejected' };
-  }
-  // If the account is SUSPENDED, don't kick to nosub — the renderer has
-  // a dedicated ban screen with the reason.
-  if (currentSub && currentSub.status === 'suspended') {
-    console.log('[main] SUSPENDED account on load — showing ban screen');
-    return _sessionDto();
   }
   if (currentSub && currentSub.active) startRevalidationLoop();
   return _sessionDto();
@@ -483,13 +514,56 @@ ipcMain.handle('license:sign-in', async () => {
         storage.saveSubscriptionCache(currentSub);
       }
     } catch (e) {
-      currentSub = { active: null, plan: null, status: 'unknown', error: e.message };
+      currentSub = {
+        active: null, plan: null, status: 'unknown',
+        error: { kind: 'network', message: e.message || String(e) },
+      };
     }
     if (currentSub && currentSub.active) startRevalidationLoop();
     return _sessionDto();
   } catch (e) {
     console.log('[main] sign-in failed:', e.message);
     return { error: e.message };
+  }
+});
+
+// v4.9: lightweight force-recheck path for the renderer. Doesn't touch
+// the session or run OAuth — just re-hits Supabase for the current sub
+// state + refreshes the signed cache. Renderer wires the "Retry check"
+// button on the nosub screen through this instead of the heavier
+// license:load (which re-runs the whole security + session recovery
+// dance).
+ipcMain.handle('license:revalidate', async () => {
+  if (!currentSess) return { ok: false, err: 'not signed in' };
+  // Re-run security checks — user may have opened x64dbg since load.
+  const secResult = await security.runChecks();
+  if (!secResult.ok) {
+    console.log('[main] revalidate: security blocked:', secResult.reason);
+    return { ok: false, err: secResult.reason, securityBlocked: true };
+  }
+  const hwid = device.getCached()?.hardware_uuid || null;
+  // Refresh token first if it's about to expire.
+  if (storage.isExpired(currentSess) && currentSess.refresh_token) {
+    try {
+      currentSess = await auth.refreshSession(currentSess);
+      if (mainWin && !mainWin.isDestroyed()) {
+        mainWin.webContents.send('license:session-updated', _sessionDto());
+      }
+    } catch (e) {
+      console.log('[main] revalidate: refresh failed:', e.message);
+    }
+  }
+  try {
+    const sub = await subscription.checkSubscription(currentSess.access_token);
+    if (sub && sub.active) {
+      subscription.attachSigToCache(sub, hwid);
+      storage.saveSubscriptionCache(sub);
+    }
+    currentSub = sub;
+    if (sub && sub.active && !revalidation.isRunning()) startRevalidationLoop();
+    return { ok: true, subscription: sub };
+  } catch (e) {
+    return { ok: false, err: e.message || String(e) };
   }
 });
 
@@ -839,6 +913,16 @@ function startRevalidationLoop() {
     getSession: () => currentSess,
     refreshFn:  async (s) => auth.refreshSession(s),
     subCheckFn: async (t) => {
+      // v4.9: run security checks on every tick — a user could have
+      // launched x64dbg / WireShark AFTER signing in. Without this,
+      // the app kept running until the next full restart.
+      const sec = await security.runChecks();
+      if (!sec.ok) {
+        console.log('[main] revalidation: security check failed:', sec.reason);
+        const err = new Error(sec.reason || 'security_check_failed');
+        err.securityBlocked = true;
+        throw err;
+      }
       const r = await subscription.checkSubscription(t);
       // Keep in-mem sub current so the dashboard reflects live state.
       if (r && r.active) currentSub = r;
@@ -865,29 +949,20 @@ function startRevalidationLoop() {
     },
     onExpired: async (reason, extra) => {
       console.log('[main] LOCKOUT:', reason, extra || '');
-      const wasSuspended = (reason === 'subscription_suspended');
-      const suspensionInfo = wasSuspended && extra ? {
-        suspension_reason: extra.suspension_reason || null,
-        suspended_at:      extra.suspended_at || null,
-      } : null;
-      // Preserve the session for the ban screen so the renderer can
-      // show the user's email + support link. Otherwise clear it.
-      const preservedSession = wasSuspended && currentSess ? {
-        email: currentSess.email,
-        display_name: currentSess.display_name,
-        avatar_url: currentSess.avatar_url,
-      } : null;
+      // v4.9: no more SUSPENDED handling (see subscription.js header —
+      // server-side has no suspension concept). Only real lockout
+      // reasons are: subscription_inactive, too_many_failures:<msg>,
+      // license_server_schema_error (new — PostgREST 42703).
       currentSess = null;
-      currentSub = wasSuspended
-        ? { active: false, status: 'suspended', ...suspensionInfo }
-        : null;
+      currentSub = null;
       storage.clearSession();
       storage.clearSubscriptionCache();
       try { await injector.uninject(); }
       catch (e) { console.log('[main] auto-uninject failed:', e.message); }
       if (mainWin && !mainWin.isDestroyed()) {
         mainWin.webContents.send('license:expired-lockout', {
-          reason, suspensionInfo, preservedSession,
+          reason,
+          serverError: extra?.serverError || null,
         });
         try { mainWin.show(); mainWin.focus(); } catch {}
       }

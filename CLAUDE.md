@@ -1,5 +1,236 @@
 ﻿# svcldb — Project Memory (Claude / Cursor)
 
+## 2026-07-06 (late evening) — v4.9 auth fix: "No active subscription" for LIFETIME users (HTTP 400 root cause)
+
+Users with genuine LIFETIME grants (in particular `ngm.ksa69@gmail.com`
+per the reported screenshot) were being routed to the "No active
+subscription" screen after a successful Google sign-in. Root cause
+identified via server-side inspection of Supabase project
+`rrrpkmzdnaodmvsuxdkw` by the Supabase Claude:
+
+### The bug
+
+`ui/src/license/subscription.js` v4.6 built this query for the
+`subscriptions` table:
+
+```
+/rest/v1/subscriptions?select=plan_type,status,current_period_end,is_lifetime,suspension_reason&status=in.(active,cancelling,suspended)
+```
+
+Two of those tokens don't exist on the actual server schema:
+
+1. **`suspension_reason` column** — never existed. PostgREST returned
+   `{code:"42703", message:"column subscriptions.suspension_reason
+   does not exist"}` as HTTP 400. Every sub check failed.
+2. **`suspended`** in the status filter — not in the CHECK enum
+   `{active, cancelling, past_due, cancelled, expired}`. Would return
+   0 rows if the query got that far, but PostgREST rejected on the
+   select clause first, so we never got there.
+
+The `manual_grants` fallback also returned zero rows for this user —
+their lifetime grant lives entirely in `subscriptions` with
+`plan_type='lifetime'` + `is_lifetime=true` + `is_manual_grant=true`.
+Old `manual_grants` rows have been migrated into `subscriptions`.
+
+### Server-side ground truth (from Supabase Claude)
+
+Project `rrrpkmzdnaodmvsuxdkw.supabase.co`:
+
+- **`subscriptions`**: `id, user_id, email, stripe_customer_id,
+  stripe_subscription_id, plan_type, status, current_period_start,
+  current_period_end, is_lifetime, is_manual_grant, granted_by,
+  grant_reason, created_at, updated_at`.
+  - `status` enum: `active, cancelling, past_due, cancelled, expired`
+  - RLS SELECT: `USING (auth.uid() = user_id)`
+- **`manual_grants`**: `id, email, plan_type, status, granted_by,
+  expires_at, notes, revoked_at, created_at`.
+  - **Keyed by EMAIL, no user_id column.** RLS: `USING (email =
+    (auth.jwt() ->> 'email'))`.
+  - `status` enum: `active, revoked` only.
+  - Empty for ngm.ksa69@gmail.com — their grant migrated to
+    `subscriptions`.
+- **`user_devices`**: `id, user_id, hardware_uuid, device_name, model,
+  platform, last_seen_at, created_at`.
+  - Unique constraint on `(user_id, hardware_uuid)` ✓
+  - RLS SELECT/INSERT/UPDATE for `auth.uid() = user_id` ✓
+  - **NO DELETE policy for authenticated users** — service_role only.
+- **`user_suspensions`**: does NOT exist.
+- **`banned_users`**: does NOT exist (Mac project only).
+- Google OAuth: enabled, PKCE flow enabled, callback expected on
+  `http://localhost:9274/callback` (Supabase URL Configuration).
+
+### What v4.9 shipped
+
+**`ui/src/license/subscription.js` (full rewrite)**:
+- Removed `suspension_reason` from `subscriptions?select=...`.
+- Removed `suspended` from the status filter.
+- Removed the entire `user_suspensions` query block (table doesn't exist).
+- Returns STRUCTURED error object:
+  `{ kind:'http'|'network'|'schema'|'clock_drift', statusCode,
+  endpoint, message, body }` instead of a stringly-typed `error`.
+  Enables downstream code to react to specific failure modes.
+- PostgREST 42703 responses are auto-classified as `kind:'schema'` so
+  future column drift shows a "server misconfig, contact support"
+  banner instead of the misleading "no active subscription".
+
+**`ui/src/license/revalidation.js`**:
+- Removed the `subscription_suspended` branch from the tick handler
+  (server can no longer return that status).
+- Added `license_server_schema_error` lockout path so schema drift
+  triggers a clear "contact support" banner mid-session instead of
+  silently unloading.
+
+**`ui/src/main.js`**:
+- `license:load` refresh-failure now short-circuits into signed-cache
+  offline-grace path (matches hooksdll behavior — avoids one extra
+  failed request when the user is offline with an expired token).
+- Replaced fragile `/http 401/` regex with structured
+  `err.kind === 'http' && err.statusCode === 401` check.
+- Removed the SUSPENDED branch in `license:load`, `license:sign-in`,
+  and `onExpired` handler (dead code — server never returns suspended).
+- Added new `license:revalidate` IPC — lightweight force-recheck path.
+  Runs security + sub check + token refresh but doesn't clear session.
+  Wired to nosub "Retry check" button instead of the heavier
+  `license:load`.
+- `startRevalidationLoop` now calls `security.runChecks()` on EVERY
+  tick (previously only at load + sign-in). Catches a user who
+  launches x64dbg / WireShark mid-session — old code kept running
+  until app restart.
+
+**`ui/src/preload.js`**:
+- Added `svc.license.revalidate()` to the whitelisted API.
+
+**`ui/src/renderer.js`**:
+- `_renderNoSub` displays specific copy per structured error kind:
+  - `schema` → "License server error — contact support with code
+    `SCHEMA_<endpoint>_<status>`. This is NOT a subscription problem."
+  - `network` → "Couldn't reach the license server — check your
+    internet and click Retry check."
+  - `clock_drift` → "System clock drift detected (Xs off). Fix your
+    time settings."
+  - Fallback → HTTP status with endpoint identification.
+- `_fromCache` case shows "Using cached subscription (X min ago)"
+  instead of falling through to the generic status line.
+- Nosub "Retry check" button now uses `svc.license.revalidate()`.
+- `license:expired-lockout` handler adds a `license_server_schema_error`
+  case with support-contact copy.
+- Suspended screen wiring is DORMANT (never routed to from JS) but
+  DOM + event handlers left in place in case server-side suspension
+  is added later. Harmless dead branch.
+
+**`ui/src/license/registration.js`**:
+- `deleteDevice` now propagates 401/403 (missing DELETE RLS policy) as
+  `{ ok:false, needsSupportAction:true, statusCode, err:'<contact
+  support with hwid...>' }`.
+- Documented the required server-side fix inline:
+  ```sql
+  CREATE POLICY "user_devices_delete_own" ON user_devices
+    FOR DELETE USING (auth.uid() = user_id);
+  ```
+- Alternative: server-side RPC (SECURITY DEFINER) at
+  `/rest/v1/rpc/delete_my_device` that validates auth.uid() = user_id
+  and does the delete.
+- Renderer's device-limit UI shows a `confirm` dialog with the
+  support-contact instructions + copies `support@cloakgpt.ca` to
+  clipboard on OK.
+
+### v4.9 hard invariants (added on top of v4.8)
+
+44. **`subscriptions?select=` MUST NOT include `suspension_reason`**
+    until a matching column is added server-side + confirmed via
+    `\d subscriptions`. Adding phantom columns is HTTP 400 (42703)
+    and mislabels EVERY subscription check as "no subscription".
+45. **`subscriptions?status=in.(...)` MUST NOT include `suspended`**
+    until it's added to the CHECK enum. Currently valid values:
+    `active, cancelling, past_due, cancelled, expired`.
+46. **`user_suspensions` table DOES NOT EXIST** on the Windows
+    Supabase project. Do not query it. Suspension enforcement, if
+    needed, requires a server-side schema addition first.
+47. **`manual_grants` is keyed by EMAIL, not user_id.** RLS filters
+    via `auth.jwt() ->> 'email'`. Never add an explicit `user_id`
+    filter — the column doesn't exist. Most modern grants live in
+    `subscriptions` with `is_manual_grant=true`, so this query is
+    often empty and that's normal.
+48. **`checkSubscription` returns STRUCTURED errors**, never string.
+    Shape: `{ kind, statusCode, endpoint, message, body }`. Downstream
+    code MUST use `.kind`/`.statusCode` — never regex-match on
+    `.message` or `.error` as a string. The v4.6 `/http 401/` regex
+    is the anti-pattern to avoid.
+49. **`security.runChecks()` MUST run on every revalidation tick,**
+    not just at load + sign-in. A user can launch x64dbg after
+    signing in; the previous code kept running until app restart.
+50. **`svc.license.revalidate()` is the LIGHTWEIGHT recheck path.**
+    Renderer's "Retry" buttons + auto-refresh use this. `license:load`
+    is heavier (re-runs security + session recovery + refresh) and
+    reserved for the boot path or explicit lockout recovery.
+51. **`user_devices` has NO DELETE RLS policy for authenticated
+    users.** `registration.deleteDevice` returns `needsSupportAction`
+    on 401/403. Fixing requires either the RLS policy above OR a
+    server-side RPC with SECURITY DEFINER. Until then, MAX_DEVICES=1
+    users can register their first device but need support to swap
+    machines.
+52. **Suspended screen DOM + code path preserved but DORMANT.** If
+    server ever adds suspension, wiring it back up is a 3-line
+    change (return `status:'suspended'` from subscription.js + route
+    to `showScreen('suspended')` in boot()/sign-in). Don't delete
+    the DOM out of pure "clean up dead code" impulse.
+
+### Build + deploy status (2026-07-06 12:36 EDT)
+
+- `ui/dist/win-unpacked/svchelper.exe` — 190,563,840 bytes, freshly built
+- All 9 bytecoded modules regenerated (subscription.jsc, revalidation.jsc,
+  registration.jsc most importantly)
+- config.js integrity stamp: `6c7f4ce682abedd1`
+- No C-side changes required — `payload/src/sub_check.c` was already
+  using the correct minimal query (`select=status&status=in.(active,
+  cancelling)`) so it kept working correctly throughout. Only the JS
+  side had the bug.
+- To deploy: user runs `install-cloakgpt.ps1` from a repackaged zip OR
+  drops the new `svchelper.exe` directory over the old install. Existing
+  `main.js::ensureCBinariesInstalled` upgrade-detection handles the
+  C-binary sync; the JS bytecode in `resources/app/` is replaced by
+  the fresh install atomically.
+
+### Live-repro verification path (for the user reporting the screenshot)
+
+1. Get the fresh `svchelper.exe` bundle onto the affected machine
+2. Launch it → Google sign-in → **should now go directly to Dashboard,
+   not to "No active subscription"**
+3. In `%APPDATA%\svchelper\` no encrypted logs are written from the
+   Electron layer (only from the C payload) — confirm success via the
+   in-app subscription pill showing "Active · lifetime".
+4. If still broken, click "Retry check" — new copy will show the
+   specific error kind (schema/network/http/clock_drift) which
+   pinpoints what's still wrong.
+
+### Distribution pipeline (canonical — see AGENTS.md + docs/DISTRIBUTION.md)
+
+Whenever you need to ship a new build to users after making changes,
+run these three steps IN ORDER from the repo root:
+
+```powershell
+# Step 1 — only if C source changed
+.\build_all.bat
+
+# Step 2 — only if JS/UI changed (this session's v4.9 fix)
+cd ui ; pnpm build ; cd ..
+
+# Step 3 — ALWAYS run. Produces fresh:
+#   Desktop\CloakGPTWindowsMaxStealth.zip     (the shippable)
+#   Desktop\CloakGPT Setup Instructions.md    (user guide)
+#   Desktop\Launch CloakGPT.lnk               (admin-flagged shortcut)
+powershell -NoProfile -ExecutionPolicy Bypass -File ui\tools\build-distribution.ps1
+```
+
+For v4.9 specifically only steps 2 + 3 were needed — no C changes.
+Fresh zip landed at `C:\Users\abdul\Desktop\CloakGPTWindowsMaxStealth.zip`
+(121 MB, 2026-07-06 12:51 EDT).
+
+Full pipeline invariants + recipe live in `AGENTS.md` (§ "Distribution
++ packaging pipeline") and `docs/DISTRIBUTION.md`.
+
+---
+
 ## 2026-07-06 (evening) — v4.8 obfuscation pass: string encryption + API hashing + Astral-PE FORBIDDEN on payload
 
 Landed the last strictly-positive-EV static-analysis-friction wins after

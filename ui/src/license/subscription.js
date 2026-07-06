@@ -1,21 +1,51 @@
 // ═══════════════════════════════════════════════════════════════
 // subscription.js — Supabase subscription check + HMAC-signed cache.
 //
-// Order of checks:
-//   1. suspensions  — dedicated ban table (if it exists server-side).
-//      Row present = user is BANNED (chargeback, TOS violation).
-//      Return { active:false, status:'suspended', suspension_reason }.
-//   2. manual_grants — lifetime whitelist (plan_type=lifetime rows).
-//   3. subscriptions — status IN (active, cancelling, suspended).
-//      If we get status=suspended here too, treat as ban.
+// v4.9 (2026-07-06 — ROOT-CAUSE FIX for HTTP 400 on lifetime users)
 //
-// Returns { active, plan, expires_at, is_lifetime, status,
-//           suspension_reason?, server_time?, error? }.
+//   Supabase schema (confirmed via server-side inspection of project
+//   rrrpkmzdnaodmvsuxdkw, see docs handoff and CLAUDE.md v4.9 entry):
 //
-// Signed cache:
+//     subscriptions columns:
+//       id, user_id, email, stripe_customer_id, stripe_subscription_id,
+//       plan_type, status, current_period_start, current_period_end,
+//       is_lifetime, is_manual_grant, granted_by, grant_reason,
+//       created_at, updated_at
+//
+//     subscriptions.status CHECK enum:
+//       active | cancelling | past_due | cancelled | expired
+//         (NO 'suspended' — never was)
+//
+//     subscriptions has NO suspension_reason column.
+//     user_suspensions table DOES NOT EXIST.
+//     banned_users table DOES NOT EXIST (Mac project only).
+//
+//     manual_grants columns:
+//       id, email, plan_type, status, granted_by, expires_at, notes,
+//       revoked_at, created_at
+//     RLS: `USING (email = (auth.jwt() ->> 'email'))` — keyed by JWT
+//     email claim, NOT by user_id.
+//     status enum: 'active' | 'revoked' (nothing else).
+//
+//   Prior v4.6 subscription.js selected `suspension_reason` and filtered
+//   `status=in.(active,cancelling,suspended)` — the extra column caused
+//   PostgREST to return 42703 (column does not exist) → 400. Lifetime
+//   users saw "No active subscription — subscriptions http 400" in the
+//   nosub screen (see screenshot 2026-07-06). This file removes both
+//   the phantom column and the phantom status value.
+//
+// Query order:
+//   1. manual_grants — lifetime email-whitelist (empty for most users
+//      because we migrated grants into subscriptions with is_lifetime=true
+//      + is_manual_grant=true).
+//   2. subscriptions — active + cancelling. Also picks up lifetime
+//      grants (is_lifetime=true) — no need for a separate lifetime
+//      query.
+//
+// Signed cache (unchanged from v4.6):
 //   signSubCache(sub, hwid) → HMAC-SHA256(LICENSE_RESPONSE_SECRET,
 //                                          JSON(sub) || hwid).
-//   loadSignedSubCache(hwid) → verifies signature; rejects stale/wrong-hwid.
+//   verifySubCache(cached, hwid) → timing-safe compare.
 // ═══════════════════════════════════════════════════════════════
 
 const crypto = require('crypto');
@@ -23,7 +53,15 @@ const {
   SUPABASE_URL, SUPABASE_ANON_KEY, MAX_CLOCK_DRIFT_SECS,
   LICENSE_RESPONSE_SECRET, APP_VERSION,
 } = require('./config');
-const security = require('./security');
+
+// Statuses we consider "subscription is currently valid". `cancelling`
+// means the user hit cancel in Stripe but the current period hasn't
+// ended yet — they paid, they get service through the end.
+//
+// `past_due` intentionally excluded: means Stripe couldn't charge the
+// renewal and is retrying — we treat those as inactive until Stripe
+// recovers the payment. Matches hooksdll behavior.
+const ACTIVE_STATUS_FILTER = 'in.(active,cancelling)';
 
 async function checkSubscription(accessToken) {
   if (!accessToken) throw new Error('No access token');
@@ -39,40 +77,9 @@ async function checkSubscription(accessToken) {
   let lastError = null;
   let serverTime = null;
 
-  // 0. Suspensions table (if it exists). Silently ignored if the table
-  //    isn't set up server-side (404) — we don't want to hard-fail on
-  //    a missing table, just log + continue.
-  try {
-    const url = `${SUPABASE_URL}/rest/v1/user_suspensions?select=reason,suspended_at,active&active=eq.true`;
-    const resp = await fetch(url, { headers, signal: AbortSignal.timeout(10_000) });
-    if (resp.ok) {
-      serverTime = _serverTime(resp);
-      _validateDrift(serverTime, requestTime, 'suspensions');
-      const rows = await resp.json();
-      if (Array.isArray(rows) && rows.length > 0) {
-        const s = rows[0];
-        console.log('[subscription] SUSPENDED account detected:', s.reason || '(no reason)');
-        return {
-          active: false,
-          plan: null,
-          expires_at: null,
-          is_lifetime: false,
-          status: 'suspended',
-          suspension_reason: s.reason || 'account_suspended',
-          suspended_at: s.suspended_at || null,
-          server_time: serverTime || requestTime,
-        };
-      }
-    } else if (resp.status !== 404) {
-      lastError = `user_suspensions http ${resp.status}`;
-    }
-  } catch (e) {
-    // Table missing / RLS denies read for non-admin / offline — treat
-    // as "not suspended" and continue with the normal flow.
-    console.log('[subscription] user_suspensions query skipped:', e.message);
-  }
-
-  // 1. Manual grants (lifetime allow-list).
+  // 1. Manual grants (email-keyed lifetime allow-list). Empty for most
+  //    users; retained for backward compat with pre-migration grants.
+  //    RLS matches by JWT `email` claim, no explicit user_id filter.
   try {
     const url = `${SUPABASE_URL}/rest/v1/manual_grants?select=plan_type,status,expires_at&status=eq.active&revoked_at=is.null`;
     const resp = await fetch(url, { headers, signal: AbortSignal.timeout(15_000) });
@@ -92,16 +99,26 @@ async function checkSubscription(accessToken) {
         };
       }
     } else {
-      lastError = `manual_grants http ${resp.status}`;
+      const body = await _readBody(resp);
+      lastError = _mkErr(resp.status, 'manual_grants', body);
+      console.log(`[subscription] manual_grants http ${resp.status}: ${body.slice(0, 200)}`);
     }
   } catch (e) {
-    lastError = `manual_grants: ${e.message}`;
+    lastError = _mkNetErr('manual_grants', e);
     console.log('[subscription] manual_grants failed:', e.message);
   }
 
   // 2. Subscriptions table.
+  //    Server schema (confirmed 2026-07-06):
+  //      SELECT plan_type, status, current_period_end, is_lifetime
+  //      FROM subscriptions
+  //      WHERE user_id = auth.uid()        -- via RLS
+  //        AND status IN ('active', 'cancelling')
+  //
+  //    This picks up BOTH normal paying subscribers AND lifetime
+  //    grants (which live in subscriptions with is_lifetime=true).
   try {
-    const url = `${SUPABASE_URL}/rest/v1/subscriptions?select=plan_type,status,current_period_end,is_lifetime,suspension_reason&status=in.(active,cancelling,suspended)`;
+    const url = `${SUPABASE_URL}/rest/v1/subscriptions?select=plan_type,status,current_period_end,is_lifetime&status=${ACTIVE_STATUS_FILTER}`;
     const resp = await fetch(url, { headers, signal: AbortSignal.timeout(15_000) });
     if (resp.ok) {
       serverTime = _serverTime(resp);
@@ -109,20 +126,6 @@ async function checkSubscription(accessToken) {
       const subs = await resp.json();
       if (Array.isArray(subs) && subs.length > 0) {
         const s = subs[0];
-        // If the ONLY subscription row we found is status=suspended,
-        // treat as ban (dedicated screen with the reason).
-        if (s.status === 'suspended') {
-          console.log('[subscription] SUSPENDED subscription:', s.suspension_reason || '(no reason)');
-          return {
-            active: false,
-            plan: s.plan_type || null,
-            expires_at: s.current_period_end || null,
-            is_lifetime: false,
-            status: 'suspended',
-            suspension_reason: s.suspension_reason || 'subscription_suspended',
-            server_time: serverTime || requestTime,
-          };
-        }
         return {
           active: true,
           plan: s.plan_type || 'pro',
@@ -133,10 +136,12 @@ async function checkSubscription(accessToken) {
         };
       }
     } else {
-      lastError = `subscriptions http ${resp.status}`;
+      const body = await _readBody(resp);
+      lastError = _mkErr(resp.status, 'subscriptions', body);
+      console.log(`[subscription] subscriptions http ${resp.status}: ${body.slice(0, 200)}`);
     }
   } catch (e) {
-    lastError = `subscriptions: ${e.message}`;
+    lastError = _mkNetErr('subscriptions', e);
     console.log('[subscription] subscriptions failed:', e.message);
   }
 
@@ -147,8 +152,52 @@ async function checkSubscription(accessToken) {
     is_lifetime: false,
     status: 'no_subscription',
     server_time: serverTime || requestTime,
+    // Structured error: { kind: 'http'|'network'|'schema', statusCode, endpoint, message, body }.
+    // Downstream code (main.js license:load) uses `.kind` and `.statusCode`
+    // instead of regex-matching a stringly-typed field.
     error: lastError,
   };
+}
+
+// ─── Error shaping ──────────────────────────────────────────────────
+//
+// Returns an ERROR object, not a string. Downstream (renderer + main
+// force-relogin path) inspects fields:
+//   .kind        — 'http' | 'network' | 'schema' | 'clock_drift'
+//   .statusCode  — HTTP status (present for kind='http'|'schema')
+//   .endpoint    — 'manual_grants' | 'subscriptions'
+//   .message     — human-readable summary
+//   .body        — first 250 bytes of response body (schema hints from PostgREST)
+function _mkErr(status, endpoint, body) {
+  // PostgREST returns 42703 (column does not exist) as 400 with a
+  // JSON body {code, message, hint, details}. Detect + mark as schema
+  // so renderer can show the "server misconfig, contact support" copy
+  // instead of the misleading "no subscription".
+  let kind = 'http';
+  if (status === 400 && body && (body.includes('42703') || body.includes('does not exist') || body.includes('PGRST'))) {
+    kind = 'schema';
+  }
+  return {
+    kind,
+    statusCode: status,
+    endpoint,
+    message: `${endpoint} http ${status}`,
+    body: (body || '').slice(0, 250),
+  };
+}
+
+function _mkNetErr(endpoint, e) {
+  return {
+    kind: 'network',
+    statusCode: null,
+    endpoint,
+    message: `${endpoint}: ${e.message || String(e)}`,
+    body: '',
+  };
+}
+
+async function _readBody(resp) {
+  try { return await resp.text(); } catch { return ''; }
 }
 
 function _serverTime(resp) {
@@ -165,7 +214,10 @@ function _validateDrift(serverTime, requestTime, ctx) {
   const drift = Math.abs(serverTime - requestTime);
   if (drift > (MAX_CLOCK_DRIFT_SECS || 300)) {
     console.log(`[subscription] ${ctx}: clock drift ${drift}s — reject`);
-    throw new Error(`clock_drift_${drift}s`);
+    const err = new Error(`clock_drift_${drift}s`);
+    err.kind = 'clock_drift';
+    err.drift = drift;
+    throw err;
   }
 }
 
@@ -186,7 +238,6 @@ function signSubCache(sub, hwid) {
     expires_at:  sub.expires_at,
     is_lifetime: sub.is_lifetime,
     status:      sub.status,
-    suspension_reason: sub.suspension_reason || null,
     _cachedAt:   sub._cachedAt,
   });
   return crypto

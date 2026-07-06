@@ -2,7 +2,7 @@
 // revalidation.js — Runtime subscription re-check + token refresh +
 //                    signed-cache offline grace + jitter.
 //
-// Adapted from hooksdll/lumio/src/license/revalidation.js with three
+// Adapted from hooksdll/lumio/src/license/revalidation.js with two
 // upgrades over the v4.2 svcldb version:
 //
 //   1. Signed subscription cache — if the network fails but we have a
@@ -11,10 +11,10 @@
 //   2. Jitter on every scheduled tick — ±20% around the base interval.
 //      Prevents thundering-herd + makes the poller invisible to server-
 //      side rate detection.
-//   3. SUSPENDED handling — server can return {active:false,
-//      status:'suspended'} which unlike a normal inactive fires an
-//      IMMEDIATE lockout with the ban reason (see main.js onExpired
-//      handler → renderer shows the ban screen).
+//
+// v4.9 (2026-07-06): removed SUSPENDED branch — server-side has no
+// suspension concept (no user_suspensions table, no 'suspended' in
+// subscriptions.status enum). See subscription.js header + CLAUDE.md.
 //
 // Payload also has its own C-side sub-check (payload/src/sub_check.c)
 // so if the Electron app is closed entirely the payload still self-
@@ -102,16 +102,18 @@ function start(deps) {
         }
         return;
       }
-      // Explicit inactive — check for suspended first (dedicated ban path).
-      if (status && status.status === 'suspended') {
-        console.log('[revalidation] SUSPENDED — locking out with ban reason');
+      // If the sub check returned a SCHEMA error (PostgREST 42703 —
+      // "column does not exist"), that's a client/server mismatch that
+      // won't self-heal on retry. Treat it as a critical failure so
+      // main.js can surface a "contact support" banner instead of
+      // silently unloading.
+      if (status && status.error && status.error.kind === 'schema') {
+        console.log('[revalidation] SCHEMA error — locking out with support-contact reason');
         stop();
-        onExpired('subscription_suspended', {
-          suspension_reason: status.suspension_reason || null,
-          suspended_at:      status.suspended_at || null,
-        });
+        onExpired('license_server_schema_error', { serverError: status.error });
         return;
       }
+      // Explicit inactive — lock out.
       console.log('[revalidation] subscription NOT ACTIVE — locking out');
       stop();
       onExpired('subscription_inactive');

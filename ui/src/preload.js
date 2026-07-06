@@ -22,9 +22,23 @@ contextBridge.exposeInMainWorld('svc', {
     signIn:       ()    => ipcRenderer.invoke('license:sign-in'),
     signOut:      ()    => ipcRenderer.invoke('license:sign-out'),
     pendingUrl:   ()    => ipcRenderer.invoke('license:pending-url'),
+    /* v4.9: lightweight force-recheck. Re-runs security + sub check
+     * against Supabase (with token refresh if needed) but does NOT
+     * clear the local session — cheaper than full license:load. Used
+     * by the "Retry check" button on the nosub screen and by the
+     * dashboard "Refresh subscription" action. Returns:
+     *   { ok:true,  subscription }
+     *   { ok:false, err, securityBlocked? } */
+    revalidate:   ()    => ipcRenderer.invoke('license:revalidate'),
     /* v4.7: remove a device from user_devices (MAX_DEVICES=1 policy).
      * Requires pendingAccessToken + pendingUserId because the caller
-     * hasn't completed a full login yet (device limit blocked it). */
+     * hasn't completed a full login yet (device limit blocked it).
+     *
+     * v4.9: server-side has NO DELETE RLS policy for authenticated
+     * users on user_devices, so this returns { ok:false, err:'...'}
+     * with statusCode=403 until a service_role-side deletion is
+     * scheduled. Renderer shows a "contact support" message in that
+     * case instead of silently pretending it worked. */
     removeDevice: (payload) => ipcRenderer.invoke('license:remove-device', payload),
   },
   on: (evt, cb) => {

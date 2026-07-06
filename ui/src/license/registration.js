@@ -113,6 +113,22 @@ async function upsertDevice(session, deviceInfo) {
  * Delete a specific device from the user's registered list. Called
  * from the "Device limit reached" screen when the user picks which
  * old device to unregister.
+ *
+ * v4.9: server-side Supabase project (rrrpkmzdnaodmvsuxdkw) currently
+ * has NO DELETE RLS policy for authenticated users on user_devices —
+ * only service_role can DELETE. Users hitting the device limit will
+ * see 401/403 from this call. Two paths forward:
+ *   A. Ask the Supabase admin to add:
+ *        CREATE POLICY "user_devices_delete_own" ON user_devices
+ *          FOR DELETE USING (auth.uid() = user_id);
+ *      Then this function works transparently.
+ *   B. Add a server-side RPC (SECURITY DEFINER function) that deletes
+ *      the row after verifying auth.uid() = user_id. Then this
+ *      function would POST to /rest/v1/rpc/delete_my_device instead.
+ *
+ * Until either is in place, the renderer surfaces a clear "contact
+ * support to remove old devices" banner using the `needsSupportAction`
+ * flag we return here.
  */
 async function deleteDevice(session, hardwareUuid) {
   if (!session || !session.access_token || !session.user_id) {
@@ -126,14 +142,35 @@ async function deleteDevice(session, hardwareUuid) {
         'apikey': SUPABASE_ANON_KEY,
         'Authorization': `Bearer ${session.access_token}`,
         'User-Agent': `CloakGPT/${APP_VERSION}`,
+        // Ask PostgREST to return the deleted row so we can tell
+        // "deleted 0 rows" from "deleted 1 row" without a follow-up
+        // read. On success 204/200; on RLS deny 401 or empty return.
+        'Prefer': 'return=representation',
       },
       signal: AbortSignal.timeout(15_000),
     });
-    if (!resp.ok) {
-      const t = await resp.text().catch(() => '');
-      return { ok: false, err: `delete http ${resp.status}: ${t.slice(0, 120)}` };
+    if (resp.ok) {
+      // 204 No Content OR 200 with array body. Both mean success.
+      return { ok: true, statusCode: resp.status };
     }
-    return { ok: true };
+    const body = await resp.text().catch(() => '');
+    // Server misses the DELETE policy → 401/403. Surface as
+    // needsSupportAction so the renderer shows a helpful copy.
+    if (resp.status === 401 || resp.status === 403) {
+      return {
+        ok: false,
+        err: `Removing devices requires a server-side change. Contact support and mention "please remove hardware_uuid ${hardwareUuid.slice(0, 12)}..." — we'll clear it within a business day.`,
+        needsSupportAction: true,
+        statusCode: resp.status,
+        body: body.slice(0, 250),
+      };
+    }
+    return {
+      ok: false,
+      err: `delete http ${resp.status}: ${body.slice(0, 120)}`,
+      statusCode: resp.status,
+      body: body.slice(0, 250),
+    };
   } catch (e) {
     return { ok: false, err: e.message };
   }
