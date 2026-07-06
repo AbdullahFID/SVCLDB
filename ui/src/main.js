@@ -343,20 +343,44 @@ function createWindow() {
 
 // ─── IPC ───────────────────────────────────────────────────────
 ipcMain.handle('license:load', async () => {
-  const { session, clearReason } = auth.loadSessionWithRecovery();
+  let { session, clearReason } = auth.loadSessionWithRecovery();
   if (!session) {
     currentSess = null; currentSub = null;
     revalidation.stop();
     return { session: null, subscription: null, clearReason };
   }
+  // v4.5.3: proactively refresh an expired (or about-to-expire) access
+  // token BEFORE hitting Supabase. Supabase JWTs are 1h — if the user
+  // quit + reopened after that window, the on-disk session has a stale
+  // access_token that gets 401'd on every REST query (sub check, RLS,
+  // everything). Refresh once; if that also fails, fall through to the
+  // sub check with the stale token so the UI still surfaces a real error.
+  if (storage.isExpired(session) && session.refresh_token) {
+    try {
+      console.log('[main] access token expired on load - refreshing...');
+      session = await auth.refreshSession(session);
+      console.log('[main] token refreshed, new expiry',
+                  new Date((session.expires_at || 0) * 1000).toISOString());
+    } catch (e) {
+      console.log('[main] refresh failed:', e.message);
+    }
+  }
   currentSess = session;
-  // Best-effort sub check; if it fails, we still return the session so
-  // the UI can show a "sub check retry" state instead of forcing re-login.
   try {
     currentSub = await subscription.checkSubscription(session.access_token);
   } catch (e) {
     console.log('[main] sub-check on load failed:', e.message);
     currentSub = { active: null, plan: null, status: 'unknown', error: e.message };
+  }
+  // If the sub check itself returned 401, that means EVEN the refreshed
+  // token is bad → force a full re-login rather than showing an
+  // unrecoverable "no active subscription" screen.
+  if (currentSub && currentSub.error && /http 401/.test(currentSub.error)) {
+    console.log('[main] 401 on sub check even after refresh - forcing re-login');
+    storage.clearSession();
+    currentSess = null; currentSub = null;
+    revalidation.stop();
+    return { session: null, subscription: null, clearReason: 'token_rejected' };
   }
   if (currentSub && currentSub.active) startRevalidationLoop();
   return _sessionDto();

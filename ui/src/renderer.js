@@ -96,6 +96,8 @@ async function boot() {
       showLoginError('Your session expired (24-hour policy). Please sign in again.');
     } else if (dto && dto.clearReason === 'tampered') {
       showLoginError('Session file was modified — signed out for safety. Please sign in again.');
+    } else if (dto && dto.clearReason === 'token_rejected') {
+      showLoginError('Your Google authentication token was rejected by the license server (likely expired beyond refresh). Please sign in again.');
     }
     showScreen('login');
     return;
