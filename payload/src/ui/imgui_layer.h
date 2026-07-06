@@ -114,6 +114,13 @@ int  ui_is_visible(void);
 /* Reply pane scroll — signed pixel delta consumed on next frame.
  * Positive = scroll DOWN (toward end), negative = scroll UP. */
 void ui_scroll_reply(int delta_px);
+
+/* Hit-test: TRUE (1) iff the overlay is currently visible AND the
+ * (x, y) screen-coordinate point lies inside the overlay's last-drawn
+ * rect. Used by the LL mouse hook to decide whether to consume a
+ * mouse-wheel event and forward it to ui_scroll_reply. Cheap; safe
+ * from any thread. Returns 0 before the overlay has ever drawn. */
+int  ui_point_in_overlay(int x, int y);
 /* TRUE (1) if there's at least one message (i.e. NOT the empty home
  * page). Used by the CLEAR hotkey handler to switch to "quit" behavior
  * on home page. */

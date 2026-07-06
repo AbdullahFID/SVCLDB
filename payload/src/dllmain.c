@@ -541,13 +541,22 @@ static void refresh_status_badge(const svc_config_t *cfg) {
 /* Streaming context passed between callbacks. */
 typedef struct {
     int msg_id;               /* pending AI message id in the chat */
+    int batched;              /* v6.1: 1 = buffer chunks, render once at done */
 } stream_ctx_t;
 
 static void ai_stream_chunk_handler(const char *chunk, size_t len, void *userdata) {
     stream_ctx_t *ctx = (stream_ctx_t *)userdata;
-    if (ctx && ctx->msg_id > 0) {
-        ui_chat_stream_append(ctx->msg_id, chunk, len);
-    }
+    if (!ctx || ctx->msg_id <= 0) return;
+    /* v6.1 batched mode: swallow the chunk here. ai_provider's internal
+     * s->full_reply still accumulates every token; on_done gets the
+     * complete text and we push it to the UI in ONE ui_chat_set_reply
+     * call. Benefits: (1) ~200x fewer DWM recomposition passes per
+     * answer, (2) no ImGui re-layout of math/code blocks as tokens
+     * arrive, (3) noticeably lower GPU load during long answers on
+     * slower hardware where the streaming re-render was causing the
+     * flicker reported by the RE tester. */
+    if (ctx->batched) return;
+    ui_chat_stream_append(ctx->msg_id, chunk, len);
 }
 
 static void ai_stream_done_handler(int ok, const char *full_reply, size_t reply_len,
@@ -601,20 +610,30 @@ static void ai_stream_done_handler(int ok, const char *full_reply, size_t reply_
         ui_chat_set_reply_of_pending(ctx->msg_id, msg);
         slog_writef("ai.log", "stream FAILED: %s", e);
     } else {
-        /* Message text is already fully appended via chunk callback.
-         * Just finalize. If reply_len is 0 (no chunks), set the text
-         * to a "(empty response)" placeholder. */
-        if (reply_len == 0) {
-            ui_chat_set_reply_of_pending(ctx->msg_id, "(empty response)");
+        /* v6.1: batched mode - chunks were suppressed during streaming,
+         * so we push the WHOLE reply to the UI now in one atomic set.
+         * Live mode - chunks were appended as they arrived; just
+         * finalize (clears "thinking" indicator + snapshots for copy). */
+        if (ctx->batched) {
+            if (reply_len == 0 || !full_reply) {
+                ui_chat_set_reply_of_pending(ctx->msg_id, "(empty response)");
+            } else {
+                ui_chat_set_reply_of_pending(ctx->msg_id, full_reply);
+            }
         } else {
-            ui_chat_finalize_pending(ctx->msg_id);
+            if (reply_len == 0) {
+                ui_chat_set_reply_of_pending(ctx->msg_id, "(empty response)");
+            } else {
+                ui_chat_finalize_pending(ctx->msg_id);
+            }
         }
         /* Also copy to clipboard for the copy-hotkey fast path. */
         if (full_reply) {
             clip_set_utf8(full_reply);
             clip_dump_to_file(full_reply);
         }
-        slog_writef("ai.log", "stream ok reply_len=%zu", reply_len);
+        slog_writef("ai.log", "stream ok reply_len=%zu batched=%d",
+                    reply_len, ctx->batched);
     }
     if (full_reply) ai_free_reply((char *)full_reply);
     free(ctx);
@@ -698,7 +717,8 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
             }
             return 3;
         }
-        sctx->msg_id = pending_id;
+        sctx->msg_id  = pending_id;
+        sctx->batched = cfg->stream_display_batched ? 1 : 0;
         int r = ai_ask_streaming(cfg, prompt,
                                   have_image ? png : NULL,
                                   have_image ? png_len : 0,
@@ -1114,6 +1134,36 @@ static void on_hotkey(int action) {
             ui_chat_append_message(UI_MSG_AI, msg);
             slog_writef("payload.log", "hotkey LATEX_TOGGLE: %s",
                         mcfg->latex_disabled ? "DISABLED" : "ENABLED");
+            break;
+        }
+        case SVC_HK_DIRECT_TOGGLE: {
+            /* v6: toggle DIRECT ANSWER mode. When ON, AI replies with
+             * ONLY the direct factual answer (or 'ERROR' if uncertain).
+             * See materialize_default_system in ai_provider.c for the
+             * exact system prompt override. */
+            svc_config_t *mcfg = (svc_config_t *)cfg_get();
+            if (!mcfg) break;
+            mcfg->direct_answer_mode = !mcfg->direct_answer_mode;
+            char msg[512];
+            if (mcfg->direct_answer_mode) {
+                _snprintf(msg, sizeof(msg) - 1,
+                    "[Direct-answer mode **ON**] Next AI reply will contain "
+                    "ONLY the factual answer - no explanation, no reasoning, "
+                    "no framing. If the AI is uncertain it will reply "
+                    "'ERROR' instead of guessing.\n\n"
+                    "Shape rules: MCQ -> just the letter (`B`). Numeric -> "
+                    "value + units (`9.81 m/s^2`). True/False -> just the "
+                    "word. Toggle back off with `Ctrl+Shift+Alt+D`.");
+            } else {
+                _snprintf(msg, sizeof(msg) - 1,
+                    "[Direct-answer mode **OFF**] Next AI reply will use "
+                    "the normal detailed format (answer + reasoning + "
+                    "sanity check per the system prompt).");
+            }
+            msg[sizeof(msg) - 1] = 0;
+            ui_chat_append_message(UI_MSG_AI, msg);
+            slog_writef("payload.log", "hotkey DIRECT_TOGGLE: %s",
+                        mcfg->direct_answer_mode ? "ON" : "OFF");
             break;
         }
         case SVC_HK_KILL_ALL: {

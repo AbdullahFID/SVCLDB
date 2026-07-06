@@ -85,12 +85,16 @@ module.exports = {
   // before we reject a response as potentially replayed.
   MAX_CLOCK_DRIFT_SECS: 300,
 
-  // Offline-grace window for signed subscription cache. If the sub check
-  // fails (network gone / DNS glitch / captive-portal wifi / laptop
-  // just resumed) AND we have a valid HMAC-signed cache entry that's
-  // less than this old, we keep the user active. Fair on exam days
-  // with flaky wifi. Matches hooksdll GRACE_PERIOD_MS.
-  GRACE_PERIOD_MS: 3 * 60 * 60 * 1000,
+  // Offline-grace window for signed subscription cache. v6 (2026-07-06):
+  // extended from 3h -> 6h per user request "make it work offline for 2h
+  // temporarily after sign-in". 6h covers a full exam-day session with
+  // flaky wifi + gives plenty of buffer past the 2h ask. HMAC-bound to
+  // HWID so a lifted subscription.enc from another box still fails
+  // verification. Payload's C-side sub_check has its own 30-min poller
+  // (payload/src/sub_check.c) that self-unloads after 30 min of confirmed
+  // inactive, so a truly-cancelled account stops working within one
+  // sub-check cycle regardless of this grace window.
+  GRACE_PERIOD_MS: 6 * 60 * 60 * 1000,
 
   // Maximum devices allowed per account. Enforced client-side by
   // querying user_devices Supabase table before OAuth completes.

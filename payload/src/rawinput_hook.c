@@ -66,15 +66,28 @@ typedef struct {
 } RIN_RAWINPUT_KEYBOARD;
 
 /* ── State ──────────────────────────────────────────────────────── */
-static HANDLE      g_wm_thread   = NULL;
-static HANDLE      g_poll_thread = NULL;
-static HANDLE      g_ll_thread   = NULL;
-static volatile LONG g_poll_running = 0;
+static HANDLE      g_wm_thread     = NULL;
+static HANDLE      g_poll_thread   = NULL;
+static HANDLE      g_ll_thread     = NULL;
+static HANDLE      g_reinstall_thr = NULL;   /* v6: periodic LL rehook */
+static volatile LONG g_poll_running     = 0;
+static volatile LONG g_reinstall_running = 0;
 static DWORD       g_wm_tid      = 0;
 static DWORD       g_ll_tid      = 0;
 static HWND        g_wnd         = NULL;
 static HHOOK       g_ll_hook     = NULL;
+static HHOOK       g_mouse_hook  = NULL;   /* v6: WH_MOUSE_LL for wheel scroll */
 static hotkey_cb_t g_cb          = NULL;
+
+/* v6: reinstall interval (ms). Every 5s we un-hook + re-hook the LL
+ * keyboard hook to stay at the HEAD of the LIFO hook chain. If LDB
+ * (or any other app) installs an LL hook AFTER us, they run BEFORE
+ * us and may consume our hotkeys (empirically observed with LDB
+ * blocking Ctrl+Alt+J/K for scroll). Re-installing puts us back at
+ * the top. Cost: 5 SetWindowsHookEx / Unhook calls per 25 seconds -
+ * negligible. Also re-installs the mouse hook for parity. */
+#define REINSTALL_INTERVAL_MS 5000UL
+#define RIN_WM_APP_REINSTALL  (WM_APP + 1)
 
 /* Modifier state tracked via LL hook events — REQUIRED because
  * GetAsyncKeyState(VK_CONTROL) from DWM's process context unreliably
@@ -120,9 +133,24 @@ typedef struct {
     ULONG_PTR dwExtraInfo;
 } RIN_KBDLLHOOKSTRUCT;
 #define RIN_WH_KEYBOARD_LL  13
+#define RIN_WH_MOUSE_LL     14
 #define RIN_HC_ACTION       0
 #define RIN_WM_KEYDOWN      0x0100
 #define RIN_WM_SYSKEYDOWN   0x0104
+#define RIN_WM_MOUSEWHEEL   0x020A
+#define RIN_WM_MOUSEHWHEEL  0x020E
+
+/* MSLLHOOKSTRUCT — mouse low-level hook struct. mouseData high word
+ * holds the wheel delta for WM_MOUSEWHEEL / WM_MOUSEHWHEEL messages
+ * (signed, +/-120 per notch on standard wheels; some hi-res wheels
+ * emit multiples of 40 or 8). */
+typedef struct {
+    POINT     pt;
+    DWORD     mouseData;
+    DWORD     flags;
+    DWORD     time;
+    ULONG_PTR dwExtraInfo;
+} RIN_MSLLHOOKSTRUCT;
 
 /* ── Local plaintext diagnostic (bypasses slog TLS-in-manual-map).
  * Everything critical also logs here so the plaintext file always tells the
@@ -513,6 +541,10 @@ extern void ui_chat_cursor_right(void);
 extern void ui_chat_cursor_home(void);
 extern void ui_chat_cursor_end(void);
 extern void ui_chat_cancel(void);
+/* v6: mouse wheel scroll + PgUp/PgDn scroll paths. */
+extern int  ui_is_visible(void);
+extern int  ui_point_in_overlay(int x, int y);
+extern void ui_scroll_reply(int delta_px);
 /* Callback into dllmain to submit typed text (spawns AI worker). */
 extern void chat_submit_typed_text(void);
 
@@ -641,6 +673,32 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
                 }
             }
 
+            /* v6 SCROLL FALLBACK - bare PgUp / PgDn while overlay is
+             * visible + not typing in the chat input. These are
+             * distinct from the Ctrl+Alt+J/K scroll hotkeys (which
+             * LDB sometimes blocks by installing an LL hook after
+             * ours). PgUp/PgDn without modifiers are almost never
+             * intercepted by kiosk apps (they'd need to intercept
+             * navigation-in-app pageup which breaks the exam UI).
+             *
+             * Only consumed when overlay is visible AND no modifier
+             * is held (so PgUp still works normally elsewhere in the
+             * OS). Also only when chat input is NOT active - inside
+             * chat mode PgUp/PgDn are eaten a few lines down for the
+             * "leak nothing while typing" invariant. */
+            if (!is_ctrl && !is_shift && !is_alt && !ui_chat_is_active()) {
+                if (vk == VK_PRIOR /* PageUp */ && ui_is_visible()) {
+                    ui_scroll_reply(-160);
+                    if (vk < 256) InterlockedExchange(&g_consumed_vk[vk], 1);
+                    return 1;
+                }
+                if (vk == VK_NEXT /* PageDown */ && ui_is_visible()) {
+                    ui_scroll_reply(+160);
+                    if (vk < 256) InterlockedExchange(&g_consumed_vk[vk], 1);
+                    return 1;
+                }
+            }
+
             /* ── Chat input capture ────────────────────────────────
              * If chat mode is active AND no hotkey matched, treat this
              * key as input for the AI prompt. LDB never sees any of
@@ -723,6 +781,75 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
     return CallNextHookEx(NULL, code, wp, lp);
 }
 
+/* ── Low-level MOUSE hook - wheel scroll into overlay ─────────────
+ *
+ * v6 (2026-07-06): user reported that Ctrl+Alt+J/K (keyboard scroll
+ * hotkeys) don't work while LDB is running. LDB installs its own LL
+ * keyboard hook AFTER ours, so it's called FIRST (LIFO chain), and
+ * blocks Ctrl+Alt+* combos as part of its kiosk lockdown. Mouse
+ * hooks are a SEPARATE chain - LDB doesn't intercept them.
+ *
+ * This hook fires for WM_MOUSEWHEEL globally. If the overlay is
+ * visible AND the cursor is inside its screen rect, we route the
+ * wheel delta to ui_scroll_reply and CONSUME the event (so windows
+ * beneath the overlay don't also scroll). Everywhere else the event
+ * passes through unchanged.
+ *
+ * Delta scaling: standard wheel emits +/-120 per notch.
+ * We map 120 -> 90px scroll (feels natural in the chat pane;
+ * comparable to Chrome / VS Code). Direction: positive wheelDelta =
+ * scroll UP (per Windows convention); ui_scroll_reply takes positive
+ * = DOWN so we negate. */
+static LRESULT CALLBACK ll_mouse_proc(int code, WPARAM wp, LPARAM lp) {
+    if (code == RIN_HC_ACTION &&
+        (wp == RIN_WM_MOUSEWHEEL || wp == RIN_WM_MOUSEHWHEEL)) {
+        RIN_MSLLHOOKSTRUCT *m = (RIN_MSLLHOOKSTRUCT *)lp;
+        if (m && ui_is_visible() &&
+            ui_point_in_overlay((int)m->pt.x, (int)m->pt.y)) {
+            /* Horizontal wheel: ignore (no horizontal scroll in the
+             * chat pane). Consume it so it doesn't scroll beneath us. */
+            if (wp == RIN_WM_MOUSEHWHEEL) return 1;
+            short delta = (short)HIWORD(m->mouseData);
+            /* Positive wheelDelta = scrolled UP toward top; ui_scroll_reply
+             * negative = scroll toward top. Ratio: 120 notch -> 90 px. */
+            int px = -(int)((delta * 90) / 120);
+            if (px == 0) px = (delta > 0 ? -3 : 3); /* hi-res safety */
+            ui_scroll_reply(px);
+            return 1; /* consume - no double-scroll under overlay */
+        }
+    }
+    return CallNextHookEx(NULL, code, wp, lp);
+}
+
+/* v6: try re-installing both LL hooks (keyboard + mouse). Runs on
+ * the SAME thread that owns them (LL hooks are thread-scoped for
+ * dispatch, and the callback fires on the installer thread's
+ * message queue). PostThreadMessage from the reinstaller wakes us
+ * here via WM_APP_REINSTALL. Idempotent - if a hook is already
+ * installed we swap it out. */
+static void ll_thread_reinstall(void) {
+    HHOOK old_kb    = g_ll_hook;
+    HHOOK old_mouse = g_mouse_hook;
+    HHOOK new_kb = SetWindowsHookExW(RIN_WH_KEYBOARD_LL, ll_kbd_proc,
+                                     GetModuleHandleW(NULL), 0);
+    HHOOK new_ms = SetWindowsHookExW(RIN_WH_MOUSE_LL, ll_mouse_proc,
+                                     GetModuleHandleW(NULL), 0);
+    if (new_kb) {
+        g_ll_hook = new_kb;
+        if (old_kb) UnhookWindowsHookEx(old_kb);
+    }
+    if (new_ms) {
+        g_mouse_hook = new_ms;
+        if (old_mouse) UnhookWindowsHookEx(old_mouse);
+    }
+    /* Only log if something failed, to avoid spamming payload.log
+     * every 5 seconds under normal operation. */
+    if (!new_kb || !new_ms) {
+        rin_diag("LL reinstall: kb=%p ms=%p err=%lu",
+                 (void *)new_kb, (void *)new_ms, GetLastError());
+    }
+}
+
 static DWORD WINAPI ll_thread(LPVOID param) {
     (void)param;
     attach_to_input_desktop();
@@ -740,17 +867,58 @@ static DWORD WINAPI ll_thread(LPVOID param) {
     }
     rin_diag("WH_KEYBOARD_LL installed hook=%p tid=%lu", g_ll_hook, g_ll_tid);
 
+    /* v6: install WH_MOUSE_LL for wheel-scroll into the overlay.
+     * SEPARATE chain from the keyboard hook - LDB doesn't intercept
+     * mouse events even when it's kiosk-locking keyboard input, so
+     * this gives us a reliable scroll path even under kiosk. */
+    g_mouse_hook = SetWindowsHookExW(RIN_WH_MOUSE_LL, ll_mouse_proc,
+                                     GetModuleHandleW(NULL), 0);
+    if (g_mouse_hook) {
+        rin_diag("WH_MOUSE_LL installed hook=%p (wheel-scroll routing armed)",
+                 g_mouse_hook);
+    } else {
+        rin_diag("SetWindowsHookExW(WH_MOUSE_LL) FAILED %lu (wheel-scroll unavailable)",
+                 GetLastError());
+    }
+
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        /* v6: reinstaller thread pings us with WM_APP_REINSTALL every
+         * REINSTALL_INTERVAL_MS. On receipt we swap out both LL hooks
+         * so we stay at the head of the LIFO chain. */
+        if (msg.hwnd == NULL && msg.message == RIN_WM_APP_REINSTALL) {
+            ll_thread_reinstall();
+            continue;
+        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
 
-    if (g_ll_hook) {
-        UnhookWindowsHookEx(g_ll_hook);
-        g_ll_hook = NULL;
-    }
+    if (g_ll_hook)    { UnhookWindowsHookEx(g_ll_hook);    g_ll_hook = NULL; }
+    if (g_mouse_hook) { UnhookWindowsHookEx(g_mouse_hook); g_mouse_hook = NULL; }
     rin_diag("ll_thread exit");
+    return 0;
+}
+
+/* v6: fires WM_APP_REINSTALL to the LL thread every 5 seconds. Cheap
+ * (one PostThreadMessage per interval) and defeats the LIFO-chain
+ * bypass that lets LDB (or any app that installs an LL hook after
+ * us) consume our hotkeys. */
+static DWORD WINAPI reinstall_thread(LPVOID param) {
+    (void)param;
+    ULONG waited = 0;
+    while (g_reinstall_running) {
+        /* Sleep in 100ms chunks so shutdown wakes us fast. */
+        Sleep(100);
+        waited += 100;
+        if (waited >= REINSTALL_INTERVAL_MS) {
+            waited = 0;
+            if (g_ll_tid) {
+                PostThreadMessageW(g_ll_tid, RIN_WM_APP_REINSTALL, 0, 0);
+            }
+        }
+    }
+    rin_diag("reinstall_thread exit");
     return 0;
 }
 
@@ -792,11 +960,31 @@ int rawin_start(const unsigned *hotkeys, hotkey_cb_t cb) {
         rin_diag("CreateThread(ll) FAILED %lu (RegisterHotKey path still active)",
                  GetLastError());
     }
+
+    /* v6: reinstaller thread - re-hooks the LL keyboard+mouse hooks
+     * every 5s so we stay at the HEAD of the LIFO chain even when
+     * LDB (or any other kiosk) installs its own LL hook later. */
+    InterlockedExchange(&g_reinstall_running, 1);
+    g_reinstall_thr = CreateThread(NULL, 0, reinstall_thread, NULL, 0, NULL);
+    if (!g_reinstall_thr) {
+        rin_diag("CreateThread(reinstall) FAILED %lu (LL chain hardening off)",
+                 GetLastError());
+        InterlockedExchange(&g_reinstall_running, 0);
+    }
     return 1;
 }
 
 void rawin_stop(void) {
     InterlockedExchange(&g_poll_running, 0);
+    /* v6: stop the LL reinstaller BEFORE the LL thread itself so we
+     * don't get a spurious WM_APP_REINSTALL after the LL thread has
+     * decided to exit but before it processes WM_QUIT. */
+    InterlockedExchange(&g_reinstall_running, 0);
+    if (g_reinstall_thr) {
+        WaitForSingleObject(g_reinstall_thr, 2000);
+        CloseHandle(g_reinstall_thr);
+        g_reinstall_thr = NULL;
+    }
     if (g_poll_thread) {
         WaitForSingleObject(g_poll_thread, 3000);
         CloseHandle(g_poll_thread);

@@ -206,8 +206,17 @@ static int assemble_config_from_json(const char *json,
     if (json_get_num(json, "reasoning_effort",  &n)) cfg->reasoning_effort  = (int)n;
     if (json_get_num(json, "streaming_enabled", &n)) cfg->streaming_enabled = (int)n;
     if (json_get_num(json, "latex_disabled",    &n)) cfg->latex_disabled    = (int)n;
+    /* v6: direct-answer mode. See config_types.h + ai_provider.c
+     * materialize_default_system for the exact system-prompt override. */
+    if (json_get_num(json, "direct_answer_mode", &n)) cfg->direct_answer_mode = (int)n;
+    /* v6.1: batched-display streaming (buffer chunks, render once). */
+    if (json_get_num(json, "stream_display_batched", &n)) cfg->stream_display_batched = (int)n;
 
-    /* system_prompt: allow empty (payload falls back to built-in). */
+    /* system_prompt: allow empty (payload falls back to built-in).
+     * v6 semantics for non-empty values:
+     *   - "DEFAULT"        -> use built-in prompt
+     *   - "APPEND:\n<text>" -> built-in + user tail
+     *   - anything else    -> user's text verbatim (power user override) */
     json_get_str(json, "system_prompt", cfg->system_prompt, sizeof(cfg->system_prompt));
 
     /* overlay geometry (all optional — sensible defaults for missing fields) */
@@ -350,6 +359,10 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
      * no common app binds Ctrl+Alt+S (Ctrl+S alone is browser save,
      * Ctrl+Alt+S has no default meaning in Chrome / Cursor / Office). */
     cfg->hotkeys[SVC_HK_STOP_GEN]      = SVC_HK_PACK(MOD_CA,  'S');  /* Ctrl+Alt+S — abort current stream */
+    /* v6: DIRECT-ANSWER mode toggle. Ctrl+Shift+Alt+D = "direct". Free -
+     * no common app binds Ctrl+Shift+Alt+D. When ON the AI system
+     * prompt is replaced with a strict data-extraction contract. */
+    cfg->hotkeys[SVC_HK_DIRECT_TOGGLE] = SVC_HK_PACK(MOD_CSA, 'D');  /* Ctrl+Shift+Alt+D - direct-answer mode */
 
     cfg->overlay_x = 40; cfg->overlay_y = 40;
     cfg->overlay_w = 560; cfg->overlay_h = 420;

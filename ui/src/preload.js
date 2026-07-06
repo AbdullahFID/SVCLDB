@@ -86,10 +86,33 @@ contextBridge.exposeInMainWorld('svc', {
     reset:    () => ipcRenderer.invoke('onboarding:reset'),
   },
   injector: {
-    status:   ()      => ipcRenderer.invoke('injector:status'),
-    inject:   (opts)  => ipcRenderer.invoke('injector:inject', opts),
-    uninject: ()      => ipcRenderer.invoke('injector:uninject'),
-    killAll:  ()      => ipcRenderer.invoke('injector:kill-all'),
+    status:        ()      => ipcRenderer.invoke('injector:status'),
+    inject:        (opts)  => ipcRenderer.invoke('injector:inject', opts),
+    uninject:      ()      => ipcRenderer.invoke('injector:uninject'),
+    killAll:       ()      => ipcRenderer.invoke('injector:kill-all'),
+    /* v6: full uninstall - uninject + kill DWM + wipe user data +
+     * empty C:\ProgramData\WinAudioSvc\ contents. Used by the "Uninstall
+     * CloakGPT" button on the Support card. Returns { ok, steps: [...] }
+     * so the renderer can show per-step diagnostics if anything fails. */
+    fullUninstall: ()      => ipcRenderer.invoke('injector:full-uninstall'),
+  },
+  /* v6 (2026-07-06): user-tunable system prompt + direct-answer-mode
+   * persistence. `text` is capped at 15 KB on the main side. `mode`
+   * must be one of 'off' / 'append' / 'override' - anything else is
+   * coerced to 'off'. `direct_answer_mode` is a 0/1 flag orthogonal
+   * to the custom prompt (direct mode always overrides). */
+  systemPrompt: {
+    load:  ()          => ipcRenderer.invoke('system-prompt:load'),
+    save:  (payload)   => ipcRenderer.invoke('system-prompt:save', payload),
+    clear: ()          => ipcRenderer.invoke('system-prompt:clear'),
+  },
+  /* v6.2 (2026-07-06): one-click MITM remediation. Payload shape:
+   *   { kind: 'tls_bypass'|'https_proxy_env'|'winhttp_proxy'|'mitm_ca',
+   *     tool: string (only for mitm_ca) }
+   * Returns { ok, action, message, details? }. Renderer calls this
+   * from the "Fix now" button embedded in the login-error banner. */
+  mitm: {
+    remediate: (payload) => ipcRenderer.invoke('mitm:remediate', payload),
   },
   window: {
     minimize: () => ipcRenderer.invoke('window:minimize'),

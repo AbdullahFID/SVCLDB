@@ -450,6 +450,15 @@ html, body {
   color: white;
 }
 .btn:disabled { opacity: 0.5; cursor: default; }
+/* v6: extra visual weight for blocking-security-error state so users
+ * clearly see the button is inert until they fix the banner. */
+.btn.is-blocked, .btn.is-blocked:hover, .btn.is-blocked:active {
+  opacity: 0.35;
+  cursor: not-allowed;
+  filter: grayscale(0.85);
+  transform: none !important;
+  box-shadow: none !important;
+}
 .btn svg { width: 18px; height: 18px; }
 
 .btn-primary {
@@ -524,6 +533,38 @@ html, body {
   line-height: 1.5;
 }
 #screen-login .error-banner.show { display: block; animation: fadeUp 0.35s ease-out both; }
+
+/* v6.2: message text + optional "Fix now" button live inside the
+ * error-banner container. Message renders above the button with a
+ * small gap. The button is intentionally warning-orange (not primary
+ * blue) so users don't confuse "auto-fix" with "sign in" - and gets
+ * a subtle wrench icon prefix in the label. */
+#screen-login .login-error-msg {
+  margin-bottom: 0;
+}
+#screen-login .login-error-fix {
+  display: inline-block;
+  margin-top: 12px;
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: 1px solid rgba(245, 158, 11, 0.55);
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.20), rgba(217, 119, 6, 0.28));
+  color: #fef3c7;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.14s ease, box-shadow 0.14s ease, background 0.14s ease;
+}
+#screen-login .login-error-fix:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 14px rgba(245, 158, 11, 0.25);
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.30), rgba(217, 119, 6, 0.40));
+}
+#screen-login .login-error-fix:active:not(:disabled) { transform: translateY(0); }
+#screen-login .login-error-fix:disabled {
+  opacity: 0.55; cursor: default;
+  background: rgba(245, 158, 11, 0.12);
+}
 @keyframes fadeUp {
   from { opacity: 0; transform: translateY(6px); }
   to   { opacity: 1; transform: translateY(0);   }
@@ -844,6 +885,155 @@ html, body {
   padding: 0 12px; height: 40px;
   display: inline-flex; align-items: center; justify-content: center;
 }
+
+/* ── v6 (2026-07-06): AI answer style card ─────────────────────── */
+/* Direct-mode toggle row + custom system prompt editor. */
+.ans-toggle-row {
+  display: flex; align-items: flex-start; gap: 14px;
+  padding: 12px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  margin-bottom: 14px;
+}
+.ans-toggle {
+  position: relative; display: inline-block;
+  width: 44px; height: 24px;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+.ans-toggle input { opacity: 0; width: 0; height: 0; }
+.ans-toggle-slider {
+  position: absolute; cursor: pointer;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(255, 255, 255, 0.10);
+  border: 1px solid var(--border);
+  border-radius: 24px;
+  transition: 0.18s;
+}
+.ans-toggle-slider::before {
+  content: ""; position: absolute;
+  height: 18px; width: 18px;
+  left: 2px; bottom: 2px;
+  background: var(--fg3);
+  border-radius: 50%;
+  transition: 0.18s;
+}
+.ans-toggle input:checked + .ans-toggle-slider {
+  background: linear-gradient(135deg, var(--accent), var(--cyan));
+  border-color: transparent;
+}
+.ans-toggle input:checked + .ans-toggle-slider::before {
+  transform: translateX(20px);
+  background: white;
+}
+.ans-toggle-text { flex: 1; min-width: 0; }
+.ans-toggle-title {
+  font-size: 13px; font-weight: 600; color: var(--fg);
+  margin-bottom: 4px;
+}
+.ans-toggle-sub {
+  font-size: 11.5px; color: var(--fg2); line-height: 1.5;
+}
+.ans-toggle-sub code {
+  padding: 1px 5px; border-radius: 4px;
+  background: rgba(6, 182, 212, 0.10);
+  color: var(--cyan-light);
+  font-family: 'JetBrains Mono', 'Consolas', monospace;
+  font-size: 10.5px;
+}
+.ans-toggle-sub kbd {
+  padding: 1px 5px; border-radius: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--border);
+  color: var(--fg2);
+  font-family: 'JetBrains Mono', 'Consolas', monospace;
+  font-size: 10.5px;
+}
+
+.prompt-editor {
+  padding: 12px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.prompt-mode-row {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.prompt-mode-label {
+  font-size: 11.5px; font-weight: 600;
+  color: var(--fg2);
+  text-transform: uppercase; letter-spacing: 0.03em;
+  margin-right: 4px;
+}
+.prompt-mode-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+  cursor: pointer;
+  transition: all 0.18s ease;
+  user-select: none;
+}
+.prompt-mode-chip input { position: absolute; opacity: 0; pointer-events: none; }
+.prompt-mode-chip span {
+  font-size: 11.5px; font-weight: 500;
+  color: var(--fg2);
+}
+.prompt-mode-chip:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+.prompt-mode-chip:has(input:checked) {
+  background: rgba(6, 182, 212, 0.14);
+  border-color: rgba(6, 182, 212, 0.5);
+}
+.prompt-mode-chip:has(input:checked) span {
+  color: var(--cyan-light);
+  font-weight: 600;
+}
+.prompt-len-badge {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--fg3);
+  font-family: 'JetBrains Mono', 'Consolas', monospace;
+}
+.prompt-len-badge.warn { color: #fbbf24; }
+.prompt-len-badge.err  { color: #f87171; }
+.prompt-textarea {
+  width: 100%; box-sizing: border-box;
+  min-height: 100px;
+  padding: 10px 12px;
+  font-family: 'JetBrains Mono', 'SF Mono', 'Consolas', monospace;
+  font-size: 12px; line-height: 1.5;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--fg);
+  resize: vertical;
+  transition: border-color 0.18s ease;
+}
+.prompt-textarea:focus {
+  outline: none;
+  border-color: var(--cyan-light);
+}
+.prompt-textarea::placeholder {
+  color: var(--fg3);
+  font-family: inherit;
+}
+.prompt-textarea:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.prompt-editor-actions {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; margin-top: 8px;
+}
+.prompt-editor-hint {
+  font-size: 11px; color: var(--fg3);
+}
+.prompt-editor-hint b { color: var(--fg2); font-weight: 600; }
 
 /* Hotkey reference card */
 .hotkey-card {

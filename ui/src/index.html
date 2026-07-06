@@ -262,6 +262,97 @@
           </div>
         </div>
 
+        <!-- v6 (2026-07-06): AI answer style card - direct mode + custom prompt -->
+        <div class="settings-card" id="answer-style-card">
+          <h3>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+            AI answer style
+            <span style="margin-left:auto;font-weight:500;font-size:11px;color:var(--fg3);text-transform:none;letter-spacing:0">How the AI should respond</span>
+          </h3>
+
+          <!-- Direct-answer mode toggle -->
+          <div class="ans-toggle-row">
+            <label class="ans-toggle">
+              <input type="checkbox" id="chk-direct-mode">
+              <span class="ans-toggle-slider"></span>
+            </label>
+            <div class="ans-toggle-text">
+              <div class="ans-toggle-title">Direct-answer mode</div>
+              <div class="ans-toggle-sub">
+                AI replies with ONLY the direct answer - no explanation, no reasoning. Returns <code>ERROR</code> if uncertain.
+                <br>MCQ: just the letter (<code>B</code>). Numeric: value + units. True/False: just the word.
+                <br>Toggle live in-overlay with <kbd>Ctrl+Shift+Alt+D</kbd>.
+              </div>
+            </div>
+          </div>
+
+          <!-- v6.1: Disable LaTeX toggle (tell AI to use Unicode / keyboard notation) -->
+          <div class="ans-toggle-row">
+            <label class="ans-toggle">
+              <input type="checkbox" id="chk-latex-off">
+              <span class="ans-toggle-slider"></span>
+            </label>
+            <div class="ans-toggle-text">
+              <div class="ans-toggle-title">Disable LaTeX math</div>
+              <div class="ans-toggle-sub">
+                Tell the AI to use plain-keyboard + Unicode math notation instead of LaTeX commands.
+                Fixes cases where the AI emits complex LaTeX the overlay can't render cleanly (e.g. malformed <code>\sqrt2,2,2</code>).
+                <br>Uses <code>x^2</code>, <code>sqrt(x)</code>, <code>pi</code>, <code>Σ[i=1..n]</code> instead of <code>x^{2}</code>, <code>\sqrt{x}</code>, <code>\pi</code>, <code>\sum_{i=1}^n</code>.
+                <br>Toggle live in-overlay with <kbd>Ctrl+Shift+Alt+L</kbd>.
+              </div>
+            </div>
+          </div>
+
+          <!-- v6.1/v6.3: Batched display toggle (buffer stream, render once at end).
+               DEFAULT ON per v6.3 - "live" streaming caused DWM stability
+               issues on slower GPUs, batched fixes them. Users who want
+               the type-along novelty can flip it back off. -->
+          <div class="ans-toggle-row">
+            <label class="ans-toggle">
+              <input type="checkbox" id="chk-batched-display" checked>
+              <span class="ans-toggle-slider"></span>
+            </label>
+            <div class="ans-toggle-text">
+              <div class="ans-toggle-title">Wait for full answer before showing <span style="color:var(--cyan-light);font-weight:500;font-size:11px;margin-left:6px">(default)</span></div>
+              <div class="ans-toggle-sub">
+                Stream tokens in the background, reveal complete answer in <b>one</b> render. <b>ON by default</b> - massively more stable, no flicker during streaming, math / code blocks render correctly in their final form.
+                <br>Overlay shows "Thinking..." until done, then full answer appears at once. Streaming still saves time - you just don't watch it type.
+                <br><b>Turn OFF</b> if you specifically want the live-typing feel and accept minor flicker on slow GPUs.
+              </div>
+            </div>
+          </div>
+
+          <!-- Custom system prompt textarea + mode radio -->
+          <div class="prompt-editor">
+            <div class="prompt-mode-row">
+              <span class="prompt-mode-label">Custom prompt:</span>
+              <label class="prompt-mode-chip">
+                <input type="radio" name="prompt-mode" value="off" checked>
+                <span>Off</span>
+              </label>
+              <label class="prompt-mode-chip">
+                <input type="radio" name="prompt-mode" value="append">
+                <span>Append to built-in</span>
+              </label>
+              <label class="prompt-mode-chip">
+                <input type="radio" name="prompt-mode" value="override">
+                <span>Replace built-in</span>
+              </label>
+              <span id="prompt-len-badge" class="prompt-len-badge">0 / 15000</span>
+            </div>
+            <textarea id="txt-system-prompt"
+                      class="prompt-textarea"
+                      placeholder="Off: uses our built-in ~10KB subject-matter expert prompt (recommended).&#10;&#10;Append: your text is added AFTER the built-in prompt. Use this to nudge tone / add instructions without losing our display constraints + subject rules.&#10;&#10;Replace: your text REPLACES the built-in prompt entirely. Power-user only - you lose all our subject-matter expertise + display formatting rules."
+                      rows="5"
+                      spellcheck="false"
+                      maxlength="15000"></textarea>
+            <div class="prompt-editor-actions">
+              <span class="prompt-editor-hint">Applies on next <b>Inject Now</b>. Encrypted at rest.</span>
+              <button id="btn-prompt-clear" class="btn btn-secondary" style="padding:6px 12px;font-size:11px">Clear</button>
+            </div>
+          </div>
+        </div>
+
         <div class="settings-card">
           <h3>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
@@ -404,6 +495,20 @@
             <button id="btn-restart-tour" class="btn btn-secondary" style="padding:10px 18px;font-size:12.5px">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
               Restart tutorial
+            </button>
+          </div>
+
+          <!-- v6 (2026-07-06): FULL UNINSTALL. Uninject payload + kill DWM
+               + wipe user data + empty C:\ProgramData\WinAudioSvc contents.
+               Danger-red button because it's destructive; renderer double-
+               confirms via a scary dialog before firing. -->
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">
+            <div style="flex:1;min-width:220px;font-size:12px;color:var(--fg2);line-height:1.5">
+              Wipe everything and clean up. Uninjects the overlay, cleanly restarts DWM, and deletes all stored data (session, API keys, custom prompt, hotkeys, encrypted logs). Then you can uninstall <b>svchelper.exe</b> from Apps &amp; Features.
+            </div>
+            <button id="btn-full-uninstall" class="btn btn-danger" style="padding:10px 18px;font-size:12.5px">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
+              Uninstall CloakGPT
             </button>
           </div>
         </div>

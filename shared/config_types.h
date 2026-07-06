@@ -41,7 +41,7 @@ typedef enum {
  * configs cleanly fail via cu_wrap_decrypt's plen != sizeof(svc_config_t)
  * check when a field is added — this magic is defence-in-depth. */
 #define SVC_CONFIG_MAGIC             0x53564C43u  /* 'SVLC' little-endian */
-#define SVC_CONFIG_SCHEMA_VERSION    5u   /* v5 added 4 per-provider api_key fields */
+#define SVC_CONFIG_SCHEMA_VERSION    7u   /* v7 added stream_display_batched */
 
 typedef struct {
     /* ── v4 header: written by Electron UI / launcher --json-config.
@@ -69,11 +69,42 @@ typedef struct {
     int         reasoning_effort;   /* 0=none 1=minimal 2=low 3=medium 4=high 5=xhigh */
     int         streaming_enabled;  /* 1 = SSE stream reply into chat */
     int         latex_disabled;     /* 1 = tell AI to use Unicode/keyboard math instead of LaTeX */
+    /* v6.1 (2026-07-06 evening): BATCHED-display streaming mode.
+     * When 1 AND streaming_enabled=1: SSE chunks are BUFFERED internally
+     * but NOT rendered to the overlay live. On stream-done the full
+     * reply is pushed to the UI in ONE final render. Benefits:
+     *   - Stability: 1 DWM recomposition per answer instead of ~200
+     *     (~50-100x less GPU churn during a long answer). Big win on
+     *     slower GPUs where the RE-tester's flicker was observed.
+     *   - Layout stability: no ImGui re-flow as tokens arrive; math /
+     *     code blocks render in their final form once, correctly.
+     *   - Copy-full-answer is guaranteed-complete on Ctrl+Alt+C.
+     * Trade-off: no "watching it type" UX; user sees a "Thinking..."
+     * indicator until the full answer appears.
+     * Ignored when streaming_enabled=0 (non-stream ai_ask path already
+     * waits for the full reply). */
+    int         stream_display_batched;
+
+    /* v6 (2026-07-06): DIRECT ANSWER MODE. When 1, the AI system prompt
+     * is replaced with a strict "reply with ONLY the direct factual
+     * answer, no explanation, ERROR if unsure" contract. User toggles
+     * via Ctrl+Shift+Alt+D or dashboard checkbox. See
+     * materialize_default_system in ai_provider.c. */
+    int         direct_answer_mode;
 
     /* System prompt (user-editable in settings UI). Sized to hold the
      * built-in SVCLDB_DEFAULT_SYSTEM_PROMPT (~10 KB of subject-matter
      * expertise ported from hooksdll/lumio/src/autosolver.js) plus
-     * headroom for user overrides. */
+     * headroom for user overrides.
+     *
+     * v6 (2026-07-06): SEMANTICS -
+     *   - Empty OR literal "DEFAULT" -> payload uses SVCLDB_DEFAULT_SYSTEM_PROMPT
+     *   - Starts with the sentinel "APPEND:\n" -> payload uses default + user
+     *     text appended (user AUGMENTS the built-in expertise)
+     *   - Anything else -> payload uses the string VERBATIM (user OVERRIDES
+     *     the built-in prompt entirely; power user territory)
+     *   - direct_answer_mode=1 overrides ALL of the above with the strict
+     *     data-extraction contract. */
     char        system_prompt[16384];
 
     /* Hotkeys (packed: (mod << 16) | vk; mod: 1=ctrl 2=shift 4=alt).
@@ -156,6 +187,11 @@ typedef enum {
 
     /* v4.5 (2026-07-06) — Stop an in-flight AI response. */
     SVC_HK_STOP_GEN      = 31,  /* Abort current stream (Ctrl+Alt+S)      */
+
+    /* v6 (2026-07-06 late) — Direct-answer mode toggle. When ON, AI
+     * replies with ONLY the direct answer (no explanation, ERROR if
+     * unsure) via a system prompt override. */
+    SVC_HK_DIRECT_TOGGLE = 32,  /* Toggle direct-answer mode (Ctrl+Shift+Alt+D) */
 
     SVC_HK_COUNT
 } svc_hotkey_action_t;

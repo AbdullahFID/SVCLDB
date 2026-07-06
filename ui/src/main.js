@@ -31,6 +31,7 @@ const storage      = require('./license/storage');
 const subscription = require('./license/subscription');
 const revalidation = require('./license/revalidation');
 const security     = require('./license/security');
+const mitm         = require('./license/mitm');
 const registration = require('./license/registration');
 const injector     = require('./injector/injector');
 const { SVC_INSTALL_DIR } = require('./license/config');
@@ -304,6 +305,111 @@ function clearApiKeys() {
   try { fs.unlinkSync(API_KEYS_LEGACY_PORTABLE()); } catch {}
 }
 
+// ─── v6 (2026-07-06) — User's custom system-prompt persistence ──
+//
+// Two shapes stored in one JSON blob under appData:
+//   { text: "...", mode: "off" | "append" | "override" }
+//
+//   - mode "off" (default): payload uses its built-in ~10 KB prompt
+//     (SVCLDB_DEFAULT_SYSTEM_PROMPT in ai_provider.c). User's text
+//     is preserved on disk but not sent.
+//   - mode "append": inject as `APPEND:\n<text>` so the payload uses
+//     the built-in prompt + user's text appended (recommended path).
+//   - mode "override": inject the user's text verbatim (power user;
+//     they lose the built-in expertise + display constraints).
+//
+// Also stores direct_answer_mode flag as a separate persisted setting
+// (independent of custom-prompt text since users typically toggle it
+// per-question rather than per-session).
+const SYSTEM_PROMPT_APPDATA  = () => path.join(app.getPath('appData'), 'svchelper', 'system_prompt.json');
+const SYSTEM_PROMPT_PORTABLE = () => path.join(SVC_INSTALL_DIR, 'ui_system_prompt.dat');
+
+function loadSystemPrompt() {
+  const empty = {
+    text: '', mode: 'off',
+    direct_answer_mode: 0,
+    /* v6.1 (2026-07-06 evening): AI-answer preferences that live in
+     * the same encrypted blob because they're all "how the AI
+     * behaves" toggles the user configures in one card:
+     *   latex_mode: 'auto' (AI decides) | 'off' (AI told to use Unicode)
+     *   stream_display: 'live' | 'batched' (hold until complete)
+     * v6.3 (2026-07-06 later): stream_display DEFAULTS to 'batched'
+     * per user request. Reasoning: ~200x fewer DWM recompose passes
+     * per answer + no ImGui re-layout of partial math/code = massive
+     * stability win. The live-typing UX is a novelty; correctness of
+     * the final rendered answer is what matters. Users who prefer
+     * the type-along feel can flip the toggle back off. */
+    latex_mode: 'auto',
+    stream_display: 'batched',
+  };
+  let raw = null;
+  try {
+    if (fs.existsSync(SYSTEM_PROMPT_APPDATA()) && safeStorage.isEncryptionAvailable()) {
+      raw = safeStorage.decryptString(fs.readFileSync(SYSTEM_PROMPT_APPDATA()));
+    }
+  } catch (e) { console.log('[main] system-prompt dpapi load fail:', e.message); }
+  if (!raw) {
+    try {
+      if (fs.existsSync(SYSTEM_PROMPT_PORTABLE())) {
+        raw = _aesDec(fs.readFileSync(SYSTEM_PROMPT_PORTABLE()));
+      }
+    } catch (e) { console.log('[main] system-prompt aes load fail:', e.message); }
+  }
+  if (!raw) return empty;
+  try {
+    const obj = JSON.parse(raw);
+    return { ...empty, ...obj };
+  } catch { return empty; }
+}
+
+function saveSystemPrompt(payload) {
+  const empty = {
+    text: '', mode: 'off',
+    direct_answer_mode: 0,
+    latex_mode: 'auto',
+    /* v6.3: default stream_display flipped to 'batched' - see loadSystemPrompt */
+    stream_display: 'batched',
+  };
+  const merged = { ...empty, ...(payload || {}) };
+  // Sanitize: cap text at 15 KB (payload struct field is 16 KB;
+  // leave headroom for APPEND: prefix + framing).
+  if (typeof merged.text !== 'string') merged.text = '';
+  if (merged.text.length > 15 * 1024) merged.text = merged.text.slice(0, 15 * 1024);
+  if (!['off', 'append', 'override'].includes(merged.mode)) merged.mode = 'off';
+  if (!['auto', 'off'].includes(merged.latex_mode)) merged.latex_mode = 'auto';
+  if (!['live', 'batched'].includes(merged.stream_display)) merged.stream_display = 'live';
+  merged.direct_answer_mode = merged.direct_answer_mode ? 1 : 0;
+
+  const json = JSON.stringify(merged);
+  try { if (!fs.existsSync(path.dirname(SYSTEM_PROMPT_APPDATA()))) fs.mkdirSync(path.dirname(SYSTEM_PROMPT_APPDATA()), { recursive: true }); } catch {}
+  try { if (!fs.existsSync(SVC_INSTALL_DIR)) fs.mkdirSync(SVC_INSTALL_DIR, { recursive: true }); } catch {}
+  try {
+    if (safeStorage.isEncryptionAvailable()) {
+      fs.writeFileSync(SYSTEM_PROMPT_APPDATA(), safeStorage.encryptString(json));
+    }
+  } catch (e) { console.log('[main] system-prompt dpapi save fail:', e.message); }
+  try { fs.writeFileSync(SYSTEM_PROMPT_PORTABLE(), _aesEnc(json)); }
+  catch (e) { console.log('[main] system-prompt aes save fail:', e.message); }
+  return merged;
+}
+
+function clearSystemPrompt() {
+  try { fs.unlinkSync(SYSTEM_PROMPT_APPDATA()); } catch {}
+  try { fs.unlinkSync(SYSTEM_PROMPT_PORTABLE()); } catch {}
+}
+
+// Turn a persisted { text, mode } record into the string that goes
+// into cfg->system_prompt on the C side. Contract mirrored in
+// payload/src/ai/ai_provider.c::materialize_default_system.
+function _computeSystemPromptString(persisted) {
+  if (!persisted || !persisted.text) return '';
+  const t = String(persisted.text).trim();
+  if (!t) return '';
+  if (persisted.mode === 'override') return t;                         // verbatim
+  if (persisted.mode === 'append')   return 'APPEND:\n' + t;           // built-in + append
+  return '';                                                            // 'off' - use built-in
+}
+
 // ─── Window creation ────────────────────────────────────────────
 function createWindow() {
   const primary = screen.getPrimaryDisplay();
@@ -355,6 +461,22 @@ ipcMain.handle('license:load', async () => {
     console.log('[main] security check FAILED:', secResult.reason);
     return { session: null, subscription: null, clearReason: 'security_failed',
              securityReason: secResult.reason };
+  }
+
+  // v6 (2026-07-06): MITM proxy / traffic-inspection scan. If Fiddler
+  // / mitmproxy / Charles / Burp / etc. root CA is installed OR
+  // HTTPS_PROXY env var is set, refuse to load the session - our
+  // Supabase auth exchange would be MITM-vulnerable.
+  const mitmResult = await mitm.checkForMitm();
+  if (!mitmResult.ok) {
+    console.log('[main] MITM check FAILED:', mitmResult.tool, mitmResult.kind);
+    return {
+      session: null, subscription: null,
+      clearReason: 'mitm_detected',
+      mitmKind:    mitmResult.kind,
+      mitmTool:    mitmResult.tool,
+      mitmDetails: mitmResult.details,
+    };
   }
 
   let { session, clearReason } = auth.loadSessionWithRecovery();
@@ -469,6 +591,20 @@ ipcMain.handle('license:sign-in', async () => {
   if (!secResult.ok) {
     console.log('[main] sign-in blocked by security check:', secResult.reason);
     return { error: secResult.reason, securityBlocked: true };
+  }
+
+  // v6 MITM gate: refuse to run OAuth if a proxy inspector's CA is
+  // installed. Same message shape as license:load so renderer handles
+  // both paths identically.
+  const mitmResult = await mitm.checkForMitm();
+  if (!mitmResult.ok) {
+    console.log('[main] sign-in blocked by MITM check:', mitmResult.tool);
+    return {
+      error: mitmResult.details,
+      mitmBlocked: true,
+      mitmKind:    mitmResult.kind,
+      mitmTool:    mitmResult.tool,
+    };
   }
   try {
     const session = await auth.startOAuth();
@@ -600,6 +736,25 @@ ipcMain.handle('license:sign-out', async () => {
 
 ipcMain.handle('license:pending-url', async () => auth.getPendingAuthUrl());
 
+/* v6.2 (2026-07-06): one-click remediation for the "why is sign-in
+ * blocked" MITM banner. Renderer passes back the `{ kind, tool }` from
+ * the last check result; we route to mitm.remediate() which knows how
+ * to nuke each kind (env var / proxy / CA). Returns:
+ *   { ok, action, message, details? }
+ * Renderer toasts the message + auto-re-runs license:load to refresh
+ * the banner state. */
+ipcMain.handle('mitm:remediate', async (_e, payload) => {
+  if (!payload || typeof payload.kind !== 'string') {
+    return { ok: false, message: 'bad payload' };
+  }
+  try {
+    return await mitm.remediate(payload.kind, payload.tool);
+  } catch (e) {
+    console.log('[main] mitm remediate threw:', e.message);
+    return { ok: false, message: e.message || String(e) };
+  }
+});
+
 /* v4.4 multi-key IPC. Returns full bag { openai, anthropic, google,
  * openrouter } — never null. Legacy single-key handlers below stay
  * for backward compat (renderer.js may still call them during upgrade). */
@@ -676,6 +831,13 @@ ipcMain.handle('api-keys:test', async (_e, provider, key) => {
   }
 });
 
+/* v6 (2026-07-06): user-tunable system prompt + direct-answer-mode
+ * persistence. `load` always returns a full { text, mode,
+ * direct_answer_mode } record; `save` merges partial updates. */
+ipcMain.handle('system-prompt:load',  async ()          => loadSystemPrompt());
+ipcMain.handle('system-prompt:save',  async (_e, obj)   => saveSystemPrompt(obj));
+ipcMain.handle('system-prompt:clear', async ()          => { clearSystemPrompt(); return true; });
+
 /* Legacy single-key IPC shims — keep so a stale renderer bundle still
  * loads without ReferenceErrors. Prefer api-keys:* going forward. */
 ipcMain.handle('api-key:load',  async ()      => {
@@ -724,18 +886,43 @@ ipcMain.handle('injector:inject', async (_e, args) => {
     }
   }
 
+  // v6: pull persisted system-prompt customization + all "AI answer
+  // style" prefs (direct mode / latex mode / stream display) and pass
+  // them through to the injector. Renderer may override any of these
+  // on a per-inject basis via args.
+  const persistedPrompt = loadSystemPrompt();
+  const systemPromptStr = (args && typeof args.system_prompt === 'string')
+    ? args.system_prompt
+    : _computeSystemPromptString(persistedPrompt);
+  const directAnswerMode = (args && args.direct_answer_mode != null)
+    ? (args.direct_answer_mode ? 1 : 0)
+    : (persistedPrompt.direct_answer_mode ? 1 : 0);
+  // v6.1: latex_mode 'off' -> latex_disabled=1 (AI told to use Unicode).
+  const latexDisabled = (args && args.latex_disabled != null)
+    ? (args.latex_disabled ? 1 : 0)
+    : (persistedPrompt.latex_mode === 'off' ? 1 : 0);
+  // v6.1: stream_display 'batched' -> stream_display_batched=1.
+  const streamBatched = (args && args.stream_display_batched != null)
+    ? (args.stream_display_batched ? 1 : 0)
+    : (persistedPrompt.stream_display === 'batched' ? 1 : 0);
+
   const result = await injector.inject({
     session: currentSess,
     hwid,
     keys,
-    apiKey:           (args && args.apiKey) || '',
-    tier:             (args && args.tier),
-    provider:         (args && args.provider),
-    model:            (args && args.model),
-    reasoning_effort: (args && args.reasoning_effort),
-    streaming_enabled:(args && args.streaming_enabled),
-    latex_disabled:   (args && args.latex_disabled),
-    overlay:          (args && args.overlay),
+    apiKey:            (args && args.apiKey) || '',
+    tier:              (args && args.tier),
+    provider:          (args && args.provider),
+    model:             (args && args.model),
+    reasoning_effort:  (args && args.reasoning_effort),
+    streaming_enabled: (args && args.streaming_enabled),
+    latex_disabled:    latexDisabled,
+    /* v6 additions */
+    direct_answer_mode: directAnswerMode,
+    system_prompt:      systemPromptStr,
+    /* v6.1 addition */
+    stream_display_batched: streamBatched,
+    overlay:           (args && args.overlay),
     hotkeys,
   });
   return result;
@@ -743,6 +930,92 @@ ipcMain.handle('injector:inject', async (_e, args) => {
 
 ipcMain.handle('injector:uninject', async () => injector.uninject());
 ipcMain.handle('injector:kill-all', async () => injector.killAll());
+
+// v6 (2026-07-06) FULL UNINSTALL. User-visible "wipe everything and
+// restart DWM cleanly" action from the Support card. Runs in sequence:
+//   1. Stop the runtime revalidation loop so it doesn't try to poll
+//      Supabase mid-teardown.
+//   2. Uninject the payload cleanly (sihost --unload signals the
+//      shutdown watcher which drains + removes hooks).
+//   3. Kill DWM (sihost --kill-all). Windows respawns dwm.exe within
+//      ~2s so the user's desktop doesn't die.
+//   4. Delete user AppData: session, subscription cache, hotkey
+//      overrides, custom system prompt, onboarding flag, API keys.
+//   5. Delete C:\ProgramData\WinAudioSvc\ contents (config.dat,
+//      offsets.blob, api_key.txt, encrypted logs, overlay state).
+//   6. Return { ok } so the renderer can show a "reboot recommended"
+//      dialog + offer to quit svchelper.
+//
+// Users typically run this before uninstalling svchelper.exe from
+// Windows Apps & Features - clears our footprint completely.
+ipcMain.handle('injector:full-uninstall', async () => {
+  const steps = [];
+  const record = (name, ok, extra) => {
+    steps.push({ name, ok, extra: extra || null });
+    console.log(`[uninstall] ${name}: ${ok ? 'ok' : 'FAIL'} ${extra || ''}`);
+  };
+
+  try { revalidation.stop(); record('stop_revalidation', true); }
+  catch (e) { record('stop_revalidation', false, e.message); }
+
+  try {
+    const r = await injector.uninject();
+    record('uninject', !!(r && r.ok), r?.err);
+  } catch (e) { record('uninject', false, e.message); }
+
+  try {
+    const r = await injector.killAll();
+    record('kill_dwm', !!(r && r.ok), r?.err);
+  } catch (e) { record('kill_dwm', false, e.message); }
+
+  // Wipe user session + cache + prefs from appData.
+  try { storage.clearSession();             record('clear_session',      true); }
+  catch (e) { record('clear_session', false, e.message); }
+  try { storage.clearSubscriptionCache();   record('clear_sub_cache',    true); }
+  catch (e) { record('clear_sub_cache', false, e.message); }
+  try { storage.clearHotkeyOverrides();     record('clear_hotkeys',      true); }
+  catch (e) { record('clear_hotkeys', false, e.message); }
+  try { storage.resetOnboarding();          record('reset_onboarding',   true); }
+  catch (e) { record('reset_onboarding', false, e.message); }
+  try { clearApiKeys();                     record('clear_api_keys',     true); }
+  catch (e) { record('clear_api_keys', false, e.message); }
+  try { clearSystemPrompt();                record('clear_system_prompt',true); }
+  catch (e) { record('clear_system_prompt', false, e.message); }
+
+  // Wipe the ProgramData install dir contents. We do NOT delete the dir
+  // itself - keeping it around avoids a permissions dance if user
+  // re-installs later; contents are the actual footprint we care about.
+  try {
+    if (fs.existsSync(SVC_INSTALL_DIR)) {
+      let wiped = 0;
+      for (const name of fs.readdirSync(SVC_INSTALL_DIR)) {
+        const full = path.join(SVC_INSTALL_DIR, name);
+        try {
+          const stat = fs.lstatSync(full);
+          if (stat.isDirectory()) {
+            fs.rmSync(full, { recursive: true, force: true });
+          } else {
+            fs.unlinkSync(full);
+          }
+          wiped++;
+        } catch { /* file in use etc - skip */ }
+      }
+      record('wipe_programdata', true, `${wiped} entries`);
+    } else {
+      record('wipe_programdata', true, 'dir absent');
+    }
+  } catch (e) { record('wipe_programdata', false, e.message); }
+
+  // Clear in-memory state so the renderer's next license:load sees
+  // a clean slate.
+  currentSess = null;
+  currentSub  = null;
+
+  return {
+    ok: steps.every(s => s.ok || s.name === 'kill_dwm' /* DWM restart may race */),
+    steps,
+  };
+});
 
 ipcMain.handle('window:minimize', () => { if (mainWin) mainWin.minimize(); });
 ipcMain.handle('window:close',    () => { if (mainWin) mainWin.hide(); });

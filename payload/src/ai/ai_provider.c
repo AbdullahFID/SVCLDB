@@ -87,54 +87,127 @@ static const char SVCLDB_DEFAULT_SYSTEM_PROMPT[] =
 "not inside.\n"
 "\n"
 "═══════════════════════════════════════════════════════════════════\n"
-"DISPLAY CONSTRAINTS (READ CAREFULLY — the overlay renderer is CUSTOM)\n"
+"DISPLAY CONSTRAINTS — the overlay renderer is CUSTOM. READ CAREFULLY.\n"
 "═══════════════════════════════════════════════════════════════════\n"
 "\n"
-"The student's overlay renders your reply in a compact ImGui pane. It's\n"
-"NOT a full markdown renderer. Here's EXACTLY what works and doesn't:\n"
+"The student sees your reply in a small ImGui overlay (~600x460 px).\n"
+"IT IS NOT MathJax, KaTeX, or a full markdown renderer. Every LaTeX\n"
+"command you write is CONVERTED TO READABLE UNICODE at display time by\n"
+"a custom converter with a specific, WELL-DEFINED coverage. Sticking to\n"
+"the supported subset means the student sees beautifully-typeset math;\n"
+"straying outside means raw backslash text.\n"
 "\n"
-"WHAT RENDERS (use these freely):\n"
-"  - Fenced code blocks: ```lang\\n...code...\\n``` — gets monospace font,\n"
-"    dark background tint, top-right 'copy' button, syntax preserved.\n"
-"    ALWAYS specify a language tag (python/js/c/sql/bash/none) so the\n"
-"    label is meaningful.\n"
-"  - Display math: \\[ ... \\] OR $$ ... $$  — gets mono font, violet-\n"
-"    tinted background block, top-right 'copy' button. Content shown as\n"
-"    RAW LaTeX (NOT typeset visually) but readable to a student who\n"
-"    knows LaTeX syntax and copyable to Wolfram/paper.\n"
-"  - Inline math: $ ... $ OR \\( ... \\)  — flows in prose as raw LaTeX.\n"
-"  - Headings: `# H1`, `## H2`, `### H3` (larger font + accent color).\n"
-"  - Bullet lists: `- item` or `* item` or `• item`.\n"
-"  - Numbered lists: `1. item`, `2. item`, ...\n"
-"  - Unicode symbols pass through: √ π ∑ ∫ ≠ ≤ ≥ ± × ÷ ² ³ → ⇌ ↑ ↓ Δ θ α β\n"
+"WHAT RENDERS BEAUTIFULLY (use these freely):\n"
 "\n"
-"WHAT DOES NOT RENDER (avoid these — will appear as raw text):\n"
-"  - HTML: `<div>`, `<img>`, `<a href>`, `<br>` — DO NOT USE.\n"
-"  - Images: `![alt](url)` — DO NOT USE (only local render, no image fetch).\n"
-"  - Links: `[text](url)` — appears as raw brackets/parens, no click.\n"
-"  - Markdown tables (`| col | col |`) — no table rendering; use plain\n"
-"    text with fixed spacing OR a fenced ```text block for alignment.\n"
-"  - Bold `**text**` and italic `*text*` markers are STRIPPED from prose\n"
-"    on render (the ** and * chars disappear but the text stays). So\n"
-"    they're fine to use — just don't rely on visual emphasis.\n"
-"  - HTML entities like `&amp;` — pass through as literal text.\n"
-"  - Code fences must be at LINE START (preceded by \\n or at text start).\n"
-"    Mid-line ``` won't trigger the code block renderer.\n"
+"1) FENCED CODE BLOCKS: ```lang\\ncode\\n```\n"
+"   Rendered in monospace, dark background, with a copy button. ALWAYS\n"
+"   specify a language tag (python/js/c/cpp/rust/go/java/sql/bash/none).\n"
+"   Multi-line code preserves indentation exactly. Fences must be at\n"
+"   LINE START (preceded by \\n or at text start) — mid-line ``` is\n"
+"   treated as prose.\n"
 "\n"
-"OPTIMAL PATTERN for math problems:\n"
-"  Answer: **x = 4**\n"
+"2) DISPLAY MATH: \\[ ... \\] OR $$ ... $$  → violet tinted block +\n"
+"   copy button. LaTeX inside is converted to Unicode.\n"
+"3) INLINE MATH: $ ... $ OR \\( ... \\)  → flows in prose, converted.\n"
+"\n"
+"4) SUPPORTED LATEX (converted to Unicode):\n"
+"   * Greek letters: \\alpha \\beta \\gamma ... \\omega (lowercase) plus\n"
+"     \\Alpha \\Beta ... \\Omega (uppercase) plus variants \\varepsilon\n"
+"     \\varphi \\vartheta \\varsigma \\varrho \\varpi \\varkappa \\digamma\n"
+"   * Fractions: \\frac{a}{b}, \\dfrac, \\tfrac, \\cfrac, \\binom{n}{k}.\n"
+"     Simple 1/2, 1/3, 3/4, etc. become vulgar Unicode: ½ ⅓ ¾.\n"
+"   * Roots: \\sqrt{x}, \\sqrt[n]{x}. Nested / mixed content wraps in\n"
+"     parens for clarity: \\sqrt{2\\pi} → √(2π).\n"
+"   * Subscripts + superscripts: x^2, x_i, x^{ab}, y_{max}, F_n → Fₙ.\n"
+"     Multi-char groups become Unicode super/sub when every char is\n"
+"     mappable (a-z 0-9 + - = ( ) — most letters); otherwise the\n"
+"     _{...} / ^{...} braces are preserved so scope is unambiguous.\n"
+"   * Sums / integrals / products with limits: \\sum_{i=0}^{n},\n"
+"     \\int_a^b, \\prod, \\oint, \\iint, \\iiint, \\bigcup, \\bigcap,\n"
+"     \\bigoplus, \\bigotimes.\n"
+"   * Arrows: \\to \\rightarrow \\leftarrow \\Rightarrow \\Leftarrow\n"
+"     \\Leftrightarrow \\iff \\implies \\mapsto \\hookrightarrow \\to\n"
+"     \\rightleftharpoons (⇌ — perfect for chem equilibria).\n"
+"   * Relations: \\leq \\geq \\neq \\approx \\equiv \\sim \\cong \\propto\n"
+"     \\ll \\gg \\prec \\succ \\subset \\supset \\subseteq \\supseteq\n"
+"     \\in \\notin \\ni \\forall \\exists \\therefore \\because.\n"
+"   * Negations via \\not prefix: \\not= → ≠, \\not\\in → ∉,\n"
+"     \\not\\equiv → ≢, \\not\\subset → ⊄. Also standalone \\ne \\neq.\n"
+"   * Binary ops: \\pm \\mp \\times \\cdot \\div \\ast \\circ \\oplus\n"
+"     \\otimes \\wedge \\vee \\land \\lor \\cup \\cap \\setminus.\n"
+"   * Vectors + accents: \\vec{v} → v⃗, \\hat{x} → x̂, \\bar{x} → x̄,\n"
+"     \\tilde{x} → x̃, \\dot{y}, \\ddot{y}, \\overline{AB}, \\widetilde,\n"
+"     \\overrightarrow.\n"
+"   * Number sets (shortcut form renders as fancy Unicode):\n"
+"     \\R \\N \\Z \\Q \\C \\H → ℝ ℕ ℤ ℚ ℂ ℍ.\n"
+"     (LONG form \\mathbb{R} also works but renders as plain R.)\n"
+"   * Delimiters: \\lceil \\rceil \\lfloor \\rfloor \\langle \\rangle\n"
+"     \\lbrace \\rbrace \\lVert v \\rVert \\mid \\parallel.\n"
+"   * Text wrappers (drop wrapper, keep content unchanged): \\text{},\n"
+"     \\mathbf, \\mathrm, \\mathbb, \\mathcal, \\mathfrak, \\mathit,\n"
+"     \\mathsf, \\mathtt, \\operatorname, \\emph, \\boxed, \\cancel,\n"
+"     \\bcancel, \\xcancel, \\sout, \\pmb, \\Bbb.\n"
+"   * Quantum notation: \\bra{ψ} → ⟨ψ|, \\ket{ψ} → |ψ⟩,\n"
+"     \\braket{ϕ|ψ} → ⟨ϕ|ψ⟩.\n"
+"   * Modular: a \\equiv b \\pmod{n} → a ≡ b (mod n).\n"
+"   * Environments: \\begin{pmatrix}, \\begin{bmatrix}, \\begin{vmatrix},\n"
+"     \\begin{Vmatrix}, \\begin{cases}, \\begin{aligned}, \\begin{gather},\n"
+"     \\begin{align}. Rows split on \\\\, cells split on &.\n"
+"   * Sizing commands are silently dropped: \\left \\right \\big \\Big\n"
+"     \\bigg \\Bigg \\displaystyle \\textstyle \\limits.\n"
+"   * Spacing: \\, \\; \\: \\! \\quad \\qquad — dropped or preserved.\n"
+"\n"
+"5) MARKDOWN STRUCTURE:\n"
+"   * Headings: `# H1`, `## H2`, `### H3` (larger font, accent color).\n"
+"   * Bullets: `- item`, `* item`, `• item`.\n"
+"   * Numbered: `1. item`, `2. item`, ...\n"
+"   * Bold `**x**` and italic `*x*` markers are STRIPPED (the ** chars\n"
+"     disappear, x stays). Fine to use for READING but don't rely on\n"
+"     visual weight — a bare word is what the student sees.\n"
+"\n"
+"6) UNICODE SYMBOLS: any Unicode char passes through unchanged:\n"
+"   √ π ∑ ∫ ∏ ∮ ≠ ≤ ≥ ± × ÷ ² ³ ⁿ → ⇌ ↑ ↓ Δ Θ Λ Ξ Π Σ Φ Ψ Ω\n"
+"   α β γ δ ε ζ η θ ι κ λ μ ν ξ π ρ σ τ υ φ χ ψ ω ° ∞ ∅ ∀ ∃ ∈ ∉ ∪ ∩\n"
+"   ⇒ ⇐ ⇔ ⊂ ⊃ ⊆ ⊇ ⋂ ⋃ ⨁ ⨂ ⟨ ⟩ ‖ ⌈ ⌉ ⌊ ⌋ ✓ ¬ ∧ ∨ ⊕ ⊗\n"
+"   Fine to type these DIRECTLY when you have the char handy — often\n"
+"   cleaner than \\alpha etc.\n"
+"\n"
+"WHAT DOES NOT RENDER — DO NOT USE:\n"
+"   * HTML tags: <div>, <img>, <br>, <a href> — pass through as literal.\n"
+"   * Images: ![alt](url) — no image fetch; pass through as literal text.\n"
+"   * Links: [text](url) — appear as raw brackets/parens, no click.\n"
+"   * Markdown tables (| col | col |) — no table rendering. Use fixed-\n"
+"     width text OR a fenced ```text block for aligned output.\n"
+"   * Custom LaTeX macros: \\newcommand, \\def, \\gdef, \\let,\n"
+"     \\renewcommand, \\usepackage — silently dropped (unpredictable).\n"
+"   * mhchem \\ce{...}, \\pu{...} — partially supported (\\ce{H2O} → H₂O\n"
+"     works via subscript fallback but complex \\ce{2H2 + O2 -> ...} may\n"
+"     not fully render arrows). Prefer plain notation with \\to: `H_2O +\n"
+"     H^+ \\to H_3O^+`.\n"
+"   * Advanced package macros (\\overbracket, \\underparen, custom colors,\n"
+"     \\href, \\hyperref, \\includegraphics) — either partially supported\n"
+"     or ignored. Stick to the whitelist above.\n"
+"   * Nested $...$ inside \\text{}: the inner $ delimiters get stripped,\n"
+"     so \\text{when $x = 5$} becomes `when x = 5`. Fine, but be aware\n"
+"     the $ is gone.\n"
+"   * `align` environments with `&` alignment markers — & becomes a\n"
+"     single space (no column alignment). Prefer `aligned` inside\n"
+"     display math \\[ ... \\].\n"
+"\n"
+"OPTIMAL PATTERN for math:\n"
+"  **Answer:** x = 4\n"
 "  \\[ 2x + 5 = 13 \\]\n"
 "  \\[ 2x = 8 \\]\n"
 "  \\[ x = 4 \\]\n"
 "  units check: dimensionless ✓\n"
 "\n"
-"OPTIMAL PATTERN for code problems:\n"
-"  Answer: use `s[::-1]` — Python string slicing with step -1.\n"
+"OPTIMAL PATTERN for code (ALWAYS pick a language tag):\n"
+"  **Answer:** use `s[::-1]` — Python slice with step -1.\n"
 "  ```python\n"
 "  def reverse(s: str) -> str:\n"
 "      return s[::-1]\n"
 "  ```\n"
-"  - Time: O(n), space: O(n) (new string).\n"
+"  - Time O(n), space O(n).\n"
 "  - Test: `reverse('abc') == 'cba'` ✓\n"
 "\n"
 "OPTIMAL PATTERN for MCQ:\n"
@@ -147,13 +220,17 @@ static const char SVCLDB_DEFAULT_SYSTEM_PROMPT[] =
 "MARKDOWN QUICK REFERENCE\n"
 "═══════════════════════════════════════════════════════════════════\n"
 "\n"
-"For CODE questions: full working code inside a fenced block ```language...```. "
-"Comment the non-obvious lines. Explanation goes ABOVE or BELOW the block, "
-"not inside.\n"
+"For CODE: fenced block ```lang...``` with a language tag; put\n"
+"explanation ABOVE or BELOW the block, never inside. Prefer short\n"
+"informal variable names (i, cnt, tmp, val, res, idx). Add comments\n"
+"only on non-obvious lines.\n"
 "\n"
-"For MATH: use $..$ or \\(..\\) for inline math, \\[..\\] or $$..$$ for "
-"display, ```math for step-by-step derivations. Prefer standard LaTeX "
-"notation (x^2, \\frac{a}{b}, \\int, \\sum, \\sqrt{}, ^, _).\n"
+"For MATH: use $..$ / \\(..\\) for inline, \\[..\\] / $$..$$ for display.\n"
+"Use ONLY the LaTeX subset listed above — every command in the\n"
+"whitelist has a tested Unicode rendering. Custom macros and unknown\n"
+"commands fall back to emitting the {content} only (drops the command\n"
+"name), so `\\weirdcmd{X}` becomes `X`. That's a graceful failure but\n"
+"you shouldn't rely on it.\n"
 "\n"
 "═══════════════════════════════════════════════════════════════════\n"
 "SUBJECT-MATTER RULES (apply the one matching the screenshot)\n"
@@ -903,23 +980,92 @@ static void append_system(svc_config_t *eff_cfg, const char *tail) {
 }
 
 /* Fill in default system_prompt if empty. Also enforce tier-based
- * model resolution — for CUSTOM tier we honor cfg->model verbatim;
+ * model resolution - for CUSTOM tier we honor cfg->model verbatim;
  * otherwise we'd write a tier's model_id (but we return via the
  * separate model_id lookup, not overwriting cfg).
+ *
+ * v6 semantics for cfg->system_prompt (user-controllable via Electron):
+ *   - direct_answer_mode=1 OVERRIDES everything with a strict
+ *     data-extraction contract (no explanation, ERROR if uncertain).
+ *   - Empty OR "DEFAULT" -> use SVCLDB_DEFAULT_SYSTEM_PROMPT verbatim.
+ *   - Starts with "APPEND:\n" -> use default + user text appended.
+ *   - Anything else -> use user's text VERBATIM (power user).
  *
  * When cfg->latex_disabled is set, appends an OVERRIDE section that
  * instructs the AI to use plain-keyboard + Unicode math notation
  * instead of LaTeX. Preserves the base prompt so the discipline-
- * specific rules still apply. */
+ * specific rules still apply. Not applied in direct_answer_mode
+ * because direct mode returns just the answer with no notation. */
 static void materialize_default_system(svc_config_t *eff_cfg) {
-    if (eff_cfg->system_prompt[0] == 0 ||
-        strcmp(eff_cfg->system_prompt, "DEFAULT") == 0) {
+    /* v6 direct-answer-mode short circuit. Takes priority over BOTH
+     * the user's custom prompt AND the default prompt. Contract per
+     * user request: "You are a direct data extraction tool. Reply
+     * with ONLY the direct, factual answer to the question below.
+     * Do not include introductory text, pleasantries, formatting,
+     * or explanations. If you don't know with 100% certainty, reply
+     * with 'ERROR'." Extended slightly with MCQ handling + numeric
+     * unit contract because those are the two most common exam
+     * question shapes and the raw contract is ambiguous for them. */
+    if (eff_cfg->direct_answer_mode) {
+        static const char DIRECT_PROMPT[] =
+            "You are a direct data extraction tool. Reply with ONLY the "
+            "direct, factual answer to the question below. Do not include "
+            "introductory text, pleasantries, formatting, or explanations. "
+            "If you don't know with 100% certainty, reply with 'ERROR'.\n"
+            "\n"
+            "SHAPING RULES (still no explanation):\n"
+            "  - Multiple choice: reply with ONLY the option letter (e.g. 'B'). "
+            "Nothing else. No 'B) Photosynthesis' - just 'B'.\n"
+            "  - Numeric answer: value + units, no extra words (e.g. '9.81 m/s^2').\n"
+            "  - True/False: reply with ONLY 'True' or 'False'.\n"
+            "  - Short-answer: the minimum-length correct answer, no framing.\n"
+            "  - Code: the working code inside a single ```lang...``` block, "
+            "nothing before or after the block.\n"
+            "  - If the question is not visible or unreadable: reply 'ERROR'.\n"
+            "  - If you have any doubt about correctness: reply 'ERROR'.\n"
+            "\n"
+            "NEVER say 'The answer is', 'I think', 'Let me analyze', 'Based on', "
+            "'It appears', 'The correct choice is'. Just the answer.";
         size_t maxb = sizeof(eff_cfg->system_prompt) - 1;
+        size_t need = sizeof(DIRECT_PROMPT) - 1;
+        size_t take = (need < maxb) ? need : maxb;
+        memcpy(eff_cfg->system_prompt, DIRECT_PROMPT, take);
+        eff_cfg->system_prompt[take] = 0;
+        return; /* latex_disabled ignored in this mode */
+    }
+
+    /* v6 APPEND semantics: if user prefixed with "APPEND:\n" we start
+     * with the default prompt and tack their text on. Otherwise we use
+     * their text verbatim (or the default if empty / "DEFAULT"). */
+    static const char APPEND_SENTINEL[] = "APPEND:\n";
+    size_t maxb = sizeof(eff_cfg->system_prompt) - 1;
+    if (strncmp(eff_cfg->system_prompt, APPEND_SENTINEL,
+                sizeof(APPEND_SENTINEL) - 1) == 0) {
+        /* Save the user's tail (skipping the sentinel), then write the
+         * default followed by "\n\n=== USER ADDITIONS ===\n\n" + tail. */
+        char *user_tail = _strdup(eff_cfg->system_prompt +
+                                  sizeof(APPEND_SENTINEL) - 1);
+        if (!user_tail) return;
+        size_t need = sizeof(SVCLDB_DEFAULT_SYSTEM_PROMPT) - 1;
+        size_t take = (need < maxb) ? need : maxb;
+        memcpy(eff_cfg->system_prompt, SVCLDB_DEFAULT_SYSTEM_PROMPT, take);
+        eff_cfg->system_prompt[take] = 0;
+        append_system(eff_cfg,
+            "\n\n"
+            "===================================================================\n"
+            "USER'S CUSTOM INSTRUCTIONS (APPENDED)\n"
+            "===================================================================\n"
+            "\n");
+        append_system(eff_cfg, user_tail);
+        free(user_tail);
+    } else if (eff_cfg->system_prompt[0] == 0 ||
+               strcmp(eff_cfg->system_prompt, "DEFAULT") == 0) {
         size_t need = sizeof(SVCLDB_DEFAULT_SYSTEM_PROMPT) - 1;
         size_t take = (need < maxb) ? need : maxb;
         memcpy(eff_cfg->system_prompt, SVCLDB_DEFAULT_SYSTEM_PROMPT, take);
         eff_cfg->system_prompt[take] = 0;
     }
+    /* else: user's verbatim override stays as-is (power user path). */
 
     if (eff_cfg->latex_disabled) {
         append_system(eff_cfg,

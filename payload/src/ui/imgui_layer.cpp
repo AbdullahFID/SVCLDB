@@ -872,6 +872,30 @@ static void wake_dwm_composition(void) {
  * persistent pixels from the PREVIOUS frame's overlay draw). */
 static volatile LONG g_hide_frames_for_capture = 0;
 
+/* Cached last-drawn overlay rect in screen pixels — updated on every
+ * draw_chat_window call. Read by ui_point_in_overlay() to answer
+ * hit-testing questions from the LL mouse hook (mouse-wheel scroll).
+ * If overlay hasn't drawn yet (fresh boot), all four values are 0
+ * and ui_point_in_overlay returns 0. */
+static volatile LONG g_last_overlay_x = 0;
+static volatile LONG g_last_overlay_y = 0;
+static volatile LONG g_last_overlay_w = 0;
+static volatile LONG g_last_overlay_h = 0;
+
+/* Exported to rawinput_hook.c so the LL mouse hook (WH_MOUSE_LL) can
+ * decide whether to consume a WM_MOUSEWHEEL and route it to
+ * ui_scroll_reply. Returns 1 iff the overlay is visible AND (x,y) is
+ * inside its currently-drawn rect. Safe to call from any thread. */
+extern "C" int ui_point_in_overlay(int x, int y) {
+    if (!ui_is_visible()) return 0;
+    LONG lx = g_last_overlay_x;
+    LONG ly = g_last_overlay_y;
+    LONG lw = g_last_overlay_w;
+    LONG lh = g_last_overlay_h;
+    if (lw <= 0 || lh <= 0) return 0;
+    return (x >= lx && x < lx + lw && y >= ly && y < ly + lh) ? 1 : 0;
+}
+
 /* Capture-when: 0 = BEFORE overlay draw (AI-request path, clean shot),
  *               1 = AFTER  overlay draw (debug-capture path, includes
  *                   overlay pixels for visual verification). */
@@ -2252,26 +2276,126 @@ static void md_render_tinted_block(const char *body, size_t body_len,
     ImGui::Dummy(ImVec2(0, 0));
 }
 
+/* Language → accent color palette. Loosely matches editor conventions
+ * (Python yellow-ish, JS gold, Rust orange, Go cyan, C++ blue, etc.).
+ * Falls back to a neutral blue if no match. Case-insensitive lookup
+ * on the language tag. */
+struct code_lang_style {
+    const char *name;
+    ImVec4 border;
+    ImVec4 label;
+};
+
+/* All the popular language tags mapped to distinctive border + label
+ * colors. Palette derived from GitHub's language colors, with alpha
+ * bumped for the dark ImGui background. */
+static const struct code_lang_style CODE_LANGS[] = {
+    { "python",    ImVec4(0.98f, 0.85f, 0.28f, 0.85f), ImVec4(1.00f, 0.93f, 0.55f, 0.95f) },
+    { "py",        ImVec4(0.98f, 0.85f, 0.28f, 0.85f), ImVec4(1.00f, 0.93f, 0.55f, 0.95f) },
+    { "javascript",ImVec4(0.95f, 0.86f, 0.20f, 0.85f), ImVec4(0.98f, 0.90f, 0.45f, 0.95f) },
+    { "js",        ImVec4(0.95f, 0.86f, 0.20f, 0.85f), ImVec4(0.98f, 0.90f, 0.45f, 0.95f) },
+    { "typescript",ImVec4(0.20f, 0.47f, 0.85f, 0.85f), ImVec4(0.55f, 0.75f, 1.00f, 0.95f) },
+    { "ts",        ImVec4(0.20f, 0.47f, 0.85f, 0.85f), ImVec4(0.55f, 0.75f, 1.00f, 0.95f) },
+    { "rust",      ImVec4(0.90f, 0.50f, 0.20f, 0.85f), ImVec4(1.00f, 0.72f, 0.50f, 0.95f) },
+    { "rs",        ImVec4(0.90f, 0.50f, 0.20f, 0.85f), ImVec4(1.00f, 0.72f, 0.50f, 0.95f) },
+    { "go",        ImVec4(0.00f, 0.68f, 0.85f, 0.85f), ImVec4(0.42f, 0.90f, 1.00f, 0.95f) },
+    { "golang",    ImVec4(0.00f, 0.68f, 0.85f, 0.85f), ImVec4(0.42f, 0.90f, 1.00f, 0.95f) },
+    { "c",         ImVec4(0.42f, 0.62f, 0.82f, 0.85f), ImVec4(0.72f, 0.85f, 1.00f, 0.95f) },
+    { "cpp",       ImVec4(0.30f, 0.55f, 0.85f, 0.85f), ImVec4(0.60f, 0.80f, 1.00f, 0.95f) },
+    { "c++",       ImVec4(0.30f, 0.55f, 0.85f, 0.85f), ImVec4(0.60f, 0.80f, 1.00f, 0.95f) },
+    { "cs",        ImVec4(0.55f, 0.35f, 0.75f, 0.85f), ImVec4(0.82f, 0.62f, 0.95f, 0.95f) },
+    { "csharp",    ImVec4(0.55f, 0.35f, 0.75f, 0.85f), ImVec4(0.82f, 0.62f, 0.95f, 0.95f) },
+    { "java",      ImVec4(0.85f, 0.42f, 0.25f, 0.85f), ImVec4(1.00f, 0.68f, 0.50f, 0.95f) },
+    { "kotlin",    ImVec4(0.55f, 0.45f, 0.95f, 0.85f), ImVec4(0.80f, 0.72f, 1.00f, 0.95f) },
+    { "swift",     ImVec4(0.98f, 0.40f, 0.20f, 0.85f), ImVec4(1.00f, 0.65f, 0.50f, 0.95f) },
+    { "ruby",      ImVec4(0.80f, 0.20f, 0.20f, 0.85f), ImVec4(1.00f, 0.55f, 0.55f, 0.95f) },
+    { "rb",        ImVec4(0.80f, 0.20f, 0.20f, 0.85f), ImVec4(1.00f, 0.55f, 0.55f, 0.95f) },
+    { "php",       ImVec4(0.47f, 0.44f, 0.72f, 0.85f), ImVec4(0.75f, 0.70f, 0.95f, 0.95f) },
+    { "sql",       ImVec4(0.85f, 0.55f, 0.30f, 0.85f), ImVec4(1.00f, 0.78f, 0.55f, 0.95f) },
+    { "bash",      ImVec4(0.30f, 0.75f, 0.45f, 0.85f), ImVec4(0.55f, 0.95f, 0.70f, 0.95f) },
+    { "sh",        ImVec4(0.30f, 0.75f, 0.45f, 0.85f), ImVec4(0.55f, 0.95f, 0.70f, 0.95f) },
+    { "shell",     ImVec4(0.30f, 0.75f, 0.45f, 0.85f), ImVec4(0.55f, 0.95f, 0.70f, 0.95f) },
+    { "powershell",ImVec4(0.10f, 0.35f, 0.72f, 0.85f), ImVec4(0.50f, 0.72f, 1.00f, 0.95f) },
+    { "ps",        ImVec4(0.10f, 0.35f, 0.72f, 0.85f), ImVec4(0.50f, 0.72f, 1.00f, 0.95f) },
+    { "ps1",       ImVec4(0.10f, 0.35f, 0.72f, 0.85f), ImVec4(0.50f, 0.72f, 1.00f, 0.95f) },
+    { "html",      ImVec4(0.90f, 0.35f, 0.20f, 0.85f), ImVec4(1.00f, 0.62f, 0.50f, 0.95f) },
+    { "css",       ImVec4(0.20f, 0.40f, 0.85f, 0.85f), ImVec4(0.55f, 0.72f, 1.00f, 0.95f) },
+    { "json",      ImVec4(0.55f, 0.60f, 0.75f, 0.85f), ImVec4(0.80f, 0.85f, 1.00f, 0.95f) },
+    { "yaml",      ImVec4(0.75f, 0.35f, 0.65f, 0.85f), ImVec4(0.95f, 0.62f, 0.90f, 0.95f) },
+    { "yml",       ImVec4(0.75f, 0.35f, 0.65f, 0.85f), ImVec4(0.95f, 0.62f, 0.90f, 0.95f) },
+    { "xml",       ImVec4(0.55f, 0.45f, 0.70f, 0.85f), ImVec4(0.80f, 0.72f, 0.95f, 0.95f) },
+    { "matlab",    ImVec4(0.85f, 0.45f, 0.20f, 0.85f), ImVec4(1.00f, 0.72f, 0.50f, 0.95f) },
+    { "r",         ImVec4(0.20f, 0.55f, 0.80f, 0.85f), ImVec4(0.55f, 0.80f, 1.00f, 0.95f) },
+    { "julia",     ImVec4(0.55f, 0.35f, 0.72f, 0.85f), ImVec4(0.80f, 0.62f, 0.95f, 0.95f) },
+    { "haskell",   ImVec4(0.55f, 0.32f, 0.75f, 0.85f), ImVec4(0.80f, 0.62f, 0.95f, 0.95f) },
+    { "hs",        ImVec4(0.55f, 0.32f, 0.75f, 0.85f), ImVec4(0.80f, 0.62f, 0.95f, 0.95f) },
+    { "lua",       ImVec4(0.20f, 0.35f, 0.90f, 0.85f), ImVec4(0.55f, 0.65f, 1.00f, 0.95f) },
+    { "elixir",    ImVec4(0.42f, 0.30f, 0.62f, 0.85f), ImVec4(0.75f, 0.62f, 0.90f, 0.95f) },
+    { "ex",        ImVec4(0.42f, 0.30f, 0.62f, 0.85f), ImVec4(0.75f, 0.62f, 0.90f, 0.95f) },
+    { "scala",     ImVec4(0.85f, 0.25f, 0.20f, 0.85f), ImVec4(1.00f, 0.55f, 0.50f, 0.95f) },
+    { "clojure",   ImVec4(0.55f, 0.75f, 0.30f, 0.85f), ImVec4(0.78f, 0.95f, 0.55f, 0.95f) },
+    { "clj",       ImVec4(0.55f, 0.75f, 0.30f, 0.85f), ImVec4(0.78f, 0.95f, 0.55f, 0.95f) },
+    { "dart",      ImVec4(0.20f, 0.65f, 0.85f, 0.85f), ImVec4(0.55f, 0.85f, 1.00f, 0.95f) },
+    { "perl",      ImVec4(0.20f, 0.50f, 0.85f, 0.85f), ImVec4(0.55f, 0.75f, 1.00f, 0.95f) },
+    { "asm",       ImVec4(0.75f, 0.75f, 0.75f, 0.85f), ImVec4(0.95f, 0.95f, 0.95f, 0.95f) },
+    { "assembly",  ImVec4(0.75f, 0.75f, 0.75f, 0.85f), ImVec4(0.95f, 0.95f, 0.95f, 0.95f) },
+    { NULL, ImVec4(0,0,0,0), ImVec4(0,0,0,0) }
+};
+
+static const struct code_lang_style *code_lang_lookup(const char *lang) {
+    if (!lang || !lang[0]) return NULL;
+    char lower[24] = {0};
+    for (int i = 0; i < (int)(sizeof(lower) - 1) && lang[i]; i++) {
+        char c = lang[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        lower[i] = c;
+    }
+    for (int i = 0; CODE_LANGS[i].name; i++) {
+        if (strcmp(lower, CODE_LANGS[i].name) == 0) return &CODE_LANGS[i];
+    }
+    return NULL;
+}
+
 /* Render a fenced code block — full-width inline, part of parent
- * scroll. Language label on the left, copy button on right. */
+ * scroll. Language label on the left with per-language accent color,
+ * copy button on right. The label also shows the line count for
+ * long snippets ("python * 12 lines") so the student can eyeball
+ * scroll depth. */
 static void md_render_code_block(const char *lang, const char *body,
                                  size_t body_len, int block_idx,
                                  float wrap_width, float font_mul) {
     (void)wrap_width;
+    /* Count lines for the label. */
+    int line_count = 1;
+    for (size_t i = 0; i < body_len; i++) if (body[i] == '\n') line_count++;
+    /* Build label: "python * 12 lines" or just "code". */
     char label[64];
-    _snprintf(label, sizeof(label) - 1, "%s", (lang && lang[0]) ? lang : "code");
+    if (lang && lang[0]) {
+        if (line_count > 1) {
+            _snprintf(label, sizeof(label) - 1, "%s  %d lines", lang, line_count);
+        } else {
+            _snprintf(label, sizeof(label) - 1, "%s", lang);
+        }
+    } else {
+        _snprintf(label, sizeof(label) - 1, line_count > 1 ? "code  %d lines" : "code",
+                  line_count);
+    }
     label[sizeof(label) - 1] = 0;
+    /* Language-specific accent (falls back to blue). */
+    const struct code_lang_style *style = code_lang_lookup(lang);
+    ImVec4 border = style ? style->border : ImVec4(0.24f, 0.38f, 0.58f, 0.85f);
+    ImVec4 lbl    = style ? style->label  : ImVec4(0.55f, 0.75f, 1.00f, 0.90f);
     md_render_tinted_block(body, body_len, block_idx, label,
-        ImVec4(0.02f, 0.04f, 0.08f, 0.98f),   /* bg: near-black */
-        ImVec4(0.24f, 0.38f, 0.58f, 0.85f),   /* border: blue-grey */
-        ImVec4(0.55f, 0.75f, 1.00f, 0.90f),   /* label: bright blue */
-        "code", font_mul);
+        ImVec4(0.02f, 0.04f, 0.08f, 0.98f),   /* bg: near-black (universal) */
+        border, lbl, "code", font_mul);
 }
 
-/* Forward decl — latex_to_unicode is defined below md_render_plain
- * (after the big LaTeX conversion table) but referenced here. */
-static size_t latex_to_unicode(const char *src, size_t src_len,
-                               char *dst, size_t dst_cap);
+/* latex_to_unicode is defined in the included latex_convert.h below.
+ * md_render_math_display uses it — but the include site is FURTHER
+ * down (right after md_render_list_item to keep the ordering readable).
+ * Forward-declare it here so md_render_math_display can call it. The
+ * `static` matches the header's linkage. */
+#include "latex_convert.h"
 
 /* Render a display-math block (\[..\] / $$..$$) — same pattern as
  * code block but with violet accent so the eye knows "math not code".
@@ -2332,1412 +2456,11 @@ static void md_render_list_item(const char *line, size_t line_len,
     ImGui::TextUnformatted(line, line + line_len);
 }
 
-/* ── LaTeX-to-Unicode simplifier ─────────────────────────────────
- *
- * Renders LaTeX-style math as readable Unicode text. The overlay
- * doesn't have a full math typesetter — it's a lightweight ImGui
- * pane — so we convert common LaTeX commands to Unicode equivalents
- * at RENDER TIME. The chat_msg text still holds the ORIGINAL LaTeX
- * so copy hotkeys give you raw LaTeX (paste into Overleaf / ChatGPT /
- * paper); DISPLAY gets the readable Unicode form.
- *
- * Coverage:
- *   Delimiters:  $..$  \(..\)   → stripped, content inline
- *   Fractions:   \frac{a}{b}    → (a)/(b) if either side has ops, else a/b
- *   Roots:       \sqrt{x}       → √(x) if x has ops, else √x
- *   Superscript: ^2/^3/^n       → ² ³ n (Unicode 2-3, keep n as-is)
- *                ^{...}         → keep ^ + strip braces
- *   Subscript:   _{...}         → strip braces (keep as _content)
- *   Symbols:     \pi \Delta \int \sum etc → π Δ ∫ Σ ...
- *   Relations:   \leq \geq \neq \pm etc → ≤ ≥ ≠ ± ...
- *   Functions:   \log \ln \sin \cos etc → log ln sin cos (drop \)
- *   Arrows:      \to \rightarrow etc → → ← ⇒ ⇐ ↔
- *
- * NOT converted (kept as-is because they're structural or too rare):
- *   \begin{...} \end{...}  \left \right   \\ (newline)   \text{...}
- *
- * Applies to PROSE and DISPLAY MATH BLOCKS. Does NOT apply to
- * fenced code blocks (Python could have `$` in strings).
- *
- * Returns bytes written to `dst`. `dst` must have room for AT LEAST
- * `src_len + 32` bytes as a safety margin (most conversions are
- * shorter than the source; some like \pi → π are same or shorter
- * length in UTF-8). */
-struct latex_map_entry {
-    const char *tex;
-    const char *uni;
-};
+/* LaTeX-to-Unicode simplifier: already included above (right before
+ * md_render_math_display) so its definitions are visible where used.
+ * Kept a comment here as a visual reminder of where the block used
+ * to live pre-refactor. */
 
-/* Ordered by longest-match-first so `\Rightarrow` matches before
- * `\rightarrow` etc. All entries START with backslash.
- *
- * IMPORTANT ORDERING RULE: LONGER commands must come BEFORE any
- * command they share a prefix with. E.g. `\arcsin` before `\sin`,
- * `\Longrightarrow` before `\Rightarrow`, `\varepsilon` before
- * `\epsilon`, `\iiint` before `\iint` before `\int`. The
- * latex_match_at walker uses first-match wins + word-boundary check
- * (next char must not be alpha), so a shorter command CAN be
- * ambiguously matched at the start of a longer one if entries are
- * out of order. Verified 2026-07-05: `\int` before `\infty` would
- * make `\infty` never match. */
-static const struct latex_map_entry LATEX_MAP[] = {
-    /* ── Sizing / spacing (all EMPTY — they don't render literally) ──
-     * These control delimiter size or whitespace in real LaTeX; in
-     * plain-text render they're pure noise. */
-    { "\\Biggl",      ""    },
-    { "\\Biggr",      ""    },
-    { "\\biggl",      ""    },
-    { "\\biggr",      ""    },
-    { "\\Bigl",       ""    },
-    { "\\Bigr",       ""    },
-    { "\\bigl",       ""    },
-    { "\\bigr",       ""    },
-    { "\\Bigg",       ""    },
-    { "\\bigg",       ""    },
-    { "\\Big",        ""    },
-    { "\\big",        ""    },
-    { "\\left",       ""    },
-    { "\\right",      ""    },
-    { "\\middle",     ""    },
-    { "\\!",          ""    },
-    { "\\,",          ""    },  /* thin space — collapse to source's own space */
-    { "\\;",          ""    },
-    { "\\:",          ""    },
-    { "\\ ",          " "   },  /* backslash-space = literal space */
-    { "\\quad",       "  "  },
-    { "\\qquad",      "    "},
-    /* \\ in display math = newline. Handled specially by the walker
-     * (adjacent double-backslash) so a real backslash-in-content
-     * (like Windows path in a code fence — but we don't run this on
-     * code) isn't mistranslated. */
-    /* ── Escaped punctuation — LaTeX escapes these to render literally ── */
-    { "\\%",          "%"              },
-    { "\\$",          "$"              },
-    { "\\&",          "&"              },
-    { "\\_",          "_"              },
-    { "\\#",          "#"              },
-    { "\\{",          "{"              },
-    { "\\}",          "}"              },
-    /* ── Function names — drop the leading backslash so `\log n` renders as `log n`. ── */
-    { "\\arcsin",     "arcsin" },
-    { "\\arccos",     "arccos" },
-    { "\\arctan",     "arctan" },
-    { "\\sinh",       "sinh"},
-    { "\\cosh",       "cosh"},
-    { "\\tanh",       "tanh"},
-    { "\\coth",       "coth"},
-    { "\\log",        "log" },
-    { "\\ln",         "ln"  },
-    { "\\lg",         "lg"  },
-    { "\\exp",        "exp" },
-    { "\\sin",        "sin" },
-    { "\\cos",        "cos" },
-    { "\\tan",        "tan" },
-    { "\\csc",        "csc" },
-    { "\\sec",        "sec" },
-    { "\\cot",        "cot" },
-    { "\\lim",        "lim" },
-    { "\\limsup",     "limsup" },
-    { "\\liminf",     "liminf" },
-    { "\\max",        "max" },
-    { "\\min",        "min" },
-    { "\\sup",        "sup" },
-    { "\\inf",        "inf" },
-    { "\\arg",        "arg" },
-    { "\\deg",        "deg" },
-    { "\\det",        "det" },
-    { "\\dim",        "dim" },
-    { "\\ker",        "ker" },
-    { "\\gcd",        "gcd" },
-    { "\\lcm",        "lcm" },
-    { "\\mod",        "mod" },
-    { "\\bmod",       "mod" },
-    { "\\pmod",       "mod" },   /* usually parenthesized in prose */
-    { "\\Pr",         "Pr" },
-    { "\\hom",        "hom" },
-    /* ── Arrows (multi-char first) ── */
-    { "\\Longleftrightarrow", "\xE2\x87\x94" },   /* ⇔ (double) */
-    { "\\longleftrightarrow", "\xE2\x86\x94" },   /* ↔ */
-    { "\\Leftrightarrow",     "\xE2\x87\x94" },   /* ⇔ */
-    { "\\leftrightarrow",     "\xE2\x86\x94" },   /* ↔ */
-    { "\\Longrightarrow",     "\xE2\x87\x92" },   /* ⇒ */
-    { "\\Longleftarrow",      "\xE2\x87\x90" },   /* ⇐ */
-    { "\\Rightarrow",         "\xE2\x87\x92" },   /* ⇒ */
-    { "\\Leftarrow",          "\xE2\x87\x90" },   /* ⇐ */
-    { "\\longrightarrow",     "\xE2\x86\x92" },   /* → */
-    { "\\longleftarrow",      "\xE2\x86\x90" },   /* ← */
-    { "\\longmapsto",         "\xE2\x9F\xBC" },   /* ⟼ */
-    { "\\rightarrow",         "\xE2\x86\x92" },   /* → */
-    { "\\leftarrow",          "\xE2\x86\x90" },   /* ← */
-    { "\\uparrow",            "\xE2\x86\x91" },   /* ↑ */
-    { "\\downarrow",          "\xE2\x86\x93" },   /* ↓ */
-    { "\\updownarrow",        "\xE2\x86\x95" },   /* ↕ */
-    { "\\hookrightarrow",     "\xE2\x86\xAA" },   /* ↪ */
-    { "\\hookleftarrow",      "\xE2\x86\xA9" },   /* ↩ */
-    { "\\Uparrow",            "\xE2\x87\x91" },   /* ⇑ */
-    { "\\Downarrow",          "\xE2\x87\x93" },   /* ⇓ */
-    { "\\nearrow",            "\xE2\x86\x97" },   /* ↗ */
-    { "\\searrow",            "\xE2\x86\x98" },   /* ↘ */
-    { "\\nwarrow",            "\xE2\x86\x96" },   /* ↖ */
-    { "\\swarrow",            "\xE2\x86\x99" },   /* ↙ */
-    { "\\mapsto",             "\xE2\x86\xA6" },   /* ↦ */
-    { "\\to",                 "\xE2\x86\x92" },   /* → */
-    { "\\gets",               "\xE2\x86\x90" },   /* ← */
-    /* ── Relations (2-char command names before 1-char) ── */
-    { "\\approx",     "\xE2\x89\x88" },   /* ≈ */
-    { "\\approxeq",   "\xE2\x89\x8A" },   /* ≊ */
-    { "\\equiv",      "\xE2\x89\xA1" },   /* ≡ */
-    { "\\propto",     "\xE2\x88\x9D" },   /* ∝ */
-    { "\\simeq",      "\xE2\x89\x83" },   /* ≃ */
-    { "\\sim",        "\xE2\x88\xBC" },   /* ∼ */
-    { "\\cong",       "\xE2\x89\x85" },   /* ≅ */
-    { "\\leqslant",   "\xE2\x89\xBD" },   /* ⩽ */
-    { "\\geqslant",   "\xE2\x89\xBE" },   /* ⩾ */
-    { "\\leq",        "\xE2\x89\xA4" },   /* ≤ */
-    { "\\geq",        "\xE2\x89\xA5" },   /* ≥ */
-    { "\\le",         "\xE2\x89\xA4" },   /* ≤ */
-    { "\\ge",         "\xE2\x89\xA5" },   /* ≥ */
-    { "\\ll",         "\xE2\x89\xAA" },   /* ≪ */
-    { "\\gg",         "\xE2\x89\xAB" },   /* ≫ */
-    { "\\neq",        "\xE2\x89\xA0" },   /* ≠ */
-    { "\\ne",         "\xE2\x89\xA0" },   /* ≠ */
-    { "\\prec",       "\xE2\x89\xBA" },   /* ≺ */
-    { "\\succ",       "\xE2\x89\xBB" },   /* ≻ */
-    { "\\preceq",     "\xE2\xAA\xAF" },   /* ⪯ */
-    { "\\succeq",     "\xE2\xAA\xB0" },   /* ⪰ */
-    /* ── Binary operators ── */
-    { "\\pm",         "\xC2\xB1"     },   /* ± */
-    { "\\mp",         "\xE2\x88\x93" },   /* ∓ */
-    { "\\times",      "\xC3\x97"     },   /* × */
-    { "\\cdot",       "\xC2\xB7"     },   /* · */
-    { "\\div",        "\xC3\xB7"     },   /* ÷ */
-    { "\\ast",        "\xE2\x88\x97" },   /* ∗ */
-    { "\\star",       "\xE2\x8B\x86" },   /* ⋆ */
-    { "\\bullet",     "\xE2\x88\x99" },   /* ∙ */
-    { "\\circ",       "\xE2\x88\x98" },   /* ∘ */
-    { "\\oplus",      "\xE2\x8A\x95" },   /* ⊕ */
-    { "\\ominus",     "\xE2\x8A\x96" },   /* ⊖ */
-    { "\\otimes",     "\xE2\x8A\x97" },   /* ⊗ */
-    { "\\oslash",     "\xE2\x8A\x98" },   /* ⊘ */
-    { "\\odot",       "\xE2\x8A\x99" },   /* ⊙ */
-    { "\\bigoplus",   "\xE2\xA8\x81" },   /* ⨁ */
-    { "\\bigotimes",  "\xE2\xA8\x82" },   /* ⨂ */
-    { "\\wedge",      "\xE2\x88\xA7" },   /* ∧ */
-    { "\\vee",        "\xE2\x88\xA8" },   /* ∨ */
-    /* ── Set / logic ── */
-    { "\\notin",      "\xE2\x88\x89" },   /* ∉ */
-    { "\\in",         "\xE2\x88\x88" },   /* ∈ */
-    { "\\ni",         "\xE2\x88\x8B" },   /* ∋ */
-    { "\\subseteq",   "\xE2\x8A\x86" },   /* ⊆ */
-    { "\\supseteq",   "\xE2\x8A\x87" },   /* ⊇ */
-    { "\\subsetneq",  "\xE2\x8A\x8A" },   /* ⊊ */
-    { "\\supsetneq",  "\xE2\x8A\x8B" },   /* ⊋ */
-    { "\\subset",     "\xE2\x8A\x82" },   /* ⊂ */
-    { "\\supset",     "\xE2\x8A\x83" },   /* ⊃ */
-    { "\\setminus",   "\xE2\x88\x96" },   /* ∖ */
-    { "\\cup",        "\xE2\x88\xAA" },   /* ∪ */
-    { "\\cap",        "\xE2\x88\xA9" },   /* ∩ */
-    { "\\emptyset",   "\xE2\x88\x85" },   /* ∅ */
-    { "\\varnothing", "\xE2\x88\x85" },   /* ∅ */
-    { "\\forall",     "\xE2\x88\x80" },   /* ∀ */
-    { "\\exists",     "\xE2\x88\x83" },   /* ∃ */
-    { "\\nexists",    "\xE2\x88\x84" },   /* ∄ */
-    { "\\therefore",  "\xE2\x88\xB4" },   /* ∴ */
-    { "\\because",    "\xE2\x88\xB5" },   /* ∵ */
-    { "\\neg",        "\xC2\xAC"     },   /* ¬ */
-    { "\\lnot",       "\xC2\xAC"     },   /* ¬ */
-    { "\\land",       "\xE2\x88\xA7" },   /* ∧ */
-    { "\\lor",        "\xE2\x88\xA8" },   /* ∨ */
-    { "\\implies",    "\xE2\x87\x92" },   /* ⇒ */
-    { "\\iff",        "\xE2\x87\x94" },   /* ⇔ */
-    /* ── Big operators ── */
-    { "\\iiint",      "\xE2\x88\xAD" },   /* ∭ */
-    { "\\iint",       "\xE2\x88\xAC" },   /* ∬ */
-    { "\\oint",       "\xE2\x88\xAE" },   /* ∮ */
-    { "\\int",        "\xE2\x88\xAB" },   /* ∫ */
-    { "\\sum",        "\xE2\x88\x91" },   /* ∑ */
-    { "\\prod",       "\xE2\x88\x8F" },   /* ∏ */
-    { "\\coprod",     "\xE2\x88\x90" },   /* ∐ */
-    { "\\bigcup",     "\xE2\x8B\x83" },   /* ⋃ */
-    { "\\bigcap",     "\xE2\x8B\x82" },   /* ⋂ */
-    { "\\bigsqcup",   "\xE2\xA8\x86" },   /* ⨆ */
-    { "\\bigwedge",   "\xE2\x8B\x80" },   /* ⋀ */
-    { "\\bigvee",     "\xE2\x8B\x81" },   /* ⋁ */
-    /* ── Calculus / analysis ── */
-    { "\\partial",    "\xE2\x88\x82" },   /* ∂ */
-    { "\\nabla",      "\xE2\x88\x87" },   /* ∇ */
-    { "\\infty",      "\xE2\x88\x9E" },   /* ∞ */
-    /* ── Greek lowercase (must come after all Greek-uppercase prefixes) ── */
-    { "\\varepsilon", "\xCE\xB5" },       /* ε (goes BEFORE \epsilon) */
-    { "\\varphi",     "\xCF\x95" },       /* ϕ (BEFORE \phi) */
-    { "\\vartheta",   "\xCF\x91" },       /* ϑ (BEFORE \theta) */
-    { "\\varsigma",   "\xCF\x82" },       /* ς (BEFORE \sigma) */
-    { "\\varrho",     "\xCF\x9A" },       /* ϱ (BEFORE \rho) */
-    { "\\varpi",      "\xCF\x96" },       /* ϖ (BEFORE \pi) */
-    { "\\alpha",      "\xCE\xB1" },       /* α */
-    { "\\beta",       "\xCE\xB2" },       /* β */
-    { "\\gamma",      "\xCE\xB3" },       /* γ */
-    { "\\delta",      "\xCE\xB4" },       /* δ */
-    { "\\epsilon",    "\xCE\xB5" },       /* ε */
-    { "\\zeta",       "\xCE\xB6" },       /* ζ */
-    { "\\eta",        "\xCE\xB7" },       /* η */
-    { "\\theta",      "\xCE\xB8" },       /* θ */
-    { "\\iota",       "\xCE\xB9" },       /* ι */
-    { "\\kappa",      "\xCE\xBA" },       /* κ */
-    { "\\lambda",     "\xCE\xBB" },       /* λ */
-    { "\\mu",         "\xCE\xBC" },       /* μ */
-    { "\\nu",         "\xCE\xBD" },       /* ν */
-    { "\\xi",         "\xCE\xBE" },       /* ξ */
-    { "\\omicron",    "\xCE\xBF" },       /* ο */
-    { "\\pi",         "\xCF\x80" },       /* π */
-    { "\\rho",        "\xCF\x81" },       /* ρ */
-    { "\\sigma",      "\xCF\x83" },       /* σ */
-    { "\\tau",        "\xCF\x84" },       /* τ */
-    { "\\upsilon",    "\xCF\x85" },       /* υ */
-    { "\\phi",        "\xCF\x86" },       /* φ */
-    { "\\chi",        "\xCF\x87" },       /* χ */
-    { "\\psi",        "\xCF\x88" },       /* ψ */
-    { "\\omega",      "\xCF\x89" },       /* ω */
-    /* ── Greek uppercase ── */
-    { "\\Alpha",      "\xCE\x91" },       /* Α */
-    { "\\Beta",       "\xCE\x92" },       /* Β */
-    { "\\Gamma",      "\xCE\x93" },       /* Γ */
-    { "\\Delta",      "\xCE\x94" },       /* Δ */
-    { "\\Epsilon",    "\xCE\x95" },       /* Ε */
-    { "\\Zeta",       "\xCE\x96" },       /* Ζ */
-    { "\\Eta",        "\xCE\x97" },       /* Η */
-    { "\\Theta",      "\xCE\x98" },       /* Θ */
-    { "\\Iota",       "\xCE\x99" },       /* Ι */
-    { "\\Kappa",      "\xCE\x9A" },       /* Κ */
-    { "\\Lambda",     "\xCE\x9B" },       /* Λ */
-    { "\\Mu",         "\xCE\x9C" },       /* Μ */
-    { "\\Nu",         "\xCE\x9D" },       /* Ν */
-    { "\\Xi",         "\xCE\x9E" },       /* Ξ */
-    { "\\Omicron",    "\xCE\x9F" },       /* Ο */
-    { "\\Pi",         "\xCE\xA0" },       /* Π */
-    { "\\Rho",        "\xCE\xA1" },       /* Ρ */
-    { "\\Sigma",      "\xCE\xA3" },       /* Σ */
-    { "\\Tau",        "\xCE\xA4" },       /* Τ */
-    { "\\Upsilon",    "\xCE\xA5" },       /* Υ */
-    { "\\Phi",        "\xCE\xA6" },       /* Φ */
-    { "\\Chi",        "\xCE\xA7" },       /* Χ */
-    { "\\Psi",        "\xCE\xA8" },       /* Ψ */
-    { "\\Omega",      "\xCE\xA9" },       /* Ω */
-    /* ── Geometry ── */
-    { "\\parallel",   "\xE2\x88\xA5" },   /* ∥ */
-    { "\\perp",       "\xE2\x8A\xA5" },   /* ⊥ */
-    { "\\angle",      "\xE2\x88\xA0" },   /* ∠ */
-    { "\\triangle",   "\xE2\x96\xB3" },   /* △ */
-    { "\\square",     "\xE2\x96\xA1" },   /* □ */
-    /* ── Delimiters ── */
-    { "\\lceil",      "\xE2\x8C\x88" },   /* ⌈ */
-    { "\\rceil",      "\xE2\x8C\x89" },   /* ⌉ */
-    { "\\lfloor",     "\xE2\x8C\x8A" },   /* ⌊ */
-    { "\\rfloor",     "\xE2\x8C\x8B" },   /* ⌋ */
-    { "\\langle",     "\xE2\x9F\xA8" },   /* ⟨ */
-    { "\\rangle",     "\xE2\x9F\xA9" },   /* ⟩ */
-    /* ── Ellipses ── */
-    { "\\dots",       "\xE2\x80\xA6" },   /* … */
-    { "\\ldots",      "\xE2\x80\xA6" },   /* … */
-    { "\\cdots",      "\xE2\x8B\xAF" },   /* ⋯ */
-    { "\\vdots",      "\xE2\x8B\xAE" },   /* ⋮ */
-    { "\\ddots",      "\xE2\x8B\xB1" },   /* ⋱ */
-    /* ── Misc symbols ── */
-    { "\\degree",     "\xC2\xB0" },       /* ° */
-    { "\\prime",      "\xE2\x80\xB2" },   /* ′ */
-    { "\\hbar",       "\xC4\xA7" },       /* ħ */
-    { "\\ell",        "\xE2\x84\x93" },   /* ℓ */
-    { "\\Re",         "\xE2\x84\x9C" },   /* ℜ */
-    { "\\Im",         "\xE2\x84\x91" },   /* ℑ */
-    { "\\aleph",      "\xE2\x84\xB5" },   /* ℵ */
-    { "\\beth",       "\xE2\x84\xB6" },   /* ℶ */
-    { "\\imath",      "\xC4\xB1" },       /* ı */
-    { "\\jmath",      "\xC8\xB7" },       /* ȷ */
-    { "\\wp",         "\xE2\x84\x98" },   /* ℘ */
-    { NULL, NULL }
-};
-
-/* Text-wrapping commands: `\text{...}`, `\mathbf{...}`, `\mathrm{...}`,
- * etc. all just wrap their content for typography. In plain-text render
- * we emit the CONTENT unchanged (recursively converted so nested
- * commands still work). Listed here for O(N) linear check per unknown
- * `\word{...}` occurrence.
- *
- * IMPORTANT: entries must match with WORD-BOUNDARY semantics — i.e.
- * `\mathbf` followed by `{` matches, but `\mathbfriend` doesn't. */
-static const char *LATEX_TEXT_WRAPPERS[] = {
-    "text", "textbf", "textit", "textrm", "textsf", "texttt",
-    "textnormal", "textup", "textsl", "textsc", "textmd",
-    "mathbf", "mathrm", "mathbb", "mathcal", "mathfrak", "mathit",
-    "mathsf", "mathtt", "mathnormal",
-    "boldsymbol", "bm", "bf", "rm", "it", "sf", "tt", "sc", "sl", "cal",
-    "operatorname", "emph", "underline",
-    /* Common LaTeX-package extras we can safely passthrough. */
-    "mbox", "hbox", "phantom", "vphantom", "hphantom",
-    "color", "textcolor", "colorbox",   /* text stays, color styling drops */
-    "small", "large", "Large", "LARGE", "Huge", "huge",
-    "tiny", "footnotesize", "normalsize", "scriptsize", "scriptstyle",
-    "displaystyle", "textstyle", "smash",
-    NULL
-};
-
-/* Accent commands — emit inner content + Unicode combining mark
- * appended AFTER each character. E.g. `\vec{v}` → `v⃗` (v + U+20D7). */
-struct latex_accent_entry {
-    const char *cmd;      /* command name (no backslash) */
-    const char *combining; /* UTF-8 combining mark (usually 2-3 bytes) */
-};
-static const struct latex_accent_entry LATEX_ACCENTS[] = {
-    { "vec",       "\xE2\x83\x97" },   /* ⃗ combining right arrow above (U+20D7) */
-    { "overrightarrow", "\xE2\x83\x97" }, /* same */
-    { "overleftarrow",  "\xE2\x83\x96" }, /* ⃖ combining left arrow (U+20D6) */
-    { "hat",       "\xCC\x82" },       /* ̂ combining circumflex (U+0302) */
-    { "widehat",   "\xCC\x82" },       /* same */
-    { "tilde",     "\xCC\x83" },       /* ̃ combining tilde (U+0303) */
-    { "widetilde", "\xCC\x83" },       /* same */
-    { "bar",       "\xCC\x84" },       /* ̄ combining macron (U+0304) */
-    { "overline",  "\xCC\x84" },       /* same visually */
-    { "dot",       "\xCC\x87" },       /* ̇ combining dot above (U+0307) */
-    { "ddot",      "\xCC\x88" },       /* ̈ combining diaeresis (U+0308) */
-    { "dddot",     "\xE2\x83\x9B" },   /* ⃛ combining three dots above (U+20DB) */
-    { "check",     "\xCC\x8C" },       /* ̌ combining caron (U+030C) */
-    { "acute",     "\xCC\x81" },       /* ́ combining acute (U+0301) */
-    { "grave",     "\xCC\x80" },       /* ̀ combining grave (U+0300) */
-    { "breve",     "\xCC\x86" },       /* ̆ combining breve (U+0306) */
-    { NULL, NULL }
-};
-
-/* Superscript digit lookup for ^0..^9 → Unicode superscript. */
-static const char *SUP_DIGITS[10] = {
-    "\xE2\x81\xB0", "\xC2\xB9",     "\xC2\xB2",     "\xC2\xB3",
-    "\xE2\x81\xB4", "\xE2\x81\xB5", "\xE2\x81\xB6", "\xE2\x81\xB7",
-    "\xE2\x81\xB8", "\xE2\x81\xB9"
-};
-/* Subscript digit lookup for _0.._9 → Unicode subscript. */
-static const char *SUB_DIGITS[10] = {
-    "\xE2\x82\x80", "\xE2\x82\x81", "\xE2\x82\x82", "\xE2\x82\x83",
-    "\xE2\x82\x84", "\xE2\x82\x85", "\xE2\x82\x86", "\xE2\x82\x87",
-    "\xE2\x82\x88", "\xE2\x82\x89"
-};
-
-/* Match a LaTeX command at src[pos]. Returns entry index or -1.
- * Uses longest-match — we walk the table in order and pick the first
- * where the source starts with entry->tex AND the char after
- * entry->tex is NOT an ASCII letter (so `\pi` doesn't match `\pion`). */
-static int latex_match_at(const char *src, size_t src_len, size_t pos) {
-    for (int i = 0; LATEX_MAP[i].tex; i++) {
-        size_t tlen = strlen(LATEX_MAP[i].tex);
-        if (pos + tlen > src_len) continue;
-        if (memcmp(src + pos, LATEX_MAP[i].tex, tlen) != 0) continue;
-        /* Boundary check: next char must not be [a-zA-Z] so we don't
-         * partial-match longer commands. `\pi` is fine before space
-         * or digit or `\`, but not before `on` (which would make it
-         * `\pion` — not a real command but we shouldn't confuse).
-         *
-         * EXCEPTION: entries whose command name ENDS in a non-alpha
-         * (like `\!`, `\,`, `\;`, `\ `, `\%`, `\{`) are self-
-         * terminating and skip this check entirely. */
-        const char *tex_end = LATEX_MAP[i].tex + tlen - 1;
-        char last_cmd_char = *tex_end;
-        int is_alpha_cmd = (last_cmd_char >= 'a' && last_cmd_char <= 'z') ||
-                           (last_cmd_char >= 'A' && last_cmd_char <= 'Z');
-        if (is_alpha_cmd && pos + tlen < src_len) {
-            char nx = src[pos + tlen];
-            if ((nx >= 'a' && nx <= 'z') || (nx >= 'A' && nx <= 'Z')) continue;
-        }
-        return i;
-    }
-    return -1;
-}
-
-/* If src at pos starts with `\<word>` where <word> is one of the
- * text-wrapping commands (LATEX_TEXT_WRAPPERS) AND is followed by `{`,
- * returns the wrapper name length (word length + 1 for backslash).
- * Otherwise 0.
- *
- * E.g. for `\text{foo}` at pos=0, returns 5 (length of `\text`).
- * The caller then extracts the `{...}` argument, recursively converts,
- * and emits the inner content. */
-static size_t latex_wrapper_at(const char *src, size_t src_len, size_t pos) {
-    if (pos >= src_len || src[pos] != '\\') return 0;
-    /* Extract command word after backslash. */
-    size_t start = pos + 1;
-    size_t end = start;
-    while (end < src_len &&
-           ((src[end] >= 'a' && src[end] <= 'z') ||
-            (src[end] >= 'A' && src[end] <= 'Z'))) end++;
-    if (end == start) return 0;
-    size_t wlen = end - start;
-    /* Must be followed by `{`. */
-    if (end >= src_len || src[end] != '{') return 0;
-    /* Look up in wrapper table. */
-    for (int i = 0; LATEX_TEXT_WRAPPERS[i]; i++) {
-        size_t klen = strlen(LATEX_TEXT_WRAPPERS[i]);
-        if (klen != wlen) continue;
-        if (memcmp(src + start, LATEX_TEXT_WRAPPERS[i], klen) != 0) continue;
-        return end - pos;   /* full command length including backslash */
-    }
-    return 0;
-}
-
-/* Same for accent commands — returns entry index or -1. */
-static int latex_accent_at(const char *src, size_t src_len, size_t pos) {
-    if (pos >= src_len || src[pos] != '\\') return -1;
-    size_t start = pos + 1;
-    size_t end = start;
-    while (end < src_len &&
-           ((src[end] >= 'a' && src[end] <= 'z') ||
-            (src[end] >= 'A' && src[end] <= 'Z'))) end++;
-    if (end == start) return -1;
-    size_t wlen = end - start;
-    if (end >= src_len || src[end] != '{') return -1;
-    for (int i = 0; LATEX_ACCENTS[i].cmd; i++) {
-        size_t klen = strlen(LATEX_ACCENTS[i].cmd);
-        if (klen != wlen) continue;
-        if (memcmp(src + start, LATEX_ACCENTS[i].cmd, klen) != 0) continue;
-        return i;
-    }
-    return -1;
-}
-
-/* Detect `\begin{env}` at pos. Returns length of the `\begin{env}`
- * prefix on match (i.e. count to just past the `}`) and writes env
- * name + length into out params. Returns 0 on no match. */
-static size_t latex_begin_at(const char *src, size_t src_len, size_t pos,
-                              const char **env_name_out, size_t *env_len_out) {
-    static const char *BEGIN = "\\begin{";
-    size_t blen = 7;
-    if (pos + blen > src_len) return 0;
-    if (memcmp(src + pos, BEGIN, blen) != 0) return 0;
-    size_t p = pos + blen;
-    size_t env_start = p;
-    while (p < src_len && src[p] != '}') {
-        /* Env names are alphanumeric plus `*` for starred variants. */
-        char c = src[p];
-        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-              (c >= '0' && c <= '9') || c == '*')) return 0;
-        p++;
-    }
-    if (p >= src_len || src[p] != '}') return 0;
-    if (env_name_out) *env_name_out = src + env_start;
-    if (env_len_out)  *env_len_out  = p - env_start;
-    return (p + 1) - pos;
-}
-
-/* Find the corresponding `\end{env}` in src starting from pos. Returns
- * offset of the `\end{env}` start relative to `pos`, or 0 if not found. */
-static size_t latex_find_end(const char *src, size_t src_len, size_t pos,
-                              const char *env, size_t env_len) {
-    /* Build match string `\end{env}`. */
-    char pattern[128];
-    if (env_len > 100) return 0;
-    int pn = _snprintf(pattern, sizeof(pattern) - 1, "\\end{%.*s}",
-                       (int)env_len, env);
-    if (pn <= 0) return 0;
-    /* Walk src looking for pattern. Track nesting: same-env `\begin`
-     * increments; matching `\end` decrements. */
-    int depth = 1;
-    size_t p = pos;
-    while (p < src_len) {
-        /* Try to match \begin{env} at p. */
-        const char *inner_env = NULL;
-        size_t inner_len = 0;
-        size_t blen = latex_begin_at(src, src_len, p, &inner_env, &inner_len);
-        if (blen && inner_len == env_len && memcmp(inner_env, env, env_len) == 0) {
-            depth++;
-            p += blen;
-            continue;
-        }
-        /* Try to match \end{env} at p. */
-        if (p + (size_t)pn <= src_len && memcmp(src + p, pattern, pn) == 0) {
-            depth--;
-            if (depth == 0) return p - pos;
-            p += pn;
-            continue;
-        }
-        p++;
-    }
-    return 0;
-}
-
-/* Append helper. Bounds-checked. */
-static void ltx_put(char *dst, size_t *dp, size_t dst_cap, const char *s, size_t n) {
-    if (*dp + n >= dst_cap) return;
-    memcpy(dst + *dp, s, n);
-    *dp += n;
-}
-static void ltx_putc(char *dst, size_t *dp, size_t dst_cap, char c) {
-    if (*dp + 1 >= dst_cap) return;
-    dst[(*dp)++] = c;
-}
-static void ltx_puts(char *dst, size_t *dp, size_t dst_cap, const char *s) {
-    ltx_put(dst, dp, dst_cap, s, strlen(s));
-}
-
-/* Skip past a `{...}` group starting at src[pos] (which must be `{`).
- * Returns index of matching `}`, or src_len on unterminated. */
-static size_t latex_skip_brace(const char *src, size_t src_len, size_t pos) {
-    if (pos >= src_len || src[pos] != '{') return pos;
-    size_t p = pos + 1;
-    int depth = 1;
-    while (p < src_len && depth > 0) {
-        if (src[p] == '\\' && p + 1 < src_len) { p += 2; continue; }
-        if (src[p] == '{') depth++;
-        else if (src[p] == '}') { depth--; if (depth == 0) return p; }
-        p++;
-    }
-    return src_len;
-}
-
-/* Advance past a UTF-8 codepoint (or 1 byte if not UTF-8 lead). */
-static size_t utf8_advance(const char *s, size_t pos, size_t end) {
-    if (pos >= end) return pos;
-    unsigned char c = (unsigned char)s[pos];
-    if (c < 0x80) return pos + 1;
-    if ((c & 0xE0) == 0xC0) return (pos + 2 <= end) ? pos + 2 : end;
-    if ((c & 0xF0) == 0xE0) return (pos + 3 <= end) ? pos + 3 : end;
-    if ((c & 0xF8) == 0xF0) return (pos + 4 <= end) ? pos + 4 : end;
-    return pos + 1;
-}
-
-/* ── Unicode super/subscript helpers ─────────────────────────────
- *
- * Full alphabetic coverage isn't 1:1 in Unicode (some letters have no
- * subscript form) — we fall back to caret/underscore for those.
- * See U+2070..209F block + Latin-1 sups + Spacing Modifier Letters. */
-
-/* Convert an ASCII char to its Unicode SUPERSCRIPT UTF-8 string.
- * Returns NULL if no mapping. */
-static const char *sup_of(char c) {
-    switch (c) {
-        case '0': return "\xE2\x81\xB0";  /* ⁰ */
-        case '1': return "\xC2\xB9";      /* ¹ */
-        case '2': return "\xC2\xB2";      /* ² */
-        case '3': return "\xC2\xB3";      /* ³ */
-        case '4': return "\xE2\x81\xB4";  /* ⁴ */
-        case '5': return "\xE2\x81\xB5";  /* ⁵ */
-        case '6': return "\xE2\x81\xB6";  /* ⁶ */
-        case '7': return "\xE2\x81\xB7";  /* ⁷ */
-        case '8': return "\xE2\x81\xB8";  /* ⁸ */
-        case '9': return "\xE2\x81\xB9";  /* ⁹ */
-        case '+': return "\xE2\x81\xBA";  /* ⁺ */
-        case '-': return "\xE2\x81\xBB";  /* ⁻ */
-        case '=': return "\xE2\x81\xBC";  /* ⁼ */
-        case '(': return "\xE2\x81\xBD";  /* ⁽ */
-        case ')': return "\xE2\x81\xBE";  /* ⁾ */
-        case 'a': return "\xE1\xB5\x83";  /* ᵃ  U+1D43 */
-        case 'b': return "\xE1\xB5\x87";  /* ᵇ  U+1D47 */
-        case 'c': return "\xE1\xB6\x9C";  /* ᶜ  U+1D9C */
-        case 'd': return "\xE1\xB5\x88";  /* ᵈ  U+1D48 */
-        case 'e': return "\xE1\xB5\x89";  /* ᵉ  U+1D49 */
-        case 'f': return "\xE1\xB6\xA0";  /* ᶠ  U+1DA0 */
-        case 'g': return "\xE1\xB5\x8D";  /* ᵍ  U+1D4D */
-        case 'h': return "\xCA\xB0";      /* ʰ  U+02B0 */
-        case 'i': return "\xE2\x81\xB1";  /* ⁱ  U+2071 */
-        case 'j': return "\xCA\xB2";      /* ʲ  U+02B2 */
-        case 'k': return "\xE1\xB5\x8F";  /* ᵏ  U+1D4F */
-        case 'l': return "\xCB\xA1";      /* ˡ  U+02E1 */
-        case 'm': return "\xE1\xB5\x90";  /* ᵐ  U+1D50 */
-        case 'n': return "\xE2\x81\xBF";  /* ⁿ  U+207F */
-        case 'o': return "\xE1\xB5\x92";  /* ᵒ  U+1D52 */
-        case 'p': return "\xE1\xB5\x96";  /* ᵖ  U+1D56 */
-        case 'r': return "\xCA\xB3";      /* ʳ  U+02B3 */
-        case 's': return "\xCB\xA2";      /* ˢ  U+02E2 */
-        case 't': return "\xE1\xB5\x97";  /* ᵗ  U+1D57 */
-        case 'u': return "\xE1\xB5\x98";  /* ᵘ  U+1D58 */
-        case 'v': return "\xE1\xB5\x9B";  /* ᵛ  U+1D5B */
-        case 'w': return "\xCA\xB7";      /* ʷ  U+02B7 */
-        case 'x': return "\xCB\xA3";      /* ˣ  U+02E3 */
-        case 'y': return "\xCA\xB8";      /* ʸ  U+02B8 */
-        default:  return NULL;
-    }
-}
-
-/* Convert an ASCII char to its Unicode SUBSCRIPT UTF-8 string.
- * Returns NULL if no mapping. */
-static const char *sub_of(char c) {
-    switch (c) {
-        case '0': return "\xE2\x82\x80";  /* ₀ */
-        case '1': return "\xE2\x82\x81";  /* ₁ */
-        case '2': return "\xE2\x82\x82";  /* ₂ */
-        case '3': return "\xE2\x82\x83";  /* ₃ */
-        case '4': return "\xE2\x82\x84";  /* ₄ */
-        case '5': return "\xE2\x82\x85";  /* ₅ */
-        case '6': return "\xE2\x82\x86";  /* ₆ */
-        case '7': return "\xE2\x82\x87";  /* ₇ */
-        case '8': return "\xE2\x82\x88";  /* ₈ */
-        case '9': return "\xE2\x82\x89";  /* ₉ */
-        case '+': return "\xE2\x82\x8A";  /* ₊ */
-        case '-': return "\xE2\x82\x8B";  /* ₋ */
-        case '=': return "\xE2\x82\x8C";  /* ₌ */
-        case '(': return "\xE2\x82\x8D";  /* ₍ */
-        case ')': return "\xE2\x82\x8E";  /* ₎ */
-        case 'a': return "\xE2\x82\x90";  /* ₐ */
-        case 'e': return "\xE2\x82\x91";  /* ₑ */
-        case 'h': return "\xE2\x82\x95";  /* ₕ */
-        case 'i': return "\xE1\xB5\xA2";  /* ᵢ  U+1D62 */
-        case 'j': return "\xE2\xB1\xBC";  /* ⱼ  U+2C7C */
-        case 'k': return "\xE2\x82\x96";  /* ₖ */
-        case 'l': return "\xE2\x82\x97";  /* ₗ */
-        case 'm': return "\xE2\x82\x98";  /* ₘ */
-        case 'n': return "\xE2\x82\x99";  /* ₙ */
-        case 'o': return "\xE2\x82\x92";  /* ₒ */
-        case 'p': return "\xE2\x82\x9A";  /* ₚ */
-        case 'r': return "\xE1\xB5\xA3";  /* ᵣ  U+1D63 */
-        case 's': return "\xE2\x82\x9B";  /* ₛ */
-        case 't': return "\xE2\x82\x9C";  /* ₜ */
-        case 'u': return "\xE1\xB5\xA4";  /* ᵤ  U+1D64 */
-        case 'v': return "\xE1\xB5\xA5";  /* ᵥ  U+1D65 */
-        case 'x': return "\xE2\x82\x93";  /* ₓ */
-        default:  return NULL;
-    }
-}
-
-/* Try to render an entire ASCII string as Unicode super/subscript.
- * Returns 1 if every char had a mapping (dst fully filled), 0 if any
- * char lacks a mapping (dst left partially written but caller should
- * fall back to `^{...}` or `_{...}` literal form).
- * `is_super`: 1 = superscript, 0 = subscript. */
-static int try_render_sup_sub(const char *s, size_t n, int is_super,
-                              char *dst, size_t *dp, size_t dst_cap) {
-    for (size_t i = 0; i < n; i++) {
-        const char *u = is_super ? sup_of(s[i]) : sub_of(s[i]);
-        if (!u) return 0;   /* no clean mapping — abort */
-        ltx_puts(dst, dp, dst_cap, u);
-    }
-    return 1;
-}
-
-/* Unicode vulgar-fraction chars for common `\frac{a}{b}` forms — much
- * more readable than `1/2` inline. */
-struct vulgar_frac_entry { const char *num; const char *den; const char *uni; };
-static const struct vulgar_frac_entry VULGAR_FRACS[] = {
-    { "1", "2", "\xC2\xBD" },       /* ½ */
-    { "1", "3", "\xE2\x85\x93" },   /* ⅓ */
-    { "2", "3", "\xE2\x85\x94" },   /* ⅔ */
-    { "1", "4", "\xC2\xBC" },       /* ¼ */
-    { "3", "4", "\xC2\xBE" },       /* ¾ */
-    { "1", "5", "\xE2\x85\x95" },   /* ⅕ */
-    { "2", "5", "\xE2\x85\x96" },   /* ⅖ */
-    { "3", "5", "\xE2\x85\x97" },   /* ⅗ */
-    { "4", "5", "\xE2\x85\x98" },   /* ⅘ */
-    { "1", "6", "\xE2\x85\x99" },   /* ⅙ */
-    { "5", "6", "\xE2\x85\x9A" },   /* ⅚ */
-    { "1", "7", "\xE2\x85\x90" },   /* ⅐ */
-    { "1", "8", "\xE2\x85\x9B" },   /* ⅛ */
-    { "3", "8", "\xE2\x85\x9C" },   /* ⅜ */
-    { "5", "8", "\xE2\x85\x9D" },   /* ⅝ */
-    { "7", "8", "\xE2\x85\x9E" },   /* ⅞ */
-    { "1", "9", "\xE2\x85\x91" },   /* ⅑ */
-    { "1", "10","\xE2\x85\x92" },   /* ⅒ */
-    { NULL, NULL, NULL }
-};
-
-/* ── Environment renderer (matrix / cases / align) ────────────────
- *
- * Renders a `\begin{env}...\end{env}` body as text art:
- *
- *   pmatrix   →   ⎛ 1 2 ⎞      (Unicode brackets)
- *                 ⎝ 3 4 ⎠
- *   bmatrix   →   ⎡ 1 2 ⎤
- *                 ⎣ 3 4 ⎦
- *   cases     →   ⎧ x  if x>0   (open brace, no close)
- *                 ⎩ -x otherwise
- *   align/aligned → each `&` becomes space, `\\` becomes newline
- *
- * All row separators (`\\`) become `\n`. Column separators (`&`) become
- * a single space (best-effort — ImGui isn't a real math typesetter).
- *
- * Body is recursively latex_to_unicode'd cell-by-cell so nested \frac,
- * \sqrt, etc. work. Row alignment is preserved by padding each cell to
- * the widest cell in that column (based on byte length — approximate). */
-static size_t latex_render_env(const char *env, size_t env_len,
-                                const char *body, size_t body_len,
-                                char *dst, size_t dst_cap);
-
-/* Convert LaTeX to Unicode. Returns bytes written to dst (NOT NUL-
- * terminated; caller adds if needed).
- *
- * 2026-07-05 late-night rewrite — much more comprehensive:
- *   - $ / \( / \) / \[ / \] delimiters stripped
- *   - \\ in display math → newline
- *   - \frac{a}{b} → Unicode vulgar frac (½ ⅓ …) if applicable, else a/b
- *   - \sqrt{x} → √(x) — always wrapped for readability
- *   - ^{...} / _{...} → Unicode super/subscript when all chars mappable
- *   - Bare ^N / _N (single digit) → Unicode super/sub
- *   - \text{...} / \mathbf{...} / \mathrm{...} etc. → strip wrapper, keep content
- *   - \vec{x} / \hat{x} / \bar{x} etc. → x + Unicode combining mark
- *   - \begin{matrix}...\end{matrix} → text-art rendering (via latex_render_env)
- *   - Full LATEX_MAP lookup (~200 symbols, longest-match-first)
- *   - Unknown \command{content} → recursively emit content (drop cmd)
- *   - Unknown \command (no braces) → preserve as literal for user diag
- *   - Stray { } stripped (they're LaTeX grouping)
- *   - $ ` * and ** stay as-is (paragraph accumulator handles md-strip) */
-static size_t latex_to_unicode(const char *src, size_t src_len,
-                               char *dst, size_t dst_cap) {
-    size_t sp = 0, dp = 0;
-    while (sp < src_len && dp + 1 < dst_cap) {
-        char c = src[sp];
-
-        /* $ delimiters (inline math): stripped. Handles $$ too. */
-        if (c == '$') {
-            sp++;
-            if (sp < src_len && src[sp] == '$') sp++;
-            continue;
-        }
-        /* \( \) delimiters: stripped. */
-        if (c == '\\' && sp + 1 < src_len &&
-            (src[sp + 1] == '(' || src[sp + 1] == ')')) {
-            sp += 2;
-            continue;
-        }
-        /* \[ \] delimiters: stripped. */
-        if (c == '\\' && sp + 1 < src_len &&
-            (src[sp + 1] == '[' || src[sp + 1] == ']')) {
-            sp += 2;
-            continue;
-        }
-        /* \\ (double-backslash) in display math = line break. */
-        if (c == '\\' && sp + 1 < src_len && src[sp + 1] == '\\') {
-            ltx_putc(dst, &dp, dst_cap, '\n');
-            sp += 2;
-            /* Consume optional `[spacing]` after \\ (e.g. `\\[1ex]`). */
-            if (sp < src_len && src[sp] == '[') {
-                while (sp < src_len && src[sp] != ']') sp++;
-                if (sp < src_len) sp++;   /* past ] */
-            }
-            /* Absorb ONE leading whitespace after line break so
-             * `\\\n  next line` doesn't produce a double blank. */
-            while (sp < src_len && (src[sp] == ' ' || src[sp] == '\t')) sp++;
-            continue;
-        }
-
-        /* \begin{env}...\end{env} — dispatch to environment renderer. */
-        if (c == '\\' && sp + 7 <= src_len &&
-            memcmp(src + sp, "\\begin{", 7) == 0) {
-            const char *env_name = NULL;
-            size_t env_len = 0;
-            size_t begin_len = latex_begin_at(src, src_len, sp,
-                                               &env_name, &env_len);
-            if (begin_len > 0) {
-                size_t body_start = sp + begin_len;
-                size_t end_off = latex_find_end(src, src_len, body_start,
-                                                 env_name, env_len);
-                if (end_off > 0) {
-                    /* Extract env body + render. */
-                    char rendered[4096];
-                    size_t rlen = latex_render_env(env_name, env_len,
-                                                    src + body_start, end_off,
-                                                    rendered, sizeof(rendered) - 1);
-                    ltx_put(dst, &dp, dst_cap, rendered, rlen);
-                    /* Skip past \end{env}. */
-                    char end_pat[128];
-                    _snprintf(end_pat, sizeof(end_pat) - 1, "\\end{%.*s}",
-                              (int)env_len, env_name);
-                    sp = body_start + end_off + strlen(end_pat);
-                    continue;
-                }
-            }
-        }
-
-        /* \frac{a}{b} */
-        if (c == '\\' && sp + 5 <= src_len &&
-            memcmp(src + sp, "\\frac", 5) == 0 &&
-            (sp + 5 == src_len || src[sp + 5] == '{')) {
-            size_t p = sp + 5;
-            if (p < src_len && src[p] == '{') {
-                size_t num_start = p + 1;
-                size_t num_end = latex_skip_brace(src, src_len, p);
-                p = (num_end < src_len) ? num_end + 1 : src_len;
-                if (p < src_len && src[p] == '{') {
-                    size_t den_start = p + 1;
-                    size_t den_end = latex_skip_brace(src, src_len, p);
-                    p = (den_end < src_len) ? den_end + 1 : src_len;
-                    /* Recursively convert num + den. */
-                    char num_buf[512], den_buf[512];
-                    size_t nl = latex_to_unicode(src + num_start,
-                                                  num_end - num_start,
-                                                  num_buf, sizeof(num_buf) - 1);
-                    num_buf[nl] = 0;
-                    size_t dl = latex_to_unicode(src + den_start,
-                                                  den_end - den_start,
-                                                  den_buf, sizeof(den_buf) - 1);
-                    den_buf[dl] = 0;
-                    /* Try vulgar fraction lookup first — much prettier. */
-                    int vulgar_ok = 0;
-                    for (int i = 0; VULGAR_FRACS[i].num; i++) {
-                        if (strcmp(num_buf, VULGAR_FRACS[i].num) == 0 &&
-                            strcmp(den_buf, VULGAR_FRACS[i].den) == 0) {
-                            ltx_puts(dst, &dp, dst_cap, VULGAR_FRACS[i].uni);
-                            vulgar_ok = 1;
-                            break;
-                        }
-                    }
-                    if (!vulgar_ok) {
-                        /* Wrap rules:
-                         *
-                         * NUM: wrap only if has op/space/paren.
-                         *
-                         * DEN: wrap if has op/space/paren OR if content
-                         *   mixes DIGIT with LETTER/multibyte (e.g. `2a`,
-                         *   `2σ²` — `1/2a` reads as `(1/2)·a` OR `1/(2a)`
-                         *   ambiguously without parens). Pure `a`, pure
-                         *   `10`, pure `speed` etc. don't need wrap
-                         *   (unambiguous atomic units).
-                         *
-                         * Yields (all real AI outputs):
-                         *   1/2         → ½ (vulgar path)
-                         *   a/b         → a/b
-                         *   dy/dx       → dy/dx (standard notation)
-                         *   distance/speed → distance/speed
-                         *   1/2a        → 1/(2a) (ambiguous → wrap)
-                         *   2/2σ²       → 2/(2σ²)
-                         *   (a+b)/(c-d) → wrap both
-                         *   1/(σ√(2π))  → den has `(` → wrap */
-                        auto has_op = [](const char *s, size_t len) -> int {
-                            for (size_t k = 0; k < len; k++) {
-                                char nc = s[k];
-                                if (nc == '+' || nc == '-' || nc == ' ' ||
-                                    nc == '*' || nc == '/' || nc == '=' ||
-                                    nc == '(' || nc == ')') return 1;
-                            }
-                            return 0;
-                        };
-                        auto is_ambiguous_den = [](const char *s, size_t len) -> int {
-                            int has_digit = 0, has_letter = 0;
-                            for (size_t k = 0; k < len; ) {
-                                unsigned char b = (unsigned char)s[k];
-                                if (b < 0x80) {
-                                    if (b >= '0' && b <= '9') has_digit = 1;
-                                    else if ((b >= 'a' && b <= 'z') ||
-                                             (b >= 'A' && b <= 'Z')) has_letter = 1;
-                                    k++;
-                                } else if ((b & 0xE0) == 0xC0) { has_letter = 1; k += 2; }
-                                else if ((b & 0xF0) == 0xE0) { has_letter = 1; k += 3; }
-                                else if ((b & 0xF8) == 0xF0) { has_letter = 1; k += 4; }
-                                else k++;
-                            }
-                            return has_digit && has_letter;
-                        };
-                        int wrap_num = has_op(num_buf, nl);
-                        int wrap_den = has_op(den_buf, dl) || is_ambiguous_den(den_buf, dl);
-                        if (wrap_num) ltx_putc(dst, &dp, dst_cap, '(');
-                        ltx_put(dst, &dp, dst_cap, num_buf, nl);
-                        if (wrap_num) ltx_putc(dst, &dp, dst_cap, ')');
-                        ltx_putc(dst, &dp, dst_cap, '/');
-                        if (wrap_den) ltx_putc(dst, &dp, dst_cap, '(');
-                        ltx_put(dst, &dp, dst_cap, den_buf, dl);
-                        if (wrap_den) ltx_putc(dst, &dp, dst_cap, ')');
-                    }
-                    sp = p;
-                    continue;
-                }
-            }
-        }
-
-        /* \binom{a}{b} → C(a,b) form. */
-        if (c == '\\' && sp + 6 <= src_len &&
-            (memcmp(src + sp, "\\binom", 6) == 0 ||
-             memcmp(src + sp, "\\tbinom", 7) == 0 ||
-             memcmp(src + sp, "\\dbinom", 7) == 0)) {
-            size_t cmd_len = (src[sp + 1] == 'b') ? 6 : 7;
-            size_t p = sp + cmd_len;
-            if (p < src_len && src[p] == '{') {
-                size_t top_start = p + 1;
-                size_t top_end = latex_skip_brace(src, src_len, p);
-                p = (top_end < src_len) ? top_end + 1 : src_len;
-                if (p < src_len && src[p] == '{') {
-                    size_t bot_start = p + 1;
-                    size_t bot_end = latex_skip_brace(src, src_len, p);
-                    p = (bot_end < src_len) ? bot_end + 1 : src_len;
-                    char t_buf[256], b_buf[256];
-                    size_t tl = latex_to_unicode(src + top_start,
-                                                  top_end - top_start,
-                                                  t_buf, sizeof(t_buf) - 1);
-                    t_buf[tl] = 0;
-                    size_t bl = latex_to_unicode(src + bot_start,
-                                                  bot_end - bot_start,
-                                                  b_buf, sizeof(b_buf) - 1);
-                    b_buf[bl] = 0;
-                    ltx_putc(dst, &dp, dst_cap, 'C');
-                    ltx_putc(dst, &dp, dst_cap, '(');
-                    ltx_put(dst, &dp, dst_cap, t_buf, tl);
-                    ltx_putc(dst, &dp, dst_cap, ',');
-                    ltx_put(dst, &dp, dst_cap, b_buf, bl);
-                    ltx_putc(dst, &dp, dst_cap, ')');
-                    sp = p;
-                    continue;
-                }
-            }
-        }
-
-        /* \sqrt[n]{x} (nth root) and \sqrt{x}. */
-        if (c == '\\' && sp + 5 <= src_len &&
-            memcmp(src + sp, "\\sqrt", 5) == 0 &&
-            (sp + 5 == src_len || src[sp + 5] == '{' || src[sp + 5] == '[')) {
-            size_t p = sp + 5;
-            /* Optional [n] index for nth root — emit as n√ prefix. */
-            if (p < src_len && src[p] == '[') {
-                p++;
-                size_t idx_start = p;
-                while (p < src_len && src[p] != ']') p++;
-                if (p < src_len) {
-                    char idx_buf[64];
-                    size_t il = latex_to_unicode(src + idx_start,
-                                                  p - idx_start,
-                                                  idx_buf, sizeof(idx_buf) - 1);
-                    idx_buf[il] = 0;
-                    /* Try Unicode superscript for the index. */
-                    size_t before_dp = dp;
-                    if (!try_render_sup_sub(idx_buf, il, 1, dst, &dp, dst_cap)) {
-                        dp = before_dp;
-                        ltx_put(dst, &dp, dst_cap, idx_buf, il);
-                    }
-                    p++;   /* past ] */
-                }
-            }
-            ltx_puts(dst, &dp, dst_cap, "\xE2\x88\x9A");   /* √ */
-            if (p < src_len && src[p] == '{') {
-                size_t inner_start = p + 1;
-                size_t inner_end = latex_skip_brace(src, src_len, p);
-                p = (inner_end < src_len) ? inner_end + 1 : src_len;
-                char inner_buf[512];
-                size_t il = latex_to_unicode(src + inner_start,
-                                              inner_end - inner_start,
-                                              inner_buf, sizeof(inner_buf) - 1);
-                inner_buf[il] = 0;
-                /* Wrap in parens for readability. Rules (in order):
-                 *   YES if inner has any op/space → √(a+b), √(a b)
-                 *   YES if inner has mixed content (digit+letter, digit
-                 *     + multibyte greek) → √(2π), √(2ac), √(2x)
-                 *   NO for pure digits (√27, √100)
-                 *   NO for pure letters (√x, √xy, √abc)
-                 *   NO for single-char content
-                 * Rationale: √27 reads unambiguously; √2π is confusing
-                 * (is it √2 · π or √(2π)?), so we wrap. */
-                int wrap = 0;
-                int has_digit = 0, has_ascii_letter = 0, has_multibyte = 0;
-                for (size_t k = 0; k < il; ) {
-                    unsigned char b = (unsigned char)inner_buf[k];
-                    if (b < 0x80) {
-                        char nc = (char)b;
-                        if (nc == '+' || nc == '-' || nc == ' ' || nc == '*' ||
-                            nc == '/' || nc == '=' || nc == '(' || nc == ')') {
-                            wrap = 1; break;
-                        }
-                        if (nc >= '0' && nc <= '9') has_digit = 1;
-                        if ((nc >= 'a' && nc <= 'z') || (nc >= 'A' && nc <= 'Z'))
-                            has_ascii_letter = 1;
-                        k++;
-                    } else if ((b & 0xE0) == 0xC0) { has_multibyte = 1; k += 2; }
-                    else if ((b & 0xF0) == 0xE0) { has_multibyte = 1; k += 3; }
-                    else if ((b & 0xF8) == 0xF0) { has_multibyte = 1; k += 4; }
-                    else k++;
-                }
-                if (!wrap) {
-                    int types = (has_digit != 0) + (has_ascii_letter != 0) +
-                                (has_multibyte != 0);
-                    if (types >= 2) wrap = 1;
-                }
-                if (wrap) ltx_putc(dst, &dp, dst_cap, '(');
-                ltx_put(dst, &dp, dst_cap, inner_buf, il);
-                if (wrap) ltx_putc(dst, &dp, dst_cap, ')');
-                sp = p;
-                continue;
-            } else {
-                sp += 5;
-                continue;
-            }
-        }
-
-        /* Accent commands: \vec{x} → x⃗ etc. */
-        {
-            int acc = latex_accent_at(src, src_len, sp);
-            if (acc >= 0) {
-                size_t cmd_len = 1 + strlen(LATEX_ACCENTS[acc].cmd);
-                size_t p = sp + cmd_len;   /* at `{` */
-                size_t inner_start = p + 1;
-                size_t inner_end = latex_skip_brace(src, src_len, p);
-                p = (inner_end < src_len) ? inner_end + 1 : src_len;
-                char inner_buf[256];
-                size_t il = latex_to_unicode(src + inner_start,
-                                              inner_end - inner_start,
-                                              inner_buf, sizeof(inner_buf) - 1);
-                inner_buf[il] = 0;
-                /* Emit each codepoint of inner + combining mark. */
-                size_t ip = 0;
-                while (ip < il) {
-                    size_t np = utf8_advance(inner_buf, ip, il);
-                    ltx_put(dst, &dp, dst_cap, inner_buf + ip, np - ip);
-                    ltx_puts(dst, &dp, dst_cap, LATEX_ACCENTS[acc].combining);
-                    ip = np;
-                }
-                sp = p;
-                continue;
-            }
-        }
-
-        /* Wrapper commands: \text{foo} / \mathbf{x} / \operatorname{lcm} etc.
-         * Emit inner content unchanged (recursively converted). */
-        {
-            size_t wrap_cmd = latex_wrapper_at(src, src_len, sp);
-            if (wrap_cmd > 0) {
-                size_t p = sp + wrap_cmd;   /* at `{` */
-                size_t inner_start = p + 1;
-                size_t inner_end = latex_skip_brace(src, src_len, p);
-                p = (inner_end < src_len) ? inner_end + 1 : src_len;
-                char inner_buf[1024];
-                size_t il = latex_to_unicode(src + inner_start,
-                                              inner_end - inner_start,
-                                              inner_buf, sizeof(inner_buf) - 1);
-                ltx_put(dst, &dp, dst_cap, inner_buf, il);
-                sp = p;
-                continue;
-            }
-        }
-
-        /* Superscript/subscript with braces: ^{...} / _{...}
-         * Try full Unicode super/sub for all chars; fall back to
-         * `^{inner}` / `_{inner}` literal on any un-mappable char.
-         * We KEEP the braces on fallback so scope is unambiguous —
-         * `\lim_{n \to \infty}` renders as `lim_{n → ∞}`, not
-         * `lim_n → ∞` which is unreadable. */
-        if ((c == '^' || c == '_') && sp + 1 < src_len && src[sp + 1] == '{') {
-            char op = c;
-            sp += 2;
-            size_t inner_start = sp;
-            size_t inner_end = latex_skip_brace(src, src_len, sp - 1);
-            sp = (inner_end < src_len) ? inner_end + 1 : src_len;
-            size_t ilen = inner_end - inner_start;
-
-            /* Recursively convert the inner content first (so \pi etc.
-             * become π etc). */
-            char inner_buf[256];
-            size_t il = latex_to_unicode(src + inner_start, ilen,
-                                          inner_buf, sizeof(inner_buf) - 1);
-            inner_buf[il] = 0;
-
-            /* Try Unicode super/sub rendering. */
-            size_t before_dp = dp;
-            int rendered_uni = try_render_sup_sub(inner_buf, il,
-                                                    op == '^', dst, &dp, dst_cap);
-            if (!rendered_uni) {
-                /* Roll back + emit literal `^{inner}` / `_{inner}`.
-                 * Braces preserved so reader knows what's being
-                 * sub/superscripted. */
-                dp = before_dp;
-                ltx_putc(dst, &dp, dst_cap, op);
-                ltx_putc(dst, &dp, dst_cap, '{');
-                ltx_put(dst, &dp, dst_cap, inner_buf, il);
-                ltx_putc(dst, &dp, dst_cap, '}');
-            }
-            continue;
-        }
-
-        /* Bare ^X or _X handling.
-         *
-         * SPECIAL CASE: ^\command — if the command is in LATEX_MAP,
-         * emit its Unicode DIRECTLY (dropping the `^`). This makes
-         * `T=0^\circ\text{C}` render as `T=0°C` — the ° symbol is
-         * already "superscript-like" so `^°` would be redundant. */
-        if ((c == '^' || c == '_') && sp + 1 < src_len && src[sp + 1] == '\\') {
-            int idx = latex_match_at(src, src_len, sp + 1);
-            if (idx >= 0) {
-                size_t tlen = strlen(LATEX_MAP[idx].tex);
-                ltx_puts(dst, &dp, dst_cap, LATEX_MAP[idx].uni);
-                sp += 1 + tlen;
-                continue;
-            }
-        }
-
-        /* Bare ^X where X is a single ASCII char (digit/letter/op).
-         * Convert to Unicode superscript if possible.
-         *
-         * Same chemistry-friendly rule as `_`: single-digit sup can be
-         * followed by a letter (e.g. `x^2y` = `x²y`), which is standard
-         * math notation. Only reject if it's followed by another digit
-         * (multi-digit sup — requires braces). */
-        if (c == '^' && sp + 1 < src_len) {
-            char nx = src[sp + 1];
-            int is_digit = (nx >= '0' && nx <= '9');
-            int at_boundary = (sp + 2 >= src_len) ||
-                (!(src[sp + 2] >= '0' && src[sp + 2] <= '9') &&
-                 !(src[sp + 2] >= 'a' && src[sp + 2] <= 'z') &&
-                 !(src[sp + 2] >= 'A' && src[sp + 2] <= 'Z'));
-            const char *uni = sup_of(nx);
-            int digit_ok = is_digit && (sp + 2 >= src_len ||
-                                          !(src[sp + 2] >= '0' && src[sp + 2] <= '9'));
-            if (uni && (at_boundary || digit_ok)) {
-                ltx_puts(dst, &dp, dst_cap, uni);
-                sp += 2;
-                continue;
-            }
-        }
-        /* Bare _X analogous — with a special case for chemistry:
-         * `H_2O` and `CO_2` are ubiquitous, so allow single-digit
-         * subscript even when followed by another letter. `x_ab`
-         * (unlikely in real math) still stays literal because
-         * we only subscript the single digit. */
-        if (c == '_' && sp + 1 < src_len) {
-            char nx = src[sp + 1];
-            int is_digit = (nx >= '0' && nx <= '9');
-            int at_boundary = (sp + 2 >= src_len) ||
-                (!(src[sp + 2] >= '0' && src[sp + 2] <= '9') &&
-                 !(src[sp + 2] >= 'a' && src[sp + 2] <= 'z') &&
-                 !(src[sp + 2] >= 'A' && src[sp + 2] <= 'Z'));
-            const char *uni = sub_of(nx);
-            /* Chemistry-friendly: single-digit sub can be followed by a
-             * letter (H_2O) but not another digit (which would be a
-             * multi-digit subscript that should use `_{...}` form). */
-            int digit_ok = is_digit && (sp + 2 >= src_len ||
-                                          !(src[sp + 2] >= '0' && src[sp + 2] <= '9'));
-            if (uni && (at_boundary || digit_ok)) {
-                ltx_puts(dst, &dp, dst_cap, uni);
-                sp += 2;
-                continue;
-            }
-        }
-
-        /* Known backslash commands via LATEX_MAP. */
-        if (c == '\\' && sp + 1 < src_len) {
-            int idx = latex_match_at(src, src_len, sp);
-            if (idx >= 0) {
-                size_t tlen = strlen(LATEX_MAP[idx].tex);
-                const char *uni = LATEX_MAP[idx].uni;
-                size_t ulen = strlen(uni);
-                ltx_puts(dst, &dp, dst_cap, uni);
-                sp += tlen;
-                /* Empty replacements (\left, \right, thin-space, etc.)
-                 * consume an adjacent space to avoid doubled spaces. */
-                if (ulen == 0 && sp < src_len && src[sp] == ' ') {
-                    if (dp > 0 && dst[dp - 1] == ' ') sp++;
-                }
-                continue;
-            }
-            /* Unknown \command — if followed by `{...}`, safest is to
-             * silently drop the command name and emit the content
-             * (so `\weird{content}` becomes `content`). This handles
-             * long-tail LaTeX (`\mathbb{R}` → `R`) even without adding
-             * every package's symbols to LATEX_MAP.
-             *
-             * If NOT followed by `{`, preserve as literal `\name` so
-             * user sees something didn't convert (helps diagnose new
-             * symbols worth adding to the map). */
-            size_t after_bs = sp + 1;
-            /* Find end of command word. */
-            size_t word_end = after_bs;
-            while (word_end < src_len &&
-                   ((src[word_end] >= 'a' && src[word_end] <= 'z') ||
-                    (src[word_end] >= 'A' && src[word_end] <= 'Z'))) {
-                word_end++;
-            }
-            if (word_end > after_bs && word_end < src_len && src[word_end] == '{') {
-                /* Drop command name, recurse on {content}. */
-                size_t inner_start = word_end + 1;
-                size_t inner_end = latex_skip_brace(src, src_len, word_end);
-                size_t after = (inner_end < src_len) ? inner_end + 1 : src_len;
-                char inner_buf[1024];
-                size_t il = latex_to_unicode(src + inner_start,
-                                              inner_end - inner_start,
-                                              inner_buf, sizeof(inner_buf) - 1);
-                ltx_put(dst, &dp, dst_cap, inner_buf, il);
-                sp = after;
-                continue;
-            }
-            /* No braces after — emit `\name` verbatim for diagnostic. */
-            ltx_putc(dst, &dp, dst_cap, '\\');
-            sp = after_bs;
-            while (sp < word_end) ltx_putc(dst, &dp, dst_cap, src[sp++]);
-            continue;
-        }
-
-        /* Strip stray { } (LaTeX grouping — no meaning in prose). */
-        if (c == '{' || c == '}') {
-            sp++;
-            continue;
-        }
-
-        /* & in a plain (non-env) context: column separator in a
-         * partial matrix or misuse. Emit a space so text doesn't
-         * jam together. */
-        if (c == '&') {
-            ltx_putc(dst, &dp, dst_cap, ' ');
-            sp++;
-            continue;
-        }
-
-        /* Default: copy verbatim (includes UTF-8 multibyte chars). */
-        ltx_putc(dst, &dp, dst_cap, c);
-        sp++;
-    }
-    return dp;
-}
-
-/* ── Environment renderer implementation ──────────────────────────
- *
- * Splits body on `\\` (row separators) and `&` (column separators),
- * recursively converts each cell, then formats with appropriate
- * bracket / alignment style.
- *
- * Supported environments:
- *   matrix, pmatrix, bmatrix, Bmatrix, vmatrix, Vmatrix, smallmatrix
- *   array   (columns spec { }|c|c|| ignored — same as matrix)
- *   cases   (open brace on left, right-aligned second col)
- *   align, aligned, gather, gathered, split, multline, eqnarray,
- *   subarray (all treat & as space + \\ as newline)
- *   equation (single-line, treat \\ as newline just in case) */
-static size_t latex_render_env(const char *env, size_t env_len,
-                                const char *body, size_t body_len,
-                                char *dst, size_t dst_cap) {
-    /* Copy env name into local for strcmp-style dispatch. */
-    char env_buf[32];
-    size_t n = env_len > sizeof(env_buf) - 1 ? sizeof(env_buf) - 1 : env_len;
-    memcpy(env_buf, env, n);
-    env_buf[n] = 0;
-    /* Strip trailing `*` (starred variants like `align*`). */
-    if (n > 0 && env_buf[n - 1] == '*') env_buf[--n] = 0;
-
-    /* Detect matrix-family + bracket style. */
-    int is_matrix = 0;
-    const char *bracket_open = "";
-    const char *bracket_close = "";
-    if (strcmp(env_buf, "matrix") == 0 ||
-        strcmp(env_buf, "smallmatrix") == 0 ||
-        strcmp(env_buf, "array") == 0) {
-        is_matrix = 1;
-    } else if (strcmp(env_buf, "pmatrix") == 0) {
-        is_matrix = 1;
-        bracket_open  = "( ";
-        bracket_close = " )";
-    } else if (strcmp(env_buf, "bmatrix") == 0) {
-        is_matrix = 1;
-        bracket_open  = "[ ";
-        bracket_close = " ]";
-    } else if (strcmp(env_buf, "Bmatrix") == 0) {
-        is_matrix = 1;
-        bracket_open  = "{ ";
-        bracket_close = " }";
-    } else if (strcmp(env_buf, "vmatrix") == 0) {
-        is_matrix = 1;
-        bracket_open  = "| ";
-        bracket_close = " |";
-    } else if (strcmp(env_buf, "Vmatrix") == 0) {
-        is_matrix = 1;
-        bracket_open  = "\xE2\x80\x96 ";      /* ‖ */
-        bracket_close = " \xE2\x80\x96";
-    }
-
-    int is_cases = (strcmp(env_buf, "cases") == 0 ||
-                    strcmp(env_buf, "dcases") == 0);
-
-    /* Skip initial `[colspec]` block for `array` env. */
-    size_t bp = 0;
-    if (strcmp(env_buf, "array") == 0 && bp < body_len && body[bp] == '{') {
-        while (bp < body_len && body[bp] != '}') bp++;
-        if (bp < body_len) bp++;
-    }
-    /* Skip a leading `{...}` alignment spec for align etc. — rare. */
-
-    /* Skip leading whitespace/newlines. */
-    while (bp < body_len && (body[bp] == ' ' || body[bp] == '\t' ||
-                             body[bp] == '\n' || body[bp] == '\r')) bp++;
-
-    /* Body sub-body. */
-    const char *sub = body + bp;
-    size_t sub_len = body_len - bp;
-    /* Trim trailing whitespace + optional trailing `\\`. */
-    while (sub_len > 0 && (sub[sub_len - 1] == ' ' || sub[sub_len - 1] == '\t' ||
-                            sub[sub_len - 1] == '\n' || sub[sub_len - 1] == '\r')) sub_len--;
-    if (sub_len >= 2 && sub[sub_len - 2] == '\\' && sub[sub_len - 1] == '\\') sub_len -= 2;
-
-    size_t dp = 0;
-
-    /* Split rows on `\\` (respecting brace nesting). */
-    size_t rp = 0;
-    int row_idx = 0;
-    while (rp < sub_len) {
-        /* Find next `\\` at same brace depth. */
-        size_t row_end = rp;
-        int depth = 0;
-        while (row_end < sub_len) {
-            char cc = sub[row_end];
-            if (cc == '{') depth++;
-            else if (cc == '}' && depth > 0) depth--;
-            else if (cc == '\\' && row_end + 1 < sub_len &&
-                     sub[row_end + 1] == '\\' && depth == 0) break;
-            row_end++;
-        }
-        /* Trim whitespace from row bounds. */
-        size_t r_start = rp;
-        size_t r_end = row_end;
-        while (r_start < r_end && (sub[r_start] == ' ' || sub[r_start] == '\t' ||
-                                    sub[r_start] == '\n' || sub[r_start] == '\r')) r_start++;
-        while (r_end > r_start && (sub[r_end - 1] == ' ' || sub[r_end - 1] == '\t' ||
-                                    sub[r_end - 1] == '\n' || sub[r_end - 1] == '\r')) r_end--;
-
-        if (r_end > r_start) {
-            if (row_idx > 0) ltx_putc(dst, &dp, dst_cap, '\n');
-            /* Cases: open brace on FIRST row, continuation ⎨ on later. */
-            if (is_cases && row_idx == 0) ltx_puts(dst, &dp, dst_cap, "\xE2\x8E\xA7 ");   /* ⎧ */
-            else if (is_cases) ltx_puts(dst, &dp, dst_cap, "\xE2\x8E\xA8 ");              /* ⎨ */
-            else if (bracket_open[0]) {
-                /* Matrix: emit opening bracket on EVERY row for readability.
-                 * Ideal LaTeX rendering uses tall stretchy brackets, but
-                 * text-mode text-art works better with per-row brackets. */
-                ltx_puts(dst, &dp, dst_cap, bracket_open);
-            }
-
-            /* Split cells on `&`. */
-            size_t cp = r_start;
-            int col_idx = 0;
-            while (cp < r_end) {
-                size_t cell_end = cp;
-                int cd = 0;
-                while (cell_end < r_end) {
-                    char cc = sub[cell_end];
-                    if (cc == '{') cd++;
-                    else if (cc == '}' && cd > 0) cd--;
-                    else if (cc == '&' && cd == 0) break;
-                    else if (cc == '\\' && cell_end + 1 < r_end &&
-                             sub[cell_end + 1] == '\\' && cd == 0) break;
-                    cell_end++;
-                }
-                /* Trim cell. */
-                size_t c_start = cp, c_end = cell_end;
-                while (c_start < c_end && (sub[c_start] == ' ' || sub[c_start] == '\t')) c_start++;
-                while (c_end > c_start && (sub[c_end - 1] == ' ' || sub[c_end - 1] == '\t')) c_end--;
-                if (col_idx > 0) {
-                    /* cases: 2 spaces to visually separate expr from condition. */
-                    if (is_cases) ltx_puts(dst, &dp, dst_cap, "  if  ");
-                    else ltx_puts(dst, &dp, dst_cap, "  ");
-                }
-                char cell_buf[512];
-                size_t cl = latex_to_unicode(sub + c_start, c_end - c_start,
-                                              cell_buf, sizeof(cell_buf) - 1);
-                ltx_put(dst, &dp, dst_cap, cell_buf, cl);
-                cp = (cell_end < r_end) ? cell_end + 1 : r_end;
-                col_idx++;
-            }
-
-            if (bracket_close[0] && !is_cases) {
-                /* Only close on the LAST row for matrices. We don't know
-                 * ahead if this IS the last row, so close every row (visual
-                 * approximation — tall matrices show brackets on each
-                 * row, which is imperfect but readable). */
-                ltx_puts(dst, &dp, dst_cap, bracket_close);
-            }
-            row_idx++;
-        }
-        rp = (row_end < sub_len) ? row_end + 2 : sub_len;
-        /* Skip optional `[N]` spacing after \\. */
-        if (rp < sub_len && sub[rp] == '[') {
-            while (rp < sub_len && sub[rp] != ']') rp++;
-            if (rp < sub_len) rp++;
-        }
-    }
-    (void)is_matrix;
-    return dp;
-}
 
 /* Render a plain-text run. Splits on newlines and detects per-line
  * markdown structure: headings, list items. Non-structured lines
@@ -4323,6 +3046,13 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     if (pos_x > (float)screen_w - 60.0f) pos_x = (float)screen_w - 60.0f;
     if (pos_y > (float)screen_h - 30.0f) pos_y = (float)screen_h - 30.0f;
 
+    /* v6: cache the drawn rect for the LL mouse hook so mouse-wheel
+     * scrolling can hit-test the cursor against the overlay. */
+    InterlockedExchange(&g_last_overlay_x, (LONG)pos_x);
+    InterlockedExchange(&g_last_overlay_y, (LONG)pos_y);
+    InterlockedExchange(&g_last_overlay_w, (LONG)base_w);
+    InterlockedExchange(&g_last_overlay_h, (LONG)base_h);
+
     ImGui::SetNextWindowPos(ImVec2(pos_x, pos_y), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(base_w, base_h), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(alpha);
@@ -4689,24 +3419,64 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
              * builds the GPU font texture from IO.Fonts on first
              * frame. Loading after that causes a missing-glyph texture.
              *
-             * Font pick logic:
-             *   - UI font: Segoe UI (Win11 UI's native sans-serif)
-             *   - Mono font: Cascadia Mono → Consolas → fallback
+             * v6.3 (2026-07-06) - MAJOR RANGE FIX:
              *
-             * Failure is silent; ImGui default (Proggy Clean 13px)
-             * takes over. That's ugly but functional.
+             * Previous ranges were BROKEN in two ways:
+             *   1. OUT OF ORDER: 0x2500 (box drawing) came before 0x2190
+             *      (arrows). ImGui requires ranges in ASCENDING order.
+             *      Any range after an out-of-order entry could be silently
+             *      dropped. This is why arrows / some symbols rendered
+             *      as '??' in AI answers.
+             *   2. MISSING critical ranges for LaTeX rendering:
+             *      - Superscripts (U+2070-209F): ² ³ ⁻ ⁺ ⁿ — emitted by
+             *        our sup_of() helper for x^2, x^{ab}, etc.
+             *      - Subscripts (U+2080-209F): ₀ ₁ ₂ ᵢ — emitted by
+             *        sub_of() for H_2O, x_i, etc.
+             *      - Number Forms (U+2150-218F): ½ ⅓ ⅔ ¼ ¾ — emitted
+             *        by our VULGAR_FRACS table for \frac{1}{2}.
+             *      - Letterlike (U+2100-214F): ℝ ℂ ℕ ℚ ℤ — sometimes
+             *        emitted for AI's blackboard-bold set names.
+             *      - Combining marks (U+0300-036F, U+20D0-20FF): the
+             *        \vec, \hat, \bar, \dot commands emit these to add
+             *        marks over the previous letter (e.g. \vec{v} → v⃗).
              *
-             * Both fonts load with a merged glyph range covering ASCII
-             * + Latin extended (for accented chars in typed chat) +
-             * Greek+math symbols (α, β, π, θ, ±, ≤, ≥, →, ⇌, ∞, ∑, ∫).
+             * Fix: use ONE contiguous range that covers everything from
+             * 0x0020 to 0x2BFF. Font atlas grows by a few MB but that's
+             * fine (we're inside DWM which has plenty of GPU memory).
+             * ImGui only allocates atlas slots for glyphs the font
+             * actually HAS, so no penalty for over-requesting.
+             *
+             * Also v6.3: MERGE Segoe UI Symbol on top so any math /
+             * symbol glyph Segoe UI itself lacks gets filled from the
+             * symbol font. Segoe UI Symbol is a dedicated Microsoft
+             * font shipped with every Win7+ install that covers 100%
+             * of the math / arrow / geometric-shape Unicode blocks.
+             *
              * CJK is DELIBERATELY not loaded (adds 200+ MB to atlas). */
             static const ImWchar RANGES_UI[] = {
-                0x0020, 0x00FF,   /* Basic Latin + Latin-1 Supplement */
-                0x0100, 0x024F,   /* Latin Extended-A + B */
-                0x0370, 0x03FF,   /* Greek (α β π θ ε λ etc.) */
-                0x2000, 0x22FF,   /* General punctuation + math ops   */
-                0x2500, 0x25FF,   /* Box drawing (bar chars for cursor) */
-                0x2190, 0x21FF,   /* Arrows (→ ← ↑ ↓ ⇌) */
+                0x0020, 0x007F,   /* Basic Latin */
+                0x00A0, 0x024F,   /* Latin-1 Supplement + Latin Extended-A/B */
+                0x0300, 0x036F,   /* Combining Diacritical Marks (accents) */
+                0x0370, 0x03FF,   /* Greek (α β π θ ε λ Σ Δ etc.) */
+                0x2000, 0x209F,   /* Punctuation + Superscripts + Subscripts */
+                0x20A0, 0x20CF,   /* Currency symbols */
+                0x20D0, 0x20FF,   /* Combining marks for symbols (\vec arrow etc.) */
+                0x2100, 0x214F,   /* Letterlike (ℝ ℂ ℕ ℚ ℤ ℵ) */
+                0x2150, 0x218F,   /* Number Forms (½ ⅓ ⅔ ¼ ¾ ⅕ ⅖ ...) */
+                0x2190, 0x21FF,   /* Arrows (→ ← ↑ ↓ ⇌ ↦ ⇒ ⇔) */
+                0x2200, 0x22FF,   /* Mathematical Operators (∀ ∃ ∈ ∫ ∑ √ ∂ ∇ ≠ ≤) */
+                0x2300, 0x23FF,   /* Misc Technical (⌈ ⌉ ⌊ ⌋ ⌜ ⌝) */
+                0x2500, 0x257F,   /* Box drawing */
+                0x2580, 0x259F,   /* Block elements */
+                0x25A0, 0x25FF,   /* Geometric shapes (■ ● ▲ ◆) */
+                0x2600, 0x26FF,   /* Misc symbols (☆ ★ ⚠) */
+                0x2700, 0x27BF,   /* Dingbats (✓ ✗) */
+                0x27C0, 0x27EF,   /* Misc Math A */
+                0x27F0, 0x27FF,   /* Supplemental Arrows-A */
+                0x2900, 0x297F,   /* Supplemental Arrows-B */
+                0x2980, 0x29FF,   /* Misc Math B */
+                0x2A00, 0x2AFF,   /* Supplemental Math Operators */
+                0x2B00, 0x2BFF,   /* Misc Symbols and Arrows */
                 0, 0
             };
             g_font_ui = io.Fonts->AddFontFromFileTTF(
@@ -4717,6 +3487,20 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
                 diag("font: segoeui.ttf load FAILED, using default");
             } else {
                 diag("font: UI = Segoe UI @ %.0fpx", UI_FONT_SIZE_PX);
+            }
+            /* v6.3: MERGE Segoe UI Symbol on top of Segoe UI so any
+             * math/symbol glyph Segoe UI itself lacks (rare - it covers
+             * most, but Cambria Math coverage is broader) gets filled
+             * from the symbol font. seguisym.ttf ships with Win7+. */
+            {
+                ImFontConfig mcfg;
+                mcfg.MergeMode = true;
+                mcfg.PixelSnapH = true;
+                ImFont *sym = io.Fonts->AddFontFromFileTTF(
+                    "C:\\Windows\\Fonts\\seguisym.ttf", UI_FONT_SIZE_PX,
+                    &mcfg, RANGES_UI);
+                if (sym) diag("font: Segoe UI Symbol merged for math coverage");
+                else     diag("font: seguisym.ttf load FAILED - math glyphs may render as ?");
             }
             /* Mono font — try Cascadia Mono, then Consolas. */
             g_font_mono = io.Fonts->AddFontFromFileTTF(
@@ -4732,6 +3516,15 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
                 diag("font: mono load FAILED, using UI font");
             } else {
                 diag("font: mono OK @ %.0fpx", MONO_FONT_SIZE_PX);
+                /* v6.3: also merge Segoe UI Symbol into mono for the
+                 * same math coverage. Cascadia Mono has decent math
+                 * coverage already but Consolas is sparse. */
+                ImFontConfig mcfg;
+                mcfg.MergeMode = true;
+                mcfg.PixelSnapH = true;
+                io.Fonts->AddFontFromFileTTF(
+                    "C:\\Windows\\Fonts\\seguisym.ttf", MONO_FONT_SIZE_PX,
+                    &mcfg, RANGES_UI);
             }
 
             ImGui::StyleColorsDark();

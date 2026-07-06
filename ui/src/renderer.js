@@ -93,7 +93,29 @@ async function boot() {
   if (dto && dto.clearReason === 'security_failed') {
     _renderLoginDeviceId();
     showLoginError(dto.securityReason ||
-      'CloakGPT will not start while a debugger or reverse-engineering tool is running. Close it and retry.');
+      'CloakGPT will not start while a debugger or reverse-engineering tool is running. Close it and retry.',
+      { blocking: true });
+    showScreen('login');
+    return;
+  }
+
+  // v6 (2026-07-06): MITM check failed — refuse to load. A traffic
+  // inspection tool's root CA is installed OR HTTPS_PROXY is set.
+  // Show login with the specific reason so the user knows exactly
+  // what to remove.
+  //
+  // v6.2: pass { remediate: { kind, tool } } so showLoginError can
+  // render an inline "Fix now" button that auto-remediates via
+  // svc.mitm.remediate + re-checks. Zero shell-fiddling from the user.
+  if (dto && dto.clearReason === 'mitm_detected') {
+    _renderLoginDeviceId();
+    showLoginError(dto.mitmDetails ||
+      `CloakGPT refuses to run because a network traffic inspection tool ` +
+      `(${dto.mitmTool || 'unknown'}) is present on this machine. Uninstall it and retry.`,
+      {
+        blocking:  true,
+        remediate: { kind: dto.mitmKind, tool: dto.mitmTool },
+      });
     showScreen('login');
     return;
   }
@@ -155,15 +177,96 @@ function _renderLoginDeviceId() {
   if (el) el.textContent = shortenHwid(state.hwid);
 }
 
-function showLoginError(msg) {
+// v6 (2026-07-06): `blocking` flag greys out the Sign-in button when
+// the error is unrecoverable-without-user-action (security / MITM
+// check found a debugger or a proxy CA). Recoverable errors like
+// session_expired / tampered / token_rejected leave the button live
+// because a fresh sign-in IS the fix.
+//
+// v6.2 (2026-07-06): if opts includes { remediate: { kind, tool } },
+// we add a "Fix now" button that calls svc.mitm.remediate and then
+// re-runs the boot check. Only offered for MITM kinds we know how to
+// auto-fix.
+const _REMEDIATE_LABEL = {
+  tls_bypass:      () => 'Unset NODE_TLS_REJECT_UNAUTHORIZED for me',
+  https_proxy_env: () => 'Remove the proxy env var for me',
+  winhttp_proxy:   () => 'Reset WinHTTP proxy for me',
+  mitm_ca:         (tool) => `Uninstall the ${tool || 'MITM'} certificate for me`,
+};
+
+function showLoginError(msg, opts) {
   const el = document.getElementById('login-error');
   if (!el) return;
-  el.textContent = msg;
+  opts = opts || {};
+
+  el.innerHTML = '';
+  const msgEl = document.createElement('div');
+  msgEl.className = 'login-error-msg';
+  msgEl.textContent = msg;
+  el.appendChild(msgEl);
+
+  // v6.2: inline "Fix now" button for auto-remediable errors.
+  if (opts.remediate && opts.remediate.kind &&
+      _REMEDIATE_LABEL[opts.remediate.kind]) {
+    const btn = document.createElement('button');
+    btn.className = 'login-error-fix';
+    btn.type = 'button';
+    btn.textContent = '\u{1F527} ' +
+      _REMEDIATE_LABEL[opts.remediate.kind](opts.remediate.tool);
+    btn.addEventListener('click', () => _handleRemediateClick(btn, opts.remediate));
+    el.appendChild(btn);
+  }
+
   el.classList.add('show');
+  const blocking = !!opts.blocking;
+  const btn  = document.getElementById('btn-signin');
+  const link = document.getElementById('copy-auth-url');
+  if (btn) {
+    btn.disabled = blocking;
+    btn.classList.toggle('is-blocked', blocking);
+    btn.title = blocking
+      ? 'Fix the issue in the banner above to unlock sign-in'
+      : '';
+  }
+  if (link) {
+    link.style.pointerEvents = blocking ? 'none' : '';
+    link.style.opacity       = blocking ? '0.35' : '';
+  }
 }
 function clearLoginError() {
   const el = document.getElementById('login-error');
-  if (el) { el.classList.remove('show'); el.textContent = ''; }
+  if (el) { el.classList.remove('show'); el.innerHTML = ''; }
+  const btn  = document.getElementById('btn-signin');
+  const link = document.getElementById('copy-auth-url');
+  if (btn)  { btn.disabled = false; btn.classList.remove('is-blocked'); btn.title = ''; }
+  if (link) { link.style.pointerEvents = ''; link.style.opacity = ''; }
+}
+
+async function _handleRemediateClick(btn, remediate) {
+  const origLabel = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Fixing\u2026';
+  try {
+    const r = await window.svc.mitm.remediate({
+      kind: remediate.kind,
+      tool: remediate.tool,
+    });
+    if (r && r.ok) {
+      toast(r.message || 'Fixed. Re-checking\u2026', 'ok');
+      // Re-run the whole boot check - if the ONLY issue was the one
+      // we just fixed, sign-in becomes available again.
+      setTimeout(() => { boot().catch(e => console.log('[renderer] boot after fix:', e.message)); }, 400);
+    } else {
+      const err = (r && r.message) || 'remediation failed';
+      toast(`Fix failed: ${err}`, 'err');
+      btn.disabled = false;
+      btn.textContent = origLabel;
+    }
+  } catch (e) {
+    toast(`Fix failed: ${e.message || e}`, 'err');
+    btn.disabled = false;
+    btn.textContent = origLabel;
+  }
 }
 
 document.getElementById('btn-signin').addEventListener('click', async () => {
@@ -175,8 +278,18 @@ document.getElementById('btn-signin').addEventListener('click', async () => {
 
     // Security check blocked sign-in.
     if (dto && dto.securityBlocked) {
-      showLoginError(dto.error);
+      showLoginError(dto.error, { blocking: true });
       toast('Sign-in blocked — see banner.', 'err');
+      return;
+    }
+
+    // v6: MITM check blocked sign-in. v6.2: same fix-now button as boot.
+    if (dto && dto.mitmBlocked) {
+      showLoginError(dto.error, {
+        blocking:  true,
+        remediate: { kind: dto.mitmKind, tool: dto.mitmTool },
+      });
+      toast(`Sign-in blocked - click "Fix now" or remove ${dto.mitmTool || 'proxy tool'} manually.`, 'err');
       return;
     }
 
@@ -788,6 +901,186 @@ document.getElementById('btn-nuke-keys')?.addEventListener('click', async () => 
   }
 });
 
+// ─── v6 (2026-07-06): AI answer style card wiring ────────────────
+// Persist textarea + mode radio + direct-mode checkbox + latex_mode +
+// stream_display. Auto-save with a 400ms debounce so we don't hammer
+// disk on every keystroke.
+let _promptState = {
+  text: '', mode: 'off',
+  direct_answer_mode: 0,
+  latex_mode: 'auto',
+  stream_display: 'live',
+};
+let _promptSaveTimer = null;
+
+function _renderPromptLen() {
+  const badge = document.getElementById('prompt-len-badge');
+  const ta    = document.getElementById('txt-system-prompt');
+  if (!badge || !ta) return;
+  const n = ta.value.length;
+  badge.textContent = `${n} / 15000`;
+  badge.classList.remove('warn', 'err');
+  if (n > 14000) badge.classList.add('err');
+  else if (n > 12000) badge.classList.add('warn');
+}
+
+function _flushPromptSoon() {
+  clearTimeout(_promptSaveTimer);
+  _promptSaveTimer = setTimeout(async () => {
+    try {
+      await window.svc.systemPrompt.save({
+        text: _promptState.text,
+        mode: _promptState.mode,
+        direct_answer_mode: _promptState.direct_answer_mode,
+        latex_mode: _promptState.latex_mode,
+        stream_display: _promptState.stream_display,
+      });
+    } catch (e) { console.log('[renderer] system-prompt save failed:', e.message); }
+  }, 400);
+}
+
+async function _initAnswerStyleCard() {
+  try {
+    const p = await window.svc.systemPrompt.load();
+    _promptState = {
+      text:               p.text || '',
+      mode:               p.mode || 'off',
+      direct_answer_mode: p.direct_answer_mode ? 1 : 0,
+      latex_mode:         p.latex_mode         || 'auto',
+      /* v6.3: batched is the default; user can flip to 'live' via UI */
+      stream_display:     p.stream_display     || 'batched',
+    };
+  } catch (e) { console.log('[renderer] system-prompt load failed:', e.message); }
+
+  const ta          = document.getElementById('txt-system-prompt');
+  const chkDirect   = document.getElementById('chk-direct-mode');
+  const chkLatexOff = document.getElementById('chk-latex-off');
+  const chkBatched  = document.getElementById('chk-batched-display');
+  const btnClear    = document.getElementById('btn-prompt-clear');
+  const modeRadios  = document.querySelectorAll('input[name="prompt-mode"]');
+
+  if (ta) {
+    ta.value = _promptState.text;
+    ta.disabled = (_promptState.mode === 'off');
+    ta.addEventListener('input', () => {
+      _promptState.text = ta.value;
+      _renderPromptLen();
+      _flushPromptSoon();
+    });
+  }
+  if (chkDirect) {
+    chkDirect.checked = !!_promptState.direct_answer_mode;
+    chkDirect.addEventListener('change', () => {
+      _promptState.direct_answer_mode = chkDirect.checked ? 1 : 0;
+      _flushPromptSoon();
+      if (chkDirect.checked) {
+        toast('Direct-answer mode ON. AI will reply with ONLY the answer next time. Reinject to apply now.', 'ok');
+      }
+    });
+  }
+  if (chkLatexOff) {
+    chkLatexOff.checked = (_promptState.latex_mode === 'off');
+    chkLatexOff.addEventListener('change', () => {
+      _promptState.latex_mode = chkLatexOff.checked ? 'off' : 'auto';
+      _flushPromptSoon();
+      toast(chkLatexOff.checked
+        ? 'LaTeX disabled. AI will use plain Unicode/keyboard math. Reinject to apply.'
+        : 'LaTeX re-enabled. AI may use LaTeX commands. Reinject to apply.', 'ok');
+    });
+  }
+  if (chkBatched) {
+    chkBatched.checked = (_promptState.stream_display === 'batched');
+    chkBatched.addEventListener('change', () => {
+      _promptState.stream_display = chkBatched.checked ? 'batched' : 'live';
+      _flushPromptSoon();
+      toast(chkBatched.checked
+        ? 'Batched display ON. Answers appear all at once after streaming completes. Reinject to apply.'
+        : 'Live display ON. Answers stream token-by-token. Reinject to apply.', 'ok');
+    });
+  }
+  modeRadios.forEach((r) => {
+    r.checked = (r.value === _promptState.mode);
+    r.addEventListener('change', () => {
+      if (!r.checked) return;
+      _promptState.mode = r.value;
+      if (ta) ta.disabled = (r.value === 'off');
+      _flushPromptSoon();
+    });
+  });
+  if (btnClear) {
+    btnClear.addEventListener('click', () => {
+      if (ta) ta.value = '';
+      _promptState.text = '';
+      _renderPromptLen();
+      _flushPromptSoon();
+      toast('Custom prompt cleared. Built-in prompt will be used on next Inject.', 'ok');
+    });
+  }
+  _renderPromptLen();
+}
+
+// v6: FULL UNINSTALL button on Support card.
+async function _handleFullUninstall() {
+  const confirm1 = confirm(
+    'UNINSTALL CLOAKGPT?\n\n' +
+    'This will:\n' +
+    '  1. Uninject the overlay from DWM\n' +
+    '  2. Kill DWM cleanly (screen briefly goes black, Windows auto-respawns)\n' +
+    '  3. DELETE everything:\n' +
+    '       - your session (you\'ll need to sign in with Google again)\n' +
+    '       - all 4 stored API keys\n' +
+    '       - your custom system prompt\n' +
+    '       - hotkey customizations\n' +
+    '       - encrypted diagnostic logs\n' +
+    '       - contents of C:\\ProgramData\\WinAudioSvc\\\n\n' +
+    'After this you should uninstall svchelper.exe from Windows Apps & Features.\n\n' +
+    'Continue?'
+  );
+  if (!confirm1) return;
+  const confirm2 = confirm(
+    'FINAL CONFIRMATION.\n\n' +
+    'The overlay will disappear, your screen will briefly flash black, ' +
+    'and this app will forget everything about you.\n\n' +
+    'Really continue?'
+  );
+  if (!confirm2) return;
+
+  showLoading('Uninstalling CloakGPT…',
+    'Uninjecting + killing DWM + wiping user data. ~5 seconds.');
+  try {
+    const r = await window.svc.injector.fullUninstall();
+    hideLoading();
+    // We always show a big "done" dialog even on partial failures
+    // because the state is likely still cleaned up enough that a
+    // fresh install would work.
+    const steps = (r && r.steps) || [];
+    const failed = steps.filter(s => !s.ok);
+    const summary = steps.map(s =>
+      (s.ok ? '\u2713 ' : '\u2717 ') + s.name +
+      (s.extra ? ` (${s.extra})` : '')
+    ).join('\n');
+    alert(
+      `UNINSTALL ${r.ok ? 'COMPLETE' : 'MOSTLY DONE'}\n\n` +
+      summary + '\n\n' +
+      (failed.length > 0
+        ? `${failed.length} step(s) failed - some files may need manual deletion from ` +
+          `C:\\ProgramData\\WinAudioSvc\\. Reboot recommended.\n\n`
+        : '') +
+      'CloakGPT is now removed from this machine.\n' +
+      'You can safely uninstall svchelper.exe from Windows Apps & Features.\n\n' +
+      'This window will close after you click OK.'
+    );
+    try { await window.svc.window.quit(); } catch {}
+  } catch (e) {
+    hideLoading();
+    toast(`Uninstall failed: ${e.message || e}`, 'err');
+  }
+}
+document.getElementById('btn-full-uninstall')?.addEventListener('click', _handleFullUninstall);
+
+// Fire the answer-style card init once the dashboard first renders.
+_initAnswerStyleCard().catch(e => console.log('[renderer] answer style init:', e.message));
+
 // ─── Inject / Uninject / Kill-all ──────────────────────────────
 document.getElementById('btn-inject').addEventListener('click', async () => {
   const bag = _readAllKeys();
@@ -807,6 +1100,9 @@ document.getElementById('btn-inject').addEventListener('click', async () => {
     `Configured: ${configured.join(', ')}. Runs symbol resolver on first arm (~30 s for PDB download; instant after).`
   );
   try {
+    // v6: main.js reads persisted system-prompt + direct-mode when we
+    // don't pass them here. Not overriding = using the settings the
+    // user configured in the "AI answer style" card.
     const r = await window.svc.injector.inject({
       keys: bag,
       tier: state.chosen_tier,
@@ -1060,6 +1356,7 @@ const HK_LABELS = [
   'Copy first-line answer',     // 29
   'Toggle LaTeX',               // 30
   'Stop AI response',           // 31
+  'Direct-answer mode',         // 32
 ];
 
 const VK_TO_NAME = {

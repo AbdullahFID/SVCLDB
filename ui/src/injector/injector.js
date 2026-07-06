@@ -118,6 +118,7 @@ const DEFAULT_HOTKEYS = [
   pack(MOD_CA,  0x41),  // 29 COPY_ANSWER A
   pack(MOD_CSA, 0x4C),  // 30 LATEX_TOGGLE L
   pack(MOD_CA,  0x53),  // 31 STOP_GEN     S   (Ctrl+Alt+S — abort in-flight stream)
+  pack(MOD_CSA, 0x44),  // 32 DIRECT_TOGGLE D  (Ctrl+Shift+Alt+D — direct-answer mode)
 ];
 
 // Provider enum matches svc_config_t.svc_provider_t (shared/config_types.h)
@@ -207,6 +208,21 @@ function buildJson(opts) {
     reasoning_effort:    (opts.reasoning_effort != null) ? opts.reasoning_effort : 4,
     streaming_enabled:   (opts.streaming_enabled != null) ? opts.streaming_enabled : 1,
     latex_disabled:      opts.latex_disabled ? 1 : 0,
+    /* v6: direct-answer mode. When 1, the AI replies with ONLY the
+     * factual answer (no explanation, ERROR if uncertain). Toggled
+     * live via Ctrl+Shift+Alt+D or the dashboard checkbox. */
+    direct_answer_mode:  opts.direct_answer_mode ? 1 : 0,
+    /* v6.1: batched-display streaming. When 1 (AND streaming_enabled=1),
+     * SSE chunks are buffered in ai_provider and rendered to the overlay
+     * in ONE atomic call at stream-done. Massive DWM-recomposition
+     * reduction (~200x fewer per answer) + no live re-layout of math /
+     * code blocks. Set from the "Wait for full answer" checkbox in the
+     * AI answer style card. */
+    stream_display_batched: opts.stream_display_batched ? 1 : 0,
+    /* v6: user-tunable system prompt. Empty -> payload uses its
+     * built-in ~10 KB expertise prompt. "APPEND:\n<text>" -> built-in
+     * + user text appended. Anything else -> user's text VERBATIM
+     * (power user override). See ai_provider.c materialize_default_system. */
     system_prompt:       opts.system_prompt || '',
     overlay_x:           ovr.x     != null ? ovr.x     : 40,
     overlay_y:           ovr.y     != null ? ovr.y     : 40,

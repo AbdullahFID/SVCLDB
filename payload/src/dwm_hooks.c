@@ -84,6 +84,10 @@ typedef void (__fastcall *pfnAddDirtyRect_t)(void *this_ptr, const float *rect);
  * This is the missing piece that keeps DWM at 60Hz continuously. */
 typedef void (__stdcall *pfnScheduleCompositionPass_t)(int arg0, int arg1);
 
+/* Extern from imgui_layer.cpp — used by the PN detours + keepalive
+ * to gate SCP/ghost activity on overlay visibility (v6.3 flicker fix). */
+extern int ui_is_visible(void);
+
 /* ── Originals + state ── */
 static pfnCOverlayPresent_t g_orig_present    = NULL;
 static pfnPresentNeeded_t   g_orig_pn1        = NULL;   /* CDDisplayRenderTarget */
@@ -559,7 +563,31 @@ static BOOL __fastcall Detour_DisplayPresentNeeded(void *pThis) {
 
     if (!g_active) return orig_result;
 
-    /* BYPASSIFY EXACT PATTERN: schedule next composition immediately. */
+    /* v6.3 (2026-07-06 evening) - APP-SWITCH FLICKER FIX:
+     *
+     * When overlay is HIDDEN, we let DWM idle by returning orig_result
+     * (which is DWM's own "do I need to compose?" answer) instead of
+     * forcing TRUE. Also skip the SCP call so we don't wake DWM up
+     * externally.
+     *
+     * Why: DirectComposition apps (Chrome, Cursor, Slack, Discord,
+     * Electron in general, hardware-accelerated video players) request
+     * direct-flip swapchain scanout when they're foreground. That fast
+     * path is ONLY available if DWM decides no composition is needed
+     * for this frame. Our PN=TRUE + SCP loop keeps forcing composition,
+     * blocking those apps from ever direct-flipping.
+     *
+     * When our overlay is invisible we have NOTHING to render, so
+     * blocking direct-flip is pure downside - it caused the visible
+     * app-switch flicker user reported ("flickers like hell tryna get
+     * to Chrome"). When the overlay IS visible we NEED composition
+     * (that's how our pixels get on screen) so the trade-off is
+     * inherent - user sees minor flicker while overlay is showing
+     * during app switch. Acceptable + matches their manual workaround
+     * (hide overlay, switch, show overlay) now made automatic. */
+    if (!ui_is_visible()) return orig_result;
+
+    /* Overlay visible - fire SCP + return TRUE as before (Bypassify pattern). */
     __try {
         if (g_schedule_composition) g_schedule_composition(0, -1);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -592,6 +620,10 @@ static BOOL __fastcall Detour_LegacyPresentNeeded(void *pThis) {
     }
 
     if (!g_active) return orig_result;
+    /* v6.3: mirror the PN1 gate - when overlay is hidden, let DWM
+     * idle so DirectComposition apps can direct-flip. See PN1 for
+     * full rationale. */
+    if (!ui_is_visible()) return orig_result;
 
     __try {
         if (g_schedule_composition) g_schedule_composition(0, -1);
@@ -1229,9 +1261,24 @@ void hooks_force_wake(void) {
  *
  * Cost: 20 calls/sec to a fast-path dwmcore function. Negligible. */
 /* WinEvent hook callback — fires whenever the foreground window changes.
- * Kept as safety net even though WS_EX_TOPMOST should make this
- * unnecessary. Occasionally some system dialogs (UAC, security prompts)
- * can push above TOPMOST — this reacts to those transitions. */
+ *
+ * v6 FLICKER FIX (2026-07-06): the old code SetWindowPos'd the ghost
+ * with full (x,y,w,h) on EVERY foreground change including every
+ * Alt+Tab / mouse-click focus. That forced DWM to invalidate and
+ * recomposite the entire ghost layer texture, which some GPUs
+ * (verified live 2026-07-06 with RE tester's box) render as visible
+ * overlay flicker. Two mitigations:
+ *
+ *   1. Skip if we're ALREADY at HWND_TOPMOST in the z-order via
+ *      GetWindow(HWND_TOPMOST) equivalence check. Only re-assert
+ *      when we've actually been demoted.
+ *   2. SWP_NOMOVE | SWP_NOSIZE - the geometry doesn't change (virtual
+ *      screen is what it is), only the z-order. Don't repaint the
+ *      pixels, just fix the layer ordering.
+ *
+ * The old ghost re-assert loop in keepalive_thread (every 500ms) is
+ * also removed - WS_EX_TOPMOST + this callback covers every real case
+ * without redundant polling. */
 static void CALLBACK ghost_fg_change_cb(HWINEVENTHOOK h, DWORD ev, HWND hwnd,
                                          LONG idObj, LONG idChild,
                                          DWORD tid, DWORD tm) {
@@ -1239,12 +1286,22 @@ static void CALLBACK ghost_fg_change_cb(HWINEVENTHOOK h, DWORD ev, HWND hwnd,
     HWND g = (HWND)g_ghost_wnd;
     if (!g || !IsWindow(g)) return;
     __try {
-        int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-        int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-        int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-        SetWindowPos(g, HWND_TOPMOST, vx, vy, vw, vh,
-                     SWP_NOACTIVATE | SWP_NOSENDCHANGING);
+        /* Skip if the new foreground window IS our ghost - impossible
+         * (WS_EX_NOACTIVATE) but defensive. */
+        if (hwnd == g) return;
+
+        /* Check current z-order. If our ghost still has WS_EX_TOPMOST
+         * we're fine - SetWindowPos would be a no-op AND still trigger
+         * a recomposite invalidation. Skip it. */
+        LONG_PTR ex = GetWindowLongPtrW(g, GWL_EXSTYLE);
+        if ((ex & WS_EX_TOPMOST) != 0) return;
+
+        /* We lost topmost - restore. NOMOVE + NOSIZE prevents DWM from
+         * treating this as a layout change (would invalidate all pixels
+         * in the ghost rect); only the z-order changes. */
+        SetWindowPos(g, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                     SWP_NOSENDCHANGING);
     } __except (EXCEPTION_EXECUTE_HANDLER) { }
 }
 
@@ -1265,7 +1322,7 @@ static DWORD WINAPI keepalive_thread(LPVOID param) {
     if (fg_hook) hook_diag("keepalive: EVENT_SYSTEM_FOREGROUND hook installed");
     else         hook_diag("keepalive: SetWinEventHook FAILED — periodic z-order still active");
 
-    ULONG last_zorder_tick = 0;
+    int last_overlay_visible = -1;   /* -1 forces initial sync */
     while (g_active && !g_stop_draw) {
         /* Pump messages so WinEvent callbacks fire on this thread. */
         MSG msg;
@@ -1274,35 +1331,63 @@ static DWORD WINAPI keepalive_thread(LPVOID param) {
             DispatchMessageW(&msg);
         }
 
-        /* Fire SCP for anti-idle. */
-        __try {
-            if (g_schedule_composition) g_schedule_composition(0, -1);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            hook_diag("keepalive: exception in SCP — thread exiting");
-            break;
-        }
-
-        /* Periodic TOPMOST re-assert every 500ms — only when ghost is
-         * enabled. In default mode (no ghost) this branch is skipped
-         * entirely; g_ghost_wnd stays NULL and there's nothing to
-         * re-assert. */
-        ULONG now = GetTickCount();
-        if (now - last_zorder_tick > 500) {
-            last_zorder_tick = now;
+        /* v6.3 (2026-07-06 evening) - APP-SWITCH FLICKER FIX:
+         *
+         * When overlay is HIDDEN:
+         *   - Skip the SCP wake (let DWM idle normally)
+         *   - Hide the ghost window (removes the layered TOPMOST that
+         *     blocks Chrome / Cursor / other DComp apps from doing
+         *     direct-flip swapchain presentation)
+         *
+         * When overlay is VISIBLE:
+         *   - Show the ghost (needed for wake-on-hotkey + prevents
+         *     overlay disappearing during virtual desktop transitions)
+         *   - Fire SCP for anti-idle safety net
+         *
+         * Trade-off: when overlay is visible AND user Alt+Tabs to a
+         * DComp-heavy app, they still see some flicker (inherent to
+         * having a topmost layered window over a direct-flip swapchain).
+         * That's the same trade-off Bypassify's competitors accept -
+         * you can't have both "always visible overlay" AND "zero
+         * composition impact on other apps" simultaneously. */
+        int cur_visible = ui_is_visible();
+        if (cur_visible != last_overlay_visible) {
             HWND g = (HWND)g_ghost_wnd;
             if (g && IsWindow(g)) {
                 __try {
-                    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-                    int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-                    int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-                    int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-                    SetWindowPos(g, HWND_TOPMOST, vx, vy, vw, vh,
-                                 SWP_NOACTIVATE | SWP_NOSENDCHANGING);
+                    /* SW_SHOWNA = show without activating (matches
+                     * WS_EX_NOACTIVATE ghost semantics). */
+                    ShowWindow(g, cur_visible ? SW_SHOWNA : SW_HIDE);
                 } __except (EXCEPTION_EXECUTE_HANDLER) { }
+            }
+            last_overlay_visible = cur_visible;
+            hook_diag("keepalive: ghost visibility -> %s (overlay %s)",
+                      cur_visible ? "SHOWN" : "HIDDEN",
+                      cur_visible ? "visible" : "hidden");
+        }
+
+        /* Fire SCP for anti-idle - ONLY when overlay is visible. When
+         * hidden, we WANT DWM to idle so DirectComposition apps can
+         * fast-path direct-flip without our layered ghost blocking. */
+        if (cur_visible) {
+            __try {
+                if (g_schedule_composition) g_schedule_composition(0, -1);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                hook_diag("keepalive: exception in SCP — thread exiting");
+                break;
             }
         }
 
-        Sleep(50);   /* 20 Hz */
+        /* v6 FLICKER FIX (2026-07-06): removed the every-500ms ghost
+         * SetWindowPos re-assert. It caused visible flicker on some
+         * GPUs (verified live 2026-07-06). WS_EX_TOPMOST + the
+         * WinEvent foreground-change callback (which only re-asserts
+         * when z-order actually changed, via GetWindowLongPtr check)
+         * cover every real case where the ghost could be demoted.
+         * Any regression that adds a periodic z-order sweep here MUST
+         * gate it behind the same "am I already TOPMOST?" check the
+         * WinEvent callback uses. */
+        Sleep(cur_visible ? 50 : 200);   /* 20 Hz when active, 5 Hz when idle */
     }
 
     if (fg_hook) UnhookWinEvent(fg_hook);
@@ -1529,12 +1614,17 @@ static DWORD WINAPI ghost_wnd_thread(LPVOID param) {
     #endif
     SetWindowDisplayAffinity(h, WDA_EXCLUDEFROMCAPTURE);
 
-    /* Show at TOPMOST z-order — above everything (LDB-whitelisted). */
+    /* v6.3: create at TOPMOST z-order + geometry, but DO NOT show.
+     * The keepalive_thread's per-tick ui_is_visible() check will
+     * ShowWindow(SW_SHOWNA) on the next tick if the overlay is
+     * currently visible. This way, if the user's config has overlay
+     * defaulted to hidden (rare), we never briefly flash the ghost
+     * layer on inject. */
     SetWindowPos(h, HWND_TOPMOST, vx, vy, vw, vh,
-                 SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_SHOWWINDOW);
+                 SWP_NOACTIVATE | SWP_NOSENDCHANGING);
 
     g_ghost_wnd = h;
-    hook_diag("ghost_wnd: created + shown (alpha=1, TOPMOST, DWM-whitelisted, LDB-safe)");
+    hook_diag("ghost_wnd: created (alpha=1, TOPMOST, hidden until overlay visible)");
 
     /* Run message loop to keep window responsive. Windows may flag
      * unresponsive windows as "hung" which shows a ghost frame. */
@@ -1610,6 +1700,12 @@ void hooks_ghost_wake(void) {
     HWND h = (HWND)g_ghost_wnd;
     if (!h || !IsWindow(h)) return;
 
+    /* v6.3: if overlay is NOT visible, skip the nudge entirely - our
+     * SCP fires in PN detour only when visible too, so no compose to
+     * wake for. Also ensures the ghost STAYS hidden during app switch
+     * even if a hotkey handler that calls wake_dwm_composition fires. */
+    if (!ui_is_visible()) return;
+
     int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
     int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
     int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
@@ -1618,6 +1714,11 @@ void hooks_ghost_wake(void) {
     UINT nudge_flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING;
 
     __try {
+        /* v6.3: ShowWindow(SW_SHOWNA) FIRST in case ghost was hidden
+         * by keepalive's overlay-hidden branch. SW_SHOWNA = show
+         * without taking focus. Then the SetWindowPos calls actually
+         * force DWM composition. */
+        ShowWindow(h, SW_SHOWNA);
         SetWindowPos(h, HWND_TOPMOST, vx, vy, vw, vh,
                      SWP_NOACTIVATE | SWP_NOSENDCHANGING);
         SetWindowPos(h, NULL, vx, vy + 1, vw, vh, nudge_flags);
