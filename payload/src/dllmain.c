@@ -1346,6 +1346,16 @@ static DWORD WINAPI init_thread(LPVOID param) {
     ui_set_hotkey_bindings(cfg->hotkeys,
                            sizeof(cfg->hotkeys) / sizeof(cfg->hotkeys[0]));
 
+    /* v8: apply Electron-configured overlay geometry + size mode.
+     * User picks these in the "Overlay appearance" dashboard card.
+     * Runs AFTER hotkey bindings so any status log line about launch
+     * geometry has the full context available. State file was already
+     * consumed by the first ensure_cs() during ui_set_hotkey_bindings
+     * so persisted user tweaks (extras from prior Ctrl+Alt+= sessions)
+     * are respected. */
+    ui_apply_launch_config(cfg->overlay_w, cfg->overlay_h,
+                           cfg->overlay_alpha, cfg->size_mode);
+
     /* Shutdown watcher — event must be openable from elevated Admin
      * launcher process, so we build a world-writable DACL via SDDL. */
     SECURITY_ATTRIBUTES sa = {0};

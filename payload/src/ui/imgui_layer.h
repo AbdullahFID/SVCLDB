@@ -162,6 +162,18 @@ void ui_bump_alpha(float delta);     /* + or - to bg alpha [0.20 .. 1.00] */
 void ui_bump_font(float delta);      /* + or - to font scale factor */
 void ui_reset_geometry(void);        /* back to defaults */
 
+/* v8 (2026-07-06): apply the launch-time overlay config that Electron
+ * built via cfg->overlay_w/h/alpha + cfg->size_mode. Called ONCE at
+ * init from dllmain, AFTER config load + state_load_once. Sets the
+ * initial base size + alpha default + clamp range for size_mode.
+ *   base_w, base_h : starting box dimensions in DPI-independent pixels.
+ *                    Pass 0 to keep hardcoded fallback (600x460).
+ *   alpha          : bg alpha [0.20..1.00]; pass -1 to skip apply.
+ *   size_mode      : 0 = normal clamps, 1 = ultra (tiny <-> huge).
+ * Thread-safe (guarded by g_ui_cs). */
+void ui_apply_launch_config(int base_w, int base_h,
+                            float alpha, int size_mode);
+
 /* Request a DWM-side screen capture. Blocks up to `timeout_ms` for a fresh
  * frame to be grabbed from the compositor's layer backbuffer (the same
  * texture we render into). Returns 1 on success with *png_out / *len_out

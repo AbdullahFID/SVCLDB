@@ -69,6 +69,24 @@ document.getElementById('tb-quit').addEventListener('click', () => {
   }
 });
 
+// ─── v1.2: dynamic app-version rendering ───────────────────────────
+// Pulled from package.json via app.getVersion() at boot so the login
+// card + titlebar always show the shipped build number. Falls back to
+// the hard-coded literal in index.html if IPC is unavailable (e.g.
+// preload broken during dev iteration).
+(async () => {
+  try {
+    const v = await window.svc.app.getVersion();
+    if (!v) return;
+    const short = 'v' + v.split('.').slice(0, 2).join('.');   // "v1.2"
+    const long  = 'CloakGPT v' + v;                             // "CloakGPT v1.2.0"
+    const tb    = document.getElementById('titlebar-ver');
+    if (tb)  tb.textContent = short;
+    const lv   = document.getElementById('login-app-ver');
+    if (lv)  lv.textContent = long;
+  } catch { /* preload not ready during dev — index.html defaults suffice */ }
+})();
+
 // ─── Global state ───────────────────────────────────────────────
 let state = {
   session: null,
@@ -1080,6 +1098,205 @@ document.getElementById('btn-full-uninstall')?.addEventListener('click', _handle
 
 // Fire the answer-style card init once the dashboard first renders.
 _initAnswerStyleCard().catch(e => console.log('[renderer] answer style init:', e.message));
+
+// ─── v1.2 (2026-07-06) — Overlay-appearance card ─────────────────
+//
+// User picks LAUNCH width / height / alpha + ultra-mode toggle. All
+// changes are persisted to overlay.json in appData via svc.overlay.
+// A "Save" button applies-on-next-Inject; live-preview updates as the
+// user drags sliders. The preview box is scaled to a mock 1920×1080
+// display so the user gets an intuitive sense of "how big will this
+// look on my screen?" without needing to actually inject first.
+//
+// SIZE_MODE CLAMP RULES (must mirror storage.js _clampOverlayInput
+// AND payload's ui_apply_launch_config bounds):
+//   normal : w [200 .. 1400], h [140 .. 1200]
+//   ultra  : w [ 80 .. 4000], h [ 60 .. 3000]
+//
+// Alpha always [0.20 .. 1.00] regardless of size mode.
+const _OVA_BOUNDS = {
+  0: { wMin:  200, wMax: 1400, hMin: 140, hMax: 1200 },  // normal
+  1: { wMin:   80, wMax: 4000, hMin:  60, hMax: 3000 },  // ultra
+};
+let _ovaState  = { size_mode: 0, w: 560, h: 420, alpha: 0.94 };
+let _ovaSaved  = { ...(_ovaState) };   // last-saved snapshot for dirty check
+
+function _ovaBounds() { return _OVA_BOUNDS[_ovaState.size_mode] || _OVA_BOUNDS[0]; }
+
+function _ovaRenderPreview() {
+  const box = document.getElementById('ova-preview-box');
+  const lbl = document.getElementById('ova-preview-w');
+  if (!box) return;
+  /* Scale from real overlay dimensions -> preview % of a mock 1920x1080
+   * display. Aspect-ratio preserving; taskbar strip at bottom already
+   * takes 6% so we treat the preview area as full 100% top-to-bottom. */
+  const pctW = Math.min(100, (_ovaState.w / 1920) * 100);
+  const pctH = Math.min(94,  (_ovaState.h / 1080) * 100);   // -6% for taskbar visual
+  box.style.width  = pctW.toFixed(2) + '%';
+  box.style.height = pctH.toFixed(2) + '%';
+  box.style.opacity = String(_ovaState.alpha.toFixed(2));
+  /* Hide the "560x420" text label if the preview box gets tiny enough
+   * that the label overflows visually; UX polish. */
+  if (lbl) {
+    if (pctW < 10 || pctH < 10) {
+      lbl.style.opacity = '0';
+    } else {
+      lbl.style.opacity = '1';
+      lbl.textContent = `${_ovaState.w}\u2009\u00d7\u2009${_ovaState.h}`;
+    }
+  }
+}
+
+function _ovaRenderValues() {
+  const setText = (id, txt) => { const el = document.getElementById(id); if (el) el.textContent = txt; };
+  setText('val-ova-w',     `${_ovaState.w} px`);
+  setText('val-ova-h',     `${_ovaState.h} px`);
+  setText('val-ova-alpha', `${Math.round(_ovaState.alpha * 100)}%`);
+}
+
+function _ovaDirty() {
+  return _ovaState.size_mode !== _ovaSaved.size_mode
+      || _ovaState.w         !== _ovaSaved.w
+      || _ovaState.h         !== _ovaSaved.h
+      || Math.abs(_ovaState.alpha - _ovaSaved.alpha) > 0.005;
+}
+
+function _ovaRenderStatus() {
+  const btn  = document.getElementById('btn-ova-save');
+  const hint = document.getElementById('ova-status');
+  const dirty = _ovaDirty();
+  if (btn)  btn.disabled = !dirty;
+  if (hint) {
+    hint.classList.toggle('dirty', dirty);
+    hint.textContent = dirty
+      ? 'Unsaved changes \u2014 click Save then Inject to apply.'
+      : 'Saved. Applies on next Inject Now.';
+  }
+}
+
+function _ovaClampToBounds() {
+  const b = _ovaBounds();
+  if (_ovaState.w < b.wMin) _ovaState.w = b.wMin;
+  if (_ovaState.w > b.wMax) _ovaState.w = b.wMax;
+  if (_ovaState.h < b.hMin) _ovaState.h = b.hMin;
+  if (_ovaState.h > b.hMax) _ovaState.h = b.hMax;
+  if (_ovaState.alpha < 0.20) _ovaState.alpha = 0.20;
+  if (_ovaState.alpha > 1.00) _ovaState.alpha = 1.00;
+}
+
+function _ovaSyncSliderRanges() {
+  const b = _ovaBounds();
+  const rW = document.getElementById('rng-ova-w');
+  const rH = document.getElementById('rng-ova-h');
+  if (rW) { rW.min = b.wMin; rW.max = b.wMax; rW.value = _ovaState.w; }
+  if (rH) { rH.min = b.hMin; rH.max = b.hMax; rH.value = _ovaState.h; }
+  const rA = document.getElementById('rng-ova-alpha');
+  if (rA) rA.value = Math.round(_ovaState.alpha * 100);
+}
+
+function _ovaRefreshAll() {
+  _ovaClampToBounds();
+  _ovaSyncSliderRanges();
+  _ovaRenderValues();
+  _ovaRenderPreview();
+  _ovaRenderStatus();
+}
+
+async function _initOverlayCard() {
+  try {
+    const p = await window.svc.overlay.load();
+    if (p) {
+      _ovaState = { size_mode: p.size_mode ? 1 : 0, w: +p.w, h: +p.h, alpha: +p.alpha };
+      _ovaSaved = { ..._ovaState };
+    }
+  } catch (e) { console.log('[renderer] overlay load failed:', e.message); }
+
+  const chkUltra = document.getElementById('chk-ova-ultra');
+  const rngW     = document.getElementById('rng-ova-w');
+  const rngH     = document.getElementById('rng-ova-h');
+  const rngA     = document.getElementById('rng-ova-alpha');
+  const btnSave  = document.getElementById('btn-ova-save');
+  const btnReset = document.getElementById('btn-ova-reset');
+
+  if (chkUltra) chkUltra.checked = !!_ovaState.size_mode;
+  _ovaRefreshAll();
+
+  if (chkUltra) {
+    chkUltra.addEventListener('change', () => {
+      _ovaState.size_mode = chkUltra.checked ? 1 : 0;
+      _ovaRefreshAll();
+    });
+  }
+  if (rngW) {
+    rngW.addEventListener('input', () => {
+      _ovaState.w = +rngW.value;
+      _ovaRenderValues(); _ovaRenderPreview(); _ovaRenderStatus();
+    });
+  }
+  if (rngH) {
+    rngH.addEventListener('input', () => {
+      _ovaState.h = +rngH.value;
+      _ovaRenderValues(); _ovaRenderPreview(); _ovaRenderStatus();
+    });
+  }
+  if (rngA) {
+    rngA.addEventListener('input', () => {
+      _ovaState.alpha = (+rngA.value) / 100;
+      _ovaRenderValues(); _ovaRenderPreview(); _ovaRenderStatus();
+    });
+  }
+
+  document.querySelectorAll('#overlay-appearance-card .ova-preset').forEach((chip) => {
+    chip.addEventListener('click', () => {
+      const w = +chip.dataset.w, h = +chip.dataset.h;
+      const ultra = chip.dataset.ultra === '1' ? 1 : 0;
+      _ovaState = { size_mode: ultra, w, h, alpha: _ovaState.alpha };
+      if (chkUltra) chkUltra.checked = !!ultra;
+      _ovaRefreshAll();
+    });
+  });
+
+  if (btnSave) {
+    btnSave.addEventListener('click', async () => {
+      if (btnSave.disabled) return;
+      btnSave.disabled = true;
+      try {
+        const saved = await window.svc.overlay.save(_ovaState);
+        if (saved) {
+          _ovaSaved = { ..._ovaState };
+          _ovaRenderStatus();
+          toast('Overlay appearance saved. Click Inject Now to apply.', 'ok');
+        } else {
+          toast('Save failed \u2014 see console for details.', 'err');
+        }
+      } catch (e) {
+        toast(`Save failed: ${e.message || e}`, 'err');
+      } finally {
+        _ovaRenderStatus();
+      }
+    });
+  }
+  if (btnReset) {
+    btnReset.addEventListener('click', async () => {
+      if (!confirm('Reset overlay appearance to defaults?\n\nSize: 560\u00d7420, alpha 94%, normal mode.')) return;
+      try {
+        const p = await window.svc.overlay.reset();
+        _ovaState = { size_mode: p.size_mode ? 1 : 0, w: +p.w, h: +p.h, alpha: +p.alpha };
+        _ovaSaved = { ..._ovaState };
+        if (chkUltra) chkUltra.checked = !!_ovaState.size_mode;
+        _ovaRefreshAll();
+        toast('Overlay appearance reset to defaults.', 'ok');
+      } catch (e) {
+        toast(`Reset failed: ${e.message || e}`, 'err');
+      }
+    });
+  }
+}
+
+// Init the overlay-appearance card at boot (safe to call before any
+// screen is shown - it just reads state + wires listeners; the card
+// itself only becomes visible when the dashboard renders).
+_initOverlayCard().catch(e => console.log('[renderer] overlay card init:', e.message));
 
 // ─── Inject / Uninject / Kill-all ──────────────────────────────
 document.getElementById('btn-inject').addEventListener('click', async () => {

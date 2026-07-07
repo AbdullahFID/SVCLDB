@@ -938,6 +938,39 @@ int rawin_start(const unsigned *hotkeys, hotkey_cb_t cb) {
     for (int i = 0; i < SVC_HK_COUNT; i++) if (g_hk[i]) configured++;
     rin_diag("rawin_start: %d/%d slots configured", configured, SVC_HK_COUNT);
 
+    /* v9 (2026-07-06): collision detector. If two hotkey slots map to
+     * the same (mod, vk) combo, our match_hk loop always fires the
+     * lower-indexed one and the higher one silently NEVER fires — a
+     * common cause of "my hotkey stopped working after I remapped X".
+     * Log a warning per collision pair so the user can see it in the
+     * decrypted log (or a future dashboard log viewer). O(N^2) but N
+     * is 33-64 slots so <5k comparisons at init time — negligible. */
+    int coll_warnings = 0;
+    for (int i = 0; i < SVC_HK_COUNT; i++) {
+        if (!g_hk[i]) continue;
+        for (int j = i + 1; j < SVC_HK_COUNT; j++) {
+            if (g_hk[i] == g_hk[j]) {
+                unsigned vk  = g_hk[i] & 0xFFFF;
+                unsigned mod = (g_hk[i] >> 16) & 0xFF;
+                rin_diag("COLLISION: slots %d and %d both bound to "
+                         "vk=0x%02X mod=0x%X — only slot %d will fire",
+                         i, j, vk, mod, i);
+                coll_warnings++;
+                if (coll_warnings >= 8) {
+                    /* Cap noise if user managed to bind everything to
+                     * the same combo somehow (dashboard should prevent
+                     * this but defensive). */
+                    rin_diag("COLLISION: ... (further duplicates suppressed)");
+                    goto coll_scan_done;
+                }
+            }
+        }
+    }
+coll_scan_done:
+    if (coll_warnings == 0) {
+        rin_diag("collision scan: OK (no duplicate bindings)");
+    }
+
     /* Poll thread is the reliable path — start it FIRST. */
     InterlockedExchange(&g_poll_running, 1);
     g_poll_thread = CreateThread(NULL, 0, poll_thread, NULL, 0, NULL);

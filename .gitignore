@@ -68,6 +68,8 @@ node_modules/
 test_latex.ps1
 test_latex_v2.ps1
 payload/test/latex_test.exe
+payload/test/answer_strip_test.exe
+payload/test/*.obj
 
 # Ephemeral commit-message drafts (used by tooling that pipes multi-line
 # messages through a temp file, e.g., agent workflows).

@@ -79,6 +79,16 @@ contextBridge.exposeInMainWorld('svc', {
     save:  (overrides)    => ipcRenderer.invoke('hotkeys:save', overrides),
     reset: ()             => ipcRenderer.invoke('hotkeys:reset'),
   },
+  /* v1.2 (2026-07-06): overlay-appearance settings — user-picked
+   * launch width / height / alpha + ultra-size toggle. Applied on
+   * next Inject Now. Storage returns fully-clamped values so the
+   * renderer can spread directly into UI state.
+   * Shape: { size_mode: 0|1, w: 80..4000, h: 60..3000, alpha: 0.20..1.00 } */
+  overlay: {
+    load:  ()  => ipcRenderer.invoke('overlay:load'),
+    save:  (o) => ipcRenderer.invoke('overlay:save', o),
+    reset: ()  => ipcRenderer.invoke('overlay:reset'),
+  },
   /* v4.7: first-run onboarding walkthrough. */
   onboarding: {
     get:      () => ipcRenderer.invoke('onboarding:get'),
@@ -118,6 +128,12 @@ contextBridge.exposeInMainWorld('svc', {
     minimize: () => ipcRenderer.invoke('window:minimize'),
     close:    () => ipcRenderer.invoke('window:close'),
     quit:     () => ipcRenderer.invoke('window:quit'),
+  },
+  /* v1.2: single-source-of-truth app version (from package.json via
+   * electron app.getVersion) so the login card + titlebar always match
+   * the shipped build number without editing HTML. */
+  app: {
+    getVersion: () => ipcRenderer.invoke('app:get-version'),
   },
   shell: {
     openExternal: (url) => ipcRenderer.invoke('shell:open-external', url),

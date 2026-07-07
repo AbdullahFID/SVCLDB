@@ -231,10 +231,81 @@ function clearHotkeyOverrides() {
   del(HOTKEYS_FILE);
 }
 
+// ─── v1.2 (2026-07-06) — Overlay-appearance persistence ─────────
+// User-picked launch size + alpha + ultra-mode toggle from the
+// dashboard's "Overlay appearance" card. Persisted as plain JSON
+// (no secrets - purely cosmetic). Applied on next "Inject Now".
+//
+// Shape returned by loadOverlayConfig (always fully populated —
+// missing fields default so the caller can spread directly):
+//   {
+//     size_mode: 0 | 1,   // 0=normal, 1=ultra
+//     w:         200..4000,
+//     h:         140..3000,
+//     alpha:     0.20..1.00,
+//   }
+const OVERLAY_FILE = path.join(APPDATA_DIR, 'overlay.json');
+
+const OVERLAY_DEFAULTS = Object.freeze({
+  size_mode: 0,
+  w:         560,
+  h:         420,
+  alpha:     0.94,
+});
+
+function _clampOverlayInput(o) {
+  if (!o || typeof o !== 'object') return { ...OVERLAY_DEFAULTS };
+  const ultra = o.size_mode === 1 || o.size_mode === '1' || o.size_mode === true ? 1 : 0;
+  const wMin = ultra ?  80 : 200;
+  const wMax = ultra ? 4000 : 1400;
+  const hMin = ultra ?  60 : 140;
+  const hMax = ultra ? 3000 : 1200;
+  let w = Number.isFinite(+o.w) ? Math.round(+o.w) : OVERLAY_DEFAULTS.w;
+  let h = Number.isFinite(+o.h) ? Math.round(+o.h) : OVERLAY_DEFAULTS.h;
+  let a = Number.isFinite(+o.alpha) ? +o.alpha : OVERLAY_DEFAULTS.alpha;
+  if (w < wMin) w = wMin;
+  if (w > wMax) w = wMax;
+  if (h < hMin) h = hMin;
+  if (h > hMax) h = hMax;
+  if (a < 0.20) a = 0.20;
+  if (a > 1.00) a = 1.00;
+  return { size_mode: ultra, w, h, alpha: Math.round(a * 100) / 100 };
+}
+
+function loadOverlayConfig() {
+  try {
+    if (!fs.existsSync(OVERLAY_FILE)) return { ...OVERLAY_DEFAULTS };
+    const raw = fs.readFileSync(OVERLAY_FILE, 'utf8');
+    const obj = JSON.parse(raw);
+    return _clampOverlayInput(obj);
+  } catch (e) {
+    console.log('[storage] overlay load failed:', e.message);
+  }
+  return { ...OVERLAY_DEFAULTS };
+}
+
+function saveOverlayConfig(o) {
+  ensureDir(APPDATA_DIR);
+  const clean = _clampOverlayInput(o);
+  try {
+    fs.writeFileSync(OVERLAY_FILE, JSON.stringify(clean, null, 2), 'utf8');
+    return clean;
+  } catch (e) {
+    console.log('[storage] overlay save failed:', e.message);
+    return null;
+  }
+}
+
+function clearOverlayConfig() {
+  del(OVERLAY_FILE);
+}
+
 module.exports = {
   saveSession, loadSession, clearSession, hasSession,
   isExpired, isStale,
   saveSubscriptionCache, loadSubscriptionCache, clearSubscriptionCache,
   isOnboardingComplete, setOnboardingComplete, resetOnboarding,
   loadHotkeyOverrides, saveHotkeyOverrides, clearHotkeyOverrides,
+  loadOverlayConfig, saveOverlayConfig, clearOverlayConfig,
+  OVERLAY_DEFAULTS,
 };

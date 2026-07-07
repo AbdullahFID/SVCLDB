@@ -229,6 +229,11 @@ function buildJson(opts) {
     overlay_w:           ovr.w     != null ? ovr.w     : 560,
     overlay_h:           ovr.h     != null ? ovr.h     : 420,
     overlay_alpha:       ovr.alpha != null ? ovr.alpha : 0.94,
+    /* v8 (2026-07-06): size_mode toggle. 0=normal, 1=ultra.
+     * Ultra widens the payload's runtime clamp range so the user's
+     * Ctrl+Shift+Alt+Arrows can shrink to a tiny pip OR grow near-
+     * fullscreen. Normal keeps the historical sensible bounds. */
+    size_mode:           opts.size_mode ? 1 : 0,
     hwid:                tokFields.hwid,
     handshake_epoch_day: tokFields.handshake_epoch_day,
     handshake_token_hex: tokFields.handshake_token_hex,

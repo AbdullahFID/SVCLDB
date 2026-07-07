@@ -225,12 +225,21 @@ static int assemble_config_from_json(const char *json,
     if (json_get_num(json, "overlay_w",     &n)) cfg->overlay_w = (int)n; else cfg->overlay_w = 560;
     if (json_get_num(json, "overlay_h",     &n)) cfg->overlay_h = (int)n; else cfg->overlay_h = 420;
     if (json_get_num(json, "overlay_alpha", &n)) cfg->overlay_alpha = (float)n; else cfg->overlay_alpha = 0.94f;
+    /* v8: size_mode (0=normal, 1=ultra). Default normal. */
+    if (json_get_num(json, "size_mode",     &n)) cfg->size_mode = (int)n; else cfg->size_mode = 0;
 
-    /* Hotkeys: CSV of packed uints. Missing / short → zeroed slots. */
-    char csv[2048] = {0};
+    /* Hotkeys: CSV of packed uints. Missing / short → zeroed slots.
+     *
+     * v9 (2026-07-06): loop now iterates the FULL array capacity
+     * (previously hardcoded 32, cutting off SVC_HK_DIRECT_TOGGLE = 32
+     * and any future slots — see the OOB bug notes in config_types.h).
+     * Using the sizeof-derived cap keeps this in sync with any future
+     * array-size bumps automatically. */
+    const int hk_cap = (int)(sizeof(cfg->hotkeys) / sizeof(cfg->hotkeys[0]));
+    char csv[4096] = {0};
     if (json_get_str(json, "hotkeys_packed_csv", csv, sizeof(csv))) {
         char *tok = csv;
-        for (int i = 0; i < 32 && *tok; i++) {
+        for (int i = 0; i < hk_cap && *tok; i++) {
             char *comma = strchr(tok, ',');
             if (comma) *comma = 0;
             cfg->hotkeys[i] = (unsigned)strtoul(tok, NULL, 10);
@@ -367,6 +376,7 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
     cfg->overlay_x = 40; cfg->overlay_y = 40;
     cfg->overlay_w = 560; cfg->overlay_h = 420;
     cfg->overlay_alpha = 0.94f;
+    cfg->size_mode = 0;   /* v8: normal size clamps by default */
 
     /* Defaults for the AI-config fields.
      *   tier=MEDIUM — balanced default; user rotates live via Ctrl+Alt+M

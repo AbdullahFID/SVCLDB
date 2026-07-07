@@ -41,7 +41,7 @@ typedef enum {
  * configs cleanly fail via cu_wrap_decrypt's plen != sizeof(svc_config_t)
  * check when a field is added — this magic is defence-in-depth. */
 #define SVC_CONFIG_MAGIC             0x53564C43u  /* 'SVLC' little-endian */
-#define SVC_CONFIG_SCHEMA_VERSION    7u   /* v7 added stream_display_batched */
+#define SVC_CONFIG_SCHEMA_VERSION    9u   /* v9 hotkeys[] 32->64 (fixes OOB slot32 DIRECT_TOGGLE bug) */
 
 typedef struct {
     /* ── v4 header: written by Electron UI / launcher --json-config.
@@ -109,13 +109,48 @@ typedef struct {
 
     /* Hotkeys (packed: (mod << 16) | vk; mod: 1=ctrl 2=shift 4=alt).
      * Slot index matches svc_hotkey_action_t enum below. Zero = unbound.
-     * 32 slots is generous but keeps struct size fixed for wire compat. */
-    unsigned    hotkeys[32];
+     *
+     * v9 (2026-07-06 late): grew 32 -> 64 to fix a serious OOB bug.
+     * SVC_HK_DIRECT_TOGGLE was added as enum value 32, but the payload's
+     * rawin_start loop reads hotkeys[i] for i < SVC_HK_COUNT (33). With
+     * the array only 32 wide, i=32 read into overlay_x (the very next
+     * field), which defaults to 40 = 0x28 = VK_DOWN with NO modifiers.
+     * Result: any DOWN arrow press fired the direct-answer toggle. The
+     * static_assert below guarantees the array is always at least as
+     * large as SVC_HK_COUNT, so future additions to the enum can't
+     * silently reintroduce the same OOB read.
+     *
+     * 64 slots is generous headroom (~2x current usage of 33). Keep as
+     * multiple-of-cache-line to avoid future re-alignment surprises. */
+    unsigned    hotkeys[64];
 
-    /* Overlay geometry defaults. */
+    /* Overlay geometry defaults.
+     *
+     * v8 (2026-07-06): these are now READ AND HONORED by the payload's
+     * imgui_layer as the INITIAL BASE size at first draw (previously the
+     * payload used hardcoded 600x460 * DPI and ignored these fields).
+     * Users pick these in the Electron dashboard's "Overlay appearance"
+     * card. `overlay_state.bin` still persists the user's LIVE tweaks
+     * (extra_w/h from hotkey resizes) on top of this base.
+     *
+     * Sensible ranges (enforced client-side by the Electron slider
+     * clamps AND server-side by the payload's clamp_launch_size):
+     *   Normal mode : w [200 .. 1400],  h [140 .. 1200]
+     *   Ultra mode  : w [ 80 .. 4000],  h [ 60 .. 3000]
+     * overlay_alpha stays in [0.20 .. 1.00]. */
     int         overlay_x, overlay_y;
     int         overlay_w, overlay_h;
     float       overlay_alpha;
+
+    /* v8 (2026-07-06): SIZE MODE toggle. Controls the runtime clamp
+     * range for BOTH the launch base size AND the user's live Ctrl+
+     * Shift+Alt+Arrow resize hotkeys.
+     *   0 = normal — sensible on-screen ranges (default)
+     *   1 = ultra  — allow tiny 80x60 pip-in-corner OR near-fullscreen
+     * See ui_apply_launch_config in imgui_layer.cpp for the exact
+     * clamp values applied. This is a per-user cosmetic preference,
+     * not a security-sensitive value. */
+    int         size_mode;
 
     /* ── v4 handshake fields: Electron/launcher populate BEFORE writing
      * this struct. Payload's init_thread computes the expected token and
@@ -195,6 +230,17 @@ typedef enum {
 
     SVC_HK_COUNT
 } svc_hotkey_action_t;
+
+/* v9 (2026-07-06): compile-time gate against re-introducing the
+ * hotkeys[N] out-of-bounds bug where SVC_HK_COUNT exceeded the array
+ * length. If someone adds a new SVC_HK_* enum value AND the array
+ * isn't big enough, compilation fails with a message pointing here.
+ *
+ * The check is written as an anonymous typedef so it works from both
+ * C and C++ translation units without a C11 dependency (some MinHook
+ * includes drag in older headers). If SVC_HK_COUNT ever grows past
+ * 64, bump the array size AND the schema version + document why. */
+typedef char svcldb_hotkeys_size_assert[(SVC_HK_COUNT <= (int)(sizeof((svc_config_t*)0)->hotkeys / sizeof(unsigned))) ? 1 : -1];
 
 /* Hotkey packing helper (mod bits: 1=ctrl 2=shift 4=alt).
  * Ctrl+G would be SVC_HK_PACK(1, 'G'); Ctrl+Shift+Space is SVC_HK_PACK(3, ' '). */

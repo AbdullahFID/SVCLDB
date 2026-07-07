@@ -46,6 +46,7 @@
 extern "C" {
 #include "../../../shared/log_secure.h"
 #include "../dwm_hooks.h"
+#include "../clipboard_out.h"   /* v9: unified retry+UNICODETEXT copy helper */
 }
 
 #pragma comment(lib, "d3d11.lib")
@@ -314,6 +315,23 @@ static int   g_extra_h  = 0;
 static float g_alpha    = 0.94f;
 static float g_font     = 1.00f;   /* multiplicative on top of DPI-derived scale */
 
+/* v8 (2026-07-06): user-configurable LAUNCH base size (from config.dat,
+ * set in the Electron dashboard's "Overlay appearance" card). Zero =
+ * fall through to the historical 600x460 hardcoded defaults, preserving
+ * behavior for stale configs that never set these fields.
+ *
+ * These are the RAW DPI-independent target dimensions in pixels. The
+ * draw_chat_window path multiplies by scale (screen_h / 1080) so a
+ * "560 wide" launch on a 4K screen actually renders ~1120px, matching
+ * the previous 600*scale behavior for defaults. */
+static int   g_base_w_cfg = 0;   /* 0 = use fallback 600 */
+static int   g_base_h_cfg = 0;   /* 0 = use fallback 460 */
+
+/* v8: size_mode toggle from cfg->size_mode. 0 = normal, 1 = ultra.
+ * Controls the RUNTIME clamp range for both the launch base + user's
+ * live resize hotkeys. Ultra allows tiny 80x60 pip AND near-fullscreen. */
+static volatile LONG g_size_mode = 0;   /* 0 normal, 1 ultra */
+
 /* ---------- Fullscreen-layer discovery ---------- *
  * DWM's COverlayContext::Present fires many times per frame — once per
  * layer. Cursor overlay is 32x32, tooltips are ~100x30, etc. We only
@@ -524,12 +542,20 @@ static void state_load_once(void) {
     memcpy(&f_font,     buf + 36, 4);
 
     /* Sanity clamps identical to nudge/resize/alpha setters. Guards
-     * against a corrupted file cascading into unusable state. */
+     * against a corrupted file cascading into unusable state.
+     *
+     * v8: extra_w/h clamps use the ULTRA bounds because we can't yet
+     * know cfg->size_mode (config isn't loaded during ensure_cs). If
+     * user was in ultra mode + persisted a big extra, we should honor
+     * it; if user later drops back to normal, the runtime clamp in
+     * draw_chat_window pins the final rendered size to the normal
+     * screen-minus-40 ceiling anyway, so the persisted large value
+     * just becomes ineffective (not lost). */
     if (iv_corner < 0 || iv_corner > 3) iv_corner = 0;
     if (iv_off_x < -4000 || iv_off_x >  4000) iv_off_x = 0;
     if (iv_off_y < -3000 || iv_off_y >  3000) iv_off_y = 0;
-    if (iv_ew    < -400  || iv_ew    >  1600) iv_ew    = 0;
-    if (iv_eh    < -300  || iv_eh    >  1600) iv_eh    = 0;
+    if (iv_ew    < -1500 || iv_ew    >  3600) iv_ew    = 0;
+    if (iv_eh    < -1200 || iv_eh    >  2800) iv_eh    = 0;
     if (f_alpha < 0.20f || f_alpha > 1.00f)  f_alpha = 0.94f;
     if (f_font  < 0.60f || f_font  > 3.00f)  f_font  = 1.00f;
 
@@ -1512,23 +1538,9 @@ extern "C" void ui_copy_reply_to_clipboard(void) {
     LeaveCriticalSection(&g_last_reply_cs);
     if (!copy) { diag("copy: no reply to copy"); return; }
     size_t sl = strlen(copy);
-
-    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, sl + 1);
-    if (hMem) {
-        char *tmp = (char *)GlobalLock(hMem);
-        if (tmp) { memcpy(tmp, copy, sl); tmp[sl] = 0; GlobalUnlock(hMem); }
-    }
+    int ok = clip_set_utf8_bytes(copy, sl);
     free(copy);
-    if (!hMem) return;
-    if (OpenClipboard(NULL)) {
-        EmptyClipboard();
-        SetClipboardData(CF_TEXT, hMem);
-        CloseClipboard();
-        diag("reply copied to clipboard (%zu chars)", sl);
-    } else {
-        GlobalFree(hMem);
-        diag("OpenClipboard failed %lu", GetLastError());
-    }
+    diag("copy_reply: %zu bytes -> %s", sl, ok ? "OK" : "FAILED");
 }
 
 /* Extract all fenced code blocks from the last AI reply and copy
@@ -1601,28 +1613,193 @@ extern "C" void ui_copy_last_ai_code(void) {
         return;
     }
 
-    /* To clipboard. */
-    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, out_len + 1);
-    if (hMem) {
-        char *tmp = (char *)GlobalLock(hMem);
-        if (tmp) { memcpy(tmp, out, out_len); tmp[out_len] = 0; GlobalUnlock(hMem); }
-    }
+    int ok = clip_set_utf8_bytes(out, out_len);
+    diag("copy_code: %d block(s), %zu bytes -> %s",
+         block_count, out_len, ok ? "OK" : "FAILED");
     free(out);
-    if (!hMem) return;
-    if (OpenClipboard(NULL)) {
-        EmptyClipboard();
-        SetClipboardData(CF_TEXT, hMem);
-        CloseClipboard();
-        diag("copy_code: %d block(s), %zu chars to clipboard", block_count, out_len);
-    } else {
-        GlobalFree(hMem);
-    }
 }
 
 /* Copy JUST the first-line "direct answer" from the last AI reply.
  * Per our SYSTEM_PROMPT contract: the AI leads with the answer in
  * the first 1-2 lines (e.g. "**x = 4**" or "B) Photosynthesis"),
  * then goes into reasoning. This copies just that leading answer. */
+/* Case-insensitive prefix check. Returns the length of the matched
+ * prefix if `p[0..plen)` starts with `needle` (case-insensitive ASCII),
+ * else 0. Only ASCII lowered — non-ASCII passes through unchanged, which
+ * is fine because our preambles ("Answer:", "The answer is:", "TL;DR:")
+ * are all ASCII. */
+static size_t answer_prefix_match(const char *p, size_t plen,
+                                   const char *needle) {
+    size_t nl = strlen(needle);
+    if (plen < nl) return 0;
+    for (size_t i = 0; i < nl; i++) {
+        char a = p[i];
+        char b = needle[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+        if (a != b) return 0;
+    }
+    return nl;
+}
+
+/* Strip a leading "Answer:" / "Ans:" / "TL;DR:" / "The answer is:" style
+ * preamble in place. Also consumes the trailing separator run (space,
+ * tab, colon, dash, em-dash, equals). Runs iteratively so nested
+ * preambles like `Answer: Answer: B` collapse to `B`.
+ *
+ * Design:
+ *  1. Match a KEYWORD (`answer`, `final answer`, `tl;dr`, `solution`, ...)
+ *     case-insensitively at buf[0..].
+ *  2. If the character IMMEDIATELY after the keyword is a known
+ *     separator (space/tab/colon/dash/em-dash), consume the keyword
+ *     PLUS the run of separators.
+ *  3. If the keyword is a bare word followed by non-separator content
+ *     (e.g. "Answer options include..."), do NOT strip — that's prose,
+ *     not a preamble.
+ *
+ * Only recognises well-known preambles — never chops arbitrary text
+ * even if it happens to start with an English word.
+ *
+ * NOTE: Keep this in sync with payload/test/answer_strip_test.c which
+ * pins the expected behavior on a suite of real-world AI response
+ * shapes. If you tweak this function, re-run those tests. */
+static const char *ANSWER_KEYWORDS[] = {
+    /* Longest-first for greedy match. Prefix collisions are handled
+     * inside strip_answer_preambles by picking the longest hit. */
+    "the correct answer is",
+    "the answer is",
+    "correct answer is",
+    "correct answer",
+    "final answer",
+    "the answer",
+    "answer is",
+    "tl;dr", "tldr",
+    "solution", "result",
+    "answer",  "ans",
+    NULL,
+};
+
+/* "Strong" separators (immediate after keyword = definitely a preamble)
+ *   colon, equals, em-dash (U+2014)
+ * "Space" separator (immediate after keyword = MAYBE a preamble, need
+ *  to check the next non-space char).
+ *
+ * Rules:
+ *   - keyword + strong-sep + optional-space* + content -> STRIP
+ *   - keyword + space + strong-sep + optional-space* + content -> STRIP
+ *     (handles `**Answer** — 4` after asterisk removal = `Answer — 4`)
+ *   - keyword + space + non-separator content -> DON'T STRIP
+ *     (e.g. `Answer options include A and B` -> prose, not a preamble)
+ *   - keyword + dash + word-char content -> DON'T STRIP
+ *     (e.g. `Result-oriented approach` -> hyphenated word, not a preamble) */
+static int is_strong_sep_at(const char *p) {
+    if (*p == ':' || *p == '=') return 1;
+    if ((unsigned char)*p == 0xE2 &&
+        (unsigned char)p[1] == 0x80 &&
+        (unsigned char)p[2] == 0x94) return 3;   /* U+2014 EM DASH */
+    return 0;
+}
+/* A dash is a strong sep ONLY if it's followed by a space (i.e. it's
+ * being used as a dash bullet, not a compound-word hyphen). */
+static int is_dash_sep_at(const char *p) {
+    if (*p != '-') return 0;
+    return (p[1] == ' ' || p[1] == '\t') ? 1 : 0;
+}
+
+/* A "copular" preamble ENDS with the word "is" (e.g. "answer is",
+ * "the answer is", "correct answer is"). For these the "is" itself
+ * IS the separator signal, so `Answer is 42` legitimately means
+ * "answer follows next" without needing a colon. Noun-only preambles
+ * (`Answer`, `Result`, `Solution`) need a colon or em-dash to avoid
+ * false-positives on prose like `Answer options include...`. */
+static int keyword_is_copular(const char *kw, size_t kw_len) {
+    if (kw_len < 3) return 0;
+    /* Last 3 chars = " is" (space-i-s). */
+    return (kw[kw_len - 3] == ' ' &&
+            (kw[kw_len - 2] == 'i' || kw[kw_len - 2] == 'I') &&
+            (kw[kw_len - 1] == 's' || kw[kw_len - 1] == 'S'));
+}
+
+static void strip_answer_preambles(char *buf) {
+    if (!buf) return;
+    for (int loops = 0; loops < 3; loops++) {
+        char *p = buf;
+        while (*p == ' ' || *p == '\t') p++;
+        size_t rem = strlen(p);
+        size_t matched = 0;
+        size_t consume_extra = 0;   /* bytes to also swallow past keyword */
+        for (int i = 0; ANSWER_KEYWORDS[i]; i++) {
+            const char *kw = ANSWER_KEYWORDS[i];
+            size_t m = answer_prefix_match(p, rem, kw);
+            if (m == 0) continue;
+            size_t extra = 0;
+            const char *tail = p + m;
+            int copular = keyword_is_copular(kw, m);
+            if (*tail == 0) {
+                /* keyword IS the entire content — no-op strip */
+                extra = 0;
+            } else if (is_strong_sep_at(tail)) {
+                extra = is_strong_sep_at(tail);
+            } else if (is_dash_sep_at(tail)) {
+                extra = 2;   /* dash + space */
+            } else if (*tail == ' ' || *tail == '\t') {
+                /* keyword + space + ???
+                 * Copular ("...is"): SPACE ALONE is enough
+                 *   ("Answer is 42" -> "42")
+                 * Non-copular: peek past space for a STRONG sep
+                 *   ("Answer options..." stays as prose,
+                 *    "Answer — 4" strips) */
+                if (copular) {
+                    /* Consume exactly the space(s) — content follows. */
+                    const char *q = tail;
+                    while (*q == ' ' || *q == '\t') q++;
+                    extra = (size_t)(q - tail);
+                } else {
+                    const char *q = tail;
+                    while (*q == ' ' || *q == '\t') q++;
+                    int ssep = is_strong_sep_at(q);
+                    int dsep = is_dash_sep_at(q);
+                    if (ssep) extra = (size_t)(q - tail) + (size_t)ssep;
+                    else if (dsep) extra = (size_t)(q - tail) + 2;
+                    else continue;   /* prose — don't strip */
+                }
+            } else {
+                continue;   /* keyword followed by letter/digit/etc — prose */
+            }
+            if (m > matched) { matched = m; consume_extra = extra; }
+        }
+        if (matched == 0) return;
+        p += matched + consume_extra;
+        /* Consume any trailing separator run (spaces, additional dashes,
+         * additional em-dashes) before the content. */
+        while (*p == ' ' || *p == '\t' || *p == ':' || *p == '=' ||
+               (unsigned char)*p == 0xE2 ||
+               (*p == '-' && (p[1] == ' ' || p[1] == '\t' || p[1] == 0))) {
+            if ((unsigned char)*p == 0xE2 &&
+                (unsigned char)p[1] == 0x80 &&
+                (unsigned char)p[2] == 0x94) {
+                p += 3;
+            } else {
+                p++;
+            }
+        }
+        memmove(buf, p, strlen(p) + 1);
+    }
+}
+
+/* Copy JUST the first-line "direct answer" from the last AI reply.
+ * Per our SYSTEM_PROMPT contract: the AI leads with the answer in
+ * the first 1-2 lines (e.g. "**x = 4**" or "B) Photosynthesis"),
+ * then goes into reasoning. This copies just that leading answer.
+ *
+ * v9 (2026-07-06):
+ *   - Retries clipboard via clip_set_utf8_bytes (5x + UNICODETEXT)
+ *     so a transient contention doesn't silently fail (previously it
+ *     was single-attempt CF_TEXT).
+ *   - Strips common answer preambles ("Answer:", "TL;DR:", ...) so
+ *     `**Answer:** B` copies as just `B` — the user is pressing this
+ *     hotkey specifically because they want THE answer, not the AI's
+ *     framing around it. */
 extern "C" void ui_copy_last_ai_answer(void) {
     ensure_last_reply_cs();
     char *snap = NULL;
@@ -1638,12 +1815,13 @@ extern "C" void ui_copy_last_ai_answer(void) {
 
     char *nl = strchr(p, '\n');
     size_t line_len = nl ? (size_t)(nl - p) : strlen(p);
-    /* Trim trailing \r. */
+    /* Trim trailing \r + trailing spaces. */
     while (line_len > 0 && (p[line_len - 1] == '\r' || p[line_len - 1] == ' ')) line_len--;
     if (line_len == 0) { free(snap); diag("copy_answer: empty first line"); return; }
 
-    /* Strip inline markdown markers (** for bold, * for italic) so the
-     * copied answer is clean plaintext. */
+    /* Strip inline markdown markers (** for bold, * for italic,
+     * backticks for inline code) so the copied answer is clean
+     * plaintext. Leaves parens/brackets/other punct intact. */
     char *clean = (char *)malloc(line_len + 1);
     if (!clean) { free(snap); return; }
     size_t cl = 0;
@@ -1659,21 +1837,20 @@ extern "C" void ui_copy_last_ai_answer(void) {
     clean[cl] = 0;
     free(snap);
 
-    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, cl + 1);
-    if (hMem) {
-        char *tmp = (char *)GlobalLock(hMem);
-        if (tmp) { memcpy(tmp, clean, cl); tmp[cl] = 0; GlobalUnlock(hMem); }
+    /* v9: peel off known preambles so `Answer: B` -> `B`, `TL;DR: 42` -> `42`. */
+    strip_answer_preambles(clean);
+    size_t final_len = strlen(clean);
+    if (final_len == 0) {
+        free(clean);
+        diag("copy_answer: nothing left after preamble strip");
+        return;
     }
+
+    int ok = clip_set_utf8_bytes(clean, final_len);
+    diag("copy_answer: %zu bytes -> %s | \"%.60s%s\"",
+         final_len, ok ? "OK" : "FAILED",
+         clean, final_len > 60 ? "..." : "");
     free(clean);
-    if (!hMem) return;
-    if (OpenClipboard(NULL)) {
-        EmptyClipboard();
-        SetClipboardData(CF_TEXT, hMem);
-        CloseClipboard();
-        diag("copy_answer: %zu chars to clipboard", cl);
-    } else {
-        GlobalFree(hMem);
-    }
 }
 
 extern "C" void ui_nudge(int dx, int dy) {
@@ -1696,10 +1873,18 @@ extern "C" void ui_resize(int dw, int dh) {
     EnterCriticalSection(&g_ui_cs);
     g_extra_w += dw;
     g_extra_h += dh;
-    if (g_extra_w < -400) g_extra_w = -400;
-    if (g_extra_w > 1600) g_extra_w = 1600;
-    if (g_extra_h < -300) g_extra_h = -300;
-    if (g_extra_h > 1600) g_extra_h = 1600;
+    /* v8: ultra mode widens the runtime resize range so the user's
+     * Ctrl+Shift+Alt+Arrows can push the overlay all the way tiny
+     * or all the way huge. Normal mode keeps the original bounds. */
+    int ultra_rt = InterlockedCompareExchange(&g_size_mode, 0, 0);
+    int lo_w = ultra_rt ? -1500 :  -400;
+    int hi_w = ultra_rt ?  3600 :  1600;
+    int lo_h = ultra_rt ? -1200 :  -300;
+    int hi_h = ultra_rt ?  2800 :  1600;
+    if (g_extra_w < lo_w) g_extra_w = lo_w;
+    if (g_extra_w > hi_w) g_extra_w = hi_w;
+    if (g_extra_h < lo_h) g_extra_h = lo_h;
+    if (g_extra_h > hi_h) g_extra_h = hi_h;
     LeaveCriticalSection(&g_ui_cs);
     state_mark_dirty();
     wake_dwm_composition();
@@ -1739,6 +1924,53 @@ extern "C" void ui_bump_font(float delta) {
     state_mark_dirty();
     wake_dwm_composition();
     diag("font -> %.2f", g_font);
+}
+
+/* v8 (2026-07-06): apply launch-time config from cfg->overlay_w/h,
+ * cfg->overlay_alpha, and cfg->size_mode. Called ONCE at init after
+ * config is loaded. Sets the initial base size, alpha default, and
+ * size-mode clamp range. Zero base_w/base_h means "keep hardcoded
+ * fallback" (600x460). Alpha < 0 means "don't touch" (preserve any
+ * value already loaded from overlay_state.bin).
+ *
+ * ORDERING contract: MUST be called after state_load_once() has read
+ * overlay_state.bin so persisted user tweaks (from prior sessions
+ * where they hit Ctrl+Alt+= etc.) survive across arms — the config
+ * only sets the LAUNCH default which the persisted extras stack onto.
+ * ensure_cs() is called first from any ui_* entry point so it's safe. */
+extern "C" void ui_apply_launch_config(int base_w, int base_h,
+                                       float alpha, int size_mode) {
+    ensure_cs();
+    EnterCriticalSection(&g_ui_cs);
+    if (base_w > 0) g_base_w_cfg = base_w;
+    if (base_h > 0) g_base_h_cfg = base_h;
+    /* Alpha: if the config has a valid value AND the state file didn't
+     * already override with a user tweak beyond the default, apply it.
+     * We simply overwrite - user's live Ctrl+Alt+=/- adjustments are
+     * captured post-init and re-persist on next tweak. */
+    if (alpha >= 0.20f && alpha <= 1.00f) g_alpha = alpha;
+    LeaveCriticalSection(&g_ui_cs);
+    InterlockedExchange(&g_size_mode, size_mode ? 1 : 0);
+    /* After applying config, ALSO clamp existing g_extra_w/h if the
+     * new size_mode is stricter than the previous state (going from
+     * ultra -> normal after a shrink). Prevents "user was ultra-small,
+     * now normal, overlay is 240 min but g_extra_w is -1400 leaving
+     * a nonsensical negative render". */
+    EnterCriticalSection(&g_ui_cs);
+    int ultra_apply = size_mode ? 1 : 0;
+    int lo_w = ultra_apply ? -1500 :  -400;
+    int hi_w = ultra_apply ?  3600 :  1600;
+    int lo_h = ultra_apply ? -1200 :  -300;
+    int hi_h = ultra_apply ?  2800 :  1600;
+    if (g_extra_w < lo_w) g_extra_w = lo_w;
+    if (g_extra_w > hi_w) g_extra_w = hi_w;
+    if (g_extra_h < lo_h) g_extra_h = lo_h;
+    if (g_extra_h > hi_h) g_extra_h = hi_h;
+    LeaveCriticalSection(&g_ui_cs);
+    state_mark_dirty();
+    wake_dwm_composition();
+    diag("apply_launch_config: base=(%d,%d) alpha=%.2f size_mode=%d",
+         base_w, base_h, alpha, size_mode);
 }
 
 extern "C" void ui_reset_geometry() {
@@ -2108,25 +2340,16 @@ static ID3D11RenderTargetView *get_or_create_rtv(ID3D11Device *dev,
  * WHOLE reply. Per-block copy buttons copy just that block. */
 
 /* Copy a range of bytes to the clipboard. Called from the per-block
- * copy button in fenced code / display math renderers. */
+ * copy button in fenced code / display math renderers.
+ *
+ * v9 (2026-07-06): switched to shared clip_set_utf8_bytes helper which
+ * retries OpenClipboard 5x with backoff + uses CF_UNICODETEXT (was
+ * CF_TEXT, silently mangled Greek/math/emoji on paste). See
+ * clipboard_out.c for the retry + Unicode-preserving contract. */
 static void md_copy_to_clipboard(const char *bytes, size_t len) {
     if (!bytes || len == 0) return;
-    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, len + 1);
-    if (!hMem) return;
-    char *tmp = (char *)GlobalLock(hMem);
-    if (tmp) {
-        memcpy(tmp, bytes, len);
-        tmp[len] = 0;
-        GlobalUnlock(hMem);
-    }
-    if (OpenClipboard(NULL)) {
-        EmptyClipboard();
-        SetClipboardData(CF_TEXT, hMem);
-        CloseClipboard();
-        diag("md_copy: %zu chars", len);
-    } else {
-        GlobalFree(hMem);
-    }
+    int ok = clip_set_utf8_bytes(bytes, len);
+    diag("md_copy: %zu bytes -> %s", len, ok ? "OK" : "FAILED");
 }
 
 /* Render a block-tinted section INLINE (no nested BeginChild scroll
@@ -3013,12 +3236,29 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     if (scale < 0.6f) scale = 0.6f;
     if (scale > 3.0f) scale = 3.0f;
 
-    float base_w = 600.0f * scale + (float)extra_w;
-    float base_h = 460.0f * scale + (float)extra_h;
-    if (base_w < 240.0f) base_w = 240.0f;
-    if (base_h < 180.0f) base_h = 180.0f;
-    if (base_w > (float)screen_w - 40.0f) base_w = (float)screen_w - 40.0f;
-    if (base_h > (float)screen_h - 40.0f) base_h = (float)screen_h - 40.0f;
+    /* v8: honor cfg->overlay_w/h as the LAUNCH base (was hardcoded 600x460).
+     * Falls back to legacy 600/460 when config field is zero (stale configs
+     * or in-payload-first-launch before Electron writes v8). Then adds the
+     * user's LIVE resize deltas (g_extra_w/h from Ctrl+Shift+Alt+Arrows +
+     * persisted in overlay_state.bin). */
+    float cfg_bw = (g_base_w_cfg > 0) ? (float)g_base_w_cfg : 600.0f;
+    float cfg_bh = (g_base_h_cfg > 0) ? (float)g_base_h_cfg : 460.0f;
+    float base_w = cfg_bw * scale + (float)extra_w;
+    float base_h = cfg_bh * scale + (float)extra_h;
+
+    /* v8: min-size floor + max-size ceiling depend on size_mode.
+     *   Normal : 240 x 180 min, screen - 40 max     (unchanged from v7)
+     *   Ultra  :  80 x  60 min, screen - 8  max     (tiny pip <-> ~fullscreen)
+     * These are RENDERED pixel bounds (post-scale) so they're consistent
+     * across resolutions. */
+    int ultra = InterlockedCompareExchange(&g_size_mode, 0, 0);
+    float min_w = ultra ?  80.0f : 240.0f;
+    float min_h = ultra ?  60.0f : 180.0f;
+    float pad   = ultra ?   8.0f :  40.0f;
+    if (base_w < min_w) base_w = min_w;
+    if (base_h < min_h) base_h = min_h;
+    if (base_w > (float)screen_w - pad) base_w = (float)screen_w - pad;
+    if (base_h > (float)screen_h - pad) base_h = (float)screen_h - pad;
 
     float margin = 32.0f * scale;
     float pos_x = 0.0f, pos_y = 0.0f;

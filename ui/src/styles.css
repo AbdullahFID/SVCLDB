@@ -438,6 +438,22 @@ html, body {
   letter-spacing: 0.03em;
 }
 
+/* Small app-version badge at the very bottom of the login card
+   so users know exactly which build they're on before signing in. */
+.login-card .app-version {
+  margin-top: 14px;
+  padding: 6px 12px;
+  display: inline-block;
+  font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  font-size: 10.5px;
+  color: var(--cyan-light);
+  background: rgba(6, 182, 212, 0.08);
+  border: 1px solid rgba(6, 182, 212, 0.20);
+  border-radius: 999px;
+  letter-spacing: 0.05em;
+  font-weight: 600;
+}
+
 .btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 10px;
   padding: 13px 28px;
@@ -1677,4 +1693,174 @@ html, body {
   padding: 1px 5px; background: rgba(255,255,255,0.05);
   border: 1px solid var(--border-h); border-radius: 3px;
   color: var(--fg2);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   v1.2 (2026-07-06) — Overlay-appearance card
+   ═══════════════════════════════════════════════════════════════ */
+
+#overlay-appearance-card .ova-grid {
+  display: grid;
+  grid-template-columns: 1fr 260px;
+  gap: 22px;
+  margin-top: 12px;
+}
+@media (max-width: 780px) {
+  #overlay-appearance-card .ova-grid { grid-template-columns: 1fr; }
+}
+
+#overlay-appearance-card .ova-sliders {
+  display: flex; flex-direction: column; gap: 10px;
+}
+
+#overlay-appearance-card .ova-slider-row {
+  display: grid;
+  grid-template-columns: 60px 1fr 78px;
+  align-items: center;
+  gap: 12px;
+}
+#overlay-appearance-card .ova-slider-row label {
+  font-size: 12px; font-weight: 600;
+  color: var(--fg2);
+  letter-spacing: 0.02em;
+}
+#overlay-appearance-card .ova-slider-row input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 6px;
+  background: linear-gradient(90deg, rgba(6, 182, 212, 0.15), rgba(6, 182, 212, 0.35));
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background 0.18s;
+}
+#overlay-appearance-card .ova-slider-row input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px; height: 16px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #22d3ee, #06b6d4);
+  border: 2px solid rgba(255,255,255,0.85);
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(6, 182, 212, 0.4);
+  transition: transform 0.15s;
+}
+#overlay-appearance-card .ova-slider-row input[type="range"]::-webkit-slider-thumb:hover {
+  transform: scale(1.15);
+}
+#overlay-appearance-card .ova-slider-row input[type="range"]:disabled {
+  opacity: 0.5; cursor: not-allowed;
+}
+#overlay-appearance-card .ova-val {
+  font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  font-size: 12px;
+  color: var(--cyan-light);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  padding: 4px 8px;
+  background: rgba(6, 182, 212, 0.08);
+  border: 1px solid rgba(6, 182, 212, 0.18);
+  border-radius: 6px;
+}
+
+#overlay-appearance-card .ova-presets {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  margin-top: 4px;
+}
+#overlay-appearance-card .ova-presets-label {
+  font-size: 11px; color: var(--fg3); margin-right: 4px;
+  text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600;
+}
+#overlay-appearance-card .ova-preset {
+  padding: 4px 12px;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+/* Live preview: proportional box on top of a fake 1920x1080 desktop.
+   Width fixed at 260px (matches grid-template-columns above), height
+   auto-derives to preserve the 16:9 desktop aspect. */
+#overlay-appearance-card .ova-preview-wrap {
+  display: flex; flex-direction: column; gap: 8px;
+}
+#overlay-appearance-card .ova-preview-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg3);
+}
+#overlay-appearance-card .ova-preview-title .ova-preview-sub {
+  font-weight: 500; text-transform: none; letter-spacing: 0;
+  color: var(--fg3); font-size: 11px;
+}
+#overlay-appearance-card .ova-preview {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background:
+    linear-gradient(135deg, rgba(30, 58, 138, 0.15) 0%, rgba(6, 182, 212, 0.08) 100%),
+    #0b1120;
+  border: 1px solid rgba(6, 182, 212, 0.22);
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: inset 0 0 24px rgba(0,0,0,0.4);
+}
+/* Fake taskbar strip at bottom for realism */
+#overlay-appearance-card .ova-preview::before {
+  content: '';
+  position: absolute; left: 0; right: 0; bottom: 0;
+  height: 6%;
+  background: rgba(255,255,255,0.06);
+  border-top: 1px solid rgba(255,255,255,0.08);
+}
+#overlay-appearance-card .ova-preview-box {
+  position: absolute;
+  top: 3%;
+  right: 3%;
+  background:
+    linear-gradient(135deg, rgba(15, 23, 42, 0.92) 0%, rgba(6, 182, 212, 0.10) 100%),
+    rgba(15, 23, 42, 0.85);
+  border: 1.5px solid rgba(34, 211, 238, 0.55);
+  border-radius: 6px;
+  box-shadow:
+    0 2px 12px rgba(6, 182, 212, 0.35),
+    inset 0 0 8px rgba(6, 182, 212, 0.10);
+  display: flex; align-items: center; justify-content: center;
+  min-width: 6px; min-height: 6px;
+  transition: width 0.18s, height 0.18s, opacity 0.18s;
+}
+#overlay-appearance-card .ova-preview-w {
+  font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  font-size: 9.5px;
+  color: rgba(255,255,255,0.85);
+  white-space: nowrap;
+  padding: 2px 4px;
+  text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+}
+#overlay-appearance-card .ova-preview-hint {
+  position: absolute;
+  left: 8px; bottom: calc(6% + 6px);
+  font-size: 9px;
+  color: rgba(255,255,255,0.35);
+  max-width: 68%;
+  line-height: 1.4;
+}
+
+#overlay-appearance-card .ova-actions {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; flex-wrap: wrap;
+  margin-top: 16px; padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+#overlay-appearance-card .ova-actions-hint {
+  font-size: 11.5px; color: var(--fg3); font-style: italic;
+}
+#overlay-appearance-card .ova-actions-hint.dirty {
+  color: var(--warn); font-style: normal; font-weight: 600;
+}
+#overlay-appearance-card #btn-ova-save {
+  padding: 10px 18px; font-size: 12.5px;
+}
+#overlay-appearance-card #btn-ova-save:disabled {
+  opacity: 0.4; cursor: not-allowed;
 }

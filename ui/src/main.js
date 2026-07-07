@@ -906,6 +906,24 @@ ipcMain.handle('injector:inject', async (_e, args) => {
     ? (args.stream_display_batched ? 1 : 0)
     : (persistedPrompt.stream_display === 'batched' ? 1 : 0);
 
+  /* v1.2 (v8 schema): pull persisted overlay-appearance prefs and merge
+   * with any per-inject override the renderer sent. Storage returns fully
+   * clamped values; renderer can pass args.overlay to override for testing.
+   * size_mode moves to the top-level field so injector.buildJson can pack
+   * it directly into the JSON handoff. */
+  const overlayCfg = storage.loadOverlayConfig();
+  const overlayOvr = (args && args.overlay) || {};
+  const overlayFinal = {
+    x:     overlayOvr.x     != null ? overlayOvr.x     : 40,
+    y:     overlayOvr.y     != null ? overlayOvr.y     : 40,
+    w:     overlayOvr.w     != null ? overlayOvr.w     : overlayCfg.w,
+    h:     overlayOvr.h     != null ? overlayOvr.h     : overlayCfg.h,
+    alpha: overlayOvr.alpha != null ? overlayOvr.alpha : overlayCfg.alpha,
+  };
+  const sizeMode = (args && args.size_mode != null)
+    ? (args.size_mode ? 1 : 0)
+    : (overlayCfg.size_mode ? 1 : 0);
+
   const result = await injector.inject({
     session: currentSess,
     hwid,
@@ -922,7 +940,9 @@ ipcMain.handle('injector:inject', async (_e, args) => {
     system_prompt:      systemPromptStr,
     /* v6.1 addition */
     stream_display_batched: streamBatched,
-    overlay:           (args && args.overlay),
+    /* v1.2 additions (v8 schema): custom launch geometry + ultra toggle */
+    overlay:           overlayFinal,
+    size_mode:         sizeMode,
     hotkeys,
   });
   return result;
@@ -1021,6 +1041,11 @@ ipcMain.handle('window:minimize', () => { if (mainWin) mainWin.minimize(); });
 ipcMain.handle('window:close',    () => { if (mainWin) mainWin.hide(); });
 ipcMain.handle('window:quit',     () => { app.quit(); });
 
+/* v1.2 (2026-07-06): expose the app version to the renderer so the login
+ * screen + titlebar can render it without a hard-coded literal that drifts
+ * across releases. Single source of truth = package.json. */
+ipcMain.handle('app:get-version', () => app.getVersion());
+
 ipcMain.handle('shell:open-external', (_e, url) => {
   if (typeof url !== 'string') return false;
   if (!/^https?:\/\//i.test(url)) return false;
@@ -1062,6 +1087,17 @@ ipcMain.handle('hotkeys:save', async (_e, overrides) => {
 ipcMain.handle('hotkeys:reset', async () => {
   storage.clearHotkeyOverrides();
   return { ok: true };
+});
+
+// ─── v1.2 (2026-07-06) — Overlay-appearance settings ──────────────
+// User-picked launch size + alpha + size_mode from the "Overlay
+// appearance" dashboard card. Purely cosmetic — no secrets, no
+// signature. Applied on next injector:inject.
+ipcMain.handle('overlay:load',  async () => storage.loadOverlayConfig());
+ipcMain.handle('overlay:save',  async (_e, o) => storage.saveOverlayConfig(o));
+ipcMain.handle('overlay:reset', async () => {
+  storage.clearOverlayConfig();
+  return storage.loadOverlayConfig();   /* returns defaults */
 });
 
 // ─── Onboarding walkthrough ────────────────────────────────────

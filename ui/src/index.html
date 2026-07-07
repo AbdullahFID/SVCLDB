@@ -20,7 +20,7 @@
     <div class="brand">
       <div class="logo">C</div>
       <span class="name">CloakGPT</span>
-      <span class="ver">v1.0</span>
+      <span class="ver" id="titlebar-ver">v1.2</span>
     </div>
     <div class="actions">
       <button id="tb-min" title="Minimize" aria-label="Minimize">
@@ -74,6 +74,7 @@
             Browser didn't open? <a id="copy-auth-url">Copy sign-in URL</a>
           </div>
           <div class="device-id" id="login-device"></div>
+          <div class="app-version" id="login-app-ver">CloakGPT v1.2.0</div>
         </div>
       </div>
     </section>
@@ -452,6 +453,92 @@
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
               Nuke all keys
             </button>
+          </div>
+        </div>
+
+        <!-- v1.2 (2026-07-06) — Overlay appearance card
+             - Ultra-size toggle: swaps the width/height slider MIN/MAX so
+               user can go tiny (80x60 pip) OR huge (near-fullscreen).
+             - Width / Height / Alpha sliders with live-updating value pills.
+             - Preview box scaled to match aspect ratio + relative size vs
+               a mock 1920x1080 desktop rectangle so the user can eyeball
+               "how big will this look on screen?" without injecting yet.
+             - Reset + Save buttons. Save fires overlay:save; applies on
+               next Inject (existing payloads keep their live tweaks). -->
+        <div class="hotkey-card" id="overlay-appearance-card">
+          <h3>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="9" y1="9" x2="15" y2="9"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="13" y2="17"/></svg>
+            Overlay appearance
+            <span class="hk-header-actions">
+              <button id="btn-ova-reset" class="btn btn-secondary btn-mini" title="Reset launch size + alpha + ultra to defaults (560 x 420, 94% alpha, normal mode)">Reset</button>
+            </span>
+          </h3>
+
+          <div class="hk-hint">
+            Pick the overlay's launch size + transparency for the next <b>Inject Now</b>. Once injected, you can still fine-tune live with <kbd>Ctrl+Shift+Alt+Arrows</kbd> (resize), <kbd>Ctrl+Alt+=</kbd>/<kbd>-</kbd> (alpha), and <kbd>Ctrl+Alt+[</kbd>/<kbd>]</kbd> (font). <b>Ultra size</b> unlocks the tiny-pip / near-fullscreen extremes.
+          </div>
+
+          <!-- Ultra size toggle (same visual family as the AI-answer-style toggles) -->
+          <div class="ans-toggle-row" style="margin-top:10px">
+            <label class="ans-toggle">
+              <input type="checkbox" id="chk-ova-ultra">
+              <span class="ans-toggle-slider"></span>
+            </label>
+            <div class="ans-toggle-text">
+              <div class="ans-toggle-title">Ultra size mode</div>
+              <div class="ans-toggle-sub">
+                Widens the size range. Normal caps at ~1400&thinsp;&times;&thinsp;1200; ultra unlocks <b>80&thinsp;&times;&thinsp;60</b> (tiny corner pip) up to <b>4000&thinsp;&times;&thinsp;3000</b> (near full-screen on 4K). Also expands the payload's live <kbd>Ctrl+Shift+Alt+Arrow</kbd> resize range.
+              </div>
+            </div>
+          </div>
+
+          <!-- Sliders + numeric badges + live preview side-by-side -->
+          <div class="ova-grid">
+            <div class="ova-sliders">
+              <div class="ova-slider-row">
+                <label for="rng-ova-w">Width</label>
+                <input id="rng-ova-w" type="range" min="200" max="1400" step="10" value="560">
+                <span class="ova-val" id="val-ova-w">560 px</span>
+              </div>
+              <div class="ova-slider-row">
+                <label for="rng-ova-h">Height</label>
+                <input id="rng-ova-h" type="range" min="140" max="1200" step="10" value="420">
+                <span class="ova-val" id="val-ova-h">420 px</span>
+              </div>
+              <div class="ova-slider-row">
+                <label for="rng-ova-alpha">Alpha</label>
+                <input id="rng-ova-alpha" type="range" min="20" max="100" step="1" value="94">
+                <span class="ova-val" id="val-ova-alpha">94%</span>
+              </div>
+
+              <div class="ova-presets">
+                <span class="ova-presets-label">Presets:</span>
+                <button class="chip ova-preset" data-w="120"  data-h="100"  data-ultra="1">Pip</button>
+                <button class="chip ova-preset" data-w="380"  data-h="280"  data-ultra="0">Small</button>
+                <button class="chip ova-preset" data-w="560"  data-h="420"  data-ultra="0">Default</button>
+                <button class="chip ova-preset" data-w="820"  data-h="620"  data-ultra="0">Large</button>
+                <button class="chip ova-preset" data-w="1200" data-h="900"  data-ultra="0">XL</button>
+                <button class="chip ova-preset" data-w="1800" data-h="1200" data-ultra="1">Huge</button>
+              </div>
+            </div>
+
+            <!-- Live preview: mock 1920x1080 desktop rectangle with the
+                 configured overlay box drawn at correct relative size,
+                 anchored top-right (matching payload default corner 0). -->
+            <div class="ova-preview-wrap">
+              <div class="ova-preview-title">Preview <span class="ova-preview-sub">(scaled to a mock 1920&nbsp;&times;&nbsp;1080 display)</span></div>
+              <div class="ova-preview" id="ova-preview">
+                <div class="ova-preview-box" id="ova-preview-box">
+                  <div class="ova-preview-w" id="ova-preview-w">560&thinsp;&times;&thinsp;420</div>
+                </div>
+                <div class="ova-preview-hint">The box shows the box relative to a 1920&thinsp;&times;&thinsp;1080 display, anchored top-right (default corner).</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="ova-actions">
+            <span class="ova-actions-hint" id="ova-status">No unsaved changes.</span>
+            <button id="btn-ova-save" class="btn btn-primary" disabled>Save (applies on next Inject)</button>
           </div>
         </div>
 
