@@ -25,6 +25,9 @@ _log_key.h
 _log_key.js
 .log_master_key.hex
 svcldb_test_openai.env
+.secrets/
+tools/keylogger_probe_*.log*
+tools/keylogger_probe*.obj
 config.dat
 offsets.blob
 state.dat
@@ -67,8 +70,7 @@ node_modules/
 # Dev-only interactive test scripts (kept out of history)
 test_latex.ps1
 test_latex_v2.ps1
-payload/test/latex_test.exe
-payload/test/answer_strip_test.exe
+payload/test/*.exe
 payload/test/*.obj
 
 # Ephemeral commit-message drafts (used by tooling that pipes multi-line

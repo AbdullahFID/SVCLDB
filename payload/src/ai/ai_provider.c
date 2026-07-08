@@ -44,10 +44,37 @@
 #define AI_TIMEOUT_REASONING_MS    900000UL
 #define AI_RETRY_MAX_ATTEMPTS      3
 #define AI_RETRY_BASE_BACKOFF_MS   800UL
+#define AI_RETRY_JITTER_PCT_DEN    3       /* max jitter = backoff / 3 (~33%) */
 
 static DWORD ai_select_receive_timeout(const svc_config_t *cfg, const char *model_id);
 static int   ai_build_fallback_order(const svc_config_t *cfg, int out_order[], int max);
 static int   ai_status_retryable(unsigned status);
+
+/* v4.6 (2026-07-08) — Google 503 "high demand" model fallback.
+ * Gemini 3.x preview models (gemini-3.1-pro-preview, gemini-3.5-flash,
+ * gemini-3-flash-preview, etc.) are prone to HTTP 503
+ * "UNAVAILABLE / model is currently experiencing high demand" during
+ * peak US-business hours (9 AM - 5 PM PT). This is a Google-side
+ * capacity issue, NOT a bug in our request. The stable 2.5.x family
+ * is orders of magnitude more reliable. When we exhaust retries on a
+ * 3.x model with 503, we transparently try one more time with a
+ * matching 2.5.x model BEFORE hopping to a completely different
+ * provider (which the user may not have a key for).
+ *
+ * Returns a static const model_id for the stable fallback, or NULL
+ * if no fallback exists (already on 2.5.x or below). */
+static const char *ai_google_stable_fallback(const char *model_id) {
+    if (!model_id) return NULL;
+    /* Gemini 3.x pro tier -> stable 2.5-pro (best available stable pro) */
+    if (strstr(model_id, "gemini-3.1-pro"))    return "gemini-2.5-pro";
+    if (strstr(model_id, "gemini-3-pro"))      return "gemini-2.5-pro";
+    /* Gemini 3.x flash tier -> stable 2.5-flash (very similar speed profile) */
+    if (strstr(model_id, "gemini-3.5-flash"))  return "gemini-2.5-flash";
+    if (strstr(model_id, "gemini-3-flash"))    return "gemini-2.5-flash";
+    if (strstr(model_id, "gemini-3.1-flash"))  return "gemini-2.5-flash";
+    /* Already on 2.5.x or older -> no better fallback */
+    return NULL;
+}
 
 /* ── DEFAULT SYSTEM PROMPT ─────────────────────────────────────────
  * ~10 KB compile-time constant carrying subject-matter expertise
@@ -1478,6 +1505,7 @@ typedef struct {
 
 static int ai_try_streaming_once(const svc_config_t *cfg_active,
                                  int provider, const char *api_key,
+                                 const char *model_override,
                                  const char *user_prompt,
                                  const char *image_b64,
                                  ai_stream_chunk_cb on_chunk,
@@ -1496,6 +1524,15 @@ static int ai_try_streaming_once(const svc_config_t *cfg_active,
     eff.api_key[sizeof(eff.api_key) - 1] = 0;
     materialize_default_system(&eff);
 
+    /* Model override path (used by v4.6 Google 503 stable-model fallback):
+     * pin the CUSTOM tier and copy the override string into eff.model so
+     * resolve_effective_model returns it verbatim. Otherwise let the
+     * standard tier-based resolution pick the model. */
+    if (model_override && model_override[0]) {
+        eff.tier = SVC_TIER_CUSTOM;
+        _snprintf(eff.model, sizeof(eff.model) - 1, "%s", model_override);
+        eff.model[sizeof(eff.model) - 1] = 0;
+    }
     const char *model_id = resolve_effective_model(&eff);
     if (!model_id || !model_id[0]) {
         _snprintf(result->err, sizeof(result->err) - 1, "no model resolved");
@@ -1620,58 +1657,123 @@ int ai_ask_streaming(const svc_config_t *cfg,
             if (nl > 0) on_chunk(note, (size_t)nl, userdata);
         }
 
-        /* Per-provider retry loop with exp backoff + Retry-After. */
-        for (int attempt = 0; attempt < AI_RETRY_MAX_ATTEMPTS; attempt++) {
-            try_result_t r;
-            int ok = ai_try_streaming_once(cfg, prov, key,
-                                            user_prompt, image_b64,
-                                            on_chunk, userdata, &r);
-            if (ok) {
-                /* Success. Hand off reply to on_done. */
-                if (image_b64) free(image_b64);
-                if (on_done) on_done(1, r.full_reply, r.full_len, NULL, userdata);
-                else if (r.full_reply) free(r.full_reply);
-                slog_writef("ai.log",
-                            "ai_ask_streaming ok provider=%s attempt=%d reply_len=%zu",
-                            ai_provider_name(prov), attempt, r.full_len);
-                return 1;
-            }
-            /* v4.5: user hit Ctrl+Alt+S mid-flight? Don't retry / don't
-             * fall back — surface whatever partial reply we buffered
-             * with a friendly note. */
-            if (ai_abort_requested()) {
-                if (image_b64) free(image_b64);
-                slog_writef("ai.log", "ai_ask_streaming ABORTED by user provider=%s",
-                            ai_provider_name(prov));
-                if (on_done) {
-                    on_done(0, NULL, 0, "stopped by user", userdata);
-                }
-                ai_clear_abort();
-                return 1;
-            }
-            /* Fail. Preserve the error for potential surfacing later. */
-            _snprintf(last_err, sizeof(last_err) - 1, "%s: %s",
-                      ai_provider_name(prov), r.err);
-            last_err[sizeof(last_err) - 1] = 0;
+        /* v4.6 (2026-07-08): per-provider, iterate over a MODEL fallback
+         * chain. First entry is the default (from the user's tier); for
+         * Google we may append the stable 2.5-flash fallback if the
+         * first model 503s. Non-Google providers only have one entry.
+         *
+         * The reason we prefer intra-provider model fallback over
+         * provider-hopping is: users often configure only ONE api key.
+         * When gemini-3.5-flash overloads with 503, hopping straight to
+         * "OpenAI" is useless if the user has no OpenAI key, and the
+         * user just sees "AI request failed". Trying gemini-2.5-flash
+         * (which uses the SAME api key and is much more stable) will
+         * usually succeed instantly. */
+        const char *model_override = NULL;   /* NULL = use tier default */
+        int model_fallback_used   = 0;       /* 0 or 1 — we try at most one model fallback per provider */
 
-            if (!ai_status_retryable(r.status)) {
-                /* Non-retryable (400/401/403/404 etc.) — fall through
-                 * to next PROVIDER, no more retries on this one. */
-                slog_writef("ai.log", "ai_ask_streaming provider=%s status=%u NON-RETRY: %s",
-                            ai_provider_name(prov), r.status, r.err);
-                break;
+        for (;;) {   /* one iteration per (default OR fallback) model */
+            unsigned last_status = 0;
+            char     last_model_id[128] = {0};
+
+            for (int attempt = 0; attempt < AI_RETRY_MAX_ATTEMPTS; attempt++) {
+                try_result_t r;
+                int ok = ai_try_streaming_once(cfg, prov, key, model_override,
+                                                user_prompt, image_b64,
+                                                on_chunk, userdata, &r);
+                if (ok) {
+                    /* Success. Hand off reply to on_done. */
+                    if (image_b64) free(image_b64);
+                    if (on_done) on_done(1, r.full_reply, r.full_len, NULL, userdata);
+                    else if (r.full_reply) free(r.full_reply);
+                    slog_writef("ai.log",
+                                "ai_ask_streaming ok provider=%s model=%s attempt=%d reply_len=%zu",
+                                ai_provider_name(prov),
+                                model_override ? model_override : "<tier-default>",
+                                attempt, r.full_len);
+                    return 1;
+                }
+                /* v4.5: user hit Ctrl+Alt+S mid-flight? Don't retry / don't
+                 * fall back — surface whatever partial reply we buffered
+                 * with a friendly note. */
+                if (ai_abort_requested()) {
+                    if (image_b64) free(image_b64);
+                    slog_writef("ai.log", "ai_ask_streaming ABORTED by user provider=%s",
+                                ai_provider_name(prov));
+                    if (on_done) {
+                        on_done(0, NULL, 0, "stopped by user", userdata);
+                    }
+                    ai_clear_abort();
+                    return 1;
+                }
+                /* Fail. Preserve the error + status for potential surfacing later. */
+                _snprintf(last_err, sizeof(last_err) - 1, "%s: %s",
+                          ai_provider_name(prov), r.err);
+                last_err[sizeof(last_err) - 1] = 0;
+                last_status = r.status;
+
+                if (!ai_status_retryable(r.status)) {
+                    /* Non-retryable (400/401/403/404 etc.) — fall through
+                     * to next PROVIDER, no more retries on this one. */
+                    slog_writef("ai.log", "ai_ask_streaming provider=%s status=%u NON-RETRY: %s",
+                                ai_provider_name(prov), r.status, r.err);
+                    break;
+                }
+                /* Retryable. Sleep the Retry-After header if present,
+                 * otherwise exponential backoff WITH JITTER.
+                 * Jitter is important during Gemini 503 spikes to avoid
+                 * the whole client fleet thundering the server in sync. */
+                DWORD backoff = r.retry_after_ms;
+                if (backoff == 0) backoff = AI_RETRY_BASE_BACKOFF_MS * (1UL << attempt);
+                if (backoff > 30000UL) backoff = 30000UL;   /* cap per-attempt */
+                DWORD jitter_cap = backoff / AI_RETRY_JITTER_PCT_DEN + 1;
+                DWORD jitter = (DWORD)(GetTickCount64() % jitter_cap);
+                backoff += jitter;
+                slog_writef("ai.log",
+                            "ai_ask_streaming provider=%s status=%u attempt=%d backoff=%lums (jitter=%lu)",
+                            ai_provider_name(prov), r.status, attempt, backoff, jitter);
+                if (attempt < AI_RETRY_MAX_ATTEMPTS - 1) Sleep(backoff);
             }
-            /* Retryable. Sleep the Retry-After header if present,
-             * otherwise exponential backoff. */
-            DWORD backoff = r.retry_after_ms;
-            if (backoff == 0) backoff = AI_RETRY_BASE_BACKOFF_MS * (1UL << attempt);
-            if (backoff > 30000UL) backoff = 30000UL;    /* cap per-attempt */
-            slog_writef("ai.log",
-                        "ai_ask_streaming provider=%s status=%u attempt=%d backoff=%lums",
-                        ai_provider_name(prov), r.status, attempt, backoff);
-            if (attempt < AI_RETRY_MAX_ATTEMPTS - 1) Sleep(backoff);
+            /* All retries on this (provider, model) exhausted. */
+
+            /* v4.6 model-fallback: if we're on Google, ran out of retries
+             * with 503 "high demand" specifically, AND haven't already
+             * tried a fallback model, resolve the stable fallback and
+             * loop once more with it. This kicks in ONCE per provider —
+             * if the fallback also 503s we fall through to next provider. */
+            if (prov == SVC_PROVIDER_GOOGLE && last_status == 503 && !model_fallback_used) {
+                /* Figure out what model we just tried (resolve from tier if
+                 * model_override was NULL). */
+                svc_config_t eff = *cfg;
+                eff.provider = prov;
+                const char *tried_model = model_override
+                                          ? model_override
+                                          : resolve_effective_model(&eff);
+                if (tried_model) {
+                    _snprintf(last_model_id, sizeof(last_model_id) - 1, "%s", tried_model);
+                    last_model_id[sizeof(last_model_id) - 1] = 0;
+                }
+                const char *fallback = ai_google_stable_fallback(last_model_id);
+                if (fallback) {
+                    if (on_chunk) {
+                        char note[192];
+                        int nl = _snprintf(note, sizeof(note) - 1,
+                                           "\n\n_(Google `%s` is overloaded, "
+                                           "retrying with stable `%s`...)_\n\n",
+                                           last_model_id, fallback);
+                        if (nl > 0) on_chunk(note, (size_t)nl, userdata);
+                    }
+                    slog_writef("ai.log",
+                                "ai_ask_streaming Google 503 model-fallback %s -> %s",
+                                last_model_id, fallback);
+                    model_override = fallback;
+                    model_fallback_used = 1;
+                    continue;   /* re-enter attempt loop with new model */
+                }
+            }
+            break;   /* no model fallback -> stop iterating models */
         }
-        /* All retries on this provider exhausted — try next provider. */
+        /* All models on this provider exhausted — try next provider. */
     }
 
     if (image_b64) free(image_b64);

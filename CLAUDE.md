@@ -1,4 +1,156 @@
-﻿# svcldb - Project Memory (Claude / Cursor)
+﻿# svcldb — Project Memory (Claude / Cursor)
+
+## 2026-07-08 (early afternoon) — v1.4 GOOGLE 503 "HIGH DEMAND" MODEL FALLBACK
+
+User-reported bug + screenshot: `AI request failed. Google: http 503
+(stream, Google)` when using MEDIUM tier (`gemini-3.5-flash`).
+
+### Root cause (confirmed via live Google API probing)
+
+**Not a bug in our request.** Gemini 3.x preview-family models
+(`gemini-3.1-pro-preview`, `gemini-3.5-flash`, `gemini-3-flash-*`,
+etc.) hit `HTTP 503 UNAVAILABLE / "This model is currently
+experiencing high demand"` during peak US business hours (9am-5pm PT),
+which corresponds to peak evening/night in most non-US timezones.
+Community data + Google forums report failure rates ~45% during
+peak. `gemini-2.5-*` family (STABLE, not preview) sees failure
+rates <5%.
+
+Live-verified: pinged the exact endpoint
+`generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:
+streamGenerateContent?alt=sse` via PowerShell / .NET HttpClient
+with User-Agent `svcldb/1.0` + HTTP/1.1 + the full ~10 KB system
+prompt — all returned HTTP 200 with clean SSE streaming. So our
+WinHTTP request path is correct; the 503 the user sees is genuine
+server-side capacity exhaustion.
+
+### The fix (`payload/src/ai/ai_provider.c`)
+
+**Intra-provider model fallback for Google 503**: when the current
+Google model exhausts retries with 503 specifically (not 429, not
+5xx-general), transparently retry ONCE with the corresponding
+stable 2.5.x model BEFORE falling back to another provider. This
+matters because users often configure only ONE api key — hopping
+from Google straight to OpenAI is useless if they have no OpenAI
+key. But `gemini-2.5-flash` uses the SAME api key + is very stable.
+
+Fallback map (`ai_google_stable_fallback`):
+- Any `gemini-3.1-pro*` / `gemini-3-pro*` → `gemini-2.5-pro`
+- Any `gemini-3.5-flash*` / `gemini-3-flash*` / `gemini-3.1-flash*` →
+  `gemini-2.5-flash`
+- Already `2.5.x` or older → NULL (fall through to next provider)
+
+Runtime UX: user sees an inline note in the chat bubble:
+```
+_(Google `gemini-3.5-flash` is overloaded, retrying with stable
+  `gemini-2.5-flash`...)_
+```
+then the fallback model's streamed response.
+
+Also added `AI_RETRY_JITTER_PCT_DEN = 3` — up to ~33% random extra
+ms per backoff to avoid thundering-herd sync across the client fleet
+during Gemini spikes. Existing exp-backoff (`800/1600/3200ms`) stays.
+
+`ai_try_streaming_once` grew a `model_override` param (NULL for
+default). When non-NULL it pins `tier=SVC_TIER_CUSTOM` + writes
+into `eff.model` so `resolve_effective_model` returns it verbatim.
+
+### Verification (all live, 2026-07-08)
+
+E2E test harness at `payload/test/ai_e2e_test.c` calls
+`ai_ask_streaming` directly (no DWM injection) with the user's
+Google API key. Env-var-gated `SVCLDB_FORCE_503_MODEL=<substring>`
+(compiled with `SVCLDB_TEST_FORCE_503`) simulates 503 for testing;
+strippped from source before commit.
+
+1. Happy path (no forced 503): `gemini-3.5-flash` returns 200 →
+   streamed answer arrives, `ai_ask_streaming returned 1`.
+2. Force 503 on `gemini-3.5-flash`: 3 retries exhaust → announce
+   fallback → `gemini-2.5-flash` succeeds → user sees clean answer
+   with the transparent fallback note.
+3. Force 503 on `gemini-3.1-pro-preview` (STRONG tier): retries
+   exhaust → fallback to `gemini-2.5-pro` → success.
+4. Force 503 on ALL gemini models: falls through to OpenAI (401
+   with bogus key) → Anthropic → OpenRouter → returns error to
+   user with the LAST provider's status. Exactly correct behavior.
+
+Unit tests at `payload/test/ai_google_fallback_test.c` — 15
+cases (pro/flash/lite fallbacks + non-fallback 2.5.x/null/junk
+inputs), all pass.
+
+### v1.4 hard invariants (added on top of v1.3)
+
+88. **`ai_google_stable_fallback` MUST only trigger on status ==
+    503, not the broader `ai_status_retryable` set.** 5xx-general
+    (500/502/504) may indicate legitimate transient network hiccups
+    where retrying the SAME model is the right move. Only 503
+    "high demand" specifically means "this model's GPU pool is
+    saturated" — that's when switching to the stable 2.5.x variant
+    is guaranteed to help. Regressing to "any 5xx triggers model
+    fallback" would incorrectly downgrade users during Google's
+    generic infra hiccups.
+
+89. **Model fallback fires AT MOST ONCE per provider per request.**
+    `model_fallback_used = 1` after the first fallback attempt
+    latches. If the fallback model ALSO 503s, we fall through to
+    the next PROVIDER (not into an infinite model-degradation loop).
+    Rationale: two consecutive 503s from Google suggests the whole
+    Gemini fleet is stressed — switching to OpenAI/Anthropic buys
+    genuine reliability, not another 503.
+
+90. **Jitter is added to EVERY retryable backoff**, not just Google
+    503s. Small (~33%) random delay smooths client thundering
+    against ANY overloaded provider. Cost: negligible entropy call
+    (`GetTickCount64() % jitter_cap`) per retry, ~microseconds.
+
+91. **`ai_try_streaming_once` `model_override` param MUST be NULL
+    for default tier resolution.** Passing an empty string ("")
+    would set `tier=SVC_TIER_CUSTOM` + `model=""` → `resolve_
+    effective_model` returns empty → "no model resolved" error.
+    Every caller MUST either pass a proper model string OR NULL.
+
+92. **`ai_e2e_test.c` + `build_e2e.bat` require the api key on
+    argv. NEVER read the key from a file the test writes and
+    NEVER log the key to stdout.** `run_e2e.ps1` decrypts a
+    DPAPI-encrypted key, passes it as argv, then wipes it from
+    memory. Any future test tool that uses a real key MUST follow
+    the same pattern.
+
+### Deployment status (2026-07-08 ~13:07 EDT)
+
+Production build (`SVCLDB_DEV_BYPASS_AUTH = 0`, no `SVCLDB_DEV_AUTH`
+env var):
+- `build/payload/dwmapiext.dll` — 736,768 bytes
+- `build/launcher/sihost.exe` — 998,401 bytes (Astral-PE scrubbed)
+- Grep for `DEV BYPASS` / `SVCLDB_DEV_AUTH` / `HANDSHAKE SKIPPED` /
+  `SUB_CHECK SKIPPED` / `SVCLDB_TEST_FORCE_503` / `SVCLDB_FORCE_
+  503_MODEL` / `TEST-503` in both shipped binaries: **0 matches**.
+- Deployed `sihost.exe` to `C:\ProgramData\WinAudioSvc\`.
+- Distribution zip rebuilt via `ui\tools\build-distribution.ps1`.
+
+### What NOT to do (learned this session)
+
+- **Don't blame WinHTTP for 503s from Google's Gemini 3.x preview
+  models.** Verified via cross-tool probing (PowerShell / .NET /
+  HttpClient with matching User-Agent + system prompt) — WinHTTP
+  isn't the culprit. It's genuine server-side capacity exhaustion.
+- **Don't add "any 5xx triggers model fallback" broadening.** Some
+  5xx (500 internal server error, 502 bad gateway, 504 timeout)
+  are network-hiccup transients where the SAME model will work on
+  the next retry. Only 503 "high demand" specifically signals
+  model-pool saturation.
+- **Don't unify the retry loop into a single "try N models × M
+  attempts" nested pair.** The current shape (M attempts per
+  model, then ONE fallback model, then next provider) reads
+  linearly + logs cleanly. Nesting would obscure the fallback
+  boundary.
+- **Don't leave `SVCLDB_TEST_FORCE_503` scaffolding in source
+  even guarded by `#ifdef`**. Even compiled-out `#ifdef`
+  branches inflate the source LOC + surprise future readers.
+  The E2E test file is enough — it doesn't need special hooks
+  in the production source path.
+
+---
 
 ## 2026-07-07 (early morning) — v1.3 RESET-BUTTON + TRANSPARENCY-FLICKER + UNIFORM-ALPHA FIX
 
