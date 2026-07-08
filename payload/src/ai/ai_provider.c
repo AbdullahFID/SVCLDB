@@ -706,7 +706,35 @@ static int build_anthropic_body(const svc_config_t *cfg, const char *user_prompt
 
     jb_obj_begin(jb);
       jb_key(jb, "model");      jb_str(jb, model_id);
-      jb_key(jb, "max_tokens"); jb_num_i(jb, resolve_max_output_tokens(cfg));
+
+      /* max_tokens sizing.
+       *
+       * 2026-07-08 fix: Anthropic's extended-thinking API strictly
+       * requires `max_tokens > thinking.budget_tokens` (returns
+       * HTTP 400 "max_tokens must be greater than thinking.budget_
+       * tokens" otherwise). Our CHEAP tier ships `default_max_output_
+       * tokens = 6144` but our extended-thinking `budget_tokens` is
+       * 16384/32768 depending on effort — so Haiku + effort >= 3
+       * hit the ceiling and got a non-retryable 400 that fell all
+       * the way through the provider chain silently. Reproduced live
+       * against api.anthropic.com/v1/messages.
+       *
+       * Compute a defensive max_tokens that's ALWAYS strictly greater
+       * than any budget_tokens we might send. Extra 2048 slack gives
+       * the model headroom for the actual output payload after
+       * thinking. When no thinking fires, we just use the tier
+       * default. */
+      int base_max_tok = resolve_max_output_tokens(cfg);
+      int budget_tok   = 0;
+      if (extended && cfg->reasoning_effort >= 3) {
+          budget_tok = cfg->reasoning_effort >= 5 ? 32768 : 16384;
+      }
+      int max_tok = base_max_tok;
+      if (budget_tok > 0 && max_tok <= budget_tok) {
+          /* +2048 slack for the actual response body after thinking. */
+          max_tok = budget_tok + 2048;
+      }
+      jb_key(jb, "max_tokens"); jb_num_i(jb, max_tok);
 
       /* System prompt as array-of-blocks with ephemeral cache_control.
        * 90% discount on cached input, 80% latency cut. Min cacheable
@@ -742,8 +770,7 @@ static int build_anthropic_body(const svc_config_t *cfg, const char *user_prompt
         jb_key(jb, "thinking");
         jb_obj_begin(jb);
           jb_key(jb, "type");           jb_str(jb, "enabled");
-          jb_key(jb, "budget_tokens");  jb_num_i(jb,
-              cfg->reasoning_effort >= 5 ? 32768 : 16384);
+          jb_key(jb, "budget_tokens");  jb_num_i(jb, budget_tok);
         jb_obj_end(jb);
       } else {
         /* Non-thinking model — set temperature explicitly. */

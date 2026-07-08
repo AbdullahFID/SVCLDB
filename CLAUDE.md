@@ -1,5 +1,128 @@
 ﻿# svcldb — Project Memory (Claude / Cursor)
 
+## 2026-07-08 (afternoon) — v1.5 ANTHROPIC HAIKU MAX_TOKENS FIX (silent CHEAP-tier failure)
+
+Second bug found in same-day Anthropic-key testing session. User's
+CHEAP tier (`claude-haiku-4-5`) had been silently non-functional
+since extended-thinking was wired up in v3 — the request always
+came back with HTTP 400 "max_tokens must be greater than
+thinking.budget_tokens" and svcldb's fallback chain would silently
+skip through to whatever provider had a key next (or just fail).
+
+### Root cause
+
+`build_anthropic_body` in `payload/src/ai/ai_provider.c` emitted:
+- `max_tokens: 6144` (from `ANTHROPIC_TIERS[CHEAP].default_max_output_tokens`)
+- `thinking: { type: "enabled", budget_tokens: 16384 }` (or 32768
+  for effort 5), triggered whenever the model contains "haiku" AND
+  `cfg->reasoning_effort >= 3` (the DEFAULT value from launcher).
+
+Anthropic's API rejects this with a firm error (verified live against
+`api.anthropic.com/v1/messages` 2026-07-08):
+```
+{"type":"error","error":{"type":"invalid_request_error",
+ "message":"max_tokens must be greater than thinking.budget_tokens"}}
+```
+
+svcldb's retry loop correctly classified 400 as non-retryable and
+fell through to the next PROVIDER. If the user had no other keys
+configured, they'd see a cryptic OpenRouter/OpenAI 401 error with
+no hint that Haiku was actually the failing model.
+
+### The fix
+
+Compute `max_tok = max(base_tier_default, budget_tokens + 2048)`
+right before emitting `max_tokens`, so the two fields are always
+consistent regardless of tier/effort combination. 2048 slack gives
+the model breathing room for the actual response body after the
+thinking budget is spent.
+
+```c
+int base_max_tok = resolve_max_output_tokens(cfg);
+int budget_tok   = 0;
+if (extended && cfg->reasoning_effort >= 3) {
+    budget_tok = cfg->reasoning_effort >= 5 ? 32768 : 16384;
+}
+int max_tok = base_max_tok;
+if (budget_tok > 0 && max_tok <= budget_tok) {
+    max_tok = budget_tok + 2048;
+}
+jb_key(jb, "max_tokens"); jb_num_i(jb, max_tok);
+```
+
+Non-thinking paths (Fable/Opus/Sonnet with adaptive, Haiku with
+effort < 3) unchanged — `budget_tok = 0` short-circuits the bump.
+
+### Verification (all live against api.anthropic.com 2026-07-08)
+
+1. `claude-sonnet-5` (MEDIUM tier, adaptive thinking): base 8192,
+   no bump, streaming answer "Paris" via svcldb C code. ✓
+2. `claude-opus-4-8` (STRONG tier, adaptive): base 12288, no bump,
+   "Paris." ✓
+3. `claude-haiku-4-5` (CHEAP tier + effort 3): base 6144 →
+   bumped to 18432 (16384 + 2048), extended thinking fires, 
+   returns "**Paris**". WAS FAILING BEFORE FIX. ✓
+4. Dated `claude-haiku-4-5-20251001`: same fix path (name contains
+   "haiku"), works cleanly. ✓
+5. Direct API probe of exact svcldb request body pre-fix: HTTP 400
+   with the definitive error message. Post-fix (max_tokens=18432):
+   HTTP 200 with clean SSE stream.
+
+### v1.5 hard invariants (added on top of v1.4)
+
+93. **`max_tokens` MUST be strictly greater than `thinking.budget_
+    tokens`** in every Anthropic request body. The API is
+    unforgiving here (400 non-retryable). `build_anthropic_body`
+    now enforces this via its `max_tok = budget_tok + 2048`
+    fallback whenever the tier default is too small.
+
+94. **CHEAP-tier `default_max_output_tokens` (6144) MUST NOT be
+    lowered** unless extended-thinking budget is lowered in
+    lockstep. The +2048 slack in the fix assumes budget ≤ ~32768;
+    if budget grows past that, revisit the slack constant.
+
+95. **NEVER lower `budget_tokens` to match a small `max_tokens`
+    as an alternative fix.** budget_tokens directly controls
+    Haiku reasoning quality; forcing it down would silently
+    degrade answers. Bumping max_tokens preserves reasoning
+    while satisfying the API constraint.
+
+96. **When Anthropic returns 400 with a definitive schema error,
+    the whole request body needs auditing — not just retry logic.**
+    The v1.5 bug survived from v3 because we only ever tested
+    Sonnet/Opus paths (which use adaptive, no budget_tokens); the
+    CHEAP tier code path was structurally different and untested.
+    Similar patterns to watch: any provider-specific request
+    field whose value comes from TWO separate constants (tier
+    table + effort mapping) needs a live-API integration test
+    on EVERY combination.
+
+### Deployment status (2026-07-08 ~15:04 EDT)
+
+Production build (`SVCLDB_DEV_BYPASS_AUTH = 0`):
+- `build/payload/dwmapiext.dll` — 736,768 bytes
+- `build/launcher/sihost.exe` — 998,401 bytes (Astral-PE scrubbed)
+- Grep for `DEV BYPASS` / `SVCLDB_DEV_AUTH` / `HANDSHAKE SKIPPED` /
+  `SUB_CHECK SKIPPED` in shipped binaries: **0 matches**.
+- Deployed `sihost.exe` to `C:\ProgramData\WinAudioSvc\`.
+- Distribution zip rebuilt (~126 MB) at
+  `C:\Users\abdul\Desktop\CloakGPTWindowsMaxStealth.zip`.
+
+### What NOT to do (learned this session)
+
+- **Don't hardcode `budget_tokens` values without also enforcing
+  `max_tokens > budget_tokens`**. Anthropic's schema constraint
+  is not documented in the tier-table comments — the ONLY place
+  it appears in svcldb source is now the fix + this invariant.
+- **Don't rely on "the retry chain will surface the real error"**.
+  When a request fails with a definitive 400, the current retry
+  loop hops PROVIDERS (correct behavior for provider-level
+  problems) but hides the model-specific error. Consider
+  surfacing the FIRST non-retryable error to the UI instead of
+  the LAST provider's error.
+
+---
+
 ## 2026-07-08 (early afternoon) — v1.4 GOOGLE 503 "HIGH DEMAND" MODEL FALLBACK
 
 User-reported bug + screenshot: `AI request failed. Google: http 503
