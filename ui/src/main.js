@@ -1095,9 +1095,120 @@ ipcMain.handle('hotkeys:reset', async () => {
 // signature. Applied on next injector:inject.
 ipcMain.handle('overlay:load',  async () => storage.loadOverlayConfig());
 ipcMain.handle('overlay:save',  async (_e, o) => storage.saveOverlayConfig(o));
+
+/* v1.3 (2026-07-07) — Reset MUST clear BOTH state stores + optionally
+ * re-inject, otherwise it looks like the button is broken to the user:
+ *
+ *   overlay.json         (AppData)  ← LAUNCH-time config Electron writes
+ *   overlay_state.bin    (SVC_INSTALL_DIR) ← RUNTIME state payload persists
+ *                                       (position nudges, alpha bumps,
+ *                                       font, corner) — stacked ON TOP
+ *                                       of the launch config every time
+ *                                       the payload starts.
+ *
+ * Bug before this fix: Reset only cleared overlay.json. On next inject
+ * the payload STILL loaded overlay_state.bin and re-applied the user's
+ * hand-tuned position/alpha/font — so "Reset" looked like a no-op.
+ *
+ * Correct sequence:
+ *   1. If payload is loaded: uninject first (waits for shutdown_watcher
+ *      to complete + waits for state_flush to finish). If we deleted
+ *      overlay_state.bin BEFORE uninject, the payload would re-write
+ *      it during its shutdown drain.
+ *   2. Delete overlay_state.bin (payload's persisted runtime tweaks).
+ *   3. Delete overlay.json (Electron's launch config -> now defaults).
+ *   4. If payload was loaded before: auto-reinject with fresh defaults.
+ *
+ * Returns: { ...defaults, reinjected: bool, wasLoaded: bool } so the
+ * renderer can show an accurate toast. */
 ipcMain.handle('overlay:reset', async () => {
+  const overlayStateBin = path.join(SVC_INSTALL_DIR, 'overlay_state.bin');
+  const wasLoaded = await injector.isPayloadLoaded().catch(() => false);
+  let reinjected = false;
+
+  /* Step 1: uninject FIRST (blocks until payload confirms unload) so it
+   * can't rewrite overlay_state.bin during its shutdown flush. */
+  if (wasLoaded) {
+    try {
+      const r = await injector.uninject();
+      console.log('[overlay:reset] uninject:', r.ok ? 'ok' : `FAIL ${r.err || r.exitCode}`);
+    } catch (e) {
+      console.log('[overlay:reset] uninject threw:', e.message);
+    }
+  }
+
+  /* Step 2: delete payload's persisted runtime state (best-effort). */
+  try {
+    if (fs.existsSync(overlayStateBin)) {
+      fs.unlinkSync(overlayStateBin);
+      console.log('[overlay:reset] deleted overlay_state.bin');
+    }
+  } catch (e) {
+    console.log('[overlay:reset] overlay_state.bin delete failed:', e.message);
+  }
+
+  /* Step 3: clear Electron-side launch config. */
   storage.clearOverlayConfig();
-  return storage.loadOverlayConfig();   /* returns defaults */
+
+  /* Step 4: if payload was running, auto-reinject with fresh defaults so
+   * the reset is immediately visible. Requires an active session + at
+   * least one API key (same guardrails as manual "Inject Now"). */
+  if (wasLoaded) {
+    if (!currentSess) {
+      console.log('[overlay:reset] skip reinject (no session)');
+    } else {
+      const keys = loadApiKeys();
+      const hasAny = keys.openai || keys.anthropic || keys.google || keys.openrouter;
+      if (!hasAny) {
+        console.log('[overlay:reset] skip reinject (no API keys)');
+      } else {
+        try {
+          /* Mirror the injector:inject handler inline. We can't just
+           * invoke the handler recursively via ipcMain because it's a
+           * private Electron API. Building the args here means the
+           * fresh (default) overlay.json + cleared overlay_state.bin
+           * both get picked up on the next payload load. */
+          const hwid = (device.getCached()?.hardware_uuid)
+                     || (await device.collect()).hardware_uuid;
+          const hotkeys = [...injector.DEFAULT_HOTKEYS];
+          const overrides = storage.loadHotkeyOverrides();
+          for (const [k, v] of Object.entries(overrides || {})) {
+            const slot = parseInt(k, 10);
+            if (Number.isFinite(slot) && slot >= 0 && slot < hotkeys.length) {
+              hotkeys[slot] = v;
+            }
+          }
+          const persistedPrompt = loadSystemPrompt();
+          const systemPromptStr = _computeSystemPromptString(persistedPrompt);
+          const overlayCfg = storage.loadOverlayConfig();  /* freshly reset -> defaults */
+          const r = await injector.inject({
+            session: currentSess,
+            hwid,
+            keys,
+            apiKey: '',
+            latex_disabled:  persistedPrompt.latex_mode === 'off' ? 1 : 0,
+            direct_answer_mode: persistedPrompt.direct_answer_mode ? 1 : 0,
+            system_prompt: systemPromptStr,
+            stream_display_batched: persistedPrompt.stream_display === 'batched' ? 1 : 0,
+            overlay: {
+              x: 40, y: 40,
+              w: overlayCfg.w, h: overlayCfg.h,
+              alpha: overlayCfg.alpha,
+            },
+            size_mode: overlayCfg.size_mode ? 1 : 0,
+            hotkeys,
+          });
+          reinjected = !!(r && r.ok);
+          console.log('[overlay:reset] reinject:', reinjected ? 'ok' : `FAIL ${r && r.err}`);
+        } catch (e) {
+          console.log('[overlay:reset] reinject threw:', e.message);
+        }
+      }
+    }
+  }
+
+  const defaults = storage.loadOverlayConfig();
+  return { ...defaults, reinjected, wasLoaded };
 });
 
 // ─── Onboarding walkthrough ────────────────────────────────────

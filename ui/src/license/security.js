@@ -30,21 +30,41 @@
 
 const { MAX_CLOCK_DRIFT_SECS } = require('./config');
 
-// 25 suspicious process names — matches hooksdll list. Compared
-// against process names WITHOUT the .exe suffix, case-insensitively.
+// 40+ suspicious process names — matches hooksdll V10.1.20 list.
+// Compared against process names WITHOUT the .exe suffix,
+// case-insensitively. Adding a new tool: pick the process name WITHOUT
+// .exe (all comparisons strip the suffix + lowercase).
+//
+// v6.3 (2026-07-06 evening): synced with hooksdll V10.1.20. Added
+// Frida family + burpsuite variants + procmon64/procexp64 + tshark +
+// mitmdump/mitmweb + windbgx/dbgview + dnspy-x86/x64 + pin/pintool +
+// DynamoRIO family + pymem/winappdbg. Frida in particular is THE big
+// modern-DBI threat model — attaching a JS runtime that hot-patches
+// our IPC calls at runtime bypasses static-analysis tools entirely.
 const SUSPICIOUS_PROCESSES = [
   // Debuggers
   'ollydbg', 'x64dbg', 'x32dbg', 'windbg', 'immunitydebugger',
+  // v6.3 addition — WinDbg Preview + dbg variants
+  'windbgx', 'dbgview',
   // Disassemblers / RE tools
-  'ida', 'ida64', 'idaq', 'idaq64', 'ghidra', 'radare2',
+  'ida', 'ida64', 'idaq', 'idaq64', 'ghidra', 'ghidrarun', 'radare2', 'r2',
+  // v6.3 addition — Dynamic instrumentation / DBI (Frida is THE big one)
+  'frida', 'frida-server', 'frida-tools', 'frida-trace', 'frida-ps',
+  'pin', 'pintool', 'drltrace', 'drrun', 'drmemory',
   // .NET decompilers
-  'dnspy', 'ilspy', 'dotpeek', 'de4dot',
+  'dnspy', 'dnspy-x86', 'dnspy-x64', 'ilspy', 'dotpeek', 'de4dot',
   // Process / registry / file monitors
-  'processhacker', 'procmon', 'procexp', 'pestudio', 'regmon', 'filemon',
-  // Network / MitM proxies
-  'wireshark', 'fiddler', 'charles', 'httpanalyzer', 'apimonitor',
+  'processhacker', 'procmon', 'procmon64', 'procexp', 'procexp64',
+  'pestudio', 'regmon', 'filemon',
+  // Network / MitM proxies (mitm.js catches CA installs too)
+  'wireshark', 'tshark', 'fiddler', 'charles', 'httpanalyzer', 'apimonitor',
+  'mitmproxy', 'mitmdump', 'mitmweb', 'burpsuite', 'burpsuite_pro',
+  'burpsuite_community', 'zap',
   // Memory manipulation / cheat tools
-  'cheatengine', 'artmoney', 'tsearch',
+  'cheatengine', 'cheatengine-x86_64', 'cheatengine-x86_64-sse4-avx2',
+  'artmoney', 'tsearch',
+  // v6.3 addition — Python-based memory inspectors (Frida-adjacent)
+  'pymem', 'winappdbg',
 ];
 
 let ffi = {};

@@ -1278,16 +1278,47 @@ async function _initOverlayCard() {
   }
   if (btnReset) {
     btnReset.addEventListener('click', async () => {
-      if (!confirm('Reset overlay appearance to defaults?\n\nSize: 560\u00d7420, alpha 94%, normal mode.')) return;
+      /* v1.3 (2026-07-07) — the confirm dialog now explains WHAT gets
+       * reset AND that the overlay auto-reinjects if it's running. This
+       * matters because reset used to look like a no-op: it only cleared
+       * the launch config, leaving the payload's runtime tweaks
+       * (overlay_state.bin) in place. Backend now clears both stores +
+       * auto-reinjects when the payload is loaded. */
+      if (!confirm(
+        'Reset overlay appearance to defaults?\n\n' +
+        'This clears:\n' +
+        '  \u2022 Launch size (defaults to 560\u00d7420)\n' +
+        '  \u2022 Alpha / opacity (defaults to 94%)\n' +
+        '  \u2022 Ultra-size toggle (defaults to normal)\n' +
+        '  \u2022 Payload runtime state (position, alpha bumps, font, corner)\n\n' +
+        'If the overlay is currently injected, it will be re-injected\n' +
+        'automatically so the reset is visible immediately.'
+      )) return;
+      btnReset.disabled = true;
+      const oldLabel = btnReset.textContent;
+      btnReset.textContent = 'Resetting\u2026';
       try {
         const p = await window.svc.overlay.reset();
         _ovaState = { size_mode: p.size_mode ? 1 : 0, w: +p.w, h: +p.h, alpha: +p.alpha };
         _ovaSaved = { ..._ovaState };
         if (chkUltra) chkUltra.checked = !!_ovaState.size_mode;
         _ovaRefreshAll();
-        toast('Overlay appearance reset to defaults.', 'ok');
+        /* Toast reflects what actually happened server-side so the user
+         * isn't left guessing. Toast supports only 'ok' + 'err' so the
+         * "needs manual re-inject" case stays as 'ok' with a call-to-
+         * action embedded in the message. */
+        if (p.reinjected) {
+          toast('Overlay reset \u2014 payload re-injected with defaults.', 'ok');
+        } else if (p.wasLoaded) {
+          toast('Overlay reset. Re-inject skipped (no session/keys) \u2014 click Inject Now.', 'ok');
+        } else {
+          toast('Overlay reset. Click Inject Now to apply.', 'ok');
+        }
       } catch (e) {
         toast(`Reset failed: ${e.message || e}`, 'err');
+      } finally {
+        btnReset.disabled = false;
+        btnReset.textContent = oldLabel;
       }
     });
   }

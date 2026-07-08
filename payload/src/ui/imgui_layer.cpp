@@ -332,6 +332,44 @@ static int   g_base_h_cfg = 0;   /* 0 = use fallback 460 */
  * live resize hotkeys. Ultra allows tiny 80x60 pip AND near-fullscreen. */
 static volatile LONG g_size_mode = 0;   /* 0 normal, 1 ultra */
 
+/* v1.3 (2026-07-07): per-frame alpha multiplier — snapshotted from
+ * g_alpha at the top of draw_chat_window and used by nested
+ * renderers (draw_chat_bubble, md_render_tinted_block, code/math
+ * block wrappers) to scale their INTERIOR background + border alphas.
+ *
+ * BUG WE'RE FIXING: before this global, bubble bg was hardcoded to
+ * alpha=0.95, code-block bg was 0.98, math-block bg was 0.98. The
+ * outer ImGui window's WindowBg respected g_alpha but everything
+ * INSIDE was near-opaque. User set alpha=0.20 and got a very
+ * transparent frame with almost-opaque chat bubbles inside — the
+ * "transparency only applies to the edges, not the chat box" report.
+ *
+ * Threading model: draw_chat_window is called from the DWM Present
+ * detour on the compositor thread. Every downstream call chain
+ * (draw_chat_bubble, md_render, md_render_code_block,
+ * md_render_math_display, md_render_tinted_block) runs synchronously
+ * on that same thread. No concurrent access — a plain static
+ * suffices, no atomic needed.
+ *
+ * Contract: draw_chat_window MUST set g_frame_alpha_mul at the top
+ * of every frame. Downstream renderers read it via with_alpha_mul().
+ * If a future call site is added that renders bubbles/blocks OUTSIDE
+ * draw_chat_window, it MUST set g_frame_alpha_mul too. */
+static float g_frame_alpha_mul = 1.0f;
+
+/* Return `c` with its alpha channel multiplied by g_frame_alpha_mul.
+ * Applied to bubble bg + border, code/math block bg + border, and
+ * button colors — everything that visually constitutes the "chat
+ * box container" so the whole container respects user transparency
+ * uniformly. Body TEXT is deliberately NOT scaled — text alpha
+ * scaling below ~0.5 makes prose unreadable, which is worse UX than
+ * having text render at full opacity against a partially-transparent
+ * background. */
+static inline ImVec4 with_alpha_mul(ImVec4 c) {
+    c.w *= g_frame_alpha_mul;
+    return c;
+}
+
 /* ---------- Fullscreen-layer discovery ---------- *
  * DWM's COverlayContext::Present fires many times per frame — once per
  * layer. Cursor overlay is 32x32, tooltips are ~100x30, etc. We only
@@ -346,9 +384,13 @@ static ID3D11Texture2D *g_target_tex = nullptr;  /* Last texture matching target
  * multiple ~fullscreen layers can pass through in the same compose cycle
  * (LDB main + LDB modal + full-screen overlay window). We must draw the
  * chat overlay ONCE per frame or the user sees duplicates ghosting into
- * each other. Track last draw tick; skip if <FRAME_DEDUP_MS since. At
- * 60fps a full frame is 16.6ms so 12ms is a safe floor. */
-#define FRAME_DEDUP_MS 12
+ * each other. Track last draw tick; skip if <FRAME_DEDUP_MS since.
+ *
+ * Threshold: 3ms. Detailed rationale + refresh-rate table lives in the
+ * v1.3 TRANSPARENCY FLICKER FIX comment below (right above the tick
+ * comparison in ui_present_frame). Do not restore 12ms — that broke
+ * every monitor >= 90Hz. */
+#define FRAME_DEDUP_MS 3
 static ULONGLONG g_last_draw_tick = 0;
 
 /* Reply-pane scroll accumulator — hotkey handler adds delta, next
@@ -2457,9 +2499,11 @@ static void md_render_tinted_block(const char *body, size_t body_len,
     float x_end = rect_max.x - pad_h;
     ImGui::SetCursorScreenPos(ImVec2(x_end - btn_w,
                                       rect_min.y + pad_v));
-    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.14f, 0.22f, 0.36f, 0.85f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.34f, 0.52f, 0.95f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.28f, 0.42f, 0.68f, 1.00f));
+    /* v1.3 (2026-07-07): copy-button bg scales with user opacity so
+     * it blends with the block bg uniformly. Text stays full-opacity. */
+    ImGui::PushStyleColor(ImGuiCol_Button,        with_alpha_mul(ImVec4(0.14f, 0.22f, 0.36f, 0.85f)));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, with_alpha_mul(ImVec4(0.22f, 0.34f, 0.52f, 0.95f)));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  with_alpha_mul(ImVec4(0.28f, 0.42f, 0.68f, 1.00f)));
     ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(0.92f, 0.96f, 1.00f, 1.00f));
     char bid[96];
     _snprintf(bid, sizeof(bid) - 1, "%s##%s%d", hk_label, btn_id_prefix, block_idx);
@@ -2604,12 +2648,15 @@ static void md_render_code_block(const char *lang, const char *body,
                   line_count);
     }
     label[sizeof(label) - 1] = 0;
-    /* Language-specific accent (falls back to blue). */
+    /* Language-specific accent (falls back to blue). v1.3 (2026-07-07):
+     * bg + border + label alphas all scale with g_frame_alpha_mul so
+     * code blocks respect the user's transparency setting instead of
+     * staying near-opaque against a transparent overlay bg. */
     const struct code_lang_style *style = code_lang_lookup(lang);
-    ImVec4 border = style ? style->border : ImVec4(0.24f, 0.38f, 0.58f, 0.85f);
-    ImVec4 lbl    = style ? style->label  : ImVec4(0.55f, 0.75f, 1.00f, 0.90f);
+    ImVec4 border = with_alpha_mul(style ? style->border : ImVec4(0.24f, 0.38f, 0.58f, 0.85f));
+    ImVec4 lbl    = with_alpha_mul(style ? style->label  : ImVec4(0.55f, 0.75f, 1.00f, 0.90f));
     md_render_tinted_block(body, body_len, block_idx, label,
-        ImVec4(0.02f, 0.04f, 0.08f, 0.98f),   /* bg: near-black (universal) */
+        with_alpha_mul(ImVec4(0.02f, 0.04f, 0.08f, 0.98f)),   /* bg: near-black (universal) */
         border, lbl, "code", font_mul);
 }
 
@@ -2628,10 +2675,13 @@ static void md_render_math_display(const char *body, size_t body_len,
     char uni_buf[8192];
     size_t ulen = latex_to_unicode(body, body_len, uni_buf, sizeof(uni_buf) - 1);
     uni_buf[ulen] = 0;
+    /* v1.3 (2026-07-07): bg + border + label alphas all scale with
+     * g_frame_alpha_mul so math blocks respect user transparency
+     * uniformly with the rest of the overlay. */
     md_render_tinted_block(uni_buf, ulen, block_idx, "math",
-        ImVec4(0.08f, 0.05f, 0.14f, 0.98f),   /* bg: dark violet */
-        ImVec4(0.50f, 0.35f, 0.72f, 0.85f),   /* border: violet */
-        ImVec4(0.85f, 0.72f, 1.00f, 0.90f),   /* label: light violet */
+        with_alpha_mul(ImVec4(0.08f, 0.05f, 0.14f, 0.98f)),   /* bg: dark violet */
+        with_alpha_mul(ImVec4(0.50f, 0.35f, 0.72f, 0.85f)),   /* border: violet */
+        with_alpha_mul(ImVec4(0.85f, 0.72f, 1.00f, 0.90f)),   /* label: light violet */
         "math", font_mul);
 }
 
@@ -2982,17 +3032,24 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
         : region_w - 4.0f;
     if (bubble_max_w < 240.0f) bubble_max_w = 240.0f;
 
-    /* Palette. */
-    ImVec4 bg    = role == UI_MSG_USER
+    /* Palette. v1.3 (2026-07-07): bg + border alpha scale with the
+     * user's opacity setting (g_frame_alpha_mul) so the whole overlay
+     * respects transparency uniformly instead of only the outer edges.
+     * Label alpha also scales (labels are part of the "container"
+     * visual, not the body content). Body text stays at full opacity
+     * for readability — text alpha scaling at low overall opacity
+     * makes prose unreadable in a way that's worse than the visual
+     * inconsistency of opaque text over a semi-transparent bubble. */
+    ImVec4 bg    = with_alpha_mul(role == UI_MSG_USER
         ? ImVec4(0.22f, 0.42f, 0.75f, 0.95f)
-        : ImVec4(0.06f, 0.09f, 0.14f, 0.95f);
-    ImVec4 border = role == UI_MSG_USER
+        : ImVec4(0.06f, 0.09f, 0.14f, 0.95f));
+    ImVec4 border = with_alpha_mul(role == UI_MSG_USER
         ? ImVec4(0.45f, 0.68f, 1.00f, 0.95f)
-        : ImVec4(0.24f, 0.38f, 0.58f, 0.85f);
-    ImVec4 label_col = role == UI_MSG_USER
+        : ImVec4(0.24f, 0.38f, 0.58f, 0.85f));
+    ImVec4 label_col = with_alpha_mul(role == UI_MSG_USER
         ? ImVec4(0.80f, 0.90f, 1.00f, 0.95f)
-        : ImVec4(0.55f, 0.75f, 1.00f, 0.90f);
-    ImVec4 text_col = ImVec4(0.96f, 0.97f, 1.0f, 1.0f);
+        : ImVec4(0.55f, 0.75f, 1.00f, 0.90f));
+    ImVec4 text_col = ImVec4(0.96f, 0.97f, 1.0f, 1.0f);   /* full opacity */
 
     /* Right-align USER bubbles. */
     if (role == UI_MSG_USER) {
@@ -3113,10 +3170,15 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
 
         /* Snapshot text for the copy handlers (button click fires
          * out-of-band; we need a stable copy). Snapshot only if the
-         * button is pressed — cheaper than snapshotting every frame. */
-        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.14f, 0.22f, 0.36f, 0.85f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.34f, 0.52f, 0.95f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.28f, 0.42f, 0.68f, 1.00f));
+         * button is pressed — cheaper than snapshotting every frame.
+         *
+         * v1.3 (2026-07-07): button bg alphas scale with the frame
+         * multiplier so they blend uniformly with the bubble bg.
+         * Button TEXT stays at full opacity so labels remain
+         * readable at low transparency. */
+        ImGui::PushStyleColor(ImGuiCol_Button,        with_alpha_mul(ImVec4(0.14f, 0.22f, 0.36f, 0.85f)));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, with_alpha_mul(ImVec4(0.22f, 0.34f, 0.52f, 0.95f)));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  with_alpha_mul(ImVec4(0.28f, 0.42f, 0.68f, 1.00f)));
         ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(0.92f, 0.96f, 1.00f, 1.00f));
 
         char hk_full[32] = {0}, hk_ans[32] = {0};
@@ -3191,6 +3253,14 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     LeaveCriticalSection(&g_ui_cs);
 
     if (!visible) return;
+
+    /* v1.3 (2026-07-07): publish alpha to the file-scope multiplier
+     * BEFORE any nested renderer runs. draw_chat_bubble +
+     * md_render_tinted_block read this via with_alpha_mul() so their
+     * hardcoded bg/border alphas scale uniformly with user opacity.
+     * See the g_frame_alpha_mul definition near the top of this
+     * file for the full contract + rationale. */
+    g_frame_alpha_mul = alpha;
 
     /* Snapshot chat messages under lock to avoid renderer-vs-append tear. */
     ensure_chat_msgs_cs();
@@ -3305,15 +3375,20 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,   ImVec2(20.0f * scale, 16.0f * scale));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,     ImVec2(10.0f * scale, 8.0f * scale));
 
+    /* v1.3 (2026-07-07): all chrome elements (title/border/separator/
+     * scrollbar) scale with the user's opacity setting via
+     * with_alpha_mul so the whole overlay looks uniformly transparent
+     * instead of "transparent frame with opaque titlebar + scrollbar".
+     * TEXT alone stays at full opacity to preserve readability. */
     ImGui::PushStyleColor(ImGuiCol_WindowBg,      ImVec4(0.04f, 0.05f, 0.09f, alpha));
-    ImGui::PushStyleColor(ImGuiCol_TitleBg,       ImVec4(0.07f, 0.09f, 0.14f, 0.98f));
-    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImVec4(0.10f, 0.14f, 0.22f, 0.98f));
-    ImGui::PushStyleColor(ImGuiCol_Border,        ImVec4(0.28f, 0.42f, 0.68f, 0.85f));
-    ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(0.94f, 0.96f, 0.99f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Separator,     ImVec4(0.20f, 0.28f, 0.42f, 0.80f));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarBg,   ImVec4(0.06f, 0.08f, 0.12f, 0.60f));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, ImVec4(0.28f, 0.42f, 0.68f, 0.85f));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered, ImVec4(0.38f, 0.52f, 0.80f, 0.90f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBg,       with_alpha_mul(ImVec4(0.07f, 0.09f, 0.14f, 0.98f)));
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, with_alpha_mul(ImVec4(0.10f, 0.14f, 0.22f, 0.98f)));
+    ImGui::PushStyleColor(ImGuiCol_Border,        with_alpha_mul(ImVec4(0.28f, 0.42f, 0.68f, 0.85f)));
+    ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(0.94f, 0.96f, 0.99f, 1.0f));  /* full opacity */
+    ImGui::PushStyleColor(ImGuiCol_Separator,     with_alpha_mul(ImVec4(0.20f, 0.28f, 0.42f, 0.80f)));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarBg,   with_alpha_mul(ImVec4(0.06f, 0.08f, 0.12f, 0.60f)));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, with_alpha_mul(ImVec4(0.28f, 0.42f, 0.68f, 0.85f)));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered, with_alpha_mul(ImVec4(0.38f, 0.52f, 0.80f, 0.90f)));
 
     if (ImGui::Begin("AI overlay", nullptr,
         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
@@ -3474,8 +3549,11 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
             ImGui::Text("Ask AI (with screenshot):");
             ImGui::PopStyleColor();
 
-            /* Frame the input area so it looks like a text box. */
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.12f, 0.20f, 0.70f));
+            /* Frame the input area so it looks like a text box.
+             * v1.3 (2026-07-07): ChildBg alpha scales with user
+             * opacity via with_alpha_mul — the chat input box is a
+             * container element, not body content. */
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, with_alpha_mul(ImVec4(0.08f, 0.12f, 0.20f, 0.70f)));
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f * scale, 6.0f * scale));
             ImGui::BeginChild("chat_input_frame",
                               ImVec2(0, ImGui::GetFrameHeightWithSpacing() * 1.4f),
@@ -3600,10 +3678,45 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
         tex->Release();     /* RTV holds its own ref. */
         if (!rtv || w == 0 || h == 0) { dev->Release(); return; }
 
-        /* Frame dedup — if another ~fullscreen layer already drew this
-         * frame, skip. Otherwise we'd render the ImGui window multiple
-         * times into different layer textures = visible duplicate overlays
-         * that ghost through each other. */
+/* Frame dedup — if another ~fullscreen layer already drew this
+ * frame, skip. Otherwise we'd render the ImGui window multiple
+ * times into different layer textures = visible duplicate overlays
+ * that ghost through each other.
+ *
+ * v1.3 (2026-07-07) THRESHOLD DROPPED 12ms -> 3ms — TRANSPARENCY
+ * FLICKER FIX.
+ *
+ * The old 12ms threshold was safe for 60Hz (16.67ms/frame) but
+ * unintentionally clamped high-refresh-rate monitors:
+ *   120Hz -> 8.33ms/frame  < 12ms -> skip every other frame
+ *   144Hz -> 6.94ms/frame  < 12ms -> skip most frames
+ *   165Hz -> 6.06ms/frame  < 12ms -> skip most frames
+ *   240Hz -> 4.17ms/frame  < 12ms -> skip most frames
+ * On any skipped frame the layer texture goes back to raw app
+ * content (no overlay pixels blended in), which the user perceives
+ * as OVERLAY FLICKER — especially visible with transparency < 100%
+ * because the semi-transparent overlay makes any per-frame
+ * on/off flip trivially noticeable (whereas an opaque overlay
+ * blocks the underlying app content, masking the flip's visual
+ * impact somewhat).
+ *
+ * 3ms threshold rationale:
+ *   - Within-cycle multi-layer draws happen microseconds apart
+ *     (DWM calls Present sequentially for LDB main + LDB modal +
+ *     other fullscreen surfaces within one compose cycle). 3ms is
+ *     plenty to catch them.
+ *   - Real vsync frames on 60/120/144/165/200/240/300Hz monitors
+ *     all have frame periods >= 3.33ms so the threshold never
+ *     wrongly rejects a legitimate frame.
+ *   - 360Hz+ monitors (2.77ms/frame) would still hit a partial skip
+ *     but those are cutting-edge esports panels; if svcldb ever
+ *     ships to that user, revisit.
+ *
+ * Belt-and-suspenders: the layer-size gate in get_or_create_rtv
+ * (only accept layers within 95% of the largest seen) ALSO
+ * eliminates duplicates from smaller-but-still-fullscreen layers.
+ * So even if this threshold underfires, we won't get duplicate
+ * overlays from smaller fullscreen surfaces. */
         ULONGLONG now = GetTickCount64();
         if ((now - g_last_draw_tick) < FRAME_DEDUP_MS) {
             dev->Release();

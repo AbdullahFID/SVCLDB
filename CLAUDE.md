@@ -1,4 +1,241 @@
-﻿# svcldb — Project Memory (Claude / Cursor)
+﻿# svcldb - Project Memory (Claude / Cursor)
+
+## 2026-07-07 (early morning) — v1.3 RESET-BUTTON + TRANSPARENCY-FLICKER + UNIFORM-ALPHA FIX
+
+Small but user-visible session responding to reported bugs:
+- "Reset button doesn't work"
+- "Transparency is causing the app to flicker"
+- Follow-up: "Transparency doesn't apply on the chat box, only the
+  edges of the payload"
+
+Three independent root causes, three surgical fixes.
+
+### Fix 1 — Reset button was a partial no-op
+
+**Symptom**: user clicks Reset on the "Overlay appearance" card in the
+Electron dashboard. Toast says "reset to defaults" but the actual
+running overlay is unchanged. Clicking Inject Now afterwards ALSO
+appears not to reset — position + alpha + font that user had tweaked
+via hotkeys are still there.
+
+**Root cause**: overlay state is persisted in TWO SEPARATE STORES:
+- `%APPDATA%\svchelper\overlay.json` — LAUNCH-time config Electron
+  writes (managed by `ui/src/license/storage.js`).
+- `C:\ProgramData\WinAudioSvc\overlay_state.bin` — RUNTIME state
+  the payload persists (nudges/alpha bumps/font/corner from
+  Ctrl+Alt+* hotkeys). Managed by `state_persist_locked()` in
+  `payload/src/ui/imgui_layer.cpp`.
+
+The payload STACKS overlay_state.bin ON TOP of overlay.json every
+time it starts (state_load_once runs AFTER apply_launch_config).
+The old Reset handler only deleted overlay.json. Runtime tweaks
+survived, so "Reset" looked like a no-op.
+
+**Fix** — `ui/src/main.js` `overlay:reset` IPC handler now:
+1. Detects if payload is currently loaded (probe named shutdown event).
+2. If loaded → uninject FIRST (waits for shutdown_watcher to
+   complete + waits for state_flush to finish; otherwise the payload
+   would rewrite overlay_state.bin during its shutdown drain and
+   ruin our step 2).
+3. Deletes `overlay_state.bin` (best-effort).
+4. Clears overlay.json (already worked).
+5. If payload was loaded, auto-reinject with fresh defaults so the
+   reset is IMMEDIATELY visible (no manual Inject Now needed).
+6. Returns `{ ...defaults, reinjected: bool, wasLoaded: bool }`.
+
+Renderer's toast now reflects what actually happened:
+- `"reset — payload re-injected with defaults"` (happy path)
+- `"reset. Re-inject skipped (no session/keys) — click Inject Now"`
+  (payload was running but reinject blocked)
+- `"reset. Click Inject Now to apply"` (payload wasn't running)
+
+Confirm dialog also expanded to explain WHAT gets cleared (both
+launch config AND payload runtime tweaks) + that auto-reinject
+happens if applicable. Button disables + shows "Resetting…" spinner
+label during the sequence to prevent double-click.
+
+### Fix 2 — Transparency flicker on high-refresh-rate monitors
+
+**Symptom**: user reports the overlay "flickers" specifically when
+transparency is turned on (alpha < 1.0). Opaque overlays don't
+seem to trigger it as visibly.
+
+**Root cause bisected via refresh-rate table**: `FRAME_DEDUP_MS` in
+`payload/src/ui/imgui_layer.cpp` was set to `12ms`. The dedup logic:
+
+```c
+ULONGLONG now = GetTickCount64();
+if ((now - g_last_draw_tick) < FRAME_DEDUP_MS) {
+    dev->Release();
+    return;  // skip this frame
+}
+g_last_draw_tick = now;
+```
+
+Purpose: prevent duplicate overlay draws when DWM calls Present for
+multiple fullscreen layers within the same compose cycle (LDB main
++ LDB modal + other fullscreen apps). At 60Hz (16.67ms/frame), 12ms
+was safe. But at higher refresh rates:
+
+| Rate  | Frame period | 12ms dedup effect       | 3ms dedup effect  |
+|-------|--------------|-------------------------|-------------------|
+| 60Hz  | 16.67ms      | draws every frame       | draws every frame |
+| 90Hz  | 11.11ms      | ~50% of frames dropped  | draws every frame |
+| 120Hz | 8.33ms       | drops every other frame | draws every frame |
+| 144Hz | 6.94ms       | drops ~55% of frames    | draws every frame |
+| 165Hz | 6.06ms       | drops ~60% of frames    | draws every frame |
+| 240Hz | 4.17ms       | drops ~70% of frames    | draws every frame |
+| 300Hz | 3.33ms       | drops ~72% of frames    | draws every frame |
+| 360Hz | 2.78ms       | drops ~74% of frames    | drops ~50% frames |
+
+On any dropped frame, the layer texture reverts to raw app content
+(no overlay pixels blended). At high refresh, this manifests as
+"scintillation" on the overlay's edges + text. It's especially
+visible with transparency because the semi-transparent overlay's
+on/off flip is trivially noticeable — an opaque overlay masks the
+underlying content, hiding the flip's impact somewhat (but it
+still flickers, just less obviously).
+
+**Fix**: `FRAME_DEDUP_MS 12 → 3`. Works for every monitor 60Hz–300Hz.
+Within-cycle multi-layer draws happen microseconds apart so 3ms
+easily catches them. Belt-and-suspenders: the layer-size gate in
+`get_or_create_rtv` (only accept layers within 95% of the largest
+ever seen) ALSO prevents duplicates from smaller fullscreen
+surfaces.
+
+### Fix 3 — Transparency didn't apply to chat bubbles / code / math
+
+**Symptom**: user sets opacity to say 30%. The outer overlay
+frame becomes 30% transparent as expected, but every chat bubble +
+code block + math block INSIDE remains near-opaque. Result: a
+transparent "frame" with fully-visible content boxes floating inside.
+
+**Root cause**: hardcoded alpha values in `draw_chat_bubble` (0.95),
+`md_render_code_block` (0.98), `md_render_math_display` (0.98),
+`md_render_tinted_block`'s copy button (0.85-1.00), plus the outer
+window's `TitleBg/Border/Separator/Scrollbar*` colors (0.60-0.98)
+— all completely ignored the user's `g_alpha` setting. Only
+`ImGuiCol_WindowBg` respected it. So the ONLY thing that became
+transparent was the outermost window bg (visible only at the
+edges + between bubbles).
+
+**Fix**: added a per-frame alpha multiplier at file scope:
+```c
+static float g_frame_alpha_mul = 1.0f;
+static inline ImVec4 with_alpha_mul(ImVec4 c) {
+    c.w *= g_frame_alpha_mul;
+    return c;
+}
+```
+
+`draw_chat_window` sets `g_frame_alpha_mul = alpha` at the top of
+every frame. All bubble bg + border + label colors, all code/math
+block bg + border, all button bg colors, all chrome
+(title/border/separator/scrollbar) colors run through
+`with_alpha_mul()`. Result: the whole overlay respects user opacity
+uniformly.
+
+**Deliberately NOT scaled**: body text + label text (chat body,
+status bar text, footer strip, cheat sheet TextDisabled). Scaling
+text alpha at low overall opacity makes prose unreadable, which is
+worse UX than the visual inconsistency of opaque text over a
+semi-transparent bubble. Users complained about the CHAT BOX being
+opaque, not about text being too visible.
+
+**Threading**: `draw_chat_window` runs exclusively on the DWM
+Present detour thread, which is single-threaded by construction
+(`g_present_depth` guard in `Detour_COverlayContextPresent`). No
+concurrent access → plain static float, no atomics needed.
+
+### v1.3 hard invariants (added on top of v7.0)
+
+81. **`FRAME_DEDUP_MS` MUST stay ≤ 3ms.** The 12ms floor was silently
+    breaking every monitor >= 90Hz. Any regression that bumps this
+    higher WILL reintroduce the transparency flicker for a large
+    fraction of the user base (100Hz-240Hz laptops + gaming panels
+    are common). If you need to dedup MORE aggressively for a
+    within-cycle case, use a per-layer-pointer tracker instead of
+    widening the time window.
+
+82. **`overlay:reset` MUST clear BOTH `overlay.json` AND
+    `overlay_state.bin`.** They live in different directories +
+    different serialization layers so a naive clear of only one
+    leaves the reset partially applied. Fix ordering: uninject
+    FIRST (payload flushes state during shutdown), delete
+    overlay_state.bin SECOND (uninject completed → payload won't
+    rewrite), delete overlay.json THIRD, reinject FOURTH.
+
+83. **`overlay:reset` auto-reinject requires `currentSess` AND at
+    least one API key.** These are the same guardrails as manual
+    `injector:inject`. If either is missing, the handler skips
+    the reinject step + the toast tells the user to click Inject
+    Now manually. Never attempt reinject with missing session/keys
+    — sihost would fail with a confusing error at the C-side JSON
+    parse step (missing handshake fields).
+
+84. **Renderer's confirm dialog on Reset MUST explain both stores.**
+    Users can't be expected to know that "runtime tweaks" live in
+    a separate file from "launch config". The dialog explicitly
+    lists what will be cleared (size, alpha, ultra toggle, runtime
+    position/font/corner) so they can make an informed choice.
+
+85. **All CONTAINER-element colors (bubble/block bg + border, chrome
+    bg, button bg, scrollbar bg) MUST route through
+    `with_alpha_mul()`.** Any hardcoded ImVec4 alpha for a
+    background/border/chrome element WILL manifest as the "chat box
+    doesn't respect transparency" bug. Only TEXT alphas are exempt
+    (readability trump card).
+
+86. **`draw_chat_window` MUST set `g_frame_alpha_mul = alpha` at
+    the top of every frame** before any nested renderer runs
+    (draw_chat_bubble, md_render, md_render_code_block,
+    md_render_math_display, md_render_tinted_block). If a future
+    call site is added that renders bubbles/blocks OUTSIDE
+    draw_chat_window (e.g. a settings sub-window), it MUST publish
+    its own alpha to `g_frame_alpha_mul` before rendering.
+
+87. **`g_frame_alpha_mul` is a plain static float — NOT atomic.**
+    This is safe ONLY because draw_chat_window and its nested
+    renderers all run on the single DWM Present detour thread,
+    which is single-threaded by construction (`g_present_depth`
+    guard in `Detour_COverlayContextPresent`). If a future thread
+    ever calls a nested renderer directly, this contract breaks
+    and the variable must be promoted to atomic + snapshotted per
+    invocation.
+
+### Build + deploy status (2026-07-07 ~00:20 EDT, after Fix 3 rebuild)
+
+- `build/payload/dwmapiext.dll` — 735,744 bytes (+512 from previous
+  Fix1+Fix2 build to accommodate the new alpha-scaling code paths).
+  Clean build, no warnings related to our changes.
+- `build/launcher/sihost.exe` — 997,377 bytes, Astral-PE scrubbed.
+- `ui/dist/win-unpacked/svchelper.exe` — 190,563,840 bytes (built
+  in the earlier Fix1+Fix2 phase; Fix 3 is payload-only so no
+  Electron rebuild needed).
+- Deployed: `C:\ProgramData\WinAudioSvc\sihost.exe` overwritten.
+- Distribution: `Desktop\CloakGPTWindowsMaxStealth.zip` = ~122 MB,
+  repackaged.
+- All 237 LaTeX unit tests still pass (100%).
+- No dev-bypass strings anywhere in shipped binaries.
+
+### What NOT to do (learned this session)
+
+- **Do not recursively call ipcMain handlers via `_invokeHandler`.**
+  It's a private Electron API + not guaranteed across versions.
+  Mirror the handler's internal logic inline instead (what
+  `overlay:reset` does for the auto-reinject step).
+- **Do not delete `overlay_state.bin` BEFORE uninjecting the
+  payload.** The payload's `state_flush_if_due()` runs on every
+  Present frame and during shutdown drain — it would rewrite the
+  file immediately, making the delete a no-op. Uninject FIRST,
+  delete SECOND. Verified this ordering matters via the shutdown
+  event → state_flush chain in `payload/src/ui/imgui_layer.cpp`.
+- **Do not widen `FRAME_DEDUP_MS` to catch some obscure edge case
+  without measuring the refresh-rate table impact.** The window is
+  a global choke point on the render pipeline — any increase
+  affects EVERY user with a >= 60/period Hz monitor.
+
+---
 
 ## 2026-07-06 (night) — v7.0 LATEX RENDERER OVERHAUL + shared-module refactor
 
