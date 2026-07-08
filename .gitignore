@@ -28,6 +28,7 @@ svcldb_test_openai.env
 .secrets/
 tools/keylogger_probe_*.log*
 tools/keylogger_probe*.obj
+tools/keylogger_probe*.exe
 config.dat
 offsets.blob
 state.dat
