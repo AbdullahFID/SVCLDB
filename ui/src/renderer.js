@@ -444,6 +444,62 @@ document.getElementById('btn-nosub-billing').addEventListener('click', () => {
   window.svc.shell.openExternal('https://cloakgpt.ca/dashboard');
 });
 
+// v1.6 (2026-07-14): "Reset local data & sign in fresh" escape hatch.
+// Wipes session, sub cache, HWID cache, onboarding flag WITHOUT touching
+// paid installation (C binaries, overlay state, api keys preserved).
+// Then re-runs OAuth from scratch. For users stuck in HWID-drift /
+// stale-cache / rejected-token loops (see subscription.js v6.4 notes).
+document.getElementById('btn-nosub-reset').addEventListener('click', async () => {
+  const el = document.getElementById('btn-nosub-reset');
+  if (!el || el.classList.contains('busy')) return;
+  const confirmed = confirm(
+    'Reset all local CloakGPT data?\n\n' +
+    'This will clear:\n' +
+    '  • Your saved session (you will need to sign in again)\n' +
+    '  • The cached subscription state\n' +
+    '  • The cached hardware fingerprint\n' +
+    '  • The onboarding tutorial flag\n\n' +
+    'This will NOT touch:\n' +
+    '  • Your API keys\n' +
+    '  • Your custom hotkeys\n' +
+    '  • Your overlay appearance settings\n' +
+    '  • The installed CloakGPT program itself\n\n' +
+    'The overlay will be uninjected if currently running. Continue?'
+  );
+  if (!confirmed) return;
+
+  const origLabel = el.textContent;
+  el.classList.add('busy');
+  el.textContent = 'Resetting local data…';
+  showLoading('Resetting local data…', 'Clearing session, cache, and hardware fingerprint.');
+  try {
+    const r = await window.svc.license.resetLocalData();
+    hideLoading();
+    el.classList.remove('busy');
+    el.textContent = origLabel;
+    if (!r || !r.ok) {
+      const failed = (r && Array.isArray(r.steps))
+        ? r.steps.filter(s => !s.ok).map(s => s.name).join(', ')
+        : 'unknown';
+      toast(`Reset partially failed: ${failed}. Please restart CloakGPT.`, 'err');
+      return;
+    }
+    toast('Local data cleared. Sign in fresh from the next screen.', 'ok');
+    // Route back to login. The user will click "Sign in with Google" and
+    // start a fresh OAuth flow — no session, no cache, no stale HWID.
+    state.session = null;
+    state.subscription = null;
+    _renderLoginDeviceId();
+    clearLoginError();
+    showScreen('login');
+  } catch (e) {
+    hideLoading();
+    el.classList.remove('busy');
+    el.textContent = origLabel;
+    toast(`Reset failed: ${e.message || e}`, 'err');
+  }
+});
+
 document.getElementById('btn-nosub-retry').addEventListener('click', async () => {
   showLoading('Re-checking subscription…', 'Querying Supabase for active grants + subscriptions.');
   try {

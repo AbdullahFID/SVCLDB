@@ -113,7 +113,27 @@ function start(deps) {
         onExpired('license_server_schema_error', { serverError: status.error });
         return;
       }
-      // Explicit inactive — lock out.
+      // v6.4 (2026-07-14): if sub check returned kind=network or
+      // kind=clock_drift, that's TRANSIENT (network) or USER-FIXABLE
+      // (clock). Do NOT interpret as "subscription inactive" — the
+      // subscription state is UNKNOWN. Feed into the failure counter
+      // like a thrown error so offline-grace + backoff kick in
+      // instead of an immediate lockout.
+      const errKind = status && status.error && status.error.kind;
+      if (errKind === 'network' || errKind === 'clock_drift') {
+        console.log(`[revalidation] transient error (${errKind}); ` +
+                    `routing through failure handler for backoff + grace-cache`);
+        // Re-throw so the catch below handles it uniformly with fetch
+        // rejects — that block does the offline-grace lookup + failure
+        // count + eventual lockout. Do NOT increment counter here —
+        // the catch will do it exactly once.
+        const e = new Error(status.error.message || errKind);
+        e.kind = errKind;
+        if (typeof status.error.drift === 'number') e.drift = status.error.drift;
+        throw e;
+      }
+      // Explicit inactive — no rows AND no error → user has no active
+      // subscription. Lock out.
       console.log('[revalidation] subscription NOT ACTIVE — locking out');
       stop();
       onExpired('subscription_inactive');

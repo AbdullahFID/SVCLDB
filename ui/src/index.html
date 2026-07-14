@@ -20,7 +20,7 @@
     <div class="brand">
       <div class="logo">C</div>
       <span class="name">CloakGPT</span>
-      <span class="ver" id="titlebar-ver">v1.2</span>
+      <span class="ver" id="titlebar-ver">v1.6</span>
     </div>
     <div class="actions">
       <button id="tb-min" title="Minimize" aria-label="Minimize">
@@ -74,7 +74,7 @@
             Browser didn't open? <a id="copy-auth-url">Copy sign-in URL</a>
           </div>
           <div class="device-id" id="login-device"></div>
-          <div class="app-version" id="login-app-ver">CloakGPT v1.2.0</div>
+          <div class="app-version" id="login-app-ver">CloakGPT v1.6.0</div>
         </div>
       </div>
     </section>
@@ -186,6 +186,13 @@
           </div>
           <div class="status-line"><span class="dot"></span><span id="nosub-status">Subscription status: <b>not_found</b></span></div>
           <p class="helper">Wrong Google account? <a id="nosub-switch-account">Sign out</a> and choose a different one on the next Google sign-in.</p>
+          <!-- v1.6 (2026-07-14): last-resort escape hatch for users stuck in
+               HWID-drift + stale-cache + rejected-token loops. Wipes every
+               cached artifact (session, sub cache, HWID cache, onboarding
+               flag) without touching paid installation. Prompts fresh OAuth. -->
+          <div class="reset-local-row">
+            <a id="btn-nosub-reset" class="reset-local-link">Still stuck? Reset local data &amp; sign in fresh</a>
+          </div>
           <div class="device-id" id="nosub-device"></div>
         </div>
       </div>

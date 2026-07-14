@@ -1,10 +1,42 @@
 // ═══════════════════════════════════════════════════════════════
 // subscription.js — Supabase subscription check + HMAC-signed cache.
 //
-// v4.9 (2026-07-06 — ROOT-CAUSE FIX for HTTP 400 on lifetime users)
+// v6.4 (2026-07-14 — ROOT-CAUSE FIX for silent clock-drift lockout)
+//
+//   Reported by user jay.perkerson@gmail.com: dashboard showed
+//   "No active subscription — Couldn't reach the license server"
+//   even though Supabase-side row was active, RLS was fine, and the
+//   REST/OAuth queries all returned HTTP 200 (verified via Supabase
+//   API logs at 2026-07-14 02:48:53 UTC).
+//
+//   Root cause: `_validateDrift` throws a special Error with
+//   `err.kind='clock_drift'` when the client's wall clock is >
+//   MAX_CLOCK_DRIFT_SECS off from Supabase's Date header. But the
+//   surrounding catch block called `_mkNetErr(endpoint, e)` which
+//   hard-coded `kind: 'network'` regardless of what the caught error
+//   actually classified itself as. Result: drift errors were
+//   MISCLASSIFIED as network errors → renderer showed the generic
+//   "couldn't reach" copy instead of the clock-drift-specific copy
+//   that already existed and was never firing.
+//
+//   Fix:
+//     1. `_mkNetErr` now preserves `e.kind` and `e.drift` if the
+//        thrown error already classified itself.
+//     2. Added exponential-backoff retry loop (3 attempts,
+//        600ms → 1200ms → 2400ms + jitter) — but ONLY for kind
+//        'network'. http/schema/clock_drift are terminal.
+//     3. Per-request timeout bumped 15s → 20s to accommodate slow
+//        cold-start Supabase pool connections.
+//
+//   MAX_CLOCK_DRIFT_SECS also bumped in config.js from 300 → 3600
+//   because 5 min was aggressive for real-world Windows w32time
+//   drift (30 min is common when Sync has failed silently). 1 h
+//   still catches egregious replay while accommodating legit users.
+//
+// v4.9 (2026-07-06) — first ROOT-CAUSE FIX (still active):
 //
 //   Supabase schema (confirmed via server-side inspection of project
-//   rrrpkmzdnaodmvsuxdkw, see docs handoff and CLAUDE.md v4.9 entry):
+//   rrrpkmzdnaodmvsuxdkw):
 //
 //     subscriptions columns:
 //       id, user_id, email, stripe_customer_id, stripe_subscription_id,
@@ -18,34 +50,26 @@
 //
 //     subscriptions has NO suspension_reason column.
 //     user_suspensions table DOES NOT EXIST.
-//     banned_users table DOES NOT EXIST (Mac project only).
 //
 //     manual_grants columns:
 //       id, email, plan_type, status, granted_by, expires_at, notes,
 //       revoked_at, created_at
 //     RLS: `USING (email = (auth.jwt() ->> 'email'))` — keyed by JWT
 //     email claim, NOT by user_id.
-//     status enum: 'active' | 'revoked' (nothing else).
-//
-//   Prior v4.6 subscription.js selected `suspension_reason` and filtered
-//   `status=in.(active,cancelling,suspended)` — the extra column caused
-//   PostgREST to return 42703 (column does not exist) → 400. Lifetime
-//   users saw "No active subscription — subscriptions http 400" in the
-//   nosub screen (see screenshot 2026-07-06). This file removes both
-//   the phantom column and the phantom status value.
+//     status enum: 'active' | 'revoked' only.
 //
 // Query order:
 //   1. manual_grants — lifetime email-whitelist (empty for most users
-//      because we migrated grants into subscriptions with is_lifetime=true
-//      + is_manual_grant=true).
-//   2. subscriptions — active + cancelling. Also picks up lifetime
-//      grants (is_lifetime=true) — no need for a separate lifetime
-//      query.
+//      because migrated grants live in subscriptions).
+//   2. subscriptions — active + cancelling. Picks up lifetime grants
+//      via is_lifetime=true — no separate lifetime query needed.
 //
-// Signed cache (unchanged from v4.6):
+// Signed cache (v6 semantics):
 //   signSubCache(sub, hwid) → HMAC-SHA256(LICENSE_RESPONSE_SECRET,
-//                                          JSON(sub) || hwid).
+//                                          JSON(payload) || hwid).
 //   verifySubCache(cached, hwid) → timing-safe compare.
+//   v6.4: caller may also pass a fallback HWID list — see
+//   verifySubCacheAgainstAny() below.
 // ═══════════════════════════════════════════════════════════════
 
 const crypto = require('crypto');
@@ -59,13 +83,30 @@ const {
 // ended yet — they paid, they get service through the end.
 //
 // `past_due` intentionally excluded: means Stripe couldn't charge the
-// renewal and is retrying — we treat those as inactive until Stripe
-// recovers the payment. Matches hooksdll behavior.
+// renewal and is retrying — treat as inactive until Stripe recovers
+// the payment. Matches hooksdll behavior.
 const ACTIVE_STATUS_FILTER = 'in.(active,cancelling)';
 
-async function checkSubscription(accessToken) {
-  if (!accessToken) throw new Error('No access token');
+// v6.4: request timeout bumped 15s → 20s. Cold-start PostgREST
+// connections during off-peak hours can take ~10-12s to respond;
+// 15s was cutting it close for users on slow wifi.
+const REQUEST_TIMEOUT_MS = 20_000;
 
+// v6.4: retry policy for TRANSIENT failures (network only).
+// Terminal errors (http 4xx, schema mismatch, clock drift) do not
+// retry — they won't self-heal by trying again.
+const MAX_RETRY_ATTEMPTS = 3;
+const RETRY_BASE_DELAY_MS = 600;
+const RETRY_JITTER_MS = 300;
+
+async function _sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Run a single sub-check pass. Returns the full result shape:
+//   { active, plan, expires_at, is_lifetime, status, server_time, error? }
+// No throws — all errors are captured into `error`. See top-file comment.
+async function _checkSubscriptionOnce(accessToken) {
   const headers = {
     'apikey':        SUPABASE_ANON_KEY,
     'Authorization': `Bearer ${accessToken}`,
@@ -79,10 +120,9 @@ async function checkSubscription(accessToken) {
 
   // 1. Manual grants (email-keyed lifetime allow-list). Empty for most
   //    users; retained for backward compat with pre-migration grants.
-  //    RLS matches by JWT `email` claim, no explicit user_id filter.
   try {
     const url = `${SUPABASE_URL}/rest/v1/manual_grants?select=plan_type,status,expires_at&status=eq.active&revoked_at=is.null`;
-    const resp = await fetch(url, { headers, signal: AbortSignal.timeout(15_000) });
+    const resp = await fetch(url, { headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
     if (resp.ok) {
       serverTime = _serverTime(resp);
       _validateDrift(serverTime, requestTime, 'manual_grants');
@@ -115,11 +155,11 @@ async function checkSubscription(accessToken) {
   //      WHERE user_id = auth.uid()        -- via RLS
   //        AND status IN ('active', 'cancelling')
   //
-  //    This picks up BOTH normal paying subscribers AND lifetime
-  //    grants (which live in subscriptions with is_lifetime=true).
+  //    Picks up BOTH normal paying subscribers AND lifetime grants
+  //    (which live in subscriptions with is_lifetime=true).
   try {
     const url = `${SUPABASE_URL}/rest/v1/subscriptions?select=plan_type,status,current_period_end,is_lifetime&status=${ACTIVE_STATUS_FILTER}`;
-    const resp = await fetch(url, { headers, signal: AbortSignal.timeout(15_000) });
+    const resp = await fetch(url, { headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
     if (resp.ok) {
       serverTime = _serverTime(resp);
       _validateDrift(serverTime, requestTime, 'subscriptions');
@@ -152,11 +192,48 @@ async function checkSubscription(accessToken) {
     is_lifetime: false,
     status: 'no_subscription',
     server_time: serverTime || requestTime,
-    // Structured error: { kind: 'http'|'network'|'schema', statusCode, endpoint, message, body }.
-    // Downstream code (main.js license:load) uses `.kind` and `.statusCode`
-    // instead of regex-matching a stringly-typed field.
+    // Structured error: { kind: 'http'|'network'|'schema'|'clock_drift',
+    //                      statusCode, endpoint, message, body, drift? }.
     error: lastError,
   };
+}
+
+// v6.4 (2026-07-14): public entry point wraps _checkSubscriptionOnce
+// with retry-on-transient-network-failure. Terminal errors (http 4xx,
+// schema mismatch, clock drift) return immediately — they won't
+// self-heal by trying again.
+async function checkSubscription(accessToken) {
+  if (!accessToken) throw new Error('No access token');
+
+  let lastResult = null;
+  for (let attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
+    lastResult = await _checkSubscriptionOnce(accessToken);
+
+    // Success — return immediately.
+    if (lastResult && lastResult.active) return lastResult;
+
+    const err = lastResult && lastResult.error;
+
+    // Genuinely no subscription (query succeeded, returned zero rows).
+    // Nothing to retry.
+    if (!err) return lastResult;
+
+    // Terminal error — client-server mismatch (schema), user clock skew
+    // (clock_drift), or non-retryable HTTP status. These won't be fixed
+    // by another attempt. See invariant docs in CLAUDE.md.
+    if (err.kind !== 'network') return lastResult;
+
+    // Transient network failure — retry with exponential backoff + jitter.
+    if (attempt < MAX_RETRY_ATTEMPTS) {
+      const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+      const jitter = Math.floor(Math.random() * RETRY_JITTER_MS);
+      console.log(`[subscription] transient network failure (attempt ${attempt}/${MAX_RETRY_ATTEMPTS}); retry in ${delay + jitter}ms`);
+      await _sleep(delay + jitter);
+    }
+  }
+
+  console.log(`[subscription] all ${MAX_RETRY_ATTEMPTS} attempts exhausted, giving up`);
+  return lastResult;
 }
 
 // ─── Error shaping ──────────────────────────────────────────────────
@@ -168,6 +245,7 @@ async function checkSubscription(accessToken) {
 //   .endpoint    — 'manual_grants' | 'subscriptions'
 //   .message     — human-readable summary
 //   .body        — first 250 bytes of response body (schema hints from PostgREST)
+//   .drift       — seconds of clock skew (present only for kind='clock_drift')
 function _mkErr(status, endpoint, body) {
   // PostgREST returns 42703 (column does not exist) as 400 with a
   // JSON body {code, message, hint, details}. Detect + mark as schema
@@ -186,14 +264,25 @@ function _mkErr(status, endpoint, body) {
   };
 }
 
+// v6.4 (2026-07-14): PRESERVE the thrown error's `.kind` if it already
+// classified itself. The classic bug pre-v6.4: `_validateDrift` threw
+// with `err.kind='clock_drift'` but this function hard-coded 'network',
+// clobbering the classification. The renderer's clock-drift-specific
+// copy therefore never fired, and every drift user saw the generic
+// "Couldn't reach the license server" instead. Fix: sniff `e.kind`
+// and `e.drift` from the thrown error.
 function _mkNetErr(endpoint, e) {
-  return {
-    kind: 'network',
+  const preClassified = e && typeof e.kind === 'string';
+  const kind = preClassified ? e.kind : 'network';
+  const out = {
+    kind,
     statusCode: null,
     endpoint,
-    message: `${endpoint}: ${e.message || String(e)}`,
+    message: `${endpoint}: ${e && e.message ? e.message : String(e)}`,
     body: '',
   };
+  if (e && typeof e.drift === 'number') out.drift = e.drift;
+  return out;
 }
 
 async function _readBody(resp) {
@@ -207,13 +296,14 @@ function _serverTime(resp) {
   return isNaN(t.getTime()) ? null : Math.floor(t.getTime() / 1000);
 }
 
-// v4.4+ — throw instead of log-only. Documented in CLAUDE.md as
-// invariant #30. Was log-only in v4.3 which allowed replay attacks.
+// v4.4+ — throw instead of log-only. Was log-only in v4.3 which
+// allowed replay attacks. Downstream MUST preserve err.kind (see
+// _mkNetErr) or the drift-specific renderer copy never fires.
 function _validateDrift(serverTime, requestTime, ctx) {
   if (!serverTime) return;
   const drift = Math.abs(serverTime - requestTime);
-  if (drift > (MAX_CLOCK_DRIFT_SECS || 300)) {
-    console.log(`[subscription] ${ctx}: clock drift ${drift}s — reject`);
+  if (drift > (MAX_CLOCK_DRIFT_SECS || 3600)) {
+    console.log(`[subscription] ${ctx}: clock drift ${drift}s — reject (max=${MAX_CLOCK_DRIFT_SECS}s)`);
     const err = new Error(`clock_drift_${drift}s`);
     err.kind = 'clock_drift';
     err.drift = drift;
@@ -226,11 +316,17 @@ function _validateDrift(serverTime, requestTime, ctx) {
 // The cache stores the entire subscription-check response along with:
 //   _cachedAt: unix seconds when it was cached
 //   _sig:      base64url HMAC-SHA256(secret, JSON(payload) || hwid)
+//   _hwid:     (v6.4) the HWID the sig was signed against, so we can
+//              recognize a cache that was signed on this machine with
+//              a NOW-ROTATED HWID and heal it in place.
 //
 // signSubCache() produces the signature.
 // verifySubCache() checks it BEFORE trusting a cached response, so
 // a lifted subscription.enc from a different machine (different HWID)
 // or a mutated JSON fails.
+// verifySubCacheAgainstAny() (v6.4) tries the cache against a list of
+// candidate HWIDs — used to survive HWID rotation on the same machine
+// (see device.js Win11 wmic deprecation notes).
 function signSubCache(sub, hwid) {
   const payload = JSON.stringify({
     active:      sub.active,
@@ -247,12 +343,14 @@ function signSubCache(sub, hwid) {
     .digest('base64url');
 }
 
-// Attach _cachedAt + _sig to a subscription result. Returns the
-// mutated `sub` object for caller convenience.
+// Attach _cachedAt + _sig (+ _hwid tag for v6.4 rotation-tolerance)
+// to a subscription result. Returns the mutated `sub` object for
+// caller convenience.
 function attachSigToCache(sub, hwid) {
   if (!sub) return sub;
   sub._cachedAt = Math.floor(Date.now() / 1000);
-  sub._sig = signSubCache(sub, hwid);
+  sub._sig      = signSubCache(sub, hwid);
+  sub._hwid     = hwid || '';
   return sub;
 }
 
@@ -270,7 +368,37 @@ function verifySubCache(cached, hwid) {
   } catch { return false; }
 }
 
+// v6.4 (2026-07-14): try to verify a cache against ANY of the provided
+// candidate HWIDs. Returns { ok, matchedHwid } — matchedHwid is the
+// specific value that verified. Used to survive HWID rotation on the
+// same physical machine (e.g. Windows 11 22H2+ where `wmic csproduct
+// get uuid` is deprecated and falls through to different sources across
+// runs). Caller then re-signs with the current preferred HWID.
+//
+// Security note: this ONLY helps IF the attacker cannot enumerate the
+// HWIDs a machine can produce — but since HWIDs derive from local
+// hardware/registry/hostname the "candidate list" IS the machine's
+// identity. An attacker who has all those inputs already has the box.
+// Using a candidate list widens the accept set trivially compared to
+// the actual hardware fingerprint.
+function verifySubCacheAgainstAny(cached, hwidCandidates) {
+  if (!cached || !cached._sig || !cached._cachedAt) return { ok: false, matchedHwid: null };
+  const list = Array.isArray(hwidCandidates) ? hwidCandidates : [hwidCandidates];
+  for (const cand of list) {
+    if (!cand) continue;
+    try {
+      if (verifySubCache(cached, cand)) {
+        return { ok: true, matchedHwid: cand };
+      }
+    } catch { /* try next */ }
+  }
+  return { ok: false, matchedHwid: null };
+}
+
 module.exports = {
   checkSubscription,
-  signSubCache, verifySubCache, attachSigToCache,
+  signSubCache, verifySubCache, verifySubCacheAgainstAny, attachSigToCache,
+  // Exported for main.js's HWID auto-heal path (see v6.4 CLAUDE.md
+  // entry). Not part of the renderer contract.
+  _validateDrift, _mkNetErr, _mkErr,
 };

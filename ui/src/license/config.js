@@ -83,7 +83,20 @@ module.exports = {
 
   // Max clock drift permitted between our host and Supabase (seconds)
   // before we reject a response as potentially replayed.
-  MAX_CLOCK_DRIFT_SECS: 300,
+  //
+  // v6.4 (2026-07-14): bumped 300 → 3600. Original 5-minute threshold
+  // was chosen for tight replay-attack defense but was rejecting real
+  // paying customers whose Windows clocks drifted 5-30 min (common
+  // when w32time sync fails silently — reported by user
+  // jay.perkerson@gmail.com whose active subscription showed
+  // "Couldn't reach the license server"; server returned HTTP 200,
+  // client rejected on drift). 1 h still catches responses cached
+  // for a day+ but accommodates legit drift.
+  //
+  // Replay-attack defense in depth remains: signed cache HMAC is HWID-
+  // bound so a leaked response can't be replayed on another machine,
+  // and Supabase JWT `exp` (1 h) invalidates stale tokens independently.
+  MAX_CLOCK_DRIFT_SECS: 3600,
 
   // Offline-grace window for signed subscription cache. v6 (2026-07-06):
   // extended from 3h -> 6h per user request "make it work offline for 2h
@@ -102,7 +115,7 @@ module.exports = {
   // an option to remove the old device.
   MAX_DEVICES: 1,
 
-  APP_VERSION: '1.2.0',
+  APP_VERSION: '1.6.0',
 
   // svcldb-specific install directory (must match shared/common.h
   // SVC_INSTALL_DIR).

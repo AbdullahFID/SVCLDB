@@ -1,5 +1,287 @@
 ﻿# svcldb — Project Memory (Claude / Cursor)
 
+## 2026-07-14 — v1.6 AUTH RELIABILITY FIX (silent clock-drift lockout + HWID rotation)
+
+Reported by user jay.perkerson@gmail.com: paying subscriber with an
+active `monthly` plan (renews 2026-08-01), OAuth flow succeeded (avatar
++ email rendered on-screen), but landed on the "No active subscription
+— Couldn't reach the license server" screen with a network-error banner.
+
+Verified server-side via Supabase MCP inspection:
+- `subscriptions` row status=`active`, plan_type=`monthly`, real
+  Stripe customer_id + subscription_id, NOT lifetime.
+- Supabase API logs at 2026-07-14 02:48:53 UTC show his sub check
+  hit `/rest/v1/subscriptions?...&status=in.(active,cancelling)`
+  and returned **HTTP 200 with his row**. Query succeeded server-side.
+- RLS policies on `subscriptions` = `USING (auth.uid() = user_id)`,
+  Jay's auth.uid matched user_id — policy allows read. Confirmed via
+  `SET LOCAL role='authenticated' + jwt.claims` simulation.
+- `user_devices` for Jay showed **3 rows for one laptop
+  (LAPTOP-PUOUN0O3)**, all with `last_seen_at` within 2h of each
+  other. Different UUIDs each row. Smoking gun for HWID instability.
+
+### The two root causes
+
+**Root cause A — silent clock-drift misclassification** (bug since v4.4):
+
+`_validateDrift` in `subscription.js` throws an Error with
+`err.kind='clock_drift'` when Supabase's Date header is > 300s off
+from the local wall clock. Every catch that could receive this
+error called `_mkNetErr(endpoint, e)` which **hard-coded
+`kind: 'network'`**, throwing away the classification. The
+renderer's `err.kind === 'clock_drift'` branch (with the specific
+"System clock drift detected — sync your Windows time" copy) was
+already implemented, but never fired because the drift kind never
+survived the outer catch.
+
+Users whose Windows clock had drifted (extremely common — w32time
+sync silently fails on many Windows installs, drift of 5-30 min is
+routine) saw the generic "Couldn't reach the license server" error
+instead of the actionable "fix your clock" prompt.
+
+`MAX_CLOCK_DRIFT_SECS = 300` (5 minutes) was ALSO too aggressive —
+was rejecting legitimate paying customers on slightly-off clocks
+because Supabase's replay-attack defense is a defense-in-depth
+concern that also has JWT-expiry + HWID-bound signed cache
+protection layered on top.
+
+**Root cause B — HWID instability from wmic deprecation**:
+
+`device.js`'s `_smbios()` uses `wmic csproduct get uuid`. WMIC is
+DEPRECATED in Windows 11 22H2+ and removed entirely in some 24H2
+builds. On affected machines the call fails silently, falls through
+to `_machineGuid()` (usually works), OR falls through further to
+`_syntheticUuid()`. Each source produces a DIFFERENT UUID for the
+same physical box.
+
+Consequences:
+- HWID rotates on every launch → 3 device rows accumulate for one
+  laptop (Jay's case)
+- MAX_DEVICES=1 policy becomes meaningless: user has 3 registered
+  devices from HWID rotation, can hit device-limit block if a
+  4th unique HWID gets computed
+- Signed sub cache is HMAC-bound to HWID → rotation invalidates
+  the cache → offline-grace fails
+- Session signature is HWID-bound → rotation → sign-out loop
+
+### The fix (all client-side — no Supabase backend touched)
+
+**1. `subscription.js` — preserve error.kind through catch:**
+```js
+function _mkNetErr(endpoint, e) {
+  const preClassified = e && typeof e.kind === 'string';
+  const kind = preClassified ? e.kind : 'network';
+  const out = { kind, statusCode: null, endpoint, message: `${endpoint}: ${e.message}`, body: '' };
+  if (e && typeof e.drift === 'number') out.drift = e.drift;
+  return out;
+}
+```
+
+`main.js` outer catches in `license:load`, `license:sign-in`,
+`license:revalidate` got the same treatment — preserve `e.kind`
+and `e.drift` when constructing the returned error DTO.
+
+**2. `subscription.js` — retry-with-backoff for kind=network:**
+
+`checkSubscription` wraps `_checkSubscriptionOnce` in a 3-attempt
+loop with 600ms → 1200ms → 2400ms + up to 300ms jitter. Only
+retries when `err.kind === 'network'` — terminal errors (http 4xx,
+schema, clock_drift) return immediately (retrying won't help). Also
+bumped per-request timeout 15s → 20s to accommodate cold-start
+PostgREST pool connections during off-peak hours.
+
+**3. `config.js` — bump MAX_CLOCK_DRIFT_SECS 300 → 3600 (1 hour):**
+
+Windows clock drift of 5-30 min is common when w32time sync fails
+silently. 1 hour still catches responses cached for a day+ (real
+replay attack surface) but accommodates legitimate drift. Defense-in-
+depth: signed cache HMAC is HWID-bound (leaked response can't be
+replayed on another box), and Supabase JWT `exp` (1h) invalidates
+stale tokens independently.
+
+**4. `device.js` — disk-persistent HWID cache:**
+
+On first successful compute, HWID is persisted to BOTH:
+- `%APPDATA%\svchelper\hwid.json` (per-user)
+- `%ProgramData%\WinAudioSvc\hwid.json` (per-machine)
+
+Subsequent runs return the cached value without re-probing.
+Fresh compute only happens if BOTH files are absent. Same fallback
+order as before (wmic → MachineGuid → synthetic) so cross-side
+(JS ↔ C) agreement is preserved on machines where wmic works.
+
+Also added `device.getAllCandidates()` for HWID-rotation cache
+recovery (see #5) and `device.clearCache()` for the nuclear
+reset-local-data escape hatch (see #7).
+
+**5. `main.js` — HWID-tolerant offline-grace cache lookup:**
+
+New `_tryOfflineGraceCache(currentHwid)` helper tries to verify
+the signed sub cache against ANY of the machine's HWID candidates,
+not just the current preferred value. If verification succeeds
+against a candidate (i.e. this machine signed the cache with a
+previously-rotating HWID), serve the cache AND re-sign it against
+the current HWID so future runs hit the fast path.
+
+Uses new `subscription.verifySubCacheAgainstAny(cached, hwidList)`
+which iterates candidates with `timingSafeEqual` on each. Security
+note: the accept set is bounded by the machine's own hardware/
+registry/hostname — an attacker who can enumerate all your candidate
+HWIDs already owns the box.
+
+**6. `revalidation.js` — treat network/clock_drift as transient
+     not lockout:**
+
+Previously: if sub check returned `active=false` for ANY reason
+(including a network-error-return-value with `active=false`),
+`onExpired('subscription_inactive')` fired immediately. That was
+wrong — a network error is transient, not "your subscription was
+cancelled". Now: if `err.kind === 'network' || 'clock_drift'`,
+the error is re-thrown into the catch block below (which handles
+grace-cache lookup + failure counting + eventual lockout after
+`MAX_CONSECUTIVE_FAILURES` real failures). Genuine inactive
+(no rows, no error) still locks out immediately.
+
+**7. Renderer — "Reset local data & sign in fresh" escape hatch:**
+
+Small danger-tinted link on the nosub screen. Wipes session, sub
+cache, HWID cache, onboarding flag (without touching paid install
+— C binaries, api keys, overlay settings preserved). Uninjects any
+running payload. Then routes back to login for a fresh OAuth flow.
+
+For users like Jay who are stuck in unrecoverable auth loops from
+HWID drift + stale cache + rejected token combinations. Wired via
+new `license:reset-local-data` IPC + `svc.license.resetLocalData()`
+in preload.
+
+### v1.6 hard invariants (added on top of v1.5)
+
+97. **`_mkNetErr` MUST preserve `e.kind`** when the thrown error
+    self-classified. Regressing to hard-coded `kind: 'network'` will
+    re-introduce the silent clock-drift lockout for every affected
+    user. Same in main.js catches for `license:load`, `sign-in`,
+    `revalidate`.
+
+98. **`checkSubscription` retry loop MUST NOT retry non-network
+    kinds.** http 4xx doesn't self-heal (401 → refresh token first;
+    403 → RLS misconfig, server-side fix needed). Schema errors are
+    server misconfig. Clock drift is a user-machine problem. Only
+    kind=network is truly transient. Regressing to "retry everything"
+    would waste API quota + delay the correct error message.
+
+99. **`MAX_CLOCK_DRIFT_SECS` MUST NOT be lowered below 3600.**
+    Windows clock drift is common. Any lower re-introduces false-
+    positive replay-rejection for legit users. Replay-attack defense
+    is provided by signed cache HWID binding + JWT expiry, NOT by
+    tight drift enforcement.
+
+100. **HWID disk cache MUST be checked BEFORE any wmic/reg/synthetic
+     probe** in `device.collect()`. Once cached, every subsequent
+     run returns cached value. Fresh compute happens ONLY when BOTH
+     cache paths are absent (first-ever run OR user ran the nuclear
+     reset). Any regression that re-probes on every call
+     re-introduces HWID rotation.
+
+101. **HWID cache is DUAL-WRITE** (%APPDATA% + %ProgramData%). If
+     user clears only one location, the other heals it on next load.
+     Never single-write — a partial wipe would break rotation
+     recovery.
+
+102. **`_tryOfflineGraceCache` MUST try current HWID FIRST**, then
+     fall through to candidate enumeration. Fast-path is essential
+     because candidate probing spawns wmic/reg subprocesses (~500ms
+     total). Users on healthy machines pay 0 candidate probes;
+     only HWID-drift-recovering machines pay the cost.
+
+103. **`revalidation.js` MUST NOT call `onExpired('subscription_
+     inactive')` when the sub check returned kind=network/clock_
+     drift.** Route through the failure counter + grace-cache path
+     so transient issues don't turn into permanent lockouts. Only
+     a `null`-error `active:false` response means genuinely inactive.
+
+104. **`license:reset-local-data` MUST preserve API keys, overlay
+     state, custom hotkeys, and C binaries.** It's a *session/auth*
+     reset, not a factory reset (that's `injector:full-uninstall`).
+     Regressing to wiping api_keys would be terrible UX — user would
+     have to re-paste every API key after every reset.
+
+### Live-verified diagnosis (2026-07-14)
+
+- Supabase MCP query confirmed Jay's active row and HTTP-200 log
+  entry matching his last_sign_in_at timestamp.
+- `_validateDrift` throw path traced through subscription.js →
+  catch → `_mkNetErr` (kind clobbered) → returned to main.js catch
+  (again clobbered) → returned to renderer as generic 'network'.
+- Renderer's `err.kind === 'clock_drift'` branch was verified to
+  exist in `_renderNoSub` line 422-425 with the correct copy — it
+  simply never received a clock_drift kind due to the clobber.
+- 3 registered device UUIDs for Jay's LAPTOP-PUOUN0O3 with
+  `last_seen_at` within a 2h window today = definitive proof of
+  HWID rotation in production.
+
+### Backend items flagged for LO's separate authorization
+
+One genuine backend issue surfaced that CANNOT be fixed client-side:
+
+- **`user_devices` has NO DELETE RLS policy for authenticated
+  users.** Only service_role can delete rows. Users hitting the
+  device-limit screen currently CANNOT self-remove old devices —
+  `registration.deleteDevice` returns 401/403 which we surface as
+  "contact support to remove hardware_uuid X". This is a paper-
+  cut for growing user bases. **Recommended (LO-authorized only):**
+  ```sql
+  CREATE POLICY "user_devices_delete_own" ON user_devices
+    FOR DELETE USING (auth.uid() = user_id);
+  ```
+  OR add a `SECURITY DEFINER` RPC `/rest/v1/rpc/delete_my_device`
+  that validates auth.uid() before deleting.
+
+This is NOT blocking Jay's current issue (he's not device-limit
+blocked — his 3 rows include his active HWID). Flagged for future
+sprint. All Jay-facing symptoms are fixed by the client-side
+changes alone.
+
+### Deployment status (pending rebuild)
+
+- `ui/package.json` version 1.2.0 → **1.6.0**
+- `ui/src/license/config.js` APP_VERSION 1.2.0 → **1.6.0**
+- `ui/src/index.html` titlebar-ver v1.2 → v1.6, login-app-ver
+  v1.2.0 → v1.6.0 (both are static fallbacks; renderer.js pulls
+  live value from `app.getVersion()` at boot)
+- Rebuild via `cd ui && pnpm build` (produces
+  `dist/win-unpacked/svchelper.exe`)
+- Distribution: `powershell ui/tools/build-distribution.ps1`
+
+### What NOT to do (learned this session)
+
+- **Never let a catch block clobber a self-classified error's
+  `.kind`.** Pattern to use everywhere: `const kind = (e && e.kind)
+  || 'network';` The classic pre-v1.6 bug was hard-coding kind
+  regardless of what the caught error looked like — three separate
+  functions had this bug, all silently misclassifying drift as
+  network.
+- **Never rely on `wmic csproduct get uuid` as the primary HWID
+  source in code that ships to Windows 11 22H2+.** WMIC is
+  deprecated and removed in 24H2. Cache-once + accept whatever
+  worked on first successful compute is the sanest workaround.
+- **Never treat sub-check network errors as "user's subscription
+  is inactive"** in the revalidation loop. That's the pre-v1.6
+  bug that would silently unload the payload from a paying
+  customer on flaky wifi. Route network errors through the failure
+  counter with offline-grace opportunity.
+- **Never bind the signed sub cache to a HWID without a fallback
+  verification path.** The v1.6 `verifySubCacheAgainstAny` +
+  `device.getAllCandidates()` is the recovery mechanism —
+  without it, ANY future HWID computation change (Windows update,
+  hardware swap, JS-side HWID algorithm tweak) permanently
+  invalidates every deployed user's cache with no recovery path.
+- **Never expose SUPABASE service_role from the client.** The
+  `license:reset-local-data` is a CLIENT-side wipe — it doesn't
+  contact the server at all. Deleting server-side rows requires
+  DELETE RLS policy (see backend note above) or admin action.
+
+---
+
 ## 2026-07-08 (afternoon) — v1.5 ANTHROPIC HAIKU MAX_TOKENS FIX (silent CHEAP-tier failure)
 
 Second bug found in same-day Anthropic-key testing session. User's

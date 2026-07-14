@@ -40,6 +40,13 @@ contextBridge.exposeInMainWorld('svc', {
      * scheduled. Renderer shows a "contact support" message in that
      * case instead of silently pretending it worked. */
     removeDevice: (payload) => ipcRenderer.invoke('license:remove-device', payload),
+    /* v6.4 (2026-07-14): nuclear "reset local data" — wipes session,
+     * sub cache, HWID cache, onboarding flag. Uninjects any running
+     * payload. Does NOT touch C binaries, overlay state, or api keys.
+     * Escape hatch for users stuck in auth loops from HWID drift or
+     * stale cached tokens. Returns { ok, steps: [...] } for a per-
+     * step diagnostic modal. */
+    resetLocalData: ()      => ipcRenderer.invoke('license:reset-local-data'),
   },
   on: (evt, cb) => {
     if (!EVENTS.has(evt) || typeof cb !== 'function') return () => {};

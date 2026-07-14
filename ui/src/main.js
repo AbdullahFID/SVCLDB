@@ -508,19 +508,14 @@ ipcMain.handle('license:load', async () => {
       const isNetworkErr = /fetch|network|timeout|ETIMEDOUT|ENOTFOUND|ECONNRESET|ECONNREFUSED|abort/i.test(e.message || '');
       if (isNetworkErr) {
         try {
-          const cached = storage.loadSubscriptionCache();
-          if (cached && subscription.verifySubCache(cached, hwid) &&
-              cached.active && cached._cachedAt) {
-            const ageMs = Date.now() - cached._cachedAt * 1000;
-            const { GRACE_PERIOD_MS } = require('./license/config');
-            if (ageMs < GRACE_PERIOD_MS) {
-              console.log(`[main] refresh offline; using signed cache ` +
-                          `(${Math.round(ageMs/1000)}s / ${GRACE_PERIOD_MS/1000}s grace)`);
-              currentSess = session;
-              currentSub = { ...cached, _fromCache: true, _cacheAgeMs: ageMs };
-              startRevalidationLoop();
-              return _sessionDto();
-            }
+          const cachedResult = await _tryOfflineGraceCache(hwid);
+          if (cachedResult) {
+            console.log(`[main] refresh offline; using signed cache ` +
+                        `(${Math.round(cachedResult._cacheAgeMs / 1000)}s age)`);
+            currentSess = session;
+            currentSub = cachedResult;
+            startRevalidationLoop();
+            return _sessionDto();
           }
         } catch (cacheErr) {
           console.log('[main] refresh-offline cache load failed:', cacheErr.message);
@@ -536,29 +531,47 @@ ipcMain.handle('license:load', async () => {
       // Persist signed cache — offline-grace can serve this later.
       subscription.attachSigToCache(currentSub, hwid);
       storage.saveSubscriptionCache(currentSub);
+    } else if (currentSub && currentSub.error && currentSub.error.kind === 'network') {
+      // v6.4 (2026-07-14): sub check returned network error AFTER
+      // internal retry (subscription.js does 3 attempts already).
+      // Try signed cache before showing "Couldn't reach" error to user.
+      const cachedResult = await _tryOfflineGraceCache(hwid);
+      if (cachedResult) {
+        console.log(`[main] sub check network-failed after retries; using signed cache ` +
+                    `(${Math.round(cachedResult._cacheAgeMs / 1000)}s age)`);
+        currentSub = cachedResult;
+      }
     }
   } catch (e) {
-    console.log('[main] sub-check on load failed:', e.message);
-    // OFFLINE-GRACE FAST PATH: try signed cache before giving up.
+    console.log('[main] sub-check on load threw:', e.message);
+    // v6.4: preserve error.kind from the thrown error if it self-classified
+    // (e.g. clock_drift). Was hard-coded to 'network' pre-v6.4 which caused
+    // Jay's "Couldn't reach the license server" screen when his clock was
+    // off — the drift-specific renderer copy never got a chance to fire.
+    const kind = (e && typeof e.kind === 'string') ? e.kind : 'network';
+    // OFFLINE-GRACE FAST PATH: try signed cache before giving up. Only
+    // meaningful for network errors — clock_drift/schema/http are
+    // terminal, showing stale cache doesn't help the user resolve them.
     let usedCache = false;
-    try {
-      const cached = storage.loadSubscriptionCache();
-      if (cached && subscription.verifySubCache(cached, hwid) &&
-          cached.active && cached._cachedAt) {
-        const ageMs = Date.now() - cached._cachedAt * 1000;
-        const { GRACE_PERIOD_MS } = require('./license/config');
-        if (ageMs < GRACE_PERIOD_MS) {
+    if (kind === 'network') {
+      try {
+        const cachedResult = await _tryOfflineGraceCache(hwid);
+        if (cachedResult) {
           console.log(`[main] sub check offline; using signed cache ` +
-                      `(${Math.round(ageMs/1000)}s / ${GRACE_PERIOD_MS/1000}s grace)`);
-          currentSub = { ...cached, _fromCache: true, _cacheAgeMs: ageMs };
+                      `(${Math.round(cachedResult._cacheAgeMs / 1000)}s age)`);
+          currentSub = cachedResult;
           usedCache = true;
         }
-      }
-    } catch {}
+      } catch {}
+    }
     if (!usedCache) {
       currentSub = {
         active: null, plan: null, status: 'unknown',
-        error: { kind: 'network', message: e.message || String(e) },
+        error: {
+          kind,
+          message: e.message || String(e),
+          drift: (e && typeof e.drift === 'number') ? e.drift : undefined,
+        },
       };
     }
   }
@@ -648,11 +661,29 @@ ipcMain.handle('license:sign-in', async () => {
       if (currentSub && currentSub.active) {
         subscription.attachSigToCache(currentSub, hwid);
         storage.saveSubscriptionCache(currentSub);
+      } else if (currentSub && currentSub.error && currentSub.error.kind === 'network') {
+        // v6.4 (2026-07-14): if the sub check returned a network error
+        // AFTER internal retry (subscription.js does 3 attempts),
+        // fall back to signed cache before showing "Couldn't reach"
+        // to the user. Symmetric with license:load path.
+        const cachedResult = await _tryOfflineGraceCache(hwid);
+        if (cachedResult) {
+          console.log(`[main] sign-in: sub check network-failed after retries; using signed cache`);
+          currentSub = cachedResult;
+        }
       }
     } catch (e) {
+      // v6.4: preserve error.kind from the thrown error if it self-classified
+      // (e.g. clock_drift). See license:load handler for full explanation of
+      // the pre-v6.4 misclassification bug this fixes.
+      const kind = (e && typeof e.kind === 'string') ? e.kind : 'network';
       currentSub = {
         active: null, plan: null, status: 'unknown',
-        error: { kind: 'network', message: e.message || String(e) },
+        error: {
+          kind,
+          message: e.message || String(e),
+          drift: (e && typeof e.drift === 'number') ? e.drift : undefined,
+        },
       };
     }
     if (currentSub && currentSub.active) startRevalidationLoop();
@@ -694,13 +725,80 @@ ipcMain.handle('license:revalidate', async () => {
     if (sub && sub.active) {
       subscription.attachSigToCache(sub, hwid);
       storage.saveSubscriptionCache(sub);
+    } else if (sub && sub.error && sub.error.kind === 'network') {
+      // v6.4: post-retry network error — try offline-grace cache before
+      // reporting to renderer as "still no active subscription".
+      try {
+        const cached = await _tryOfflineGraceCache(hwid);
+        if (cached) {
+          currentSub = cached;
+          return { ok: true, subscription: cached };
+        }
+      } catch {}
     }
     currentSub = sub;
     if (sub && sub.active && !revalidation.isRunning()) startRevalidationLoop();
     return { ok: true, subscription: sub };
   } catch (e) {
-    return { ok: false, err: e.message || String(e) };
+    // v6.4: preserve error.kind (e.g. clock_drift) rather than clobbering to string.
+    return {
+      ok: false,
+      err: e.message || String(e),
+      kind: (e && typeof e.kind === 'string') ? e.kind : 'network',
+      drift: (e && typeof e.drift === 'number') ? e.drift : undefined,
+    };
   }
+});
+
+/* v6.4 (2026-07-14): "Reset local data & retry" nuclear option.
+ *
+ * Wipes every cached artifact — session, subscription cache, HWID
+ * cache, hotkey overrides, onboarding flag — WITHOUT touching the
+ * user's paid installation (C binaries, overlay state, api_keys stay).
+ * Also uninjects a running payload since its config is bound to a
+ * session we're about to drop.
+ *
+ * This is the escape hatch for users stuck in unrecoverable auth
+ * states (HWID drift + stale cache + rejected token), like the
+ * reported case for jay.perkerson@gmail.com. Renderer's nosub screen
+ * exposes it as a button below "Retry check".
+ *
+ * After running, renderer re-invokes license:load which begins from
+ * a clean slate — OAuth is prompted again.
+ *
+ * Returns { ok, steps: [{name, ok}, ...] } so renderer can show a
+ * per-step summary in a modal. */
+ipcMain.handle('license:reset-local-data', async () => {
+  const steps = [];
+  const record = (name, ok, extra) => {
+    steps.push({ name, ok, extra: extra || null });
+    console.log(`[reset-local] ${name}: ${ok ? 'ok' : 'FAIL'} ${extra || ''}`);
+  };
+
+  try { revalidation.stop(); record('stop_revalidation', true); }
+  catch (e) { record('stop_revalidation', false, e.message); }
+
+  try {
+    const r = await injector.uninject();
+    record('uninject_payload', !!(r && r.ok), r && r.err);
+  } catch (e) { record('uninject_payload', false, e.message); }
+
+  try { storage.clearSession();            record('clear_session',      true); }
+  catch (e) { record('clear_session', false, e.message); }
+  try { storage.clearSubscriptionCache();  record('clear_sub_cache',    true); }
+  catch (e) { record('clear_sub_cache', false, e.message); }
+  try { storage.resetOnboarding();         record('reset_onboarding',   true); }
+  catch (e) { record('reset_onboarding', false, e.message); }
+  try { device.clearCache();               record('clear_hwid_cache',   true); }
+  catch (e) { record('clear_hwid_cache', false, e.message); }
+
+  currentSess = null;
+  currentSub  = null;
+
+  return {
+    ok:    steps.every(s => s.ok),
+    steps,
+  };
 });
 
 // v4.7: Device management — remove a device from user_devices so the
@@ -1388,6 +1486,61 @@ function startRevalidationLoop() {
       }
     },
   });
+}
+
+// ─── v6.4 (2026-07-14) — HWID-tolerant offline grace cache ───────
+//
+// The signed sub cache is HMAC-bound to HWID. When HWID rotates on
+// the same physical machine (Win11 22H2+ wmic deprecation quirks —
+// see device.js top-file comment for detail), verification against
+// the CURRENT HWID fails and the cache is discarded, defeating the
+// whole point of offline grace.
+//
+// Fix: try to verify against ANY HWID this machine can produce
+// (wmic + MachineGuid + synthetic — plus the cached one). If any
+// verifies AND the cache is still fresh, use it AND re-sign the
+// cache against the CURRENTLY preferred HWID so future runs match.
+//
+// Returns a fully-shaped sub object with { ..._fromCache: true,
+// _cacheAgeMs } or null if no valid+fresh+verifiable cache exists.
+async function _tryOfflineGraceCache(currentHwid) {
+  let cached = null;
+  try { cached = storage.loadSubscriptionCache(); } catch { return null; }
+  if (!cached || !cached.active || !cached._cachedAt) return null;
+
+  const ageMs = Date.now() - cached._cachedAt * 1000;
+  const { GRACE_PERIOD_MS } = require('./license/config');
+  if (ageMs >= GRACE_PERIOD_MS) {
+    console.log(`[main] cache stale (${Math.round(ageMs/1000)}s > ${GRACE_PERIOD_MS/1000}s grace) — discard`);
+    return null;
+  }
+
+  // Try current HWID first (fast path — cache was signed with same value).
+  if (currentHwid && subscription.verifySubCache(cached, currentHwid)) {
+    return { ...cached, _fromCache: true, _cacheAgeMs: ageMs };
+  }
+
+  // HWID rotated (or cache never had matching HWID). Try all candidates.
+  try {
+    const candidates = await device.getAllCandidates();
+    const verifyResult = subscription.verifySubCacheAgainstAny(cached, candidates);
+    if (verifyResult.ok) {
+      console.log(`[main] cache verified against candidate HWID ` +
+                  `(currentHwid didn't match, but candidate did) — re-signing to current`);
+      // Re-sign against the current HWID so next time the fast-path
+      // verify succeeds without needing candidate enumeration.
+      if (currentHwid) {
+        const resigned = { ...cached };
+        subscription.attachSigToCache(resigned, currentHwid);
+        try { storage.saveSubscriptionCache(resigned); } catch {}
+      }
+      return { ...cached, _fromCache: true, _cacheAgeMs: ageMs };
+    }
+  } catch (e) {
+    console.log('[main] cache candidate-verify failed:', e.message);
+  }
+
+  return null;
 }
 
 // ─── DTO for the renderer ───────────────────────────────────────
