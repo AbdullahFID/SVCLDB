@@ -162,6 +162,16 @@ void ui_bump_alpha(float delta);     /* + or - to bg alpha [0.20 .. 1.00] */
 void ui_bump_font(float delta);      /* + or - to font scale factor */
 void ui_reset_geometry(void);        /* back to defaults */
 
+/* v1.6.2 (2026-07-15): plumb the vtable-slot target RVAs from
+ * offsets.blob into the UI layer, so get_backbuffer_texture can
+ * discover the correct vtable slot indices at first Present() call
+ * (dynamic-preferred, hardcoded-fallback). Called once at init from
+ * dllmain, AFTER pl_offsets_load succeeds. Any of the three RVAs
+ * being 0 means "no PDB hint — use hardcoded slot" for that entry.
+ * Thread-safe (single-writer at init before any Present detour). */
+typedef unsigned long long ui_rva_t;
+void ui_set_vtable_slot_hints(ui_rva_t gpb_rva, ui_rva_t gd3d_rva, ui_rva_t acc_rva);
+
 /* v8 (2026-07-06): apply the launch-time overlay config that Electron
  * built via cfg->overlay_w/h/alpha + cfg->size_mode. Called ONCE at
  * init from dllmain, AFTER config load + state_load_once. Sets the

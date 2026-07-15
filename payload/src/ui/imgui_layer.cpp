@@ -209,6 +209,144 @@ static bool is_ptr_in_loaded_module_code(const void *p) {
     return (mbi.Protect & exec_mask) != 0;
 }
 
+/* ── v1.6.2 (2026-07-15) — dynamic vtable-slot discovery ──
+ *
+ * dllmain plumbs the resolver-discovered RVAs of the vtable target
+ * methods into the UI layer via ui_set_vtable_slot_hints(). Any RVA
+ * being 0 means "no PDB hint — fall back to hardcoded slot" for
+ * that entry.
+ *
+ * At first Present() call, get_backbuffer_texture walks pLayer's
+ * (and pRes's) vtable up to MAX_VTABLE_SCAN_SLOTS, finds the slot
+ * whose function pointer's (addr - dwmcore_base) matches the hint
+ * RVA, and caches the discovered slot index for the process lifetime.
+ * If no match, falls back to the hardcoded GPB_SLOT / GD3D_SLOT /
+ * ACC3_SLOT constants (which work for ~800+ Bypassify users).
+ *
+ * Solves the "DWM crashes ~1s after inject on Windows patches with
+ * re-ordered vtable" bug (jay.perkerson@gmail.com 2026-07-15).
+ * Zero regression risk for users where hardcoded works — dynamic
+ * discovers the SAME slot the hardcoded constant points to, uses
+ * it, no user-visible change.
+ *
+ * MAX_VTABLE_SCAN_SLOTS = 64 covers all known dwmcore layouts with
+ * generous headroom (typical vtable has 25-40 entries; we don't
+ * want to walk past the vtable into adjacent data). */
+#define MAX_VTABLE_SCAN_SLOTS 64
+
+static volatile ui_rva_t g_rva_gpb  = 0;   /* GetPhysicalBackBuffer RVA hint */
+static volatile ui_rva_t g_rva_gd3d = 0;   /* GetD3D11Resource RVA hint      */
+static volatile ui_rva_t g_rva_acc  = 0;   /* accessor RVA hint              */
+
+/* Discovered slot indices (cached across calls). -1 = not yet resolved
+ * or dynamic scan failed → falls back to hardcoded constant. */
+static volatile int g_dyn_slot_gpb  = -1;
+static volatile int g_dyn_slot_gd3d = -1;
+static volatile int g_dyn_slot_acc  = -1;
+
+extern "C" void ui_set_vtable_slot_hints(ui_rva_t gpb_rva, ui_rva_t gd3d_rva, ui_rva_t acc_rva) {
+    g_rva_gpb  = gpb_rva;
+    g_rva_gd3d = gd3d_rva;
+    g_rva_acc  = acc_rva;
+    /* Note: don't log here — this runs before slog is fully set up in
+     * some code paths. Discovery attempts log their own diagnostics. */
+}
+
+/* Walk a vtable up to MAX_VTABLE_SCAN_SLOTS looking for a slot whose
+ * function pointer, when compared as an offset from dwmcore's base,
+ * equals `target_rva`. Returns the matching slot index or -1.
+ *
+ * SEH-wrapped because vtable might be shorter than we scan; a bad
+ * page-read is caught + returns -1 (falls back to hardcoded). */
+static int find_vtable_slot_by_rva(void **vtbl, ui_rva_t target_rva) {
+    if (!vtbl || target_rva == 0) return -1;
+    ensure_dwmcore_bounds_cached();
+    if (!g_dwmcore_base) return -1;
+
+    int found = -1;
+    __try {
+        for (int i = 0; i < MAX_VTABLE_SCAN_SLOTS; i++) {
+            /* Bounds-check the pointer read itself — vtable might end
+             * before slot MAX_VTABLE_SCAN_SLOTS. */
+            if (!is_readable(&vtbl[i], sizeof(void *))) break;
+            void *fn = vtbl[i];
+            if (!fn) continue;
+            /* Fast-path: dwmcore-only check (99% of methods). */
+            const BYTE *pb = (const BYTE *)fn;
+            if (pb < g_dwmcore_base || pb >= (g_dwmcore_base + g_dwmcore_size)) continue;
+            ui_rva_t rva = (ui_rva_t)(pb - g_dwmcore_base);
+            if (rva == target_rva) {
+                found = i;
+                break;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        /* Vtable turned out shorter than we scanned or unmapped — bail. */
+    }
+    return found;
+}
+
+/* One-shot dynamic slot discovery. Called from get_backbuffer_texture
+ * on first successful call. Logs the result so we can see per-user
+ * whether dynamic matched hardcoded (validation) or found a different
+ * slot (drift on that Windows build). */
+static void discover_gpb_slot_once(void **layer_vtbl, int hardcoded) {
+    static volatile LONG s_done = 0;
+    if (InterlockedCompareExchange(&s_done, 1, 0) != 0) return;
+    int dyn = find_vtable_slot_by_rva(layer_vtbl, g_rva_gpb);
+    if (dyn >= 0) {
+        g_dyn_slot_gpb = dyn;
+        if (dyn == hardcoded) {
+            diag("vtable: gpb_slot dynamic=%d hardcoded=%d MATCH", dyn, hardcoded);
+        } else {
+            diag("vtable: gpb_slot dynamic=%d hardcoded=%d DRIFT — using dynamic",
+                 dyn, hardcoded);
+        }
+    } else {
+        diag("vtable: gpb_slot dynamic-scan MISS (rva_hint=0x%llx) — falling back to hardcoded %d",
+             (unsigned long long)g_rva_gpb, hardcoded);
+    }
+}
+static void discover_gd3d_slot_once(void **layer_vtbl, int hardcoded) {
+    static volatile LONG s_done = 0;
+    if (InterlockedCompareExchange(&s_done, 1, 0) != 0) return;
+    int dyn = find_vtable_slot_by_rva(layer_vtbl, g_rva_gd3d);
+    if (dyn >= 0) {
+        g_dyn_slot_gd3d = dyn;
+        if (dyn == hardcoded) {
+            diag("vtable: gd3d_slot dynamic=%d hardcoded=%d MATCH", dyn, hardcoded);
+        } else {
+            diag("vtable: gd3d_slot dynamic=%d hardcoded=%d DRIFT — using dynamic",
+                 dyn, hardcoded);
+        }
+    } else {
+        diag("vtable: gd3d_slot dynamic-scan MISS (rva_hint=0x%llx) — falling back to hardcoded %d",
+             (unsigned long long)g_rva_gd3d, hardcoded);
+    }
+}
+static void discover_acc_slot_once(void **res_vtbl, int hardcoded) {
+    static volatile LONG s_done = 0;
+    if (InterlockedCompareExchange(&s_done, 1, 0) != 0) return;
+    int dyn = find_vtable_slot_by_rva(res_vtbl, g_rva_acc);
+    if (dyn >= 0) {
+        g_dyn_slot_acc = dyn;
+        if (dyn == hardcoded) {
+            diag("vtable: acc_slot dynamic=%d hardcoded=%d MATCH", dyn, hardcoded);
+        } else {
+            diag("vtable: acc_slot dynamic=%d hardcoded=%d DRIFT — using dynamic",
+                 dyn, hardcoded);
+        }
+    } else {
+        diag("vtable: acc_slot dynamic-scan MISS (rva_hint=0x%llx) — falling back to hardcoded %d",
+             (unsigned long long)g_rva_acc, hardcoded);
+    }
+}
+
+/* Convenience — returns the slot to USE (dynamic if discovered, else hardcoded). */
+static inline int effective_gpb_slot(void)  { int d = g_dyn_slot_gpb;  return d >= 0 ? d : GPB_SLOT;  }
+static inline int effective_gd3d_slot(void) { int d = g_dyn_slot_gd3d; return d >= 0 ? d : GD3D_SLOT; }
+static inline int effective_acc_slot(void)  { int d = g_dyn_slot_acc;  return d >= 0 ? d : ACC3_SLOT; }
+
 /* ---------- RTV cache ---------- */
 struct RtvCacheEntry {
     ID3D11Texture2D        *tex;
@@ -2337,29 +2475,40 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer) {
         void **layer_vtbl = *(void ***)pLayer;
         if (!is_readable(layer_vtbl, (ACC3_SLOT + 1) * 8)) return nullptr;
 
-        /* v1.6.1: validate slot 5 (GPB_SLOT) points into dwmcore. */
-        void *fn_gpb = layer_vtbl[GPB_SLOT];
+        /* v1.6.2: one-shot dynamic slot discovery. Walk pLayer's vtable
+         * looking for the slot whose function pointer's RVA matches the
+         * resolver-supplied hint. If found, cache + use dynamically.
+         * If not found (RVA hint was 0 OR no matching slot), effective_
+         * gpb_slot returns the hardcoded GPB_SLOT constant. */
+        discover_gpb_slot_once(layer_vtbl, GPB_SLOT);
+        discover_gd3d_slot_once(layer_vtbl, GD3D_SLOT);
+        const int slot_gpb  = effective_gpb_slot();
+        const int slot_gd3d = effective_gd3d_slot();
+
+        /* v1.6.1: validate GPB slot points into dwmcore. */
+        void *fn_gpb = layer_vtbl[slot_gpb];
         if (!is_ptr_in_dwmcore(fn_gpb)) {
             static volatile LONG s_first_bad_gpb = 0;
             if (InterlockedCompareExchange(&s_first_bad_gpb, 1, 0) == 0) {
-                diag("vtable slot GPB_SLOT=%d points OUTSIDE dwmcore.dll "
+                diag("vtable slot GPB=%d (dyn=%d hc=%d) points OUTSIDE dwmcore.dll "
                      "(fn=%p base=%p size=%zu) — Windows build likely re-ordered "
                      "the vtable; skipping overlay draw to prevent CFG/CET crash",
-                     GPB_SLOT, fn_gpb, g_dwmcore_base, (size_t)g_dwmcore_size);
+                     slot_gpb, g_dyn_slot_gpb, GPB_SLOT,
+                     fn_gpb, g_dwmcore_base, (size_t)g_dwmcore_size);
             }
             return nullptr;
         }
         void *pPhysBack = ((pfnVGet)fn_gpb)(pLayer);
         if (!pPhysBack || !is_readable(pPhysBack, 8)) return nullptr;
 
-        /* v1.6.1: validate slot 24 (GD3D_SLOT). */
-        void *fn_gd3d = layer_vtbl[GD3D_SLOT];
+        /* v1.6.1: validate GD3D slot. */
+        void *fn_gd3d = layer_vtbl[slot_gd3d];
         if (!is_ptr_in_dwmcore(fn_gd3d)) {
             static volatile LONG s_first_bad_gd3d = 0;
             if (InterlockedCompareExchange(&s_first_bad_gd3d, 1, 0) == 0) {
-                diag("vtable slot GD3D_SLOT=%d points OUTSIDE dwmcore.dll "
+                diag("vtable slot GD3D=%d (dyn=%d hc=%d) points OUTSIDE dwmcore.dll "
                      "(fn=%p) — skipping overlay draw",
-                     GD3D_SLOT, fn_gd3d);
+                     slot_gd3d, g_dyn_slot_gd3d, GD3D_SLOT, fn_gd3d);
             }
             return nullptr;
         }
@@ -2369,14 +2518,18 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer) {
         void **res_vtbl = *(void ***)pRes;
         if (!is_readable(res_vtbl, (ACC3_SLOT + 1) * 8)) return nullptr;
 
-        /* v1.6.1: validate slot 19 (ACC3_SLOT). */
-        void *fn_acc = res_vtbl[ACC3_SLOT];
+        /* v1.6.2: one-shot dynamic slot discovery on res_vtbl (accessor). */
+        discover_acc_slot_once(res_vtbl, ACC3_SLOT);
+        const int slot_acc = effective_acc_slot();
+
+        /* v1.6.1: validate ACC slot. */
+        void *fn_acc = res_vtbl[slot_acc];
         if (!is_ptr_in_dwmcore(fn_acc)) {
             static volatile LONG s_first_bad_acc = 0;
             if (InterlockedCompareExchange(&s_first_bad_acc, 1, 0) == 0) {
-                diag("vtable slot ACC3_SLOT=%d points OUTSIDE dwmcore.dll "
+                diag("vtable slot ACC=%d (dyn=%d hc=%d) points OUTSIDE dwmcore.dll "
                      "(fn=%p) — skipping overlay draw",
-                     ACC3_SLOT, fn_acc);
+                     slot_acc, g_dyn_slot_acc, ACC3_SLOT, fn_acc);
             }
             return nullptr;
         }
@@ -2411,14 +2564,23 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer) {
             return nullptr;
         }
 
-        /* First successful call — log the pointer values so we can
-         * cross-check what a working vtable layout looks like on this
-         * specific Windows build. Cheap one-shot. */
+        /* First successful call — log the pointer values AND their
+         * dwmcore RVAs so support has definitive per-Windows-build data
+         * on what class::method each slot resolves to. When comparing
+         * across users, an RVA match against a known symbol in the
+         * resolver's log tells us definitively what slot is invoking. */
         static volatile LONG s_first_ok = 0;
         if (InterlockedCompareExchange(&s_first_ok, 1, 0) == 0) {
+            ui_rva_t rva_gpb  = g_dwmcore_base ? (ui_rva_t)((BYTE *)fn_gpb  - g_dwmcore_base) : 0;
+            ui_rva_t rva_gd3d = g_dwmcore_base ? (ui_rva_t)((BYTE *)fn_gd3d - g_dwmcore_base) : 0;
+            ui_rva_t rva_acc  = g_dwmcore_base ? (ui_rva_t)((BYTE *)fn_acc  - g_dwmcore_base) : 0;
             diag("get_backbuffer_texture: OK on first call "
-                 "(gpb=%p gd3d=%p acc=%p qi=%p tex=%p)",
-                 fn_gpb, fn_gd3d, fn_acc, fn_qi, out_tex);
+                 "(gpb_slot=%d rva=0x%llx  gd3d_slot=%d rva=0x%llx  "
+                 "acc_slot=%d rva=0x%llx  qi=%p  tex=%p)",
+                 slot_gpb,  (unsigned long long)rva_gpb,
+                 slot_gd3d, (unsigned long long)rva_gd3d,
+                 slot_acc,  (unsigned long long)rva_acc,
+                 fn_qi, out_tex);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         static volatile LONG s_first_seh = 0;

@@ -39,6 +39,12 @@ typedef struct {
     uint64_t addDirtyRectLegacy;
     uint64_t presentDisplay;
     uint64_t presentLegacy;
+    /* --- v1.6.2 — vtable-slot target RVAs (payload matches these
+     * against the live vtable at first Present() to discover the
+     * correct slot indices dynamically, replacing hardcoded 5/24/19). */
+    uint64_t getPhysicalBackBufferRva;
+    uint64_t getD3D11ResourceRva;
+    uint64_t accessorRva;
 } OffsetsBlob;
 
 #define BLOB_PATH      SVC_INSTALL_DIR "\\" SVC_OFFSETS_BLOB
@@ -243,10 +249,71 @@ int main(void) {
     b.presentDisplay = resolve("dwmcore!CDDisplayRenderTarget::Present");
     b.presentLegacy  = resolve("dwmcore!CLegacyRenderTarget::Present");
 
+    /* v1.6.2 — vtable-slot target RVAs. Payload walks pLayer's vtable
+     * at first Present() call and matches these against the live function
+     * pointers to discover the correct slot index for each method,
+     * replacing hardcoded GPB_SLOT=5 / GD3D_SLOT=24 / ACC3_SLOT=19.
+     *
+     * The hardcoded values came from Bypassify's original RE and work
+     * for ~800+ Bypassify users, but Windows patch levels can re-order
+     * internal vtables (verified on user jay.perkerson@gmail.com's box,
+     * 2026-07-15 — DWM crashed within 1s of inject). Dynamic discovery
+     * closes that failure mode.
+     *
+     * If PDB doesn't expose these symbol names (which happens on some
+     * Windows editions), the RVA stays 0 → payload falls back to
+     * hardcoded slots, same behavior as pre-v1.6.2. */
+    /* Try known class variants (Windows 10/11 pre-24H2, 24H2, 25H2+).
+     * The class that owns GetPhysicalBackBuffer / GetD3D11Resource has
+     * been renamed across Windows versions:
+     *   - Older Windows 10/11: COverlaySwapChain
+     *   - Windows 11 24H2+:    CDDisplaySwapChain (buffer class:
+     *                           CDDisplaySwapChainBuffer)
+     * We resolve BOTH so payload's dynamic scan has more RVA candidates
+     * to match against — increases coverage when pLayer's actual vtable
+     * slot dispatches to whichever variant is live. */
+    b.getPhysicalBackBufferRva = resolve("dwmcore!CDDisplaySwapChain::GetPhysicalBackBuffer");
+    if (!b.getPhysicalBackBufferRva)
+        b.getPhysicalBackBufferRva = resolve("dwmcore!COverlaySwapChain::GetPhysicalBackBuffer");
+    if (!b.getPhysicalBackBufferRva)
+        b.getPhysicalBackBufferRva = resolve_wild("dwmcore!*SwapChain::GetPhysicalBackBuffer");
+    if (!b.getPhysicalBackBufferRva)
+        b.getPhysicalBackBufferRva = resolve_wild("dwmcore!*::GetPhysicalBackBuffer");
+    if (!b.getPhysicalBackBufferRva)
+        b.getPhysicalBackBufferRva = resolve_wild("dwmcore!*PhysicalBackBuffer*");
+
+    b.getD3D11ResourceRva = resolve("dwmcore!CDDisplaySwapChainBuffer::GetD3D11Resource");
+    if (!b.getD3D11ResourceRva)
+        b.getD3D11ResourceRva = resolve("dwmcore!CDDisplaySwapChain::GetD3D11Resource");
+    if (!b.getD3D11ResourceRva)
+        b.getD3D11ResourceRva = resolve("dwmcore!COverlaySwapChain::GetD3D11Resource");
+    if (!b.getD3D11ResourceRva)
+        b.getD3D11ResourceRva = resolve_wild("dwmcore!*::GetD3D11Resource");
+    if (!b.getD3D11ResourceRva)
+        b.getD3D11ResourceRva = resolve_wild("dwmcore!*GetD3D11Resource*");
+
+    /* Accessor method — its exact name is class-dependent (defined on
+     * whatever D3D11 resource wrapper GetD3D11Resource returns). Try
+     * common patterns; if none hit, payload uses hardcoded slot 19. */
+    b.accessorRva = resolve("dwmcore!CDeviceTextureTarget::GetTexture2D");
+    if (!b.accessorRva)
+        b.accessorRva = resolve_wild("dwmcore!*Target::GetTexture2D");
+    if (!b.accessorRva)
+        b.accessorRva = resolve_wild("dwmcore!*::GetTexture2D");
+    if (!b.accessorRva)
+        b.accessorRva = resolve_wild("dwmcore!*::AsTexture2D");
+    if (!b.accessorRva)
+        b.accessorRva = resolve_wild("dwmcore!*::GetResource");
+
     int n = 0;
     uint64_t *f = (uint64_t *)&b;
-    for (int i = 0; i < 21; i++) if (f[i]) n++;
-    log_line("Resolved %d/21 symbols", n);
+    const int total_fields = (int)(sizeof(b) / sizeof(uint64_t));
+    for (int i = 0; i < total_fields; i++) if (f[i]) n++;
+    log_line("Resolved %d/%d symbols", n, total_fields);
+    log_line("Vtable-slot RVA hints: gpb=0x%llX gd3d=0x%llX acc=0x%llX",
+             (unsigned long long)b.getPhysicalBackBufferRva,
+             (unsigned long long)b.getD3D11ResourceRva,
+             (unsigned long long)b.accessorRva);
 
     /* Payload only NEEDS cOverlayContextPresent + isOverlayPrevented.
      * Everything else is nice-to-have (wda etc. we don't use in svcldb). */

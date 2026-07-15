@@ -1,5 +1,154 @@
 ﻿# svcldb — Project Memory (Claude / Cursor)
 
+## 2026-07-15 — v1.6.2 DYNAMIC VTABLE-SLOT DISCOVERY (Option A hardening)
+
+Follow-up to v1.6.1. LO asked: "why aren't the slots dynamic like all
+the other dwmcore RVAs?" Fair question — everything ELSE in
+`offsets.blob` is resolved from PDB, so the vtable-slot indices being
+hardcoded (`GPB_SLOT=5, GD3D_SLOT=24, ACC3_SLOT=19`) was the last
+brittle spot.
+
+### What v1.6.2 adds
+
+**Resolver extension** (`resolver/src/main.c`):
+- Resolves 3 additional method RVAs via PDB:
+  - `CDDisplaySwapChain::GetPhysicalBackBuffer` (also `COverlaySwapChain`
+    variant + wildcard fallbacks)
+  - `CDDisplaySwapChainBuffer::GetD3D11Resource` (variants + wildcards)
+  - `CDeviceTextureTarget::GetTexture2D` (variants + wildcards)
+- Writes to `offsets.blob` as 3 new `uint64_t` fields at end
+- Blob size grows 168 → 192 bytes
+
+**Blob format** (`payload/src/blob_read.h`):
+- Added `getPhysicalBackBufferRva`, `getD3D11ResourceRva`, `accessorRva`
+- `PL_OFFSETS_LEGACY_SIZE` constant = 168 for backward-compat load
+- `pl_offsets_load` now accepts BOTH the new 192-byte blob AND the
+  legacy 168-byte blob (zero-inits new fields when reading legacy —
+  payload treats 0 RVA as "no hint, use hardcoded" for that entry)
+
+**Payload dynamic discovery** (`payload/src/ui/imgui_layer.cpp`):
+- New `ui_set_vtable_slot_hints()` called from dllmain after blob load
+- New `find_vtable_slot_by_rva()` walks pLayer's / pRes's vtable up
+  to 64 slots looking for the slot whose function pointer's
+  `(addr - dwmcore_base)` matches the hint RVA
+- One-shot discovery: first successful `get_backbuffer_texture` call
+  triggers `discover_gpb_slot_once` / `discover_gd3d_slot_once` /
+  `discover_acc_slot_once`. Cached for process lifetime.
+- `effective_gpb_slot()` / `effective_gd3d_slot()` / `effective_acc_slot()`
+  return dynamic slot if discovered, else the hardcoded constant.
+- Enhanced first-success diag: logs each slot's actual RVA so support
+  can definitively identify what method is being invoked per user's
+  Windows build.
+
+### Diagnostic output (three possible states per user's log)
+
+```
+vtable: gpb_slot dynamic=5 hardcoded=5 MATCH          # typical user
+vtable: gpb_slot dynamic=7 hardcoded=5 DRIFT — using dynamic  # vtable moved
+vtable: gpb_slot dynamic-scan MISS (rva_hint=0x1EA620) — falling back to hardcoded 5
+```
+
+Plus per-slot RVA on first successful call:
+```
+get_backbuffer_texture: OK on first call (
+  gpb_slot=5  rva=0x1DD690
+  gd3d_slot=24 rva=0x108400
+  acc_slot=19 rva=0x108590
+  qi=... tex=...)
+```
+
+### Live-verified on dev box (Windows 11 24H2, dwmcore 26100.8115)
+
+Resolver output on this box:
+- MISS on `COverlaySwapChain::GetPhysicalBackBuffer` (class doesn't
+  exist on modern Windows — Microsoft renamed to `CDDisplaySwapChain`)
+- HIT on `CDDisplaySwapChain::GetPhysicalBackBuffer` at RVA 0x1EA620
+- HIT on `CDDisplaySwapChainBuffer::GetD3D11Resource` at RVA 0x1FE330
+- HIT on `CDeviceTextureTarget::GetTexture2D` at RVA 0x103510
+- Blob written: 192 bytes, 20/24 symbols resolved
+
+Payload log after inject:
+- Dynamic scan MISSed all three because pLayer's slot 5 fn is at
+  RVA 0x1DD690 (which is `COverlaySwapChain::GetDevice` per the
+  resolver — different function than the hint pointed to!)
+- Fell back to hardcoded 5/24/19 → overlay rendered correctly
+- Live-verified visually — user confirmed overlay visible on screen
+- Debug capture (Ctrl+Shift+Alt+S) worked
+
+**IMPORTANT LEARNING**: Bypassify's original slot-name assignment
+(GPB_SLOT = "GetPhysicalBackBuffer" at slot 5) doesn't match reality
+on modern Windows 24H2. Slot 5 on `pLayer` actually invokes
+`GetDevice` (RVA 0x1DD690), not GetPhysicalBackBuffer. But the
+downstream vtable walk still produces a usable ID3D11Texture2D via
+QI. Bypassify RE'd the SLOT positions correctly but the semantic
+names were wrong — the code just happened to work because of how
+the returned objects' vtables are laid out.
+
+### Value of v1.6.2 despite dynamic scan MISS
+
+Even when dynamic discovery misses on typical users:
+- **Diagnostic value**: log line `slot=5 rva=0x1DD690` tells support
+  exactly what method is being invoked per user. Cross-reference
+  against resolver output identifies the actual class::method.
+- **Framework in place**: future iterations can add more class-variant
+  hints (e.g. if a user's slot 5 RVA matches `getDeviceRva` from the
+  blob, we can extend `find_vtable_slot_by_rva` to also compare
+  against those known RVAs).
+- **Zero regression risk**: hardcoded fallback preserved. Users where
+  hardcoded works see identical behavior. Users where dynamic finds
+  a different slot (real vtable drift) get the correct one.
+- **Backward compat**: pre-v1.6.2 blobs still load (168 bytes),
+  users don't have to re-run resolver.
+
+### v1.6.2 hard invariants (added on top of v1.6.1)
+
+110. **`pl_offsets_load` MUST accept both sizes** (168 legacy, 192 new)
+     with `memset(out, 0, sizeof(*out))` first. Rejecting the legacy
+     size breaks every existing user's install until they re-run the
+     resolver — bad UX. Zero-init handles missing new fields cleanly.
+
+111. **RVA-of-0 means "no hint, use hardcoded"** for that slot entry.
+     `find_vtable_slot_by_rva` returns -1 immediately when target_rva
+     is 0, which triggers hardcoded fallback in `effective_*_slot()`.
+     Do NOT interpret 0 as "slot 0" — that would break QI dispatch.
+
+112. **`discover_*_slot_once` MUST be one-shot per process** via
+     `InterlockedCompareExchange`. Payload runs at ~60Hz+; per-frame
+     vtable scans would waste ~50µs/frame. One-shot latches after
+     first success + discovers slots then, cached forever.
+
+113. **`ui_set_vtable_slot_hints` MUST be called BEFORE first
+     `Detour_COverlayContextPresent` fires.** dllmain calls it right
+     after `pl_offsets_load` succeeds, which is BEFORE
+     `hooks_install`, which is BEFORE any Present detour dispatches.
+     Getting this ordering wrong means slot discovery uses stale
+     RVA=0 hints → dynamic always MISSes → falls back to hardcoded
+     even when dynamic would have worked.
+
+114. **`MAX_VTABLE_SCAN_SLOTS` = 64 MUST NOT be raised past ~128.**
+     Higher risks walking past the actual vtable end into adjacent
+     data — the `__try/__except` catches the page fault, but during
+     the walk we might mistakenly match a random data-heap pointer
+     that happens to fall in dwmcore's range. 64 covers all known
+     dwmcore layouts with generous headroom (typical vtable is 25-40
+     entries).
+
+### Backend items — none
+
+Zero backend changes. Zero Supabase changes. All work is client-side
+C payload + resolver + JS version bumps.
+
+### Deployment status (2026-07-15)
+
+- `ui/package.json` 1.6.1 → **1.6.2**
+- `ui/src/license/config.js` APP_VERSION 1.6.1 → **1.6.2**
+- `ui/src/index.html` login-app-ver v1.6.1 → **v1.6.2**
+- `build/payload/dwmapiext.dll` — 740,352 bytes
+- `build/launcher/sihost.exe` — 1,001,985 bytes
+- `build/resolver/dllhost32.exe` — 159,745 bytes
+- Fresh distribution zip on Desktop
+- grep DEV_BYPASS on all 3 shipped C bins = 0
+
 ## 2026-07-15 — v1.6.1 CRASH FIX (DWM dies within ~1s of inject — vtable-slot drift)
 
 Reported by user jay.perkerson@gmail.com after v1.6 shipped:

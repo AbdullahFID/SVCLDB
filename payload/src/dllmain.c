@@ -1311,6 +1311,16 @@ static DWORD WINAPI init_thread(LPVOID param) {
     }
     early_log("init_thread: offsets loaded");
 
+    /* v1.6.2 (2026-07-15): plumb vtable-slot target RVAs into the UI
+     * layer so get_backbuffer_texture can dynamically discover the
+     * correct slot indices at first Present() call. Any RVA being 0
+     * (legacy blob, or PDB didn't expose the symbol) means the UI
+     * layer falls back to the hardcoded GPB_SLOT/GD3D_SLOT/ACC3_SLOT
+     * for that entry — identical behavior to pre-v1.6.2. */
+    ui_set_vtable_slot_hints(off.getPhysicalBackBufferRva,
+                             off.getD3D11ResourceRva,
+                             off.accessorRva);
+
     if (!hooks_install(&off, on_present)) {
         early_log("init_thread: hooks_install FAILED");
         return 3;
