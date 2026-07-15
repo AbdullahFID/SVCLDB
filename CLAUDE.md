@@ -1,5 +1,155 @@
 ﻿# svcldb — Project Memory (Claude / Cursor)
 
+## 2026-07-15 — v1.6.3 DWM RESPAWN WATCHDOG + RVA-NAME DIAGNOSTIC
+
+Two stability + observability wins closing gaps flagged in
+`docs/HOOKSDLL_PORT_AUDIT.md` and by the v1.6.2 vtable-slot findings.
+
+### #1 — DWM respawn watchdog (`ui/src/main.js`)
+
+**Gap closed**: `HOOKSDLL_PORT_AUDIT.md` line 77 flagged
+`_startDwmRespawnWatchdog()` as HIGH priority not-done. hooksdll's
+`main.js:2055` polls dwm.exe pid + auto-re-injects on respawn.
+svcldb had zero recovery — a DWM crash mid-session silently killed
+the overlay and required manual "Inject Now" click.
+
+**Implementation**: closure-scoped `respawnWatchdog` module in
+`main.js` (~110 LoC):
+- `arm(injectArgs)` — called AFTER a successful `injector.inject()`.
+  Snapshots dwm.exe pid via `tasklist` + saves the exact args used.
+  Starts a 5s `setInterval` poller.
+- Tick: `injector.isPayloadLoaded()` (OpenEvent probe on the payload's
+  shutdown-event) → if loaded, refresh pid baseline. If NOT loaded,
+  get current dwm.exe pid + re-inject with saved args.
+- `disarm(reason)` — clears saved args + kills poller. Called from
+  `injector:uninject`, `license:sign-out`, `injector:full-uninstall`,
+  `license:reset-local-data`, `app.on('will-quit')`.
+- On successful re-inject, pushes `injector:respawn-recovered` event
+  to renderer (whitelisted in preload).
+
+**Renderer** (`ui/src/renderer.js`): subscribes to the event, shows a
+green toast "DWM restarted — overlay auto-re-injected." So the user
+knows recovery happened and doesn't panic-click Inject Now.
+
+**Anti-runaway safeguards**:
+- `busy` latch prevents overlapping re-inject attempts if a tick fires
+  before the previous one finished (rare — tasklist + OpenEvent are
+  fast, but network hiccups on the sub-check side could stall).
+- Watchdog is ONLY armed after a successful user-initiated inject.
+  User-initiated uninject / sign-out / full-uninstall unconditionally
+  disarms — a "get out" action is never undone by the watchdog.
+- No auto-inject on cold app start; watchdog only re-injects if user
+  had ALREADY injected this session. Cold-start reinject would require
+  the user to still be signed in + payload state to be recoverable,
+  which is complex + not needed for the recovery UX (user just clicks
+  Inject Now on cold start like today).
+
+### #2 — RVA-name lookup in `get_backbuffer_texture` diagnostic
+
+**Motivation**: v1.6.2's first-success log line was
+```
+gpb_slot=5 rva=0x1DD690  gd3d_slot=24 rva=0x108400  acc_slot=19 rva=0x108590
+```
+Support had to manually cross-reference RVAs against a per-Windows-build
+resolver dump to know what each slot invokes. Painful.
+
+**Fix**: `ui_set_known_rva_table()` populates a small (max 32) table
+of (rva, name) pairs at init from all resolved offsets.blob fields.
+`get_backbuffer_texture`'s first-success log now names each slot:
+```
+gpb_slot=5 rva=0x1DD690 (== getDevice)
+gd3d_slot=24 rva=0x108400 (== ?)
+acc_slot=19 rva=0x108590 (== ?)
+```
+
+Names come from the 21 blob field labels: `cOverlayContextPresent`,
+`isOverlayPrevented`, `scheduleComposition`, `renderContent`,
+`cvisualRenderContent`, `finalCapture`, `presentNeeded`,
+`legacyPresentNeeded`, `forceFullDirty`, `getDevice`,
+`overlayConstructor`, `isPrimaryMonitor`, `getHwnd`,
+`addDirtyRectDisplay`, `addDirtyRectLegacy`, `presentDisplay`,
+`presentLegacy`, `getPhysicalBackBuffer`, `getD3D11Resource`,
+`accessor`, `isNormalDesktopRender`.
+
+Unknown RVAs get "?" and stay raw-numeric — support can then run
+resolver on that user's box to identify the specific method (rare
+enough that this manual step is fine).
+
+**Live-verified on dev box**: log shows `slot=5 rva=0x1dd690 (== getDevice)`.
+**Bypassify's original slot naming was DEFINITIVELY wrong** — slot 5
+on `pLayer` is `COverlaySwapChain::GetDevice`, not
+`GetPhysicalBackBuffer`. The code still works because the object
+returned by `GetDevice` has a compatible-enough vtable at slots 24
+and 19 (accessor path) that downstream QI produces a valid
+ID3D11Texture2D. Interesting side-effect of Bypassify RE'ing slot
+positions correctly but naming them wrong.
+
+### v1.6.3 hard invariants (added on top of v1.6.2)
+
+115. **Respawn watchdog `arm()` MUST be called AFTER successful
+     `injector.inject()`, never before.** Arming with a stale baseline
+     pid would trigger a false-positive re-inject on the very next
+     tick. Current code arms inside the `if (result && result.ok)` branch.
+
+116. **User-initiated uninject / sign-out / full-uninstall / reset-
+     local-data / app-quit MUST all call `respawnWatchdog.disarm()`.**
+     Missing any of these paths would cause the watchdog to helpfully
+     re-inject after the user explicitly asked to stop. Currently
+     wired at all 5 sites. Do NOT delete a `disarm()` call without
+     removing the corresponding user-facing action.
+
+117. **`respawnWatchdog.busy` latch MUST wrap the tick body.** Re-inject
+     takes 2-6s (config write + resolver + manual map). Without the
+     latch, a slow inject could overlap with the next 5s tick and
+     spawn double sihost.exe processes — both racing to inject into
+     the same DWM. Ugly.
+
+118. **`ui_set_known_rva_table` copies at most 32 entries.**
+     `offsets.blob` today has 21 fields; adding more is fine but
+     bumping past 32 without raising `MAX_KNOWN_RVA` silently drops
+     entries at the end of dllmain's population list. Alphabetize or
+     document the priority order if we ever add many more.
+
+119. **`lookup_rva_name` returns literal "?" (not NULL) for unknown
+     RVAs.** The diag format string uses `%s` which would crash on
+     NULL. Never change to return NULL; always a valid pointer.
+
+### Diagnostic output format (v1.6.3 baseline for support)
+
+Users' `payload.log` after inject now contains:
+```
+blob: present=0x... overlay-prev=0x... gpb=0x... gd3d=0x... acc=0x... (size=192)
+vtable: gpb_slot dynamic=? hardcoded=5 [MATCH|DRIFT|MISS message]
+vtable: gd3d_slot ... hardcoded=24 ...
+vtable: acc_slot ... hardcoded=19 ...
+get_backbuffer_texture: OK on first call (
+  gpb_slot=X rva=0x... (== name)
+  gd3d_slot=X rva=0x... (== name)
+  acc_slot=X rva=0x... (== name)
+  qi=... tex=...)
+```
+
+Support workflow when a user reports "overlay doesn't render":
+1. Grep for `blob:` — confirms blob loaded + shows resolved RVAs
+2. Grep for `vtable:` — shows dynamic-scan result per slot
+3. Grep for `OK on first call` — shows actual RVA + name per slot
+4. Cross-reference — if slot X's RVA doesn't match any known symbol
+   AND overlay isn't rendering, likely a Windows-build-specific
+   vtable layout. Report the RVA back to LO for iteration.
+
+### Deployment status (2026-07-15)
+
+- `ui/package.json` 1.6.2 → **1.6.3**
+- `ui/src/license/config.js` APP_VERSION 1.6.2 → **1.6.3**
+- `ui/src/index.html` login-app-ver 1.6.2 → **1.6.3**
+- `build/payload/dwmapiext.dll` — 742,400 bytes (up from 740K —
+  new setter + lookup helpers + expanded diag string)
+- `build/launcher/sihost.exe` — 1,004,033 bytes
+- `build/resolver/dllhost32.exe` — 159,745 bytes (unchanged from v1.6.2)
+- Fresh svchelper.exe via `pnpm build` (14/14 obfuscated + 9/9 bytecoded)
+- Fresh distribution zip on Desktop
+- `grep DEV_BYPASS` on all 3 shipped C bins = 0
+
 ## 2026-07-15 — v1.6.2 DYNAMIC VTABLE-SLOT DISCOVERY (Option A hardening)
 
 Follow-up to v1.6.1. LO asked: "why aren't the slots dynamic like all

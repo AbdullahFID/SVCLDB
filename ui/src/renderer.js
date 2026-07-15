@@ -1561,6 +1561,12 @@ if (window.svc && typeof window.svc.on === 'function') {
     if (dto.subscription) state.subscription = dto.subscription;
     _renderDashboard();
   });
+  /* v1.6.3: DWM crashed + respawned; main auto-re-injected the payload
+   * with the same args. Nothing for the user to do; just let them know
+   * their overlay recovered so they don't panic + manually re-inject. */
+  window.svc.on('injector:respawn-recovered', () => {
+    toast('DWM restarted — overlay auto-re-injected.', 'ok');
+  });
   window.svc.on('license:expired-lockout', (info) => {
     state.injected = false;
     clearInterval(_pollTimer);

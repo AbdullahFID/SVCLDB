@@ -252,6 +252,38 @@ extern "C" void ui_set_vtable_slot_hints(ui_rva_t gpb_rva, ui_rva_t gd3d_rva, ui
      * some code paths. Discovery attempts log their own diagnostics. */
 }
 
+/* v1.6.3: known-RVA lookup table. Populated once at init by
+ * ui_set_known_rva_table(); read (lock-free) at first Present() to
+ * name each vtable slot's actual function in the diag log. Small
+ * bounded copy (MAX_KNOWN_RVA = 32) — plenty for offsets.blob's ~20
+ * meaningful entries. */
+#define MAX_KNOWN_RVA 32
+static ui_rva_symbol_t g_known_rva[MAX_KNOWN_RVA];
+static int             g_known_rva_count = 0;
+
+extern "C" void ui_set_known_rva_table(const ui_rva_symbol_t *table, int count) {
+    if (!table || count <= 0) return;
+    int n = count > MAX_KNOWN_RVA ? MAX_KNOWN_RVA : count;
+    int written = 0;
+    for (int i = 0; i < n; i++) {
+        if (table[i].rva == 0 || !table[i].name) continue;
+        g_known_rva[written] = table[i];
+        written++;
+    }
+    g_known_rva_count = written;
+}
+
+/* O(N) linear search — N is tiny (~20). Called at most 3 times per
+ * DWM lifetime (once per slot on first Present success). Returns
+ * name of the symbol whose RVA matches, or "?" if unknown. */
+static const char *lookup_rva_name(ui_rva_t rva) {
+    if (rva == 0) return "?";
+    for (int i = 0; i < g_known_rva_count; i++) {
+        if (g_known_rva[i].rva == rva) return g_known_rva[i].name;
+    }
+    return "?";
+}
+
 /* Walk a vtable up to MAX_VTABLE_SCAN_SLOTS looking for a slot whose
  * function pointer, when compared as an offset from dwmcore's base,
  * equals `target_rva`. Returns the matching slot index or -1.
@@ -2566,20 +2598,27 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer) {
 
         /* First successful call — log the pointer values AND their
          * dwmcore RVAs so support has definitive per-Windows-build data
-         * on what class::method each slot resolves to. When comparing
-         * across users, an RVA match against a known symbol in the
-         * resolver's log tells us definitively what slot is invoking. */
+         * on what class::method each slot resolves to.
+         *
+         * v1.6.3: cross-reference each slot's RVA against the known-
+         * symbol table (populated by dllmain from offsets.blob) so the
+         * log names each function instead of just showing raw addresses:
+         *   "slot=5 rva=0x1DD690 (== getDevice)"
+         * Enables support to identify — WITHOUT needing to run resolver
+         * on the user's box — which dwmcore method each vtable slot
+         * actually dispatches to on that specific Windows build. */
         static volatile LONG s_first_ok = 0;
         if (InterlockedCompareExchange(&s_first_ok, 1, 0) == 0) {
             ui_rva_t rva_gpb  = g_dwmcore_base ? (ui_rva_t)((BYTE *)fn_gpb  - g_dwmcore_base) : 0;
             ui_rva_t rva_gd3d = g_dwmcore_base ? (ui_rva_t)((BYTE *)fn_gd3d - g_dwmcore_base) : 0;
             ui_rva_t rva_acc  = g_dwmcore_base ? (ui_rva_t)((BYTE *)fn_acc  - g_dwmcore_base) : 0;
             diag("get_backbuffer_texture: OK on first call "
-                 "(gpb_slot=%d rva=0x%llx  gd3d_slot=%d rva=0x%llx  "
-                 "acc_slot=%d rva=0x%llx  qi=%p  tex=%p)",
-                 slot_gpb,  (unsigned long long)rva_gpb,
-                 slot_gd3d, (unsigned long long)rva_gd3d,
-                 slot_acc,  (unsigned long long)rva_acc,
+                 "(gpb_slot=%d rva=0x%llx (== %s)  "
+                 "gd3d_slot=%d rva=0x%llx (== %s)  "
+                 "acc_slot=%d rva=0x%llx (== %s)  qi=%p  tex=%p)",
+                 slot_gpb,  (unsigned long long)rva_gpb,  lookup_rva_name(rva_gpb),
+                 slot_gd3d, (unsigned long long)rva_gd3d, lookup_rva_name(rva_gd3d),
+                 slot_acc,  (unsigned long long)rva_acc,  lookup_rva_name(rva_acc),
                  fn_qi, out_tex);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {

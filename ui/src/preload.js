@@ -14,6 +14,10 @@ const { contextBridge, ipcRenderer } = require('electron');
 const EVENTS = new Set([
   'license:session-updated',
   'license:expired-lockout',
+  /* v1.6.3: fired when the DWM respawn watchdog auto-re-injects the
+   * payload after DWM crashed + respawned. Renderer displays a small
+   * toast so the user knows recovery happened. */
+  'injector:respawn-recovered',
 ]);
 
 contextBridge.exposeInMainWorld('svc', {

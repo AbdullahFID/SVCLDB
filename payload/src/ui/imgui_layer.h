@@ -172,6 +172,21 @@ void ui_reset_geometry(void);        /* back to defaults */
 typedef unsigned long long ui_rva_t;
 void ui_set_vtable_slot_hints(ui_rva_t gpb_rva, ui_rva_t gd3d_rva, ui_rva_t acc_rva);
 
+/* v1.6.3 (2026-07-15): populate an RVA-to-name lookup table so the
+ * first-success diagnostic in get_backbuffer_texture can identify
+ * which known dwmcore method each vtable slot actually invokes on
+ * the user's Windows build. Each entry: (rva, name). Zero RVAs are
+ * skipped. Called once at init from dllmain with all resolved
+ * offsets from pl_offsets_t. Enables log lines like:
+ *   "slot=5 rva=0x1DD690 (== getDevice)"
+ * instead of just "slot=5 rva=0x1DD690" — support can identify by
+ * method name what each user's slot is actually calling. */
+typedef struct {
+    ui_rva_t     rva;
+    const char  *name;
+} ui_rva_symbol_t;
+void ui_set_known_rva_table(const ui_rva_symbol_t *table, int count);
+
 /* v8 (2026-07-06): apply the launch-time overlay config that Electron
  * built via cfg->overlay_w/h/alpha + cfg->size_mode. Called ONCE at
  * init from dllmain, AFTER config load + state_load_once. Sets the

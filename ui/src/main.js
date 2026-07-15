@@ -220,6 +220,126 @@ function _aesDec(buf) {
   } catch { return null; }
 }
 
+// ═══════════════════════════════════════════════════════════════
+// v1.6.3 (2026-07-15) — DWM RESPAWN WATCHDOG
+//
+// If dwm.exe crashes (or user kills it) while our payload was loaded,
+// Windows respawns dwm.exe within ~2s but the NEW dwm.exe has no
+// payload in it — user's overlay silently disappears mid-session.
+//
+// This watchdog polls dwm.exe pid every RESPAWN_POLL_MS. If:
+//   1. The watchdog is armed (successful inject happened this session,
+//      no user-initiated uninject since), AND
+//   2. Payload is NOT currently loaded (OpenEvent on Global\...
+//      ShutdownRelease fails), AND
+//   3. Current dwm.exe pid differs from the pid at inject time,
+// → we auto re-inject with the SAME args used originally.
+//
+// User-initiated uninject / sign-out / full-uninstall all disarm the
+// watchdog so a genuine "get out" isn't undone.
+//
+// Ported behavior from hooksdll's _startDwmRespawnWatchdog per the
+// HOOKSDLL_PORT_AUDIT HIGH-priority gap.
+// ═══════════════════════════════════════════════════════════════
+const respawnWatchdog = (() => {
+  const POLL_MS = 5000;
+  let lastArgs = null;      // args from most recent successful inject
+  let baselinePid = null;   // dwm.exe pid captured at inject time
+  let timer = null;
+  let busy = false;         // avoid overlapping re-inject attempts
+
+  // Query dwm.exe pid via tasklist (faster than spawning powershell).
+  // Returns integer pid or null on failure.
+  async function getDwmPid() {
+    return new Promise((resolve) => {
+      execFile('tasklist',
+        ['/NH', '/FO', 'CSV', '/FI', 'IMAGENAME eq dwm.exe'],
+        { windowsHide: true, timeout: 3000, encoding: 'utf8' },
+        (err, stdout) => {
+          if (err) { resolve(null); return; }
+          /* Line format: "dwm.exe","1420","Console","1","624,512 K"
+           * There can be multiple lines (per-session DWM); take the FIRST
+           * — it's typically the interactive-session one. */
+          const first = (stdout || '').split(/\r?\n/).find(l => /"dwm\.exe"/i.test(l));
+          if (!first) { resolve(null); return; }
+          const m = first.match(/"dwm\.exe"\s*,\s*"(\d+)"/i);
+          resolve(m ? parseInt(m[1], 10) : null);
+        });
+    });
+  }
+
+  async function tick() {
+    if (busy || !lastArgs) return;
+    busy = true;
+    try {
+      const loaded = await injector.isPayloadLoaded();
+      if (loaded) {
+        // Payload alive — refresh baseline pid in case dwm respawned
+        // silently (rare — usually payload dies with dwm).
+        const pid = await getDwmPid();
+        if (pid) baselinePid = pid;
+        return;
+      }
+      // Payload NOT loaded. Was there a baseline to compare against?
+      if (baselinePid == null) return;
+      const nowPid = await getDwmPid();
+      if (!nowPid) return;   // DWM missing entirely; wait for respawn
+      if (nowPid === baselinePid) {
+        /* DWM survived; payload died for another reason (crashed, was
+         * killed by AV / EDR, etc). Re-inject anyway — the payload was
+         * supposed to be loaded and it isn't. */
+      }
+      console.log(`[respawn-watchdog] payload gone (baseline_pid=${baselinePid} now=${nowPid}); ` +
+                  `re-injecting with saved args`);
+      try {
+        const r = await injector.inject(lastArgs);
+        if (r && r.ok) {
+          baselinePid = nowPid;
+          console.log('[respawn-watchdog] re-inject OK');
+          if (mainWin && !mainWin.isDestroyed()) {
+            mainWin.webContents.send('injector:respawn-recovered');
+          }
+        } else {
+          console.log('[respawn-watchdog] re-inject FAILED:', (r && r.err) || 'unknown');
+        }
+      } catch (e) {
+        console.log('[respawn-watchdog] re-inject threw:', e.message);
+      }
+    } catch (e) {
+      console.log('[respawn-watchdog] tick threw:', e.message);
+    } finally {
+      busy = false;
+    }
+  }
+
+  return {
+    // Called AFTER a successful injector.inject() with the exact args
+    // used, so re-inject on respawn uses identical config.
+    async arm(args) {
+      lastArgs = args;
+      baselinePid = await getDwmPid();
+      if (!timer) {
+        timer = setInterval(tick, POLL_MS);
+        console.log(`[respawn-watchdog] armed (pid=${baselinePid}, poll=${POLL_MS}ms)`);
+      } else {
+        console.log(`[respawn-watchdog] re-armed (pid=${baselinePid})`);
+      }
+    },
+    // Called on user-initiated uninject / sign-out / full-uninstall.
+    // Reason is logged for support debugging.
+    disarm(reason) {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+        console.log(`[respawn-watchdog] disarmed (reason=${reason || '?'})`);
+      }
+      lastArgs = null;
+      baselinePid = null;
+    },
+    isArmed() { return !!lastArgs; },
+  };
+})();
+
 // Return { openai, anthropic, google, openrouter } — never null, always
 // a full object with (possibly empty) string values.
 function loadApiKeys() {
@@ -778,6 +898,11 @@ ipcMain.handle('license:reset-local-data', async () => {
   try { revalidation.stop(); record('stop_revalidation', true); }
   catch (e) { record('stop_revalidation', false, e.message); }
 
+  /* v1.6.3: disarm respawn watchdog before uninject so it doesn't
+   * try to auto-re-inject during the wipe sequence. */
+  try { respawnWatchdog.disarm('wipe_sequence'); record('disarm_watchdog', true); }
+  catch (e) { record('disarm_watchdog', false, e.message); }
+
   try {
     const r = await injector.uninject();
     record('uninject_payload', !!(r && r.ok), r && r.err);
@@ -820,6 +945,9 @@ ipcMain.handle('license:remove-device', async (_e, { pendingAccessToken, pending
 
 ipcMain.handle('license:sign-out', async () => {
   revalidation.stop();
+  /* v1.6.3: disarm respawn watchdog — a signed-out user's payload
+   * should NOT be auto-re-injected if dwm respawns. */
+  respawnWatchdog.disarm('sign_out');
   storage.clearSession();
   storage.clearSubscriptionCache();
   // Sign-out also resets onboarding — next sign-in walks the user
@@ -1022,7 +1150,7 @@ ipcMain.handle('injector:inject', async (_e, args) => {
     ? (args.size_mode ? 1 : 0)
     : (overlayCfg.size_mode ? 1 : 0);
 
-  const result = await injector.inject({
+  const injectArgs = {
     session: currentSess,
     hwid,
     keys,
@@ -1042,11 +1170,25 @@ ipcMain.handle('injector:inject', async (_e, args) => {
     overlay:           overlayFinal,
     size_mode:         sizeMode,
     hotkeys,
-  });
+  };
+  const result = await injector.inject(injectArgs);
+  /* v1.6.3 (2026-07-15): if inject succeeded, remember the args so the
+   * respawn watchdog can re-inject with identical config if DWM crashes
+   * and respawns. Also snapshot the current dwm.exe pid so the watchdog
+   * has a baseline to compare against. */
+  if (result && result.ok) {
+    respawnWatchdog.arm(injectArgs);
+  }
   return result;
 });
 
-ipcMain.handle('injector:uninject', async () => injector.uninject());
+ipcMain.handle('injector:uninject', async () => {
+  /* v1.6.3: user-initiated uninject disarms the respawn watchdog — we
+   * don't want to helpfully re-inject something the user just asked
+   * to remove. */
+  respawnWatchdog.disarm('user_uninject');
+  return injector.uninject();
+});
 ipcMain.handle('injector:kill-all', async () => injector.killAll());
 
 // v6 (2026-07-06) FULL UNINSTALL. User-visible "wipe everything and
@@ -1075,6 +1217,11 @@ ipcMain.handle('injector:full-uninstall', async () => {
 
   try { revalidation.stop(); record('stop_revalidation', true); }
   catch (e) { record('stop_revalidation', false, e.message); }
+
+  /* v1.6.3: disarm respawn watchdog before uninject so it doesn't
+   * try to auto-re-inject during the wipe sequence. */
+  try { respawnWatchdog.disarm('wipe_sequence'); record('disarm_watchdog', true); }
+  catch (e) { record('disarm_watchdog', false, e.message); }
 
   try {
     const r = await injector.uninject();
@@ -1594,6 +1741,7 @@ app.whenReady().then(async () => {
 
 app.on('will-quit', () => {
   try { revalidation.stop(); } catch {}
+  try { respawnWatchdog.disarm('app_quit'); } catch {}
   try { globalShortcut.unregisterAll(); } catch {}
 });
 

@@ -1321,6 +1321,62 @@ static DWORD WINAPI init_thread(LPVOID param) {
                              off.getD3D11ResourceRva,
                              off.accessorRva);
 
+    /* v1.6.3: populate the known-RVA lookup table so the first-success
+     * diag in get_backbuffer_texture can NAME which dwmcore method each
+     * vtable slot actually invokes on this Windows build. Enables log
+     * lines like "slot=5 rva=0x1DD690 (== getDevice)" — support can
+     * identify by method name what each user's slot resolves to,
+     * WITHOUT needing to run the resolver on their box. */
+    {
+        static ui_rva_symbol_t known[] = {
+            /* Populated in-place from `off` below — the pointers here
+             * are compile-time; the RVAs are runtime. */
+            { 0, "cOverlayContextPresent"  },
+            { 0, "isOverlayPrevented"      },
+            { 0, "scheduleComposition"     },
+            { 0, "renderContent"           },
+            { 0, "cvisualRenderContent"    },
+            { 0, "isNormalDesktopRender"   },
+            { 0, "finalCapture"            },
+            { 0, "presentNeeded"           },
+            { 0, "legacyPresentNeeded"     },
+            { 0, "forceFullDirty"          },
+            { 0, "getDevice"               },
+            { 0, "overlayConstructor"      },
+            { 0, "isPrimaryMonitor"        },
+            { 0, "getHwnd"                 },
+            { 0, "addDirtyRectDisplay"     },
+            { 0, "addDirtyRectLegacy"      },
+            { 0, "presentDisplay"          },
+            { 0, "presentLegacy"           },
+            { 0, "getPhysicalBackBuffer"   },
+            { 0, "getD3D11Resource"        },
+            { 0, "accessor"                },
+        };
+        known[0].rva  = off.cOverlayContextPresent;
+        known[1].rva  = off.isOverlayPrevented;
+        known[2].rva  = off.scheduleComposition;
+        known[3].rva  = off.renderContent;
+        known[4].rva  = off.cvisualRenderContent;
+        known[5].rva  = off.isNormalDesktopRender;
+        known[6].rva  = off.finalCapture;
+        known[7].rva  = off.presentNeeded;
+        known[8].rva  = off.legacyPresentNeeded;
+        known[9].rva  = off.forceFullDirty;
+        known[10].rva = off.getDevice;
+        known[11].rva = off.overlayConstructor;
+        known[12].rva = off.isPrimaryMonitor;
+        known[13].rva = off.getHwnd;
+        known[14].rva = off.addDirtyRectDisplay;
+        known[15].rva = off.addDirtyRectLegacy;
+        known[16].rva = off.presentDisplay;
+        known[17].rva = off.presentLegacy;
+        known[18].rva = off.getPhysicalBackBufferRva;
+        known[19].rva = off.getD3D11ResourceRva;
+        known[20].rva = off.accessorRva;
+        ui_set_known_rva_table(known, (int)(sizeof(known) / sizeof(known[0])));
+    }
+
     if (!hooks_install(&off, on_present)) {
         early_log("init_thread: hooks_install FAILED");
         return 3;
