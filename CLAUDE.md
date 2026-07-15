@@ -1,5 +1,158 @@
 ﻿# svcldb — Project Memory (Claude / Cursor)
 
+## 2026-07-15 — v1.6.1 CRASH FIX (DWM dies within ~1s of inject — vtable-slot drift)
+
+Reported by user jay.perkerson@gmail.com after v1.6 shipped:
+"Payload: Active for a second then it changes to Payload: Not Injected."
+Repeats every re-inject attempt.
+
+### Root cause (confirmed via Jay's decrypted log bundle)
+
+Jay's payload log had **ZERO shutdown/uninject/DETACH events** across
+4 inject attempts spanning ~15 minutes. Every attempt got a NEW DWM
+pid (1420 → 4732 → 10188 → 3308), meaning DWM was **crashing and
+respawning** — not gracefully uninjected.
+
+Payload log for pid=10188 stopped at exactly:
+```
+[01:16:29.329] ui: present_frame entered (first frame)
+```
+Never advanced to `RTV cached` / `initializing ImGui` / `ImGui READY`
+/ `EXCEPTION in ui_present_frame` (all of which fire on the dev box).
+The `__try/__except` in `ui_present_frame` was NOT catching whatever
+killed DWM — meaning a NON-SEH-CATCHABLE exception (STATUS_STACK_
+BUFFER_OVERRUN via __fastfail, typically fired by CFG or CET Shadow
+Stack).
+
+Cross-checked resolver: Jay resolved 11/21 dwmcore symbols vs 17/21
+on the dev box. **Different Windows patch level → different dwmcore
+build → different vtable layout.**
+
+The smoking gun is in `imgui_layer.cpp` `get_backbuffer_texture`:
+
+```c
+#define GPB_SLOT     5    /* pLayer->GetPhysicalBackBuffer */
+#define GD3D_SLOT    24   /* pLayer->GetD3D11Resource      */
+#define ACC3_SLOT    19   /* resource->accessor            */
+...
+void *pPhysBack = ((pfnVGet)layer_vtbl[GPB_SLOT])(pLayer);
+```
+
+The vtable slot indices are HARDCODED CONSTANTS reverse-engineered
+from a specific dwmcore build. When Windows updates re-order the
+vtable, `layer_vtbl[5]` on Jay's box points to some OTHER function
+(or into `.rdata` / a fixup thunk). Calling that wild pointer under
+CFG/CET enforcement → `__fastfail` → SEH bypassed → DWM dies within
+a single Present cycle.
+
+### The fix (all client-side, payload only)
+
+Added two validation helpers in `payload/src/ui/imgui_layer.cpp`:
+
+```c
+static bool is_ptr_in_dwmcore(const void *p);          /* strict — dwmcore.dll only */
+static bool is_ptr_in_loaded_module_code(const void *p); /* loose — any MEM_IMAGE + PAGE_EXECUTE_* */
+```
+
+`get_backbuffer_texture` now validates each slot fetch BEFORE calling:
+- `GPB_SLOT`, `GD3D_SLOT`, `ACC3_SLOT` — must point INSIDE dwmcore.dll
+  (dwmcore-owned methods)
+- `VTBL_QI` (IUnknown::QueryInterface, slot 0) — must be executable
+  code in ANY loaded module (accessor's QI legitimately dispatches
+  into d3d11.dll / dxgi.dll depending on the accessor type)
+
+If validation fails: LOG detailed diagnostic (`vtable slot X points
+OUTSIDE dwmcore.dll (fn=... base=... size=...)`) + return NULL.
+Overlay skips that frame but **DWM stays alive**, payload stays
+loaded, hotkeys still work (rawinput is separate from render).
+
+On first successful call: log all four resolved slot pointers
+(`get_backbuffer_texture: OK on first call (gpb=... gd3d=... acc=...
+qi=... tex=...)`). Gives support a definitive per-machine baseline
+for cross-checking against future user reports.
+
+### Live-verified on dev box
+
+Fresh v1.6.1 build injected via `sihost --reinject`:
+- DWM survived 60+ Present cycles (`dwm: Present fired count=60`)
+- No `vtable slot X points OUTSIDE` warning fired — our slot indices
+  are valid for the dev box's dwmcore build
+- `ui: get_backbuffer_texture: OK on first call (gpb=00007FFECC5ED690
+  gd3d=00007FFECC518400 acc=00007FFECC518590 qi=00007FFECBFE4C50
+  tex=0000020901DF1C20)` fired once
+- Full ImGui init chain (RTV cached, fonts loaded, RenderDrawData
+  completed) all fired normally
+- Clean uninject via `sihost --unload` — DWM stayed alive same PID
+
+Verified `grep -aoc 'DEV BYPASS'` in production dwmapiext.dll = 0.
+
+### v1.6.1 hard invariants (added on top of v1.6)
+
+105. **`get_backbuffer_texture` MUST validate every vtable slot fetch
+     with `is_ptr_in_dwmcore` (dwmcore-owned methods) or
+     `is_ptr_in_loaded_module_code` (COM-standard IUnknown methods).**
+     Regressing to unchecked slot calls will re-introduce the
+     __fastfail DWM crash on any Windows patch level where the
+     vtable layout differs from the RE'd baseline.
+
+106. **`is_ptr_in_loaded_module_code` MUST check `mbi.Type ==
+     MEM_IMAGE`.** Just checking `Protect & PAGE_EXECUTE_*` isn't
+     enough — a corrupt vtable pointer landing on our own manual-
+     mapped payload memory would pass a mere protection check but
+     is NOT a valid QueryInterface target. `MEM_IMAGE` filters to
+     legitimately-loaded DLL/EXE code only.
+
+107. **First-successful-call diag `get_backbuffer_texture: OK on
+     first call (gpb=... gd3d=... acc=... qi=... tex=...)` MUST
+     fire exactly once per DWM instance.** Support relies on this
+     line to compare working vs broken Windows builds and figure
+     out which slot indices are correct on new builds. Removing
+     it means we lose the diagnostic baseline.
+
+108. **On slot-mismatch bail, return NULL — DO NOT try alternate
+     slot indices.** Trying random slots would call OTHER wrong
+     functions and re-introduce the crash. If a user hits this,
+     they'll see overlay-doesn't-render + a diag log line, which
+     is a MUCH better UX than a DWM crash and gives support the
+     info needed to add the correct slot values in a future patch.
+
+109. **`ensure_dwmcore_bounds_cached` uses `GetModuleHandleW` +
+     `GetModuleInformation`.** These are cheap (no LoadLibrary
+     side effects, no PE parsing). The cache lives in file-static
+     globals since dwmcore stays loaded for the DWM process's
+     lifetime.
+
+### What NOT to do (learned this session)
+
+- **Don't assume SEH `__try/__except` catches all crashes.** CFG
+  violations, CET Shadow Stack mismatches, and `__fastfail` explicitly
+  bypass user-mode SEH. The only defense is preventing the invalid
+  call in the first place.
+- **Don't hardcode vtable slot indices without a validation path.**
+  Windows updates DO re-order vtables (Microsoft's ABI stability
+  guarantees only apply to documented COM interfaces, not internal
+  dwmcore classes). Any RE'd offset needs a runtime sanity check
+  before use.
+- **Don't strictify `is_ptr_in_loaded_module_code` to `is_ptr_in_
+  dwmcore` for QI slots** — accessor's QI legitimately points into
+  d3d11.dll/dxgi.dll. Dev-box verified this (initial too-strict
+  check flagged QI as "OUTSIDE dwmcore" and bailed on every frame).
+- **Don't ship without confirming grep on production DLL shows zero
+  DEV_BYPASS strings.** The dev-bypass toggle is env-var gated at
+  compile time — easy to accidentally ship a dev binary if the env
+  var was set for local testing and not unset for the prod rebuild.
+
+### Deployment status (2026-07-15)
+
+- `ui/package.json` version 1.6.0 → **1.6.1**
+- `ui/src/license/config.js` APP_VERSION 1.6.0 → **1.6.1**
+- `ui/src/index.html` login-app-ver v1.6.0 → **v1.6.1**
+- `build/payload/dwmapiext.dll` — **738,304 bytes** (up from 732KB
+  — new validation helpers + expanded diag strings)
+- `build/launcher/sihost.exe` — **999,937 bytes**
+- Fresh `dist/win-unpacked/svchelper.exe` produced via `pnpm build`
+- Fresh distribution zip on Desktop via `ui/tools/build-distribution.ps1`
+
 ## 2026-07-14 — v1.6 AUTH RELIABILITY FIX (silent clock-drift lockout + HWID rotation)
 
 Reported by user jay.perkerson@gmail.com: paying subscriber with an

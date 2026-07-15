@@ -36,6 +36,7 @@
 #include <dxgi.h>
 #include <wincodec.h>
 #include <shlwapi.h>
+#include <psapi.h>
 #include <stdio.h>
 
 #include "../../../shared/imgui/imgui.h"
@@ -53,6 +54,7 @@ extern "C" {
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "psapi.lib")
 
 /* ---------- Vtable slots (production-verified in hooksdll) ---------- */
 #define GPB_SLOT     5    /* pLayer->GetPhysicalBackBuffer */
@@ -140,6 +142,71 @@ static bool is_readable(const void *addr, size_t bytes) {
     if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
     if ((BYTE *)addr + bytes > (BYTE *)mbi.BaseAddress + mbi.RegionSize) return false;
     return true;
+}
+
+/* v1.6.1 (2026-07-15) — Executability probe for vtable-slot validation.
+ *
+ * The hardcoded vtable slots in get_backbuffer_texture (GPB_SLOT=5,
+ * GD3D_SLOT=24, ACC3_SLOT=19) were reverse-engineered from a specific
+ * dwmcore build. When Windows updates re-order the vtable (different
+ * patch levels, ARM64 vs x64, N vs full SKU), our slot indices point
+ * to the WRONG function pointer for that build. Calling the wrong
+ * pointer either:
+ *   - Lands in valid code that happens to have a different signature
+ *     → stack corruption → later __fastfail
+ *   - Lands in NON-code (heap, .data, unmapped) → __fastfail via CFG
+ *     or CET Shadow Stack (BYPASSES __try/__except entirely)
+ *
+ * Reported by jay.perkerson@gmail.com 2026-07-15: DWM crashed within
+ * ~1s of every inject. Payload log stopped exactly at first-frame
+ * BEFORE any ImGui init line, which is where get_backbuffer_texture
+ * runs. His resolver hit 11/21 symbols vs 17/21 on the dev box —
+ * confirming different dwmcore build.
+ *
+ * Fix: validate each vtable slot fetch returns a pointer INSIDE
+ * dwmcore.dll's executable memory before calling. If not, log and
+ * bail — overlay doesn't render (returns NULL from
+ * get_backbuffer_texture) but DWM STAYS ALIVE, hotkeys still work,
+ * and payload emits diagnostic that tells support what happened. */
+static HMODULE g_dwmcore_mod  = NULL;
+static BYTE   *g_dwmcore_base = NULL;
+static SIZE_T  g_dwmcore_size = 0;
+static void ensure_dwmcore_bounds_cached(void) {
+    if (g_dwmcore_mod) return;
+    HMODULE m = GetModuleHandleW(L"dwmcore.dll");
+    if (!m) return;
+    MODULEINFO mi = {0};
+    if (!GetModuleInformation(GetCurrentProcess(), m, &mi, sizeof(mi))) return;
+    g_dwmcore_mod  = m;
+    g_dwmcore_base = (BYTE *)mi.lpBaseOfDll;
+    g_dwmcore_size = (SIZE_T)mi.SizeOfImage;
+}
+static bool is_ptr_in_dwmcore(const void *p) {
+    if (!p) return false;
+    ensure_dwmcore_bounds_cached();
+    if (!g_dwmcore_base || !g_dwmcore_size) return false;
+    const BYTE *pb = (const BYTE *)p;
+    return pb >= g_dwmcore_base && pb < (g_dwmcore_base + g_dwmcore_size);
+}
+
+/* v1.6.1: Any executable memory owned by an IMAGE-mapped section (i.e.
+ * inside a legitimately-loaded DLL/EXE). Used for looser slot validation
+ * on COM-standard vtable positions (e.g. IUnknown::QueryInterface at
+ * slot 0) which legitimately dispatch across module boundaries — the
+ * accessor's QI might point into d3d11.dll or dxgi.dll, not dwmcore.
+ *
+ * MEM_IMAGE + PAGE_EXECUTE_* is the correct signature for loaded-DLL
+ * code — excludes heap/stack/manual-map regions where a corrupted vtable
+ * pointer might otherwise land. */
+static bool is_ptr_in_loaded_module_code(const void *p) {
+    if (!p) return false;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    if (mbi.Type  != MEM_IMAGE)  return false;
+    DWORD exec_mask = PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                      PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    return (mbi.Protect & exec_mask) != 0;
 }
 
 /* ---------- RTV cache ---------- */
@@ -2241,31 +2308,122 @@ extern "C" char *ui_chat_take_and_clear() {
 }
 
 /* Walk pLayer's vtable to get backbuffer ID3D11Texture2D*.
- * Slot values verified from main hooksdll production code (dwm_payload.c). */
+ * Slot values verified from main hooksdll production code (dwm_payload.c).
+ *
+ * v1.6.1 (2026-07-15) — hardened against vtable-layout drift.
+ *
+ *   The slot indices below (GPB_SLOT=5, GD3D_SLOT=24, ACC3_SLOT=19)
+ *   were reverse-engineered from a SPECIFIC dwmcore.dll build.
+ *   Windows patch updates can re-order the vtable (verified on user
+ *   jay.perkerson@gmail.com's box, 2026-07-15). Calling the wrong
+ *   slot invokes a wild function pointer that Windows' CFG / CET
+ *   Shadow Stack traps with __fastfail, which BYPASSES __try/__except
+ *   entirely and takes DWM down.
+ *
+ *   Fix: validate each vtable-slot pointer is inside dwmcore.dll's
+ *   executable memory BEFORE calling. If not, log detailed diag and
+ *   return NULL — overlay skips this frame instead of crashing DWM.
+ *   Payload stays loaded; hotkeys still work (rawinput is separate
+ *   from render); support gets a clear log line pointing at the
+ *   slot mismatch. */
 static ID3D11Texture2D *get_backbuffer_texture(void *pLayer) {
     ID3D11Texture2D *out_tex = nullptr;
+
+    /* Populate dwmcore bounds cache on first call. Cheap. */
+    ensure_dwmcore_bounds_cached();
+
     __try {
         if (!pLayer || !is_readable(pLayer, 8)) return nullptr;
         void **layer_vtbl = *(void ***)pLayer;
         if (!is_readable(layer_vtbl, (ACC3_SLOT + 1) * 8)) return nullptr;
 
-        void *pPhysBack = ((pfnVGet)layer_vtbl[GPB_SLOT])(pLayer);
+        /* v1.6.1: validate slot 5 (GPB_SLOT) points into dwmcore. */
+        void *fn_gpb = layer_vtbl[GPB_SLOT];
+        if (!is_ptr_in_dwmcore(fn_gpb)) {
+            static volatile LONG s_first_bad_gpb = 0;
+            if (InterlockedCompareExchange(&s_first_bad_gpb, 1, 0) == 0) {
+                diag("vtable slot GPB_SLOT=%d points OUTSIDE dwmcore.dll "
+                     "(fn=%p base=%p size=%zu) — Windows build likely re-ordered "
+                     "the vtable; skipping overlay draw to prevent CFG/CET crash",
+                     GPB_SLOT, fn_gpb, g_dwmcore_base, (size_t)g_dwmcore_size);
+            }
+            return nullptr;
+        }
+        void *pPhysBack = ((pfnVGet)fn_gpb)(pLayer);
         if (!pPhysBack || !is_readable(pPhysBack, 8)) return nullptr;
 
-        void *pRes = ((pfnVGet)layer_vtbl[GD3D_SLOT])(pLayer);
+        /* v1.6.1: validate slot 24 (GD3D_SLOT). */
+        void *fn_gd3d = layer_vtbl[GD3D_SLOT];
+        if (!is_ptr_in_dwmcore(fn_gd3d)) {
+            static volatile LONG s_first_bad_gd3d = 0;
+            if (InterlockedCompareExchange(&s_first_bad_gd3d, 1, 0) == 0) {
+                diag("vtable slot GD3D_SLOT=%d points OUTSIDE dwmcore.dll "
+                     "(fn=%p) — skipping overlay draw",
+                     GD3D_SLOT, fn_gd3d);
+            }
+            return nullptr;
+        }
+        void *pRes = ((pfnVGet)fn_gd3d)(pLayer);
         if (!pRes || !is_readable(pRes, 8)) return nullptr;
 
         void **res_vtbl = *(void ***)pRes;
         if (!is_readable(res_vtbl, (ACC3_SLOT + 1) * 8)) return nullptr;
 
-        void *pAcc = ((pfnVGet)res_vtbl[ACC3_SLOT])(pRes);
+        /* v1.6.1: validate slot 19 (ACC3_SLOT). */
+        void *fn_acc = res_vtbl[ACC3_SLOT];
+        if (!is_ptr_in_dwmcore(fn_acc)) {
+            static volatile LONG s_first_bad_acc = 0;
+            if (InterlockedCompareExchange(&s_first_bad_acc, 1, 0) == 0) {
+                diag("vtable slot ACC3_SLOT=%d points OUTSIDE dwmcore.dll "
+                     "(fn=%p) — skipping overlay draw",
+                     ACC3_SLOT, fn_acc);
+            }
+            return nullptr;
+        }
+        void *pAcc = ((pfnVGet)fn_acc)(pRes);
         if (!pAcc || !is_readable(pAcc, 8)) return nullptr;
 
         void **acc_vtbl = *(void ***)pAcc;
-        pfnQI qi = (pfnQI)acc_vtbl[VTBL_QI];
+        if (!is_readable(acc_vtbl, (VTBL_QI + 1) * 8)) return nullptr;
+
+        /* QueryInterface is COM-standard slot 0 on every IUnknown-derived
+         * object. The accessor's QI legitimately dispatches into whatever
+         * module implements it (often d3d11.dll or dxgi.dll, not dwmcore),
+         * so we accept a pointer inside ANY loaded module's executable
+         * region — much looser than the dwmcore-only check used for the
+         * GPB/GD3D/ACC3 slots (which are dwmcore-owned methods). */
+        void *fn_qi = acc_vtbl[VTBL_QI];
+        if (!is_ptr_in_loaded_module_code(fn_qi)) {
+            static volatile LONG s_first_bad_qi = 0;
+            if (InterlockedCompareExchange(&s_first_bad_qi, 1, 0) == 0) {
+                diag("vtable slot VTBL_QI=%d on accessor is NOT executable "
+                     "loaded-module code (fn=%p) — skipping overlay draw",
+                     VTBL_QI, fn_qi);
+            }
+            return nullptr;
+        }
+        pfnQI qi = (pfnQI)fn_qi;
         HRESULT hr = qi(pAcc, &IID_ID3D11Texture2D_LOCAL, (void **)&out_tex);
-        if (FAILED(hr)) return nullptr;
+        if (FAILED(hr)) {
+            static volatile LONG s_first_qi_fail = 0;
+            if (InterlockedCompareExchange(&s_first_qi_fail, 1, 0) == 0)
+                diag("QueryInterface(ID3D11Texture2D) FAILED hr=0x%08lx", hr);
+            return nullptr;
+        }
+
+        /* First successful call — log the pointer values so we can
+         * cross-check what a working vtable layout looks like on this
+         * specific Windows build. Cheap one-shot. */
+        static volatile LONG s_first_ok = 0;
+        if (InterlockedCompareExchange(&s_first_ok, 1, 0) == 0) {
+            diag("get_backbuffer_texture: OK on first call "
+                 "(gpb=%p gd3d=%p acc=%p qi=%p tex=%p)",
+                 fn_gpb, fn_gd3d, fn_acc, fn_qi, out_tex);
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        static volatile LONG s_first_seh = 0;
+        if (InterlockedCompareExchange(&s_first_seh, 1, 0) == 0)
+            diag("get_backbuffer_texture: SEH exception caught (first)");
         return nullptr;
     }
     return out_tex;
