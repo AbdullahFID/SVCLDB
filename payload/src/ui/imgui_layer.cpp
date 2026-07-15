@@ -1497,7 +1497,10 @@ extern "C" void ui_chat_append_message(int role, const char *text) {
     if (g_chat_msg_count < CHAT_MAX_MSGS) g_chat_msg_count++;
     LeaveCriticalSection(&g_chat_msgs_cs);
 
-    /* New activity — cancel home-forced mode so user sees the new msg. */
+    /* New activity — cancel home-forced mode so if user opens the
+     * overlay later they land on the chat view (not the empty cheat-
+     * sheet). Only meaningful WHILE the overlay is visible; harmless
+     * otherwise. */
     InterlockedExchange(&g_home_view_forced, 0);
 
     /* NOTE: this function INTENTIONALLY does NOT update
@@ -1507,11 +1510,26 @@ extern "C" void ui_chat_append_message(int role, const char *text) {
      * Real AI answers flow through ui_chat_set_reply_of_pending
      * which DOES update the snapshot. */
 
-    EnterCriticalSection(&g_ui_cs);
-    g_visible = true;
-    LeaveCriticalSection(&g_ui_cs);
+    /* v1.6.4 (2026-07-15): DO NOT auto-show the overlay on new
+     * message. Preserve current g_visible state.
+     *
+     * User feedback (2026-07-15): "keep the overlay hidden even if
+     * you clicked the shortcut to answer and the students them self
+     * can show/hide it. Because at his current state its kinda nerves
+     * rocking if someone passing saw it lol"
+     *
+     * Rationale: users hiding the overlay for stealth expect it to
+     * STAY hidden. Auto-showing on Ctrl+Shift+Space (Ask) defeats the
+     * purpose — someone walking by mid-exam sees the overlay flash
+     * on-screen. New behavior: message appends silently; user hits
+     * Ctrl+Alt+G to view OR Ctrl+Alt+C to copy answer to clipboard
+     * without ever showing the overlay. If overlay was ALREADY
+     * visible when the message arrived, it stays visible and the
+     * message renders normally in-view (backwards-compat for users
+     * who prefer the running-conversation flow). */
     wake_dwm_composition();
-    diag("chat: appended role=%d len=%zu", role, strlen(text));
+    diag("chat: appended role=%d len=%zu (visibility preserved: %d)",
+         role, strlen(text), (int)g_visible);
 }
 
 extern "C" int ui_chat_append_pending(void) {
@@ -1529,14 +1547,18 @@ extern "C" int ui_chat_append_pending(void) {
     if (g_chat_msg_count < CHAT_MAX_MSGS) g_chat_msg_count++;
     LeaveCriticalSection(&g_chat_msgs_cs);
 
-    /* New AI turn starting — bring the chat back into view. */
+    /* New AI turn starting — cancel home-forced so IF the user opens
+     * the overlay they land on the chat view. Only matters when the
+     * overlay becomes visible. */
     InterlockedExchange(&g_home_view_forced, 0);
 
-    EnterCriticalSection(&g_ui_cs);
-    g_visible = true;
-    LeaveCriticalSection(&g_ui_cs);
+    /* v1.6.4: DO NOT auto-show (see ui_chat_append_message for full
+     * rationale). Preserve current visibility. Stream flows silently
+     * if overlay was hidden. User hits Ctrl+Alt+G to view OR
+     * Ctrl+Alt+C to copy answer to clipboard. */
     wake_dwm_composition();
-    diag("chat: pending id=%d", id);
+    diag("chat: pending id=%d (visibility preserved: %d)",
+         id, (int)g_visible);
     return id;
 }
 
@@ -3807,10 +3829,11 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
              * without touching the font atlas (which would inflate the
              * DLL by ~1MB for one glyph). */
             ImGui::TextDisabled("--- Ask AI ---");
-            ImGui::TextDisabled("  Ctrl+Shift+Space    Screenshot + ask AI");
+            ImGui::TextDisabled("  Ctrl+Shift+Space    Screenshot + ask AI (STAYS HIDDEN if you hid overlay)");
             ImGui::TextDisabled("  Ctrl+Alt+T          Type a question (chat mode)");
             ImGui::TextDisabled("  Ctrl+Alt+Enter      Regenerate last answer");
             ImGui::TextDisabled("  Ctrl+Alt+S          STOP the in-flight AI response");
+            ImGui::TextDisabled("  Ctrl+Alt+G          Show/hide overlay (view answer when safe)");
             ImGui::TextDisabled("  Ctrl+Alt+J / K      Scroll chat down / up");
             ImGui::TextDisabled("  Ctrl+Alt+N          New chat (clear all msgs - DESTRUCTIVE)");
             ImGui::TextDisabled("  Ctrl+Alt+X          Back to home (preserves msgs) / Quit on home");
