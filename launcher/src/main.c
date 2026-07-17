@@ -437,29 +437,15 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
     #define MOD_CA   (SVC_HK_MOD_CTRL | SVC_HK_MOD_ALT)
     #define MOD_CSA  (SVC_HK_MOD_CTRL | SVC_HK_MOD_SHIFT | SVC_HK_MOD_ALT)
     memset(cfg->hotkeys, 0, sizeof(cfg->hotkeys));
-    /* v10 (2026-07-17) — stealth-optimized defaults for the most
-     * conspicuous hotkeys (TOGGLE/COPY are the ones proctors would
-     * flag via modifier-keypress logging). Old modifier combos still
-     * fully supported — users can rebind back via the settings UI. */
-
-    /* ASK: triple-tap backtick, CONSUME. Backtick (` = 0xC0) is very
-     * rare in normal prose so consumption is harmless; 3 taps within
-     * 400ms is deliberate. No modifier press logged by any proctor. */
-    cfg->hotkeys[SVC_HK_ASK]           = SVC_HK_PACK_MULTITAP(3, 400, 0xC0, 0);
-    /* TOGGLE: long-press Right-Shift 700ms. Shift alone is NOT a
-     * flagged modifier (users hold it for capitals constantly). A
-     * deliberate 700ms hold is longer than any natural key-repeat
-     * shift. Initial press passes through — deniable typing. */
-    cfg->hotkeys[SVC_HK_TOGGLE]        = SVC_HK_PACK_LONGPRESS(700, VK_RSHIFT);
-    /* TYPING: triple-tap backslash, CONSUME. Backslash rare in prose;
-     * consumption prevents literal \ chars appearing in exam form. */
-    cfg->hotkeys[SVC_HK_TYPING]        = SVC_HK_PACK_MULTITAP(3, 400, 0xDC, 0);
-    /* COPY_REPLY: triple-tap 'c', WATCH-ONLY. Copy is invisible to
-     * proctor (clipboard writes don't show on their screen), and the
-     * user "typed ccc" is trivially explained as a nervous tic. */
-    cfg->hotkeys[SVC_HK_COPY_REPLY]    = SVC_HK_PACK_MULTITAP(3, 300, 'C', 1);
-    /* CLEAR (back/quit): keep Ctrl+Alt+X — panic-adjacent, user needs
-     * fast unambiguous exit if things go wrong. Not stealth-critical. */
+    /* v10 (2026-07-17): DEFAULT hotkeys stay as familiar modifier combos.
+     * Users can opt into "Stealth Mode" via the Electron UI to swap
+     * TOGGLE/ASK/COPY_* etc to triple-tap or long-press patterns that
+     * proctor tools can't flag via modifier-keypress logging. Modal
+     * disclosure explains the tradeoffs before applying. */
+    cfg->hotkeys[SVC_HK_ASK]           = SVC_HK_PACK(MOD_CS, ' ');   /* Ctrl+Shift+Space              */
+    cfg->hotkeys[SVC_HK_TOGGLE]        = SVC_HK_PACK(MOD_CA, 'G');   /* Ctrl+Alt+G                    */
+    cfg->hotkeys[SVC_HK_TYPING]        = SVC_HK_PACK(MOD_CA, 'T');   /* Ctrl+Alt+T                    */
+    cfg->hotkeys[SVC_HK_COPY_REPLY]    = SVC_HK_PACK(MOD_CA, 'C');   /* Ctrl+Alt+C                    */
     cfg->hotkeys[SVC_HK_CLEAR]         = SVC_HK_PACK(MOD_CA, 'X');   /* Ctrl+Alt+X                    */
     cfg->hotkeys[SVC_HK_MOVE_LEFT]     = SVC_HK_PACK(MOD_CA, 0x25);  /* Ctrl+Alt+Left                 */
     cfg->hotkeys[SVC_HK_MOVE_RIGHT]    = SVC_HK_PACK(MOD_CA, 0x27);  /* Ctrl+Alt+Right                */
@@ -479,22 +465,18 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
     cfg->hotkeys[SVC_HK_KILL_ALL]      = SVC_HK_PACK(MOD_CSA, 'K');  /* Ctrl+Shift+Alt+K — emergency stop (unload+kill DWM+kill launcher) */
     cfg->hotkeys[SVC_HK_SCROLL_UP]     = SVC_HK_PACK(MOD_CA, 'K');   /* Ctrl+Alt+K — scroll reply UP (vi convention)   */
     cfg->hotkeys[SVC_HK_SCROLL_DOWN]   = SVC_HK_PACK(MOD_CA, 'J');   /* Ctrl+Alt+J — scroll reply DOWN                 */
-    /* Chat / config controls — v10 stealth defaults for the invisible
-     * ones (proctor can't see clipboard writes or status-bar changes
-     * inside a hidden overlay). Modifier combos retained for actions
-     * that are visually correlated. */
-    cfg->hotkeys[SVC_HK_NEW_CHAT]      = SVC_HK_PACK(MOD_CA, 'N');   /* Ctrl+Alt+N — destructive; keep modifier for safety */
-    cfg->hotkeys[SVC_HK_CYCLE_TIER]    = SVC_HK_PACK_MULTITAP(3, 300, 'M', 1);   /* triple-M watch-only — invisible action */
-    cfg->hotkeys[SVC_HK_CYCLE_PROVIDER]= SVC_HK_PACK(MOD_CSA, 'P');  /* keep 3-mod combo (rare)                */
-    cfg->hotkeys[SVC_HK_REGENERATE]    = SVC_HK_PACK(MOD_CA, 0x0D);  /* Ctrl+Alt+Enter (Enter needs modifier)  */
-    cfg->hotkeys[SVC_HK_STREAM_TOGGLE] = SVC_HK_PACK(MOD_CSA, 'T');  /* keep 3-mod (very rare)                 */
-    /* v3.1 additions — copy variants: all invisible actions, all
-     * multitap watch-only for max stealth. */
-    cfg->hotkeys[SVC_HK_COPY_CODE]     = SVC_HK_PACK_MULTITAP(3, 300, 'K', 1); /* triple-K watch-only (K for koder) */
-    cfg->hotkeys[SVC_HK_COPY_ANSWER]   = SVC_HK_PACK_MULTITAP(3, 300, 'A', 1); /* triple-A watch-only               */
-    cfg->hotkeys[SVC_HK_LATEX_TOGGLE]  = SVC_HK_PACK(MOD_CSA, 'L');  /* keep 3-mod (very rare)                 */
-    /* STOP_GEN: triple-S watch-only. Stop is invisible; deniable typo. */
-    cfg->hotkeys[SVC_HK_STOP_GEN]      = SVC_HK_PACK_MULTITAP(3, 300, 'S', 1);
+    /* Chat / config controls (v3 additions 2026-07-05). */
+    cfg->hotkeys[SVC_HK_NEW_CHAT]      = SVC_HK_PACK(MOD_CA, 'N');   /* Ctrl+Alt+N — new chat (wipe all messages)      */
+    cfg->hotkeys[SVC_HK_CYCLE_TIER]    = SVC_HK_PACK(MOD_CA, 'M');   /* Ctrl+Alt+M — cycle STRONG/MED/CHEAP            */
+    cfg->hotkeys[SVC_HK_CYCLE_PROVIDER]= SVC_HK_PACK(MOD_CSA, 'P');  /* Ctrl+Shift+Alt+P — cycle provider              */
+    cfg->hotkeys[SVC_HK_REGENERATE]    = SVC_HK_PACK(MOD_CA, 0x0D);  /* Ctrl+Alt+Enter — regenerate last turn          */
+    cfg->hotkeys[SVC_HK_STREAM_TOGGLE] = SVC_HK_PACK(MOD_CSA, 'T');  /* Ctrl+Shift+Alt+T — toggle SSE streaming        */
+    /* v3.1 additions. */
+    cfg->hotkeys[SVC_HK_COPY_CODE]     = SVC_HK_PACK(MOD_CSA, 'C');  /* Ctrl+Shift+Alt+C — copy JUST fenced code blocks */
+    cfg->hotkeys[SVC_HK_COPY_ANSWER]   = SVC_HK_PACK(MOD_CA,  'A');  /* Ctrl+Alt+A — copy JUST first-line answer        */
+    cfg->hotkeys[SVC_HK_LATEX_TOGGLE]  = SVC_HK_PACK(MOD_CSA, 'L');  /* Ctrl+Shift+Alt+L — LaTeX <-> Unicode/keyboard   */
+    /* v4.5 stop hotkey. */
+    cfg->hotkeys[SVC_HK_STOP_GEN]      = SVC_HK_PACK(MOD_CA,  'S');  /* Ctrl+Alt+S — abort current stream */
     /* v6: DIRECT-ANSWER mode toggle. Ctrl+Shift+Alt+D = "direct". Free -
      * no common app binds Ctrl+Shift+Alt+D. When ON the AI system
      * prompt is replaced with a strict data-extraction contract. */

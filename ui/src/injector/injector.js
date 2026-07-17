@@ -137,46 +137,77 @@ function packMultitap(vk, count, gap_ms, watch_only) {
 }
 
 // Slot indices MUST match shared/config_types.h svc_hotkey_action_t.
-// v10: stealth-optimized defaults using MULTITAP/LONGPRESS for slots
-// where proctor-visible modifier presses are a concern. Modifier
-// combos retained for panic/rare/visible-anyway actions.
-// Users can rebind any slot to any mode via the hotkey editor.
-const VK_RSHIFT = 0xA1;
+// DEFAULTS are the familiar modifier combos (backward-compat with v9).
+// v10 adds LONGPRESS/MULTITAP as OPT-IN via the "Stealth mode" toggle
+// in the hotkey editor — see STEALTH_OVERRIDES below.
 const DEFAULT_HOTKEYS = [
-  packMultitap(0xC0, 3, 400, false),      //  0 ASK        — triple-tap backtick (rare in prose, CONSUME)
-  packLongpress(VK_RSHIFT, 700),          //  1 TOGGLE     — hold Right-Shift 700ms (Shift-alone not flagged)
-  packMultitap(0xDC, 3, 400, false),      //  2 TYPING     — triple-tap backslash (rare, CONSUME)
-  packMultitap(0x43, 3, 300, true),       //  3 COPY_REPLY — triple-C WATCH-ONLY (copy invisible to proctor)
-  pack(MOD_CA,  0x58),                    //  4 CLEAR      — Ctrl+Alt+X (panic-adjacent, keep modifier)
-  pack(MOD_CA,  0x25),                    //  5 MOVE_LEFT     (visible movement — modifier OK)
-  pack(MOD_CA,  0x27),                    //  6 MOVE_RIGHT
-  pack(MOD_CA,  0x26),                    //  7 MOVE_UP
-  pack(MOD_CA,  0x28),                    //  8 MOVE_DOWN
-  pack(MOD_CSA, 0x27),                    //  9 RESIZE_WIDER
-  pack(MOD_CSA, 0x25),                    // 10 RESIZE_NARROW
-  pack(MOD_CSA, 0x28),                    // 11 RESIZE_TALLER
-  pack(MOD_CSA, 0x26),                    // 12 RESIZE_SHORT
-  pack(MOD_CA,  0x51),                    // 13 CYCLE_CORNER — Ctrl+Alt+Q
-  pack(MOD_CA,  0xBB),                    // 14 ALPHA_UP  (+)
-  pack(MOD_CA,  0xBD),                    // 15 ALPHA_DOWN (-)
-  pack(MOD_CA,  0xDD),                    // 16 FONT_UP   (])
-  pack(MOD_CA,  0xDB),                    // 17 FONT_DOWN ([)
-  pack(MOD_CA,  0x52),                    // 18 RESET     R
-  pack(MOD_CSA, 0x53),                    // 19 DEBUG_CAP S
-  pack(MOD_CSA, 0x4B),                    // 20 KILL_ALL  — panic mode, keep 3-mod
-  pack(MOD_CA,  0x4B),                    // 21 SCROLL_UP K (visible)
-  pack(MOD_CA,  0x4A),                    // 22 SCROLL_DOWN J
-  pack(MOD_CA,  0x4E),                    // 23 NEW_CHAT  N — destructive, keep modifier
-  packMultitap(0x4D, 3, 300, true),       // 24 CYCLE_TIER — triple-M WATCH-ONLY (status-bar only, invisible if hidden)
-  pack(MOD_CSA, 0x50),                    // 25 CYCLE_PROVIDER P (rare)
-  pack(MOD_CA,  0x0D),                    // 26 REGENERATE Enter (needs modifier — Enter alone submits forms)
-  pack(MOD_CSA, 0x54),                    // 27 STREAM_TOGGLE T (rare)
-  packMultitap(0x4B, 3, 300, true),       // 28 COPY_CODE   — triple-K WATCH-ONLY (K for Koder; copy invisible)
-  packMultitap(0x41, 3, 300, true),       // 29 COPY_ANSWER — triple-A WATCH-ONLY
-  pack(MOD_CSA, 0x4C),                    // 30 LATEX_TOGGLE L (rare)
-  packMultitap(0x53, 3, 300, true),       // 31 STOP_GEN    — triple-S WATCH-ONLY (stop is invisible to proctor)
-  pack(MOD_CSA, 0x44),                    // 32 DIRECT_TOGGLE D (rare)
+  pack(MOD_CS,  0x20),  //  0 ASK           Ctrl+Shift+Space
+  pack(MOD_CA,  0x47),  //  1 TOGGLE        Ctrl+Alt+G
+  pack(MOD_CA,  0x54),  //  2 TYPING        Ctrl+Alt+T
+  pack(MOD_CA,  0x43),  //  3 COPY_REPLY    Ctrl+Alt+C
+  pack(MOD_CA,  0x58),  //  4 CLEAR         Ctrl+Alt+X
+  pack(MOD_CA,  0x25),  //  5 MOVE_LEFT
+  pack(MOD_CA,  0x27),  //  6 MOVE_RIGHT
+  pack(MOD_CA,  0x26),  //  7 MOVE_UP
+  pack(MOD_CA,  0x28),  //  8 MOVE_DOWN
+  pack(MOD_CSA, 0x27),  //  9 RESIZE_WIDER
+  pack(MOD_CSA, 0x25),  // 10 RESIZE_NARROW
+  pack(MOD_CSA, 0x28),  // 11 RESIZE_TALLER
+  pack(MOD_CSA, 0x26),  // 12 RESIZE_SHORT
+  pack(MOD_CA,  0x51),  // 13 CYCLE_CORNER
+  pack(MOD_CA,  0xBB),  // 14 ALPHA_UP  (+)
+  pack(MOD_CA,  0xBD),  // 15 ALPHA_DOWN (-)
+  pack(MOD_CA,  0xDD),  // 16 FONT_UP   (])
+  pack(MOD_CA,  0xDB),  // 17 FONT_DOWN ([)
+  pack(MOD_CA,  0x52),  // 18 RESET     R
+  pack(MOD_CSA, 0x53),  // 19 DEBUG_CAP S
+  pack(MOD_CSA, 0x4B),  // 20 KILL_ALL  K
+  pack(MOD_CA,  0x4B),  // 21 SCROLL_UP K
+  pack(MOD_CA,  0x4A),  // 22 SCROLL_DOWN J
+  pack(MOD_CA,  0x4E),  // 23 NEW_CHAT  N
+  pack(MOD_CA,  0x4D),  // 24 CYCLE_TIER M
+  pack(MOD_CSA, 0x50),  // 25 CYCLE_PROVIDER P
+  pack(MOD_CA,  0x0D),  // 26 REGENERATE Enter
+  pack(MOD_CSA, 0x54),  // 27 STREAM_TOGGLE T
+  pack(MOD_CSA, 0x43),  // 28 COPY_CODE C
+  pack(MOD_CA,  0x41),  // 29 COPY_ANSWER A
+  pack(MOD_CSA, 0x4C),  // 30 LATEX_TOGGLE L
+  pack(MOD_CA,  0x53),  // 31 STOP_GEN     S
+  pack(MOD_CSA, 0x44),  // 32 DIRECT_TOGGLE D
 ];
+
+/* v10 (2026-07-17) — STEALTH MODE overlay.
+ *
+ * When user enables "Stealth mode" in the hotkey editor, these
+ * overrides are applied to the specific slots below. The overrides
+ * pattern-match against proctor-tool visibility:
+ *   - Ctrl/Alt/Fn/Win keypresses are logged as "modifier used" by
+ *     aggressive exam browsers (LDB, Respondus Monitor). Shift alone
+ *     is not — it's normal typing.
+ *   - Triple-tap patterns without modifier don't show as "hotkey use"
+ *     — they look like ordinary typing (plausible deniability).
+ *   - Watch-only variants let the actual keystrokes reach downstream
+ *     apps unchanged. Proctor sees "user typed ccc" as a nervous tic
+ *     or typo.
+ *   - Long-press of Right-Shift is a deliberate gesture that has no
+ *     legitimate typing use (shifts are momentary).
+ *
+ * Slots NOT overridden here stay on their standard modifier combos
+ * — for actions where either (a) the response IS visible to the
+ * proctor anyway (movement, resize, opacity) so a modifier keypress
+ * doesn't add signal, or (b) the action is destructive/panic-mode
+ * (CLEAR quit, KILL_ALL, NEW_CHAT) where user reliability trumps
+ * concealment. */
+const STEALTH_OVERRIDES = {
+   0: packMultitap(0xC0, 3, 400, false), // ASK        — triple ` consume (rare key)
+   1: packLongpress(0xA1, 700),          // TOGGLE     — hold Right-Shift 700ms
+   2: packMultitap(0xDC, 3, 400, false), // TYPING     — triple \ consume
+   3: packMultitap(0x43, 3, 300, true),  // COPY_REPLY — triple-C watch-only
+  24: packMultitap(0x4D, 3, 300, true),  // CYCLE_TIER — triple-M watch-only
+  28: packMultitap(0x4B, 3, 300, true),  // COPY_CODE  — triple-K watch-only
+  29: packMultitap(0x41, 3, 300, true),  // COPY_ANSWER — triple-A watch-only
+  31: packMultitap(0x53, 3, 300, true),  // STOP_GEN   — triple-S watch-only
+};
 
 // Provider enum matches svc_config_t.svc_provider_t (shared/config_types.h)
 const PROVIDER = {
@@ -411,6 +442,7 @@ module.exports = {
   detectProvider, pickPrimaryProvider,
   PROVIDER,
   DEFAULT_HOTKEYS,
+  STEALTH_OVERRIDES,          /* v10: opt-in stealth-mode mapping */
   /* v10: exposed for renderer.js hotkey editor UI. */
   pack, packLongpress, packMultitap,
   KIND_MODIFIER, KIND_LONGPRESS, KIND_MULTITAP, KIND_DISABLED,

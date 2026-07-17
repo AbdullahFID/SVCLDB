@@ -1572,6 +1572,137 @@ html, body {
   line-height: 1.5;
 }
 
+/* v10 (2026-07-17): Stealth-mode banner at top of the hotkey editor. */
+.hk-stealth-banner {
+  background: linear-gradient(135deg, rgba(6,182,212,0.06) 0%, rgba(139,92,246,0.05) 100%);
+  border: 1px solid rgba(6, 182, 212, 0.25);
+  border-radius: 12px;
+  padding: 16px 18px;
+  margin-bottom: 16px;
+  transition: border-color .16s, background .16s;
+}
+.hk-stealth-banner.active {
+  border-color: rgba(34, 197, 94, 0.45);
+  background: linear-gradient(135deg, rgba(34,197,94,0.08) 0%, rgba(6,182,212,0.06) 100%);
+}
+.hk-stealth-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 20px;
+}
+.hk-stealth-title {
+  font-size: 14px; font-weight: 700;
+  color: var(--fg);
+  display: flex; align-items: center; gap: 8px;
+}
+.hk-stealth-on {
+  font-size: 10px; font-weight: 800;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(34,197,94,0.20);
+  color: #4ade80;
+  letter-spacing: 0.08em;
+}
+.hk-stealth-sub {
+  font-size: 12px; color: var(--fg2);
+  margin-top: 4px; line-height: 1.5;
+}
+.hk-stealth-sub b { color: var(--fg); }
+.hk-toggle-switch {
+  position: relative;
+  width: 42px; height: 22px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.hk-toggle-switch input {
+  position: absolute; opacity: 0; width: 0; height: 0;
+}
+.hk-toggle-slider {
+  position: absolute; inset: 0;
+  background: rgba(255,255,255,0.10);
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 999px;
+  transition: background .16s;
+}
+.hk-toggle-slider::before {
+  content: '';
+  position: absolute;
+  top: 2px; left: 2px;
+  width: 16px; height: 16px;
+  background: var(--fg);
+  border-radius: 50%;
+  transition: transform .16s;
+}
+.hk-toggle-switch input:checked + .hk-toggle-slider {
+  background: rgba(34,197,94,0.50);
+  border-color: rgba(34,197,94,0.75);
+}
+.hk-toggle-switch input:checked + .hk-toggle-slider::before {
+  transform: translateX(20px);
+  background: #fff;
+}
+
+/* v10: Stealth mapping table in the enable modal. */
+#hk-record-modal-root .stealth-lead {
+  font-size: 13px; line-height: 1.55;
+  color: var(--fg2); margin-bottom: 18px;
+}
+#hk-record-modal-root .stealth-lead b { color: var(--fg); }
+#hk-record-modal-root .stealth-tradeoff-title {
+  font-size: 12px; font-weight: 700;
+  color: var(--cyan-light);
+  letter-spacing: 0.06em; text-transform: uppercase;
+  margin-bottom: 8px;
+}
+#hk-record-modal-root .stealth-mapping-table {
+  width: 100%; border-collapse: collapse;
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+#hk-record-modal-root .stealth-mapping-table th {
+  text-align: left;
+  padding: 6px 8px;
+  color: var(--fg2);
+  font-weight: 600;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+}
+#hk-record-modal-root .stealth-mapping-table td {
+  padding: 6px 8px;
+  color: var(--fg);
+  vertical-align: top;
+}
+#hk-record-modal-root .stealth-slot-label { font-weight: 600; }
+#hk-record-modal-root .stealth-slot-old {
+  color: var(--fg2);
+  font-family: 'SF Mono', 'Cascadia Code', monospace;
+  font-size: 11px;
+}
+#hk-record-modal-root .stealth-slot-arrow {
+  color: rgba(6,182,212,0.6);
+  text-align: center;
+  width: 20px;
+}
+#hk-record-modal-root .stealth-slot-new {
+  color: #4ade80;
+  font-family: 'SF Mono', 'Cascadia Code', monospace;
+  font-size: 11px; font-weight: 600;
+}
+#hk-record-modal-root .stealth-tradeoff-list {
+  margin: 6px 0 12px 20px; padding: 0;
+  font-size: 12px; color: var(--fg); line-height: 1.55;
+}
+#hk-record-modal-root .stealth-tradeoff-list li { margin-bottom: 6px; }
+#hk-record-modal-root .stealth-tradeoff-list b { color: var(--cyan-light); }
+#hk-record-modal-root .stealth-tradeoff-list code {
+  font-family: 'SF Mono', 'Cascadia Code', monospace;
+  font-size: 11px;
+  padding: 1px 5px;
+  background: rgba(255,255,255,0.06);
+  border-radius: 3px;
+}
+#hk-record-modal-root .stealth-tradeoff-note {
+  font-size: 12px; color: var(--fg2); font-style: italic;
+  margin: 8px 0 20px 0;
+}
+
 /* ── Onboarding overlay ────────────────────────────────────────── */
 #onboarding-overlay {
   position: fixed; inset: 0; z-index: 9200;

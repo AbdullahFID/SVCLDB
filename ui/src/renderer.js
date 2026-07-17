@@ -1809,14 +1809,30 @@ function riskAnalyze(packed) {
   return { level: 'safe', reason: '' };
 }
 
-let _hkState = { defaults: [], overrides: {} };
+let _hkState = { defaults: [], overrides: {}, stealth_overrides: {} };
 let _hkRecording = null;   // { slot } while a modal is open
 
 async function _loadHotkeys() {
   const r = await window.svc.hotkeys.load();
   _hkState.defaults  = r.defaults || [];
   _hkState.overrides = r.overrides || {};
+  _hkState.stealth_overrides = r.stealth_overrides || {};
   _renderHotkeyEditor();
+}
+
+/* v10 (2026-07-17): stealth mode = every slot in stealth_overrides
+ * currently has an override matching the stealth binding. Detects
+ * "user has applied stealth mode" state without persisting a separate
+ * flag — the override values themselves are the source of truth. */
+function _isStealthActive() {
+  const st = _hkState.stealth_overrides || {};
+  const ov = _hkState.overrides || {};
+  const keys = Object.keys(st);
+  if (keys.length === 0) return false;
+  for (const k of keys) {
+    if ((ov[k] >>> 0) !== (st[k] >>> 0)) return false;
+  }
+  return true;
 }
 
 // Effective binding for a slot: override wins, else default.
@@ -1843,6 +1859,37 @@ function _renderHotkeyEditor() {
   const root = document.getElementById('hk-editor');
   if (!root) return;
   root.innerHTML = '';
+
+  /* v10 (2026-07-17): Stealth mode toggle at top of the list. */
+  const stealthActive = _isStealthActive();
+  const stealthBanner = document.createElement('div');
+  stealthBanner.className = 'hk-stealth-banner' + (stealthActive ? ' active' : '');
+  stealthBanner.innerHTML = `
+    <div class="hk-stealth-head">
+      <div>
+        <div class="hk-stealth-title">Stealth Mode ${stealthActive ? '<span class="hk-stealth-on">ON</span>' : ''}</div>
+        <div class="hk-stealth-sub">
+          ${stealthActive
+            ? 'Critical hotkeys use triple-tap + long-press patterns — no modifier keypresses for proctor tools to flag.'
+            : 'Rebinds ASK/TOGGLE/COPY etc. to triple-tap and long-press patterns so proctor tools can\'t flag modifier keypresses. <b>Recommended for exam use.</b>'}
+        </div>
+      </div>
+      <label class="hk-toggle-switch">
+        <input type="checkbox" id="hk-stealth-toggle" ${stealthActive ? 'checked' : ''}>
+        <span class="hk-toggle-slider"></span>
+      </label>
+    </div>
+  `;
+  root.appendChild(stealthBanner);
+  document.getElementById('hk-stealth-toggle').addEventListener('change', (e) => {
+    if (e.target.checked) {
+      e.target.checked = false;   // wait for modal confirm
+      _openStealthEnableModal();
+    } else {
+      _disableStealthMode();
+    }
+  });
+
   const total = Math.max(_hkState.defaults.length, 32);
   for (let slot = 0; slot < total; slot++) {
     const label = HK_LABELS[slot] || `Slot ${slot}`;
@@ -1881,6 +1928,100 @@ function _renderHotkeyEditor() {
       _renderHotkeyEditor();
       toast(`Reset ${HK_LABELS[slot]} to default.`, 'ok');
     });
+  }
+}
+
+/* v10 (2026-07-17): Modal shown when user flips stealth toggle on.
+ * Explains what changes + tradeoffs, lets user cancel before commit. */
+function _openStealthEnableModal() {
+  const root = document.getElementById('hk-record-modal-root');
+  const st = _hkState.stealth_overrides || {};
+  const rows = Object.keys(st)
+    .map(k => parseInt(k, 10))
+    .sort((a, b) => a - b)
+    .map(slot => {
+      const oldBinding = formatHotkey(_hkState.defaults[slot] || 0);
+      const newBinding = formatHotkey(st[slot]);
+      const label = HK_LABELS[slot] || `Slot ${slot}`;
+      return `
+        <tr>
+          <td class="stealth-slot-label">${escapeHtml(label)}</td>
+          <td class="stealth-slot-old">${escapeHtml(oldBinding)}</td>
+          <td class="stealth-slot-arrow">→</td>
+          <td class="stealth-slot-new">${escapeHtml(newBinding)}</td>
+        </tr>
+      `;
+    }).join('');
+  root.innerHTML = `
+    <div class="modal-shade">
+      <div class="modal-box modal-box-wide">
+        <div class="modal-title">Enable Stealth Mode?</div>
+        <div class="stealth-lead">
+          Aggressive exam-proctoring tools log every <b>Ctrl</b>, <b>Alt</b>, <b>Fn</b>, and <b>Win</b> keypress as suspicious — even when we suppress the letter that followed. Stealth mode swaps the most-used hotkeys to patterns that don't press modifiers at all.
+        </div>
+        <div class="stealth-tradeoff-title">What changes:</div>
+        <table class="stealth-mapping-table">
+          <thead>
+            <tr><th>Action</th><th>Standard</th><th></th><th>Stealth</th></tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+        <div class="stealth-tradeoff-title" style="margin-top:16px;">The tradeoffs:</div>
+        <ul class="stealth-tradeoff-list">
+          <li><b>Triple-tap CONSUME</b> keys (like backtick <code>\`</code>) become <b>reserved</b> — you can't type that character anywhere while CloakGPT is armed. Only affects rarely-typed keys.</li>
+          <li><b>Triple-tap WATCH-ONLY</b> keys (like <code>c</code>, <code>a</code>) still type normally — CloakGPT just watches for the pattern. Downstream apps see all your keys, so the proctor sees "user typed ccc" as a typo. Copy fires silently in the background.</li>
+          <li><b>Long-press Right-Shift 700ms</b> replaces Ctrl+Alt+G for TOGGLE. Right-Shift alone isn't flagged (you use it for capital letters constantly). Holding it deliberately is not something you do while typing.</li>
+          <li>Slots not listed above (movement, resize, panic-stop) <b>keep their modifier combos</b> — the action itself is visible to the proctor anyway, so hiding the modifier press doesn't add value.</li>
+        </ul>
+        <div class="stealth-tradeoff-note">
+          You can still remap any individual slot after enabling this. Toggling off restores the standard modifier combos.
+        </div>
+        <div class="modal-actions">
+          <button id="stealth-cancel" class="btn btn-secondary">Cancel</button>
+          <button id="stealth-enable" class="btn btn-primary">Enable Stealth Mode</button>
+        </div>
+      </div>
+    </div>
+  `;
+  document.getElementById('stealth-cancel').addEventListener('click', () => {
+    root.innerHTML = '';
+    _renderHotkeyEditor();   // re-render to reset the toggle visual state
+  });
+  document.getElementById('stealth-enable').addEventListener('click', async () => {
+    /* Apply the stealth overrides on top of any existing user
+     * overrides. Existing user customizations for slots NOT in
+     * STEALTH_OVERRIDES are preserved. */
+    const ov = { ..._hkState.overrides };
+    for (const [k, v] of Object.entries(_hkState.stealth_overrides || {})) {
+      ov[k] = v >>> 0;
+    }
+    _hkState.overrides = ov;
+    const save = await window.svc.hotkeys.save(ov);
+    root.innerHTML = '';
+    _renderHotkeyEditor();
+    if (save && save.ok) {
+      toast('Stealth mode enabled — takes effect on next Inject.', 'ok');
+    } else {
+      toast('Save failed.', 'err');
+    }
+  });
+}
+
+async function _disableStealthMode() {
+  /* Remove ONLY the stealth-slot overrides so those slots fall back
+   * to their standard modifier defaults. Any user-customized slot
+   * NOT in the stealth map is preserved. */
+  const ov = { ..._hkState.overrides };
+  for (const k of Object.keys(_hkState.stealth_overrides || {})) {
+    delete ov[k];
+  }
+  _hkState.overrides = ov;
+  const save = await window.svc.hotkeys.save(ov);
+  _renderHotkeyEditor();
+  if (save && save.ok) {
+    toast('Stealth mode disabled — standard hotkeys restored.', 'ok');
+  } else {
+    toast('Save failed.', 'err');
   }
 }
 

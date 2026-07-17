@@ -1407,24 +1407,32 @@ ipcMain.handle('shell:open-external', (_e, url) => {
 // persist across launches via appData/hotkeys.json.
 ipcMain.handle('hotkeys:load', async () => {
   const overrides = storage.loadHotkeyOverrides();
-  // Also return the defaults so the renderer knows the base binding to
-  // show alongside each override (or as the fallback if unset).
   return {
     defaults: injector.DEFAULT_HOTKEYS,
     overrides,
+    /* v10 (2026-07-17): stealth-mode overlay — mapping of slot ->
+     * packed binding that gets applied when user enables stealth
+     * mode. Renderer uses this to know which slots to bulk-override
+     * and shows the mapping in the pre-enable modal. */
+    stealth_overrides: injector.STEALTH_OVERRIDES,
   };
 });
 
 ipcMain.handle('hotkeys:save', async (_e, overrides) => {
   if (!overrides || typeof overrides !== 'object') return { ok: false, err: 'bad_overrides' };
-  // Sanitize: values must be integers 0..(2^24-1). Drop bogus entries.
+  /* v10: packed uint now uses bits 24-28 for kind + watch flag, so
+   * the old 2^24 upper bound would reject valid LONGPRESS/MULTITAP
+   * bindings. New bound: fits in unsigned 32-bit (packed >= 0
+   * and <= 0xFFFFFFFF). Range check is soft — the C-side unpacker
+   * masks kind to 4 bits + extra to 8 bits + vk to 16 bits, so any
+   * garbage in the reserved bits is silently discarded. */
   const clean = {};
   for (const [k, v] of Object.entries(overrides)) {
     const slot = parseInt(k, 10);
     const packed = (typeof v === 'number') ? v : parseInt(v, 10);
     if (Number.isFinite(slot) && slot >= 0 && slot < 64 &&
-        Number.isFinite(packed) && packed >= 0 && packed < (1 << 24)) {
-      clean[slot] = packed;
+        Number.isFinite(packed) && packed >= 0 && packed <= 0xFFFFFFFF) {
+      clean[slot] = packed >>> 0;   // force unsigned
     }
   }
   const ok = storage.saveHotkeyOverrides(clean);
