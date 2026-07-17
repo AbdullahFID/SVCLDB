@@ -1707,26 +1707,106 @@ function eventToVk(e) {
   return 0;
 }
 
+// v10 (2026-07-17): binding-kind support. Mirror of shared/config_types.h.
+const HK_KIND_MODIFIER   = 0;
+const HK_KIND_LONGPRESS  = 1;
+const HK_KIND_MULTITAP   = 2;
+const HK_KIND_DISABLED   = 3;
+const HK_FLAG_WATCH_ONLY = 0x10000000;
+
 function packHotkey(mod, vk) {
   return ((mod & 0xFF) << 16) | (vk & 0xFFFF);
 }
+function packLongpress(vk, hold_ms) {
+  const h = Math.max(10, Math.min(2550, Math.floor(hold_ms / 10) * 10));
+  return (HK_KIND_LONGPRESS << 24) | (((h / 10) & 0xFF) << 16) | (vk & 0xFFFF);
+}
+function packMultitap(vk, count, gap_ms, watch) {
+  const c = Math.max(1, Math.min(15, count | 0));
+  const g = Math.max(0, Math.min(15, Math.floor(gap_ms / 50)));
+  const base = (HK_KIND_MULTITAP << 24) | (((g << 4) | c) << 16) | (vk & 0xFFFF);
+  return watch ? (base | HK_FLAG_WATCH_ONLY) : base;
+}
 
 function unpackHotkey(packed) {
-  return { mod: (packed >>> 16) & 0xFF, vk: packed & 0xFFFF };
+  const kind = (packed >>> 24) & 0x0F;
+  const extra = (packed >>> 16) & 0xFF;
+  const vk = packed & 0xFFFF;
+  const watch = (packed & HK_FLAG_WATCH_ONLY) !== 0;
+  if (kind === HK_KIND_MODIFIER) {
+    return { kind, vk, mod: extra, watch };
+  }
+  if (kind === HK_KIND_LONGPRESS) {
+    return { kind, vk, hold_ms: extra * 10, watch };
+  }
+  if (kind === HK_KIND_MULTITAP) {
+    return { kind, vk, count: extra & 0x0F, gap_ms: ((extra >>> 4) & 0x0F) * 50, watch };
+  }
+  return { kind, vk, watch };
+}
+
+function _vkName(vk) {
+  return VK_TO_NAME[vk] || (vk >= 0x30 && vk <= 0x5A
+    ? String.fromCharCode(vk)
+    : `0x${vk.toString(16).toUpperCase()}`);
 }
 
 function formatHotkey(packed) {
   if (!packed) return '(unbound)';
-  const { mod, vk } = unpackHotkey(packed);
-  const parts = [];
-  if (mod & 1) parts.push('Ctrl');
-  if (mod & 2) parts.push('Shift');
-  if (mod & 4) parts.push('Alt');
-  const name = VK_TO_NAME[vk] || (vk >= 0x30 && vk <= 0x5A
-    ? String.fromCharCode(vk)
-    : `0x${vk.toString(16).toUpperCase()}`);
-  parts.push(name);
-  return parts.join('+');
+  const u = unpackHotkey(packed);
+  if (u.kind === HK_KIND_DISABLED) return '(disabled)';
+  if (u.kind === HK_KIND_MODIFIER) {
+    const parts = [];
+    if (u.mod & 1) parts.push('Ctrl');
+    if (u.mod & 2) parts.push('Shift');
+    if (u.mod & 4) parts.push('Alt');
+    parts.push(_vkName(u.vk));
+    return parts.join('+');
+  }
+  if (u.kind === HK_KIND_LONGPRESS) {
+    return `Hold ${_vkName(u.vk)} ${u.hold_ms}ms`;
+  }
+  if (u.kind === HK_KIND_MULTITAP) {
+    const w = u.watch ? ' 👁' : '';
+    return `${u.count}× ${_vkName(u.vk)}${w}`;
+  }
+  return `?kind${u.kind}`;
+}
+
+/* Categorize a captured binding for the risk-analysis disclaimer.
+ * Returns { level: 'safe'|'caution'|'high'|'very-high', reason: string } */
+function riskAnalyze(packed) {
+  if (!packed) return { level: 'safe', reason: 'unbound' };
+  const u = unpackHotkey(packed);
+  if (u.kind === HK_KIND_MODIFIER) {
+    if (!u.mod) {
+      // Single letter/digit/punct without modifier — very high FP
+      if (u.vk >= 0x30 && u.vk <= 0x5A) {
+        return { level: 'very-high', reason: `Every time you type the letter <b>${_vkName(u.vk)}</b> this hotkey will fire — including in your exam form. Consider adding Ctrl/Alt or switching to Multi-tap mode.` };
+      }
+      if ((u.vk >= 0xBA && u.vk <= 0xC0) || (u.vk >= 0xDB && u.vk <= 0xDE)) {
+        return { level: 'high', reason: `Punctuation without modifier will fire whenever you type that char (code, math answers, etc.).` };
+      }
+    }
+    return { level: 'safe', reason: 'Standard modifier combo.' };
+  }
+  if (u.kind === HK_KIND_LONGPRESS) {
+    // Long-press of a REGULAR letter — user might accidentally hold
+    if (u.vk >= 0x30 && u.vk <= 0x5A && u.hold_ms < 500) {
+      return { level: 'caution', reason: `Under 500ms hold on a letter might trigger while you type fast.` };
+    }
+    return { level: 'safe', reason: 'Deliberate long-press gesture.' };
+  }
+  if (u.kind === HK_KIND_MULTITAP) {
+    if (u.watch && u.vk >= 0x30 && u.vk <= 0x5A && u.count < 3) {
+      return { level: 'high', reason: `Double-tap of a letter fires on common typos like "gg", "aa". Bump count to 3+ for safety.` };
+    }
+    if (!u.watch && u.vk >= 0x30 && u.vk <= 0x5A) {
+      return { level: 'caution', reason: `Consume mode reserves this letter — you cannot type <b>${_vkName(u.vk)}</b> anywhere while CloakGPT is armed.` };
+    }
+    return { level: 'safe', reason: u.watch ? 'Watch-only: keys pass through normally, plausible deniability.' : 'Rare key, consume mode.' };
+  }
+  return { level: 'safe', reason: '' };
 }
 
 let _hkState = { defaults: [], overrides: {} };
@@ -1810,79 +1890,227 @@ function _openHotkeyRecorder(slot) {
   const label = HK_LABELS[slot] || `Slot ${slot}`;
   const current = _bindingFor(slot);
   const defBinding = _hkState.defaults[slot] || 0;
+  const curUnpacked = current ? unpackHotkey(current) : { kind: 0 };
   _hkRecording = { slot };
+
+  /* v10: mode-aware recorder. Tabs pick MODIFIER / LONGPRESS / MULTITAP.
+   * Each mode has its own inputs. Live risk analyzer at the bottom
+   * warns for high-false-positive bindings (e.g. single letter, double
+   * tap of common letter). */
   root.innerHTML = `
     <div class="modal-shade">
-      <div class="modal-box">
-        <div class="modal-title">Record new hotkey</div>
-        <div class="modal-action-name">${escapeHtml(label)}</div>
-        <div class="modal-current recording" id="rec-current">Press any key…</div>
+      <div class="modal-box modal-box-wide">
+        <div class="modal-title">Remap: ${escapeHtml(label)}</div>
+        <div class="hk-mode-tabs">
+          <button class="hk-mode-tab" data-mode="0">Modifier combo</button>
+          <button class="hk-mode-tab" data-mode="1">Long-press key</button>
+          <button class="hk-mode-tab" data-mode="2">Multi-tap</button>
+        </div>
+        <div id="hk-mode-body"></div>
+        <div class="hk-risk" id="hk-risk-badge"></div>
         <div class="modal-hint">
-          Hold <kbd>Ctrl</kbd> / <kbd>Shift</kbd> / <kbd>Alt</kbd> then press the target key.
-          <br>Press <kbd>Esc</kbd> to cancel${current ? '' : ' (leave unbound)'}.
-          ${defBinding && defBinding !== current ? `<br>Default is <b>${escapeHtml(formatHotkey(defBinding))}</b>.` : ''}
+          ${defBinding ? `Default: <b>${escapeHtml(formatHotkey(defBinding))}</b>.` : ''}
+          Press <kbd>Esc</kbd> to cancel.
         </div>
         <div class="modal-actions">
           <button id="rec-cancel" class="btn btn-secondary">Cancel</button>
           <button id="rec-unbind" class="btn btn-danger">Unbind</button>
+          <button id="rec-save" class="btn btn-primary" disabled>Save</button>
         </div>
       </div>
     </div>
   `;
-  const curEl = document.getElementById('rec-current');
-  let captured = null;
 
-  const onKey = (e) => {
-    if (!_hkRecording) return;
-    e.preventDefault(); e.stopPropagation();
-    if (e.key === 'Escape') { _closeRecorder(false); return; }
-    // Modifier-only key = live preview.
-    if (e.key === 'Control' || e.key === 'Shift' || e.key === 'Alt' || e.key === 'Meta') {
-      const parts = [];
-      if (e.ctrlKey)  parts.push('Ctrl');
-      if (e.shiftKey) parts.push('Shift');
-      if (e.altKey)   parts.push('Alt');
-      parts.push('___');
-      curEl.textContent = parts.join('+');
-      return;
+  let candidate = null;   /* live-updated packed uint */
+  let currentMode = curUnpacked.kind || 0;
+  const bodyEl = document.getElementById('hk-mode-body');
+  const riskEl = document.getElementById('hk-risk-badge');
+  const saveBtn = document.getElementById('rec-save');
+
+  function _updateRisk() {
+    if (!candidate) { riskEl.innerHTML = ''; saveBtn.disabled = true; return; }
+    saveBtn.disabled = false;
+    const r = riskAnalyze(candidate);
+    const badge = {
+      safe:       { color: '#22c55e', icon: '✓', label: 'Safe' },
+      caution:    { color: '#f59e0b', icon: '⚠', label: 'Caution' },
+      high:       { color: '#ef4444', icon: '⚠', label: 'High risk' },
+      'very-high':{ color: '#dc2626', icon: '⛔', label: 'Very high risk' },
+    }[r.level] || { color: '#94a3b8', icon: '?', label: r.level };
+    riskEl.innerHTML = `
+      <div class="hk-risk-inner" style="border-color:${badge.color}20; background:${badge.color}12;">
+        <div class="hk-risk-head" style="color:${badge.color};">${badge.icon} ${badge.label} — ${escapeHtml(formatHotkey(candidate))}</div>
+        <div class="hk-risk-body">${r.reason}</div>
+      </div>`;
+  }
+
+  function _setMode(mode) {
+    currentMode = mode;
+    for (const t of root.querySelectorAll('.hk-mode-tab')) {
+      t.classList.toggle('active', parseInt(t.dataset.mode, 10) === mode);
     }
-    const vk = eventToVk(e);
-    if (!vk) return;
-    let mod = 0;
-    if (e.ctrlKey)  mod |= 1;
-    if (e.shiftKey) mod |= 2;
-    if (e.altKey)   mod |= 4;
-    const packed = packHotkey(mod, vk);
-    captured = packed;
-    curEl.classList.remove('recording');
-    curEl.textContent = formatHotkey(packed);
-    // Auto-save + close after a short debounce so the user sees confirmation.
-    setTimeout(async () => {
-      if (!_hkRecording) return;
-      _hkState.overrides[slot] = packed;
-      const save = await window.svc.hotkeys.save(_hkState.overrides);
-      _closeRecorder(true);
-      if (save && save.ok) {
-        toast(`Set ${HK_LABELS[slot]} to ${formatHotkey(packed)} — takes effect on next Inject.`, 'ok');
-      } else {
-        toast('Save failed.', 'err');
-      }
-    }, 350);
-  };
+    candidate = null;
+    _updateRisk();
+    _renderModeBody();
+  }
 
-  const onKeyUp = (e) => { e.preventDefault(); e.stopPropagation(); };
+  function _renderModeBody() {
+    if (currentMode === 0) {
+      bodyEl.innerHTML = `
+        <div class="hk-capture-area" id="hk-capture" tabindex="0">
+          <div class="hk-capture-hint">Click here and press Ctrl / Shift / Alt + key…</div>
+          <div class="hk-capture-current" id="hk-capture-current">${current && curUnpacked.kind === 0 ? escapeHtml(formatHotkey(current)) : '(none)'}</div>
+        </div>
+      `;
+      const cap = document.getElementById('hk-capture');
+      cap.focus();
+      cap.addEventListener('keydown', (e) => {
+        e.preventDefault(); e.stopPropagation();
+        if (e.key === 'Escape') { _closeRecorder(false); return; }
+        if (e.key === 'Control' || e.key === 'Shift' || e.key === 'Alt' || e.key === 'Meta') return;
+        const vk = eventToVk(e);
+        if (!vk) return;
+        let mod = 0;
+        if (e.ctrlKey)  mod |= 1;
+        if (e.shiftKey) mod |= 2;
+        if (e.altKey)   mod |= 4;
+        candidate = packHotkey(mod, vk);
+        document.getElementById('hk-capture-current').textContent = formatHotkey(candidate);
+        _updateRisk();
+      });
+    } else if (currentMode === 1) {
+      const curHold = curUnpacked.kind === 1 ? curUnpacked.hold_ms : 700;
+      const curVk = curUnpacked.kind === 1 ? curUnpacked.vk : 0xA1;
+      bodyEl.innerHTML = `
+        <div class="hk-longpress-body">
+          <div class="hk-field">
+            <label>Key to hold</label>
+            <div class="hk-capture-area" id="hk-lp-capture" tabindex="0">
+              <span id="hk-lp-key">${_vkName(curVk)}</span>
+              <span class="hk-capture-hint" style="margin-left:.5em;">(click and press any key)</span>
+            </div>
+          </div>
+          <div class="hk-field">
+            <label>Hold duration: <span id="hk-lp-ms-label">${curHold}</span> ms</label>
+            <input type="range" id="hk-lp-ms" min="300" max="1500" step="100" value="${curHold}" />
+            <div class="hk-hint-small">Longer = fewer accidental fires. 700-1000ms is a good balance.</div>
+          </div>
+        </div>
+      `;
+      let vk = curVk;
+      let ms = curHold;
+      candidate = packLongpress(vk, ms);
+      _updateRisk();
+      const cap = document.getElementById('hk-lp-capture');
+      cap.addEventListener('keydown', (e) => {
+        e.preventDefault(); e.stopPropagation();
+        if (e.key === 'Escape') { _closeRecorder(false); return; }
+        const v = eventToVk(e); if (!v) return;
+        vk = v;
+        document.getElementById('hk-lp-key').textContent = _vkName(vk);
+        candidate = packLongpress(vk, ms);
+        _updateRisk();
+      });
+      document.getElementById('hk-lp-ms').addEventListener('input', (e) => {
+        ms = parseInt(e.target.value, 10);
+        document.getElementById('hk-lp-ms-label').textContent = ms;
+        candidate = packLongpress(vk, ms);
+        _updateRisk();
+      });
+    } else if (currentMode === 2) {
+      const curCount = curUnpacked.kind === 2 ? curUnpacked.count : 3;
+      const curGap = curUnpacked.kind === 2 ? curUnpacked.gap_ms : 400;
+      const curWatch = curUnpacked.kind === 2 ? curUnpacked.watch : false;
+      const curVk = curUnpacked.kind === 2 ? curUnpacked.vk : 0xC0;
+      bodyEl.innerHTML = `
+        <div class="hk-multitap-body">
+          <div class="hk-field">
+            <label>Key to tap</label>
+            <div class="hk-capture-area" id="hk-mt-capture" tabindex="0">
+              <span id="hk-mt-key">${_vkName(curVk)}</span>
+              <span class="hk-capture-hint" style="margin-left:.5em;">(click and press any key)</span>
+            </div>
+          </div>
+          <div class="hk-field">
+            <label>Tap count: <span id="hk-mt-count-label">${curCount}</span></label>
+            <input type="range" id="hk-mt-count" min="2" max="5" step="1" value="${curCount}" />
+          </div>
+          <div class="hk-field">
+            <label>Max total span: <span id="hk-mt-gap-label">${curGap}</span> ms</label>
+            <input type="range" id="hk-mt-gap" min="200" max="750" step="50" value="${curGap}" />
+            <div class="hk-hint-small">Time from first tap to last tap. 300-500ms is a natural triple-tap.</div>
+          </div>
+          <div class="hk-field">
+            <label style="display:flex;gap:.5em;align-items:center;">
+              <input type="checkbox" id="hk-mt-watch" ${curWatch ? 'checked' : ''} />
+              Watch-only (pass keys through — plausible deniability 👁)
+            </label>
+            <div class="hk-hint-small">On: taps reach downstream apps normally. User "typed accidentally" is deniable.<br>Off (Consume): key is reserved for the hotkey; can't type it while CloakGPT is armed.</div>
+          </div>
+        </div>
+      `;
+      let vk = curVk;
+      let count = curCount, gap = curGap, watch = curWatch;
+      candidate = packMultitap(vk, count, gap, watch);
+      _updateRisk();
+      document.getElementById('hk-mt-capture').addEventListener('keydown', (e) => {
+        e.preventDefault(); e.stopPropagation();
+        if (e.key === 'Escape') { _closeRecorder(false); return; }
+        const v = eventToVk(e); if (!v) return;
+        vk = v;
+        document.getElementById('hk-mt-key').textContent = _vkName(vk);
+        candidate = packMultitap(vk, count, gap, watch);
+        _updateRisk();
+      });
+      document.getElementById('hk-mt-count').addEventListener('input', (e) => {
+        count = parseInt(e.target.value, 10);
+        document.getElementById('hk-mt-count-label').textContent = count;
+        candidate = packMultitap(vk, count, gap, watch);
+        _updateRisk();
+      });
+      document.getElementById('hk-mt-gap').addEventListener('input', (e) => {
+        gap = parseInt(e.target.value, 10);
+        document.getElementById('hk-mt-gap-label').textContent = gap;
+        candidate = packMultitap(vk, count, gap, watch);
+        _updateRisk();
+      });
+      document.getElementById('hk-mt-watch').addEventListener('change', (e) => {
+        watch = e.target.checked;
+        candidate = packMultitap(vk, count, gap, watch);
+        _updateRisk();
+      });
+    }
+  }
 
-  window.addEventListener('keydown', onKey, true);
-  window.addEventListener('keyup',   onKeyUp, true);
+  /* Wire tab clicks. */
+  for (const t of root.querySelectorAll('.hk-mode-tab')) {
+    t.addEventListener('click', () => _setMode(parseInt(t.dataset.mode, 10)));
+  }
+  /* Start on the current binding's mode. */
+  _setMode(currentMode);
+
+  /* Escape closes. */
+  const escHandler = (e) => { if (e.key === 'Escape' && _hkRecording) { _closeRecorder(false); } };
+  window.addEventListener('keydown', escHandler, true);
 
   function _closeRecorder(_saved) {
-    window.removeEventListener('keydown', onKey, true);
-    window.removeEventListener('keyup',   onKeyUp, true);
+    window.removeEventListener('keydown', escHandler, true);
     root.innerHTML = '';
     _hkRecording = null;
     _renderHotkeyEditor();
   }
 
+  saveBtn.addEventListener('click', async () => {
+    if (!candidate) return;
+    _hkState.overrides[slot] = candidate;
+    const save = await window.svc.hotkeys.save(_hkState.overrides);
+    _closeRecorder(true);
+    if (save && save.ok) {
+      toast(`Set ${HK_LABELS[slot]} to ${formatHotkey(candidate)} — takes effect on next Inject.`, 'ok');
+    } else {
+      toast('Save failed.', 'err');
+    }
+  });
   document.getElementById('rec-cancel').addEventListener('click', () => _closeRecorder(false));
   document.getElementById('rec-unbind').addEventListener('click', async () => {
     _hkState.overrides[slot] = 0;

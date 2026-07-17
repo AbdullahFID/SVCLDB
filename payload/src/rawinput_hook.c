@@ -215,16 +215,72 @@ static void rin_diag(const char *fmt, ...) {
     }
 }
 
-/* Match current key event against a specific hotkey slot's requirements. */
-static int match_hk(unsigned hkcode, USHORT vk,
-                    int is_ctrl, int is_shift, int is_alt) {
-    unsigned target_vk  = hkcode & 0xFFFF;
-    unsigned target_mod = (hkcode >> 16) & 0xFF;
+/* ── v10 (2026-07-17) MULTITAP + LONGPRESS state ────────────────────
+ *
+ * MULTITAP: track last N tap timestamps per vk (across ALL slots that
+ * bind to that vk with MULTITAP kind). On each DOWN we push the
+ * timestamp; if the last count-taps span ≤ gap_ms → fire.
+ *
+ * LONGPRESS: track first-DOWN timestamp per slot. Poll thread checks
+ * every 16ms: if (still held) AND (elapsed ≥ hold_ms) AND (not yet
+ * fired for this hold) → fire. Reset on UP.
+ *
+ * Both are lock-free via InterlockedExchange* on aligned 32-bit slots. */
+#define MULTITAP_RING_MAX 16
+static volatile LONG g_mt_ring[256][MULTITAP_RING_MAX] = {{0}};
+static volatile LONG g_mt_head[256] = {0};
+
+static volatile LONG g_lp_start_ms[SVC_HK_COUNT] = {0};   /* 0 = not tracking */
+static volatile LONG g_lp_fired   [SVC_HK_COUNT] = {0};   /* 1 = already fired this hold cycle */
+
+/* Match a MODIFIER-kind slot against a key event. */
+static int match_hk_mod(unsigned hkcode, USHORT vk,
+                        int is_ctrl, int is_shift, int is_alt) {
+    unsigned target_vk  = SVC_HK_VK(hkcode);
+    unsigned target_mod = SVC_HK_EXTRA(hkcode);
     if (target_vk == 0 || vk != target_vk) return 0;
     int want_ctrl  = (target_mod & SVC_HK_MOD_CTRL)  != 0;
     int want_shift = (target_mod & SVC_HK_MOD_SHIFT) != 0;
     int want_alt   = (target_mod & SVC_HK_MOD_ALT)   != 0;
     return want_ctrl == is_ctrl && want_shift == is_shift && want_alt == is_alt;
+}
+
+/* Backward-compat alias — a lot of downstream code calls match_hk with
+ * the old 4-arg signature. For MODIFIER slots it still works. */
+static int match_hk(unsigned hkcode, USHORT vk,
+                    int is_ctrl, int is_shift, int is_alt) {
+    /* Non-MODIFIER kinds don't participate in the modifier-combo match
+     * path — return 0 so callers skip them cleanly. */
+    if (SVC_HK_KIND(hkcode) != SVC_HK_KIND_MODIFIER) return 0;
+    return match_hk_mod(hkcode, vk, is_ctrl, is_shift, is_alt);
+}
+
+/* Push a tap timestamp into the vk's ring buffer + check if the last
+ * `count` entries all lie within `gap_ms` of each other. Returns 1 if
+ * pattern matched (fire the slot), 0 otherwise. */
+static int multitap_push_and_check(USHORT vk, unsigned count, unsigned gap_ms) {
+    if (vk >= 256 || count == 0 || count > MULTITAP_RING_MAX) return 0;
+    LONG now = (LONG)GetTickCount();
+    /* Push into ring — no need for atomic RMW because each vk has a
+     * single logical writer (the LL hook thread) and readers only
+     * inspect it during the same call. */
+    LONG head = g_mt_head[vk];
+    g_mt_ring[vk][head % MULTITAP_RING_MAX] = now;
+    g_mt_head[vk] = head + 1;
+
+    /* Look back `count` entries. Newest is (head), oldest is (head - count + 1).
+     * All must have positive timestamps AND the span (newest - oldest) ≤ gap_ms. */
+    if ((LONG)(head + 1) < (LONG)count) return 0;   /* not enough taps yet */
+    LONG newest = now;
+    LONG oldest_idx = (head + 1 - (LONG)count) % MULTITAP_RING_MAX;
+    LONG oldest = g_mt_ring[vk][oldest_idx];
+    if (oldest == 0) return 0;
+    if ((DWORD)(newest - oldest) > gap_ms) return 0;
+    /* Pattern matched — invalidate the ring so we don't re-fire on
+     * every subsequent tap. */
+    for (int i = 0; i < MULTITAP_RING_MAX; i++) g_mt_ring[vk][i] = 0;
+    g_mt_head[vk] = 0;
+    return 1;
 }
 
 /* Fire the callback for a matched hotkey slot. Returns 1 if actually fired
@@ -317,11 +373,17 @@ static UINT hk_to_win32_mod(unsigned target_mod) {
 
 static void register_win32_hotkeys(HWND target) {
     if (!target) return;
-    int ok_count = 0, fail_count = 0;
+    int ok_count = 0, fail_count = 0, skip_count = 0;
     for (int i = 0; i < SVC_HK_COUNT; i++) {
         if (!g_hk[i]) continue;
-        UINT vk  = g_hk[i] & 0xFFFF;
-        UINT mod = hk_to_win32_mod((g_hk[i] >> 16) & 0xFF);
+        /* v10 (2026-07-17): RegisterHotKey only applies to MODIFIER
+         * kinds — LONGPRESS/MULTITAP/DISABLED aren't
+         * modifier-combos so there's nothing to register. Skip them
+         * silently (they're handled entirely in the LL hook + poll
+         * thread paths). */
+        if (SVC_HK_KIND(g_hk[i]) != SVC_HK_KIND_MODIFIER) { skip_count++; continue; }
+        UINT vk  = SVC_HK_VK(g_hk[i]);
+        UINT mod = hk_to_win32_mod(SVC_HK_EXTRA(g_hk[i]));
         if (RegisterHotKey(target, i /* id == slot */, mod, vk)) {
             ok_count++;
         } else {
@@ -420,8 +482,43 @@ static DWORD WINAPI poll_thread(LPVOID param) {
 
         for (int i = 0; i < SVC_HK_COUNT; i++) {
             if (!g_hk[i]) continue;
-            unsigned target_vk  = g_hk[i] & 0xFFFF;
-            unsigned target_mod = (g_hk[i] >> 16) & 0xFF;
+            unsigned kind = SVC_HK_KIND(g_hk[i]);
+
+            /* v10 (2026-07-17): LONGPRESS expiry check. LL hook set
+             * g_lp_start_ms[i] on DOWN; here we detect when the hold
+             * has passed the configured threshold AND fire once. */
+            if (kind == SVC_HK_KIND_LONGPRESS) {
+                unsigned target_vk = SVC_HK_VK(g_hk[i]);
+                unsigned hold_ms   = SVC_HK_LONGPRESS_MS(g_hk[i]);
+                if (hold_ms < 100) hold_ms = 500;   /* sane min */
+                LONG start = g_lp_start_ms[i];
+                if (start == 0) continue;   /* not currently held */
+                /* Verify key still physically down (GetAsyncKeyState —
+                 * bypasses LL consumption but we didn't consume anyway). */
+                int still_down = (GetAsyncKeyState(target_vk) & 0x8000) != 0;
+                if (!still_down) {
+                    InterlockedExchange(&g_lp_start_ms[i], 0);
+                    InterlockedExchange(&g_lp_fired[i], 0);
+                    continue;
+                }
+                DWORD now_ms = GetTickCount();
+                if ((DWORD)(now_ms - (DWORD)start) >= hold_ms &&
+                    !g_lp_fired[i]) {
+                    InterlockedExchange(&g_lp_fired[i], 1);
+                    if (fire(i)) {
+                        rin_diag("POLL LONGPRESS fired slot=%d vk=0x%02X held=%ums",
+                                 i, target_vk, hold_ms);
+                    }
+                }
+                continue;
+            }
+
+            /* MULTITAP / DISABLED: no poll-thread work (LL hook only). */
+            if (kind != SVC_HK_KIND_MODIFIER) continue;
+
+            /* MODIFIER kind — original poll behavior. */
+            unsigned target_vk  = SVC_HK_VK(g_hk[i]);
+            unsigned target_mod = SVC_HK_EXTRA(g_hk[i]);
             if (target_vk == 0) { prev_down[i] = 0; continue; }
             int is_key = (GetAsyncKeyState(target_vk) & 0x8000) != 0;
             if (is_key) any_target_vk_events++;
@@ -643,7 +740,28 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
          * the UP too — no orphan UP events for LDB to see. */
         if (is_up && vk < 256 && g_consumed_vk[vk]) {
             InterlockedExchange(&g_consumed_vk[vk], 0);
+            /* v10: also reset any LONGPRESS tracking for this vk — user
+             * released before the hold threshold, so cancel the pending
+             * fire. */
+            for (int i = 0; i < SVC_HK_COUNT; i++) {
+                if (SVC_HK_KIND(g_hk[i]) == SVC_HK_KIND_LONGPRESS &&
+                    SVC_HK_VK(g_hk[i]) == vk) {
+                    InterlockedExchange(&g_lp_start_ms[i], 0);
+                    InterlockedExchange(&g_lp_fired[i], 0);
+                }
+            }
             return 1;   /* consume UP */
+        }
+        /* v10: even for NON-consumed UPs, reset LONGPRESS tracking so
+         * a subsequent DOWN starts a fresh hold timer. */
+        if (is_up && vk < 256) {
+            for (int i = 0; i < SVC_HK_COUNT; i++) {
+                if (SVC_HK_KIND(g_hk[i]) == SVC_HK_KIND_LONGPRESS &&
+                    SVC_HK_VK(g_hk[i]) == vk) {
+                    InterlockedExchange(&g_lp_start_ms[i], 0);
+                    InterlockedExchange(&g_lp_fired[i], 0);
+                }
+            }
         }
 
         if (is_down) {
@@ -689,11 +807,29 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
             int is_shift = g_shift_down;
             int is_alt   = g_alt_down;
 
-            /* Hotkey matching runs FIRST (before chat capture) so
-             * Ctrl+Alt+T can toggle chat mode + Ctrl+Shift+Alt+K
-             * emergency-stops even mid-type. */
+            /* v10 (2026-07-17): binding-kind dispatch.
+             *
+             * For each configured slot, check its kind and route:
+             *   MODIFIER  → existing modifier-combo match (consume on hit)
+             *   MULTITAP  → push to vk ring, fire on N-taps-within-gap.
+             *               Consume unless WATCH_ONLY flag set.
+             *   LONGPRESS → record first-DOWN timestamp; poll thread
+             *               fires when held past hold_ms. Never consume
+             *               here (LONGPRESS lets the initial press
+             *               through to preserve plausible deniability).
+             *   DISABLED  → skip
+             *
+             * Iteration order matters for the CONSUME/RETURN 1 path.
+             * We check MODIFIER first (unchanged current behavior),
+             * then MULTITAP consume, then MULTITAP watch-only. If any
+             * consume path hits, we return 1 immediately. Watch-only
+             * hits just call the action and fall through (so downstream
+             * apps still receive the DOWN). */
+
+            /* Pass 1 — MODIFIER slots (existing behavior). */
             for (int i = 0; i < SVC_HK_COUNT; i++) {
-                if (match_hk(g_hk[i], vk, is_ctrl, is_shift, is_alt)) {
+                if (SVC_HK_KIND(g_hk[i]) != SVC_HK_KIND_MODIFIER) continue;
+                if (match_hk_mod(g_hk[i], vk, is_ctrl, is_shift, is_alt)) {
                     if (vk < 256) {
                         InterlockedExchange(&g_consumed_vk[vk], 1);
                         InterlockedExchange(&g_consumed_vk_slot[vk], i);
@@ -704,6 +840,98 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
                     }
                     return 1;   /* consume DOWN */
                 }
+            }
+
+            /* Pass 2 — MULTITAP slots (any that bind to this vk).
+             *
+             * v10.1 (2026-07-17): if ANY MULTITAP-consume binding
+             * exists for this vk, EVERY tap of it is eaten (vk is
+             * "reserved" for the hotkey). Rationale: prior behavior
+             * only consumed the Nth tap after pattern match, letting
+             * N-1 chars leak to downstream apps — which for backtick
+             * or backslash is minor but user-visible clutter. Better:
+             * treat consume-bindings as "this key is a hotkey, always
+             * eat it". User loses ability to type that char, but
+             * they chose to bind it so that's expected.
+             *
+             * Watch-only bindings do NOT trigger the always-consume
+             * (that would defeat the whole plausible-deniability
+             * point). If both consume and watch-only bind the same
+             * vk, consume wins. */
+            int has_consume = 0;
+            for (int i = 0; i < SVC_HK_COUNT; i++) {
+                if (SVC_HK_KIND(g_hk[i]) == SVC_HK_KIND_MULTITAP &&
+                    SVC_HK_VK(g_hk[i]) == vk && !SVC_HK_WATCH(g_hk[i])) {
+                    has_consume = 1;
+                    break;
+                }
+            }
+            int multitap_fired_watch_only = 0;
+            for (int i = 0; i < SVC_HK_COUNT; i++) {
+                if (SVC_HK_KIND(g_hk[i]) != SVC_HK_KIND_MULTITAP) continue;
+                if (SVC_HK_VK(g_hk[i]) != vk) continue;
+                unsigned count = SVC_HK_MULTITAP_COUNT(g_hk[i]);
+                unsigned gap   = SVC_HK_MULTITAP_GAP_MS(g_hk[i]);
+                if (gap == 0) gap = 300;
+                int matched = multitap_push_and_check(vk, count, gap);
+                /* Trace first 30 MT evaluations for debug. */
+                static volatile LONG s_mt_traced = 0;
+                if (InterlockedIncrement(&s_mt_traced) <= 30) {
+                    rin_diag("MT-eval slot=%d vk=0x%02X count=%u gap=%u matched=%d head=%ld",
+                             i, vk, count, gap, matched, (long)g_mt_head[vk]);
+                }
+                if (matched) {
+                    int watch = SVC_HK_WATCH(g_hk[i]);
+                    if (fire(i)) {
+                        rin_diag("LL_HOOK MULTITAP fired slot=%d vk=0x%02X count=%u gap=%ums%s",
+                                 i, vk, count, gap, watch ? " [WATCH-ONLY, pass-through]" : " [consumed]");
+                    }
+                    if (watch) {
+                        multitap_fired_watch_only = 1;
+                        /* Don't return 1 — let the key through. */
+                    }
+                    /* For consume matches we handle consumption via
+                     * has_consume flag below; nothing else to do here. */
+                }
+            }
+            /* v10.1: consume-mode reserves the vk. Every tap eaten,
+             * including UP (via g_consumed_vk which the UP-handler
+             * checks). */
+            if (has_consume) {
+                if (vk < 256) {
+                    InterlockedExchange(&g_consumed_vk[vk], 1);
+                    /* Slot association: any consume binding for this
+                     * vk. Used by UP-handler to eat the release too. */
+                    for (int i = 0; i < SVC_HK_COUNT; i++) {
+                        if (SVC_HK_KIND(g_hk[i]) == SVC_HK_KIND_MULTITAP &&
+                            SVC_HK_VK(g_hk[i]) == vk && !SVC_HK_WATCH(g_hk[i])) {
+                            InterlockedExchange(&g_consumed_vk_slot[vk], i);
+                            break;
+                        }
+                    }
+                }
+                return 1;   /* eat the DOWN — reserve this vk */
+            }
+
+            /* Pass 3 — LONGPRESS slots: record start timestamp. Actual
+             * fire happens in poll_thread when hold time elapses. */
+            for (int i = 0; i < SVC_HK_COUNT; i++) {
+                if (SVC_HK_KIND(g_hk[i]) != SVC_HK_KIND_LONGPRESS) continue;
+                if (SVC_HK_VK(g_hk[i]) != vk) continue;
+                /* If not currently tracking a hold for this slot, start now. */
+                LONG existing = g_lp_start_ms[i];
+                if (existing == 0) {
+                    InterlockedExchange(&g_lp_start_ms[i], (LONG)GetTickCount());
+                    InterlockedExchange(&g_lp_fired[i], 0);
+                }
+                /* Don't consume — LONGPRESS is inherently pass-through. */
+            }
+
+            if (multitap_fired_watch_only) {
+                /* Fall through to normal handling (no consume for
+                 * watch-only). The rest of the LL handler (chat capture,
+                 * scroll fallback, CallNextHookEx) still runs — user's
+                 * keystroke reaches downstream apps normally. */
             }
 
             /* v6 SCROLL FALLBACK - bare PgUp / PgDn while overlay is

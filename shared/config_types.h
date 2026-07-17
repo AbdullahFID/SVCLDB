@@ -41,7 +41,7 @@ typedef enum {
  * configs cleanly fail via cu_wrap_decrypt's plen != sizeof(svc_config_t)
  * check when a field is added — this magic is defence-in-depth. */
 #define SVC_CONFIG_MAGIC             0x53564C43u  /* 'SVLC' little-endian */
-#define SVC_CONFIG_SCHEMA_VERSION    9u   /* v9 hotkeys[] 32->64 (fixes OOB slot32 DIRECT_TOGGLE bug) */
+#define SVC_CONFIG_SCHEMA_VERSION    10u  /* v10 hotkey binding modes: MODIFIER (existing) + LONGPRESS + MULTITAP + WATCH_ONLY flag */
 
 typedef struct {
     /* ── v4 header: written by Electron UI / launcher --json-config.
@@ -242,9 +242,79 @@ typedef enum {
  * 64, bump the array size AND the schema version + document why. */
 typedef char svcldb_hotkeys_size_assert[(SVC_HK_COUNT <= (int)(sizeof((svc_config_t*)0)->hotkeys / sizeof(unsigned))) ? 1 : -1];
 
-/* Hotkey packing helper (mod bits: 1=ctrl 2=shift 4=alt).
- * Ctrl+G would be SVC_HK_PACK(1, 'G'); Ctrl+Shift+Space is SVC_HK_PACK(3, ' '). */
+/* ── Hotkey packed-uint format (32-bit) ────────────────────────────
+ *
+ *   bits 0-15  : vk (Windows virtual-key code, 0-65535)
+ *   bits 16-23 : extra byte (kind-dependent):
+ *                  KIND_MODIFIER: mod bits (bit0=Ctrl bit1=Shift bit2=Alt)
+ *                  KIND_LONGPRESS: hold time in 10ms units (max 2550ms)
+ *                  KIND_MULTITAP: low nibble = tap count (1..15)
+ *                                 high nibble = max_gap_ms/50 (0..750ms)
+ *   bits 24-27 : kind (0-15):
+ *                  0 = MODIFIER (default; backward-compat with v9 configs)
+ *                  1 = LONGPRESS (watch-only semantics — initial DOWN passes
+ *                                 through, action fires when key held past
+ *                                 hold_ms threshold)
+ *                  2 = MULTITAP  (N taps within max_gap; consume OR
+ *                                 watch-only per WATCH_ONLY flag)
+ *                  3 = DISABLED  (slot is off — no binding fires)
+ *   bit  28    : WATCH_ONLY flag — for MULTITAP: DON'T consume events,
+ *                let user's typing through; action fires but keys reach
+ *                downstream apps normally. Enables plausible-deniability
+ *                stealth (proctor sees "user typed ggg" typo, not a
+ *                mysterious blocked key sequence).
+ *   bits 29-31 : reserved (must be 0)
+ *
+ * Backward compat: any packed value with bits 24-31 == 0 reads as
+ * KIND_MODIFIER with old-style (mod<<16)|vk semantics. Existing v9
+ * hotkey configs work unchanged.
+ *
+ * v10 (2026-07-17): new binding modes added for stealth hotkey rebinds.
+ * Old defaults preserved; new defaults use LONGPRESS/MULTITAP where
+ * they improve concealment vs proctor-tool observation. */
+#define SVC_HK_KIND_MODIFIER   0u
+#define SVC_HK_KIND_LONGPRESS  1u
+#define SVC_HK_KIND_MULTITAP   2u
+#define SVC_HK_KIND_DISABLED   3u
+
+#define SVC_HK_FLAG_WATCH_ONLY 0x10000000u   /* bit 28 */
+
+/* Extract fields from a packed hotkey uint. */
+#define SVC_HK_VK(pk)      ((unsigned)(pk) & 0xFFFFu)
+#define SVC_HK_EXTRA(pk)   (((unsigned)(pk) >> 16) & 0xFFu)
+#define SVC_HK_KIND(pk)    (((unsigned)(pk) >> 24) & 0x0Fu)
+#define SVC_HK_WATCH(pk)   (((unsigned)(pk) & SVC_HK_FLAG_WATCH_ONLY) != 0)
+
+/* Legacy MODIFIER pack (backward compat) — v9 hotkey configs use this.
+ *   Ctrl+G       = SVC_HK_PACK(1, 'G')
+ *   Ctrl+Shift+G = SVC_HK_PACK(3, 'G')
+ *   Ctrl+Alt+G   = SVC_HK_PACK(5, 'G')
+ *   3-mod combos = SVC_HK_PACK(7, 'K') */
 #define SVC_HK_PACK(mod, vk) (((unsigned)(mod) << 16) | (unsigned)(vk))
+
+/* Pack a LONGPRESS binding: hold this VK for hold_ms milliseconds → fire.
+ * Initial keypress passes through unchanged (proctor sees single tap).
+ * hold_ms clamped to [100..2550] internally. */
+#define SVC_HK_PACK_LONGPRESS(hold_ms, vk) \
+    ((SVC_HK_KIND_LONGPRESS << 24) | (((unsigned)((hold_ms) / 10) & 0xFFu) << 16) | ((unsigned)(vk) & 0xFFFFu))
+
+/* Pack a MULTITAP binding: N taps of this VK within max_gap ms → fire.
+ * When WATCH_ONLY (watch != 0), the taps are NOT consumed — user's
+ * typing goes through unchanged, action fires when pattern matches.
+ * count: [1..15], max_gap_ms: [0..750] rounded to 50ms granularity. */
+#define SVC_HK_PACK_MULTITAP(count, gap_ms, vk, watch) \
+    ((SVC_HK_KIND_MULTITAP << 24) | \
+     ((((((unsigned)(gap_ms) / 50) & 0xFu) << 4) | ((unsigned)(count) & 0xFu)) << 16) | \
+     ((unsigned)(vk) & 0xFFFFu) | \
+     ((watch) ? SVC_HK_FLAG_WATCH_ONLY : 0u))
+
+/* MULTITAP extra-byte accessors (only meaningful when KIND == MULTITAP). */
+#define SVC_HK_MULTITAP_COUNT(pk)      (SVC_HK_EXTRA(pk) & 0xFu)
+#define SVC_HK_MULTITAP_GAP_MS(pk)     (((SVC_HK_EXTRA(pk) >> 4) & 0xFu) * 50u)
+
+/* LONGPRESS extra-byte accessor. */
+#define SVC_HK_LONGPRESS_MS(pk)        ((unsigned)SVC_HK_EXTRA(pk) * 10u)
+
 #define SVC_HK_MOD_CTRL      1
 #define SVC_HK_MOD_SHIFT     2
 #define SVC_HK_MOD_ALT       4
