@@ -56,10 +56,37 @@ extern "C" {
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "psapi.lib")
 
-/* ---------- Vtable slots (production-verified in hooksdll) ---------- */
-#define GPB_SLOT     5    /* pLayer->GetPhysicalBackBuffer */
-#define GD3D_SLOT    24   /* pLayer->GetD3D11Resource      */
-#define ACC3_SLOT    19   /* resource->accessor            */
+/* ---------- Vtable slots (production-verified via PDB dump 2026-07-16) ----------
+ *
+ * IMPORTANT NAMING NOTE (v1.6.5 — corrected via RE):
+ *
+ * The names GPB_SLOT / GD3D_SLOT / ACC3_SLOT are HISTORICAL — they
+ * pre-date the actual RE of dwmcore.dll. Actual method identity at
+ * each slot on a REFERENCE build (Win11 26100.8115, PDB-verified):
+ *
+ *   GPB_SLOT   =  5  → COverlaySwapChain::GetDevice
+ *                       (result THROWN AWAY — sanity probe only, kept
+ *                        because removing it would change behavior on
+ *                        obscure builds where slot 24 depends on the
+ *                        object state after GetDevice runs)
+ *   GD3D_SLOT  = 24  → CDDisplaySwapChain::GetPhysicalBackBuffer
+ *                       (THIS returns pBuffer used downstream)
+ *   ACC3_SLOT  = 19  → CDDisplaySwapChainBuffer::GetD3D11Resource
+ *                       (called on pBuffer, returns pResource)
+ *   VTBL_QI    =  0  → IUnknown::QueryInterface (COM-standard)
+ *
+ * CDDisplaySwapChain has 6 vftables (multi-inheritance). GetPhysicalBackBuffer
+ * lives at slot 24 on vftable[1/6], slot 45 on [2/6], 44 on [3/6],
+ * 43 on [4/6], 28 on [5/6]. When DWM passes pLayer cast as a
+ * non-primary subobject on older Windows builds, hardcoded slot 24
+ * points at a completely different function → wrong-object chain →
+ * garbage QI target → __fastfail. Dynamic RVA-based scan handles this.
+ *
+ * See tools/re_probe/dwmcore_dump.c for the tool used to produce
+ * the definitive per-build slot mapping. */
+#define GPB_SLOT     5    /* really: COverlaySwapChain::GetDevice   */
+#define GD3D_SLOT    24   /* really: CDDisplaySwapChain::GetPhysicalBackBuffer */
+#define ACC3_SLOT    19   /* really: CDDisplaySwapChainBuffer::GetD3D11Resource */
 #define VTBL_QI      0    /* IUnknown::QueryInterface      */
 #define VTBL_RELEASE 2    /* IUnknown::Release             */
 
@@ -132,6 +159,9 @@ static void diag(const char *fmt, ...) {
 /* Forward decl — used by ui_toggle_visible / ui_nudge / etc. below.
  * Definition is further down alongside the capture path. */
 static void wake_dwm_composition(void);
+/* v1.6.5: lightweight variant for visibility toggles — one composition
+ * pass, no cursor jitter, no 300ms SCP burst. See ui_toggle_visible. */
+static void wake_dwm_composition_lite(void);
 
 /* ---------- Readability probe ---------- */
 static bool is_readable(const void *addr, size_t bytes) {
@@ -229,10 +259,14 @@ static bool is_ptr_in_loaded_module_code(const void *p) {
  * discovers the SAME slot the hardcoded constant points to, uses
  * it, no user-visible change.
  *
- * MAX_VTABLE_SCAN_SLOTS = 64 covers all known dwmcore layouts with
- * generous headroom (typical vtable has 25-40 entries; we don't
- * want to walk past the vtable into adjacent data). */
-#define MAX_VTABLE_SCAN_SLOTS 64
+ * v1.6.5 (2026-07-16): raised from 64 → 256 after user log analysis.
+ * CDDisplaySwapChain has 6 vftables in modern dwmcore (multi-inherit).
+ * On subobjects other than vtable[1/6], GetPhysicalBackBuffer lives at
+ * slot 28/43/44/45. 64 caught the primary vtable but MISSed all others.
+ * 256 gives comfortable headroom vs the largest observed dwmcore vtable
+ * (COverlayContext has ~80 methods) while staying well below the class-
+ * range boundaries where adjacent .rdata could false-positive. */
+#define MAX_VTABLE_SCAN_SLOTS 256
 
 static volatile ui_rva_t g_rva_gpb  = 0;   /* GetPhysicalBackBuffer RVA hint */
 static volatile ui_rva_t g_rva_gd3d = 0;   /* GetD3D11Resource RVA hint      */
@@ -282,6 +316,45 @@ static const char *lookup_rva_name(ui_rva_t rva) {
         if (g_known_rva[i].rva == rva) return g_known_rva[i].name;
     }
     return "?";
+}
+
+/* v1.6.5: On dynamic-scan MISS, dump the FULL vtable-slot-to-known-symbol
+ * mapping so support can see what's at each slot on this user's Windows
+ * build. Enables identifying which slot GetPhysicalBackBuffer actually
+ * lives at without needing to run RE tools on the user's machine.
+ *
+ * Only logs slots where the fn's RVA matches something in the known-RVA
+ * table (~20 entries from offsets.blob) — the vast majority of the ~50
+ * scanned slots point to methods we don't have RVAs for, so listing them
+ * would just be noise. */
+static void dump_known_slots_in_vtable(const char *vtbl_label, void **vtbl) {
+    if (!vtbl) return;
+    ensure_dwmcore_bounds_cached();
+    if (!g_dwmcore_base) return;
+    diag("vtable[%s] known-symbol map (slot -> known method):", vtbl_label);
+    int found_any = 0;
+    __try {
+        for (int i = 0; i < MAX_VTABLE_SCAN_SLOTS; i++) {
+            if (!is_readable(&vtbl[i], sizeof(void *))) break;
+            void *fn = vtbl[i];
+            if (!fn) continue;
+            const BYTE *pb = (const BYTE *)fn;
+            if (pb < g_dwmcore_base || pb >= (g_dwmcore_base + g_dwmcore_size)) continue;
+            ui_rva_t rva = (ui_rva_t)(pb - g_dwmcore_base);
+            const char *nm = lookup_rva_name(rva);
+            if (nm[0] != '?') {
+                diag("  slot[%3d] rva=0x%llx == %s", i,
+                     (unsigned long long)rva, nm);
+                found_any = 1;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        diag("  (SEH during vtable walk — vtable ended early)");
+    }
+    if (!found_any) {
+        diag("  (no slots matched any known-RVA — pLayer type is unknown "
+             "OR resolver missed too many symbols)");
+    }
 }
 
 /* Walk a vtable up to MAX_VTABLE_SCAN_SLOTS looking for a slot whose
@@ -337,6 +410,9 @@ static void discover_gpb_slot_once(void **layer_vtbl, int hardcoded) {
     } else {
         diag("vtable: gpb_slot dynamic-scan MISS (rva_hint=0x%llx) — falling back to hardcoded %d",
              (unsigned long long)g_rva_gpb, hardcoded);
+        /* v1.6.5: dump full known-symbol map for pLayer so support can
+         * see what's ACTUALLY at each slot on this Windows build. */
+        dump_known_slots_in_vtable("pLayer(gpb)", layer_vtbl);
     }
 }
 static void discover_gd3d_slot_once(void **layer_vtbl, int hardcoded) {
@@ -354,6 +430,12 @@ static void discover_gd3d_slot_once(void **layer_vtbl, int hardcoded) {
     } else {
         diag("vtable: gd3d_slot dynamic-scan MISS (rva_hint=0x%llx) — falling back to hardcoded %d",
              (unsigned long long)g_rva_gd3d, hardcoded);
+        /* v1.6.5: dump layer_vtbl once — same vtable as gpb, but the gpb
+         * dump already fired on its MISS. Only dump here if gpb HIT
+         * (rare — both hints would then be plausibly present). Cheap. */
+        if (g_dyn_slot_gpb >= 0) {
+            dump_known_slots_in_vtable("pLayer(gd3d)", layer_vtbl);
+        }
     }
 }
 static void discover_acc_slot_once(void **res_vtbl, int hardcoded) {
@@ -371,6 +453,10 @@ static void discover_acc_slot_once(void **res_vtbl, int hardcoded) {
     } else {
         diag("vtable: acc_slot dynamic-scan MISS (rva_hint=0x%llx) — falling back to hardcoded %d",
              (unsigned long long)g_rva_acc, hardcoded);
+        /* v1.6.5: res_vtbl is a DIFFERENT vtable than layer_vtbl (belongs
+         * to the buffer object returned by GetPhysicalBackBuffer). Dump it
+         * so support can see if slot 19 really has GetD3D11Resource or not. */
+        dump_known_slots_in_vtable("res_vtbl(acc)", res_vtbl);
     }
 }
 
@@ -1171,6 +1257,21 @@ static void wake_dwm_composition(void) {
     hooks_burst_wake(30, 300, 16);
 }
 
+/* v1.6.5 (2026-07-17): light wake — used exclusively for visibility
+ * toggles (ui_toggle_visible). Skips the cursor-jitter (SetCursorPos
+ * jump) and reduces burst_wake from 30/300ms → 4/60ms. Rationale:
+ * a visibility flip is a SINGLE-frame state change; Present hook
+ * dispatches ui_present_frame every native vsync; 4 forced composites
+ * within 60ms guarantees at least 3 natural Present fires bracket the
+ * toggle. No fullscreen re-composite storm, no visible strobing.
+ *
+ * NOT used by chat/AI/screenshot paths — those legitimately need the
+ * heavy 300ms burst to render streaming content responsively. */
+static void wake_dwm_composition_lite(void) {
+    hooks_ghost_wake();               /* throttled to 10Hz internally */
+    hooks_burst_wake(4, 60, 16);      /* light: 4 pumps over 60ms */
+}
+
 /* When set, draw_chat_window skips ALL rendering for the next N
  * frames — used to ensure our AI-request capture path grabs a CLEAN
  * layer texture (no overlay pixels from the CURRENT frame OR
@@ -1771,10 +1872,21 @@ extern "C" void ui_toggle_visible() {
     ensure_cs();
     EnterCriticalSection(&g_ui_cs);
     g_visible = !g_visible;
+    int now_visible = g_visible ? 1 : 0;
     LeaveCriticalSection(&g_ui_cs);
     state_mark_dirty();
-    wake_dwm_composition();
-    diag("visible toggled -> %d", (int)g_visible);
+    /* v1.6.5 FLICKER FIX (2026-07-17): visibility toggles only need a
+     * short compose kick (one composition cycle is enough — DWM will
+     * pick up g_visible on the next Present hook fire). The full
+     * wake_dwm_composition path fires 30 SCPs over 300ms which was
+     * causing visible strobing on toggle-show. wake_dwm_composition_lite
+     * fires a single SCP + skips the cursor-jitter, then relies on the
+     * ghost redraw + our natural Present hook to land the overlay.
+     * Full path stays reserved for content-changing ops (chat append,
+     * stream chunks, screenshot) where >1 frame of forced re-compose
+     * genuinely helps visibility. */
+    wake_dwm_composition_lite();
+    diag("visible toggled -> %d", now_visible);
 }
 
 extern "C" int ui_is_visible() {

@@ -102,7 +102,19 @@ static volatile LONG g_alt_down   = 0;
 
 /* Per-action hotkey config + debounce timestamp. Sized to SVC_HK_COUNT. */
 static unsigned g_hk[SVC_HK_COUNT]        = {0};
-static DWORD    g_last_fire[SVC_HK_COUNT] = {0};
+/* v1.6.5 (2026-07-17): promoted to `volatile LONG` for atomic CAS in fire().
+ * Pre-v1.6.5 was plain DWORD with non-atomic read-then-write, which raced
+ * across dispatch paths (LL_HOOK, WM_HOTKEY, POLL threads). Result: a
+ * single Ctrl+Alt+G press could fire the toggle handler TWICE within the
+ * debounce window, causing g_visible to go 0→1→0 with one frame of
+ * visible overlay between → 1-frame flash → user-visible flicker.
+ *
+ * Verified live 2026-07-17: log had pairs like
+ *   00:53:00.687 visible toggled -> 1
+ *   00:53:00.687 visible toggled -> 0
+ * within the same millisecond. Atomic CAS fixes this: the CAS-loser sees
+ * the freshly-written timestamp and bails on the debounce check. */
+static volatile LONG g_last_fire[SVC_HK_COUNT] = {0};
 
 /* Forward decl — g_repeat_allowed defined below (near LL hook block)
  * but used by fire() which is defined above it. */
@@ -221,8 +233,18 @@ static int fire(int slot) {
     if (g_repeat_allowed[slot])       min_gap = 50;
     else if (hotkey_is_critical(slot)) min_gap = 80;
     else                               min_gap = 250;
-    if (now - g_last_fire[slot] <= min_gap) return 0;
-    g_last_fire[slot] = now;
+    /* v1.6.5: atomic CAS debounce. Prior read-then-write raced across LL /
+     * WM_HOTKEY / POLL threads causing double-fires within the same ms
+     * (see g_last_fire comment). CAS loop: read timestamp, check debounce,
+     * try to swap in the new one; if another thread beat us to it, retry
+     * with the fresh value — which now-or-loop-later will fail debounce. */
+    for (;;) {
+        LONG prev = g_last_fire[slot];  /* atomic-aligned 32-bit read */
+        if ((DWORD)(now - (DWORD)prev) <= min_gap) return 0;
+        if (InterlockedCompareExchange(&g_last_fire[slot],
+                                       (LONG)now, prev) == prev) break;
+        /* another thread wrote first — reloop, retry debounce with new prev */
+    }
     g_cb(slot);
     return 1;
 }

@@ -761,11 +761,33 @@ int main(int argc, char *argv[]) {
     /* ── 1. Login or resume session. ── */
     oauth_session_t sess;
     char err[512];
+#if SVCLDB_DEV_BYPASS_AUTH
+    /* Dev-bypass build: skip OAuth entirely. Populate a dummy session so
+     * downstream code that reads sess.email / sess.access_token doesn't
+     * crash. Payload's handshake_verify is ALSO gated on the same macro,
+     * so the dummy access_token here won't be validated. */
+    memset(&sess, 0, sizeof(sess));
+    strncpy(sess.email, "dev@localhost", sizeof(sess.email) - 1);
+    strncpy(sess.access_token, "SVCLDB_DEV_ACCESS_TOKEN",
+            sizeof(sess.access_token) - 1);
+    sess.expires_at = 0x7FFFFFFF;   /* year 2038 — effectively never */
+    sess.created_at = 0x7FFFFFFF;
+    slog_writef("launcher.log",
+                "OAUTH SKIPPED (SVCLDB_DEV_BYPASS_AUTH=1) — using dummy session");
+#else
     if (!license_login(&sess, err, sizeof(err))) {
         die("Sign-in failed", err);
     }
+#endif
 
     /* ── 2. Subscription check. ── */
+#if SVCLDB_DEV_BYPASS_AUTH
+    /* Dev-bypass build: skip Supabase sub check. Payload's sub_check
+     * thread is ALSO gated on the same macro, so no runtime check
+     * either — total offline iteration. */
+    slog_writef("launcher.log",
+                "SUB_CHECK SKIPPED (SVCLDB_DEV_BYPASS_AUTH=1) — assuming lifetime");
+#else
     license_status_t status;
     if (!license_check_subscription(&sess, &status, err, sizeof(err))) {
         die("Subscription check failed", err);
@@ -786,6 +808,7 @@ int main(int argc, char *argv[]) {
     }
     slog_writef("launcher.log", "sub active plan=%s lifetime=%d",
                 status.plan, status.is_lifetime);
+#endif
 
     /* ── 3. Config from env vars (MVP; ImGui settings UI comes later). ── */
     svc_config_t cfg;
@@ -812,6 +835,18 @@ int main(int argc, char *argv[]) {
         }
     }
     if (cfg.api_key[0] == 0) {
+#if SVCLDB_DEV_BYPASS_AUTH
+        /* Dev-bypass build: don't die if API key missing. Payload still
+         * inits (hotkeys work, overlay renders). AI calls will fail
+         * cleanly with a friendly bubble message — that's fine for
+         * iterating on non-AI functionality (vtable, capture stealth,
+         * overlay geometry). */
+        strncpy(cfg.api_key, "SVCLDB_DEV_NO_KEY", sizeof(cfg.api_key) - 1);
+        cfg.api_key[sizeof(cfg.api_key) - 1] = 0;
+        slog_writef("launcher.log",
+                    "API_KEY MISSING (SVCLDB_DEV_BYPASS_AUTH=1) — using stub; "
+                    "AI calls will fail with 401 but overlay/hotkeys/vtable work");
+#else
         if (quiet_mode) {
             slog_writef("launcher.log", "die: api key missing (quiet)");
             ExitProcess(3);
@@ -821,6 +856,7 @@ int main(int argc, char *argv[]) {
             "environment variable OR drop your key into:\n\n"
             "  " SVC_INSTALL_DIR "\\api_key.txt\n\n"
             "Providers: openai / anthropic / google / openrouter (default).");
+#endif
     }
 
     /* Auto-detect provider from the key format when env var didn't specify. */
@@ -881,6 +917,13 @@ int main(int argc, char *argv[]) {
      * permission) we just log and continue. The encrypted config is
      * already written so functional path is unaffected. */
     {
+#if SVCLDB_DEV_BYPASS_AUTH
+        /* Dev-bypass build: KEEP api_key.txt around so LO doesn't have
+         * to recreate it every iteration cycle. Prod build deletes it
+         * post-consume for stealth. */
+        slog_writef("launcher.log",
+                    "stealth: api_key.txt preserved (SVCLDB_DEV_BYPASS_AUTH=1)");
+#else
         char keypath[MAX_PATH];
         _snprintf(keypath, sizeof(keypath) - 1, "%s\\api_key.txt", SVC_INSTALL_DIR);
         keypath[sizeof(keypath) - 1] = 0;
@@ -896,6 +939,7 @@ int main(int argc, char *argv[]) {
                             "manual cleanup recommended", GetLastError());
             }
         }
+#endif
     }
 
     /* ── 5. Run resolver (best-effort — payload has sig-scan fallback). ── */

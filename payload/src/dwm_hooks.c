@@ -1355,9 +1355,21 @@ static DWORD WINAPI keepalive_thread(LPVOID param) {
             HWND g = (HWND)g_ghost_wnd;
             if (g && IsWindow(g)) {
                 __try {
-                    /* SW_SHOWNA = show without activating (matches
-                     * WS_EX_NOACTIVATE ghost semantics). */
-                    ShowWindow(g, cur_visible ? SW_SHOWNA : SW_HIDE);
+                    /* v1.6.5 FLICKER FIX (2026-07-17): check ghost's actual
+                     * WS_VISIBLE state before calling ShowWindow. Prior
+                     * unconditional call raced with hooks_ghost_wake's own
+                     * ShowWindow when a hotkey (Ctrl+Alt+G) fired within
+                     * 50ms — DOUBLE ShowWindow on a fullscreen layered
+                     * window = double DWM invalidate = visible flash on
+                     * toggle-show. Now: only call if state actually
+                     * differs from Windows' view of the window. */
+                    LONG st = GetWindowLongPtrW(g, GWL_STYLE);
+                    int is_shown = (st & WS_VISIBLE) != 0;
+                    if (cur_visible && !is_shown) {
+                        ShowWindow(g, SW_SHOWNA);
+                    } else if (!cur_visible && is_shown) {
+                        ShowWindow(g, SW_HIDE);
+                    }
                 } __except (EXCEPTION_EXECUTE_HANDLER) { }
             }
             last_overlay_visible = cur_visible;
@@ -1711,17 +1723,53 @@ void hooks_ghost_wake(void) {
     int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
     int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
 
-    UINT nudge_flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING;
+    /* v1.6.5 FLICKER FIX (2026-07-17): throttle to 10Hz max.
+     * wake_dwm_composition is called from ~30 different sites (every
+     * hotkey, every chat activity, every AI stream chunk). If several
+     * fire within one frame (e.g., user types fast in chat), we'd
+     * ShowWindow + RedrawWindow N times per frame → visible strobing.
+     * 100ms throttle = at most 10 wakes/sec, plenty for perceived
+     * responsiveness, none of the strobe. */
+    static volatile LONG64 s_last_wake_tick = 0;
+    LONG64 now = (LONG64)GetTickCount64();
+    LONG64 prev = s_last_wake_tick;
+    if (now - prev < 100) return;
+    InterlockedExchange64(&s_last_wake_tick, now);
 
     __try {
-        /* v6.3: ShowWindow(SW_SHOWNA) FIRST in case ghost was hidden
-         * by keepalive's overlay-hidden branch. SW_SHOWNA = show
-         * without taking focus. Then the SetWindowPos calls actually
-         * force DWM composition. */
-        ShowWindow(h, SW_SHOWNA);
+        /* v1.6.5 FLICKER FIX (2026-07-17):
+         *
+         * Pre-v1.6.5 did:
+         *   ShowWindow(SW_SHOWNA)
+         *   SetWindowPos(HWND_TOPMOST, full geometry)      // z-order assert
+         *   SetWindowPos(NULL, vx, vy + 1, vw, vh, nudge)  // move down 1px
+         *   SetWindowPos(NULL, vx, vy,     vw, vh, nudge)  // move back
+         *
+         * The 1-pixel move nudge on a FULLSCREEN alpha=1 layered window
+         * forces DWM to invalidate + recomposite the ENTIRE desktop.
+         * On a Ctrl+Alt+G toggle-show, that visible screen invalidation
+         * appears as a brief flash BEFORE the overlay pixels land — the
+         * "flickers then shows" bug LO reported 2026-07-17.
+         *
+         * Fix: replace the position-nudge with RedrawWindow(RDW_INVALIDATE |
+         * RDW_UPDATENOW). This still forces DWM to paint but scopes the
+         * invalidation to our OWN ghost region (which is alpha=1/255 =
+         * imperceptible), NOT the entire desktop. Composition still gets
+         * kicked; no visible flash.
+         *
+         * The burst_wake SCP loop that follows (in wake_dwm_composition)
+         * keeps DWM out of idle for 300ms, so if the RedrawWindow alone
+         * misses a compose cycle, the next SCP fires within 16ms and the
+         * overlay lands cleanly. */
+        /* Only call ShowWindow if actually needed — avoids second
+         * fullscreen invalidate when keepalive already synced ghost. */
+        LONG st = GetWindowLongPtrW(h, GWL_STYLE);
+        if (!(st & WS_VISIBLE)) ShowWindow(h, SW_SHOWNA);
+        /* Assert TOPMOST z-order without moving (SWP_NOMOVE|SWP_NOSIZE):
+         * this is a no-op if we're already TOPMOST but re-hoists us if
+         * some other app briefly stole the slot. Zero pixel invalidation. */
         SetWindowPos(h, HWND_TOPMOST, vx, vy, vw, vh,
-                     SWP_NOACTIVATE | SWP_NOSENDCHANGING);
-        SetWindowPos(h, NULL, vx, vy + 1, vw, vh, nudge_flags);
-        SetWindowPos(h, NULL, vx, vy,     vw, vh, nudge_flags);
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING);
+        RedrawWindow(h, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
     } __except (EXCEPTION_EXECUTE_HANDLER) { }
 }

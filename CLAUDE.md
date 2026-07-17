@@ -1,5 +1,255 @@
 ﻿# svcldb — Project Memory (Claude / Cursor)
 
+## 2026-07-17 — v1.6.5 VTABLE-DRIFT + FLICKER + LAUNCHER-DEV-BYPASS FIX
+
+### The report (from user simplystoragespace173@gmail.com, 2026-07-16)
+
+Paying weekly subscriber. Clicked Inject in v1.6.4 svchelper. Overlay
+never appeared; DWM eventually crashed. Log bundle sent for triage.
+
+### Root cause chain (bisected via PDB dump of live dwmcore.dll)
+
+**#1 — pLayer isn't always the primary subobject of CDDisplaySwapChain.**
+On this user's older Win11 build, `COverlayContext::Present(pLayer, ...)`
+was passing pLayer cast as a NON-primary multi-inherit subobject where
+`GetPhysicalBackBuffer` sits at slot 28/43/44/45 depending on subobject,
+not slot 24. Hardcoded slot 24 fetched an unrelated method (e.g.
+`COverlaySwapChain::IsValid` returns BOOL, treated as pointer → wrong
+downstream chain → QI landed on data bytes `0x0076006500000000` — that's
+literally UTF-16 "ev" chars. v1.6.1's `is_ptr_in_loaded_module_code`
+guard correctly refused to call it → overlay skipped every frame →
+user saw nothing. RE-verified via `tools/re_probe/dwmcore_dump.c` which
+dumps every vftable's contents from the local dwmcore.pdb.
+
+**#2 — v1.6.2's dynamic scan was semantically inverted.**
+The 3 RVA hints plumbed into `ui_set_vtable_slot_hints` were WRONG:
+```
+Pre-v1.6.5:
+  ui_set_vtable_slot_hints(getPhysicalBackBufferRva,  // labeled "gpb"
+                           getD3D11ResourceRva,       // labeled "gd3d"
+                           accessorRva)               // labeled "acc"
+```
+But the SLOTS those hints controlled were called for actually-different
+methods:
+- Slot 5 on pLayer = `GetDevice` (result discarded), NOT GetPhysicalBackBuffer
+- Slot 24 on pLayer = `GetPhysicalBackBuffer`, NOT GetD3D11Resource
+- Slot 19 on res_vtbl = `GetD3D11Resource`, NOT GetTexture2D-accessor
+
+So the dynamic scan always MISSed (searched pLayer for GetPhysicalBackBuffer
+RVA at slot 5's "gpb hint" → not there; searched pLayer for GetD3D11Resource
+at slot 24's "gd3d hint" → GetD3D11Resource lives on the BUFFER's vtable,
+never on pLayer → miss). Fell back to hardcoded 5/24/19, which was fine
+for vftable[0] but wrong for vftable[1..5].
+
+**#3 — MAX_VTABLE_SCAN_SLOTS=64 was too narrow.**
+Multi-inherit subobjects have GetPhysicalBackBuffer at slots 43/44/45.
+64 covers them; but combined with #2, dynamic scan effectively did
+nothing on drift.
+
+**#4 — sub_check hard-unloaded on 3 network failures.**
+`payload/src/sub_check.c` self-unloaded after 3 consecutive Supabase
+network errors. This mirrored the pre-v1.6 JS-side policy that was
+ALREADY fixed in v1.6 (invariant #103) to NOT lockout on `kind:'network'`.
+C-side was stuck on the old aggressive policy → paying users on flaky
+wifi got their overlay ripped out mid-session.
+
+**#5 — Ctrl+Alt+G toggle-flicker (surfaced during v1.6.5 testing).**
+Two problems compounded:
+- `fire()` in `rawinput_hook.c` had non-atomic debounce → LL_HOOK,
+  WM_HOTKEY, POLL_THREAD all raced on `g_last_fire[slot]`, single
+  physical press could fire the toggle handler twice within same ms
+  → g_visible went 0→1→0 in one frame → 1-frame flash
+- `hooks_ghost_wake` + `keepalive_thread` both did unconditional
+  `ShowWindow(SW_SHOWNA)` + `SetWindowPos` fullscreen nudge on the
+  layered ghost within 50ms of each other → double DWM invalidate
+  of the entire desktop → visible flash on toggle-show
+- `hooks_burst_wake(30, 300, 16)` fired 19 forced composites for a
+  simple visibility toggle — overkill causing rapid re-renders
+
+### What v1.6.5 shipped
+
+**Vtable-drift fix** (`payload/src/dllmain.c`):
+```
+Post-v1.6.5:
+  ui_set_vtable_slot_hints(off.getDevice,                 // slot 5 IS GetDevice
+                           off.getPhysicalBackBufferRva,  // slot 24 IS GetPhysicalBackBuffer
+                           off.getD3D11ResourceRva)       // slot 19 IS GetD3D11Resource
+```
+Hints now match the ACTUAL method identities at each slot. Dynamic scan
+MATCHES on typical builds (zero regression), DRIFTS to correct slot on
+user builds with reshuffled multi-inherit subobjects. Bumped
+`MAX_VTABLE_SCAN_SLOTS 64 → 256` for headroom.
+
+**Enhanced diagnostics on MISS** (`payload/src/ui/imgui_layer.cpp`):
+New `dump_known_slots_in_vtable()` fires when a dynamic-scan misses —
+walks the vtable slots 0-255, cross-references each slot's fn RVA
+against the known-symbols table from `offsets.blob`, and logs every
+match. Enables per-user diagnosis without needing to run RE tools on
+their box: log shows `slot[28] rva=0x1EA620 == getPhysicalBackBuffer`
+even when hardcoded 24 was wrong. Ships v1.6.5 baseline.
+
+**sub_check policy alignment** (`payload/src/sub_check.c`):
+Removed `SUB_CHECK_MAX_NET_FAILURES` self-unload. Network errors now
+back off indefinitely (2/4/8/15/30 min cap) but NEVER self-unload.
+Only explicit HTTP-200 empty-result OR HTTP-401/403 triggers unload.
+Matches v1.6 JS-side revalidation.js policy.
+
+**Atomic CAS debounce** (`payload/src/rawinput_hook.c`):
+`g_last_fire[]` promoted to `volatile LONG`; `fire()` now uses
+`InterlockedCompareExchange` loop to make the "read timestamp → check
+gap → write timestamp" sequence atomic. LL_HOOK/WM_HOTKEY/POLL races
+resolved — the CAS-loser sees the fresh timestamp and bails.
+
+**Flicker fix** (`payload/src/dwm_hooks.c` + `payload/src/ui/imgui_layer.cpp`):
+- `keepalive_thread` ghost sync now checks `GWL_STYLE & WS_VISIBLE`
+  before calling ShowWindow — no more double-show race
+- `hooks_ghost_wake` same guard + 10Hz throttle via
+  `InterlockedExchange64` on `s_last_wake_tick`
+- Removed the 3× `SetWindowPos` fullscreen nudge, replaced with
+  `RedrawWindow(NULL, RDW_INVALIDATE | RDW_UPDATENOW)` — invalidates
+  ghost region only (alpha=1/255 = imperceptible), NOT the full desktop
+- New `wake_dwm_composition_lite()` — 4 SCP pumps over 60ms (vs 30
+  over 300ms in the full path). `ui_toggle_visible` now uses lite;
+  chat/AI/screenshot paths keep the heavy wake for streaming responsiveness
+
+**Launcher dev-bypass wiring** (`launcher/build.bat` + `launcher/src/main.c`):
+Pre-v1.6.5: `SVCLDB_DEV_AUTH=1` only wrapped the payload's handshake +
+sub_check gates. Launcher still forced OAuth + Supabase sub check +
+API-key-required die on every `sihost --quiet` iteration → couldn't
+truly iterate offline.
+Post-v1.6.5: same env-var now also compiles the launcher with
+`SVCLDB_DEV_BYPASS_AUTH=1`, which:
+- Populates a dummy `oauth_session_t` (email="dev@localhost",
+  access_token="SVCLDB_DEV_ACCESS_TOKEN")
+- Skips `license_check_subscription` entirely
+- Stubs `cfg->api_key = "SVCLDB_DEV_NO_KEY"` if user hasn't dropped
+  api_key.txt (AI calls fail cleanly with 401 but overlay/hotkeys/
+  vtable-scan all work)
+- Keeps `api_key.txt` around post-consume (prod deletes it for stealth)
+
+All wrapped in `#if SVCLDB_DEV_BYPASS_AUTH` gates. Production builds
+have ZERO dev-bypass footprint — verified via `grep -aoc "DEV BYPASS"`
+on all shipping binaries = 0.
+
+### RE tools shipped (new: `tools/re_probe/`)
+
+- `dwmcore_dump.c` (~280 LoC) — loads dwmcore.dll via
+  `LoadLibraryEx(DONT_RESOLVE_DLL_REFERENCES)`, loads its PDB via
+  dbghelp, enumerates every method of COverlaySwapChain /
+  CDDisplaySwapChain / CDDisplaySwapChainBuffer / CDeviceTextureTarget /
+  COverlayContext with RVAs. Then walks each `ClassName::vftable`
+  symbol and dumps up to 256 slots per vftable, resolving each fn
+  pointer via SymFromAddr. Ends with a v1.6.5-fix simulation that
+  proves my new hint plumbing correctly finds the target slot in
+  ALL 5 valid CDDisplaySwapChain subobject vftables.
+- `build.bat` — standalone `cl /nologo /W3 /O2` compile, uses shipped
+  dbghelp for PDB access.
+
+Used to verify BEFORE writing any patch code — LO's direct instruction
+was "RE dwmcore.dll with ur RE tools of ghdira etc AND check web
+detially to see if ur hyptoehsis even map out right if ur confident
+then proceed". Static proof via the tool + web research on chaosium43's
+public dwm-overlay repo (`https://github.com/chaosium43/dwm-overlay`)
+confirmed the fix design before touching production code.
+
+### v1.6.5 hard invariants (added on top of v1.6.4)
+
+124. **RVA hints for vtable-slot discovery MUST match the ACTUAL method
+     identity at that slot, NOT the semantic role we WISH it were.**
+     Historical name confusion: slots called "gpb"/"gd3d"/"acc" are
+     really GetDevice/GetPhysicalBackBuffer/GetD3D11Resource. Never
+     "helpfully" swap the hint labels — they're plumbed to explicit
+     slot indexes and swapping the hints re-breaks dynamic discovery.
+
+125. **`MAX_VTABLE_SCAN_SLOTS` = 256, floor 128.** COverlayContext has
+     ~80 methods, multi-inherit subobjects sit around slot 43-45.
+     Never lower below 128 without RE-verifying no Windows build
+     places any target method past slot 128. Never raise past 1024
+     without walking is_readable guard — page-fault risk into adjacent
+     .rdata.
+
+126. **`fire()` in rawinput_hook.c MUST use atomic CAS on `g_last_fire[slot]`.**
+     Non-atomic read-then-write races across LL_HOOK / WM_HOTKEY /
+     POLL threads. Any regression to plain `if (now-last<gap) return;
+     last=now;` reintroduces double-fire flash on toggle keys.
+     Debounce loop pattern documented inline.
+
+127. **Ghost `ShowWindow` calls MUST be guarded by `GWL_STYLE &
+     WS_VISIBLE` check.** Two dispatchers (keepalive_thread +
+     hooks_ghost_wake) both fire on visibility transitions. Unconditional
+     calls double-invalidate the fullscreen layered window and cause a
+     visible desktop flash. The guard makes both dispatchers idempotent.
+
+128. **`hooks_ghost_wake` MUST be throttled to 10Hz max** via
+     `InterlockedExchange64` on `s_last_wake_tick`. Called from ~30
+     sites (every hotkey, chat activity, AI stream chunk). Without the
+     throttle, rapid consecutive fires (e.g., chat typing) cause
+     visible strobing.
+
+129. **`ui_toggle_visible` MUST use `wake_dwm_composition_lite`, NOT
+     the full wake.** Full wake fires 30 SCP pumps over 300ms which is
+     overkill for a visibility flip and CAUSES the strobe. Lite fires
+     4 SCPs over 60ms — enough for DWM to pick up the state change on
+     the next natural Present without over-forcing composites. Content-
+     changing paths (chat, AI, screenshot) keep the heavy wake.
+
+130. **`sub_check.c` MUST NOT self-unload on network failures.** Only
+     explicit HTTP-200 empty-result OR HTTP-401/403 triggers unload.
+     Any regression to `if (fails >= N) trigger_self_unload()` breaks
+     the v1.6 policy (invariant #103) that paying subscribers on
+     transient net issues KEEP their overlay.
+
+131. **`SVCLDB_DEV_AUTH=1` MUST be honored by BOTH `payload/build.bat`
+     AND `launcher/build.bat`.** Payload-only dev bypass leaves the
+     launcher forcing OAuth + sub check + API-key check on every
+     iteration → useless. Launcher gates must be `#if
+     SVCLDB_DEV_BYPASS_AUTH` around: license_login call, sub_check
+     block, api_key-required die, api_key.txt delete. Prod builds
+     (no env var) have all four active → zero regression.
+
+132. **Production builds MUST have `grep -aoc "DEV BYPASS"` = 0 on both
+     `dwmapiext.dll` AND `sihost.exe`.** Any leaked dev-bypass string
+     in a shipping binary is a security regression (attacker can flip
+     the flag via env var if the check is env-var-gated at runtime,
+     though our compile-time check is safer). Pre-release grep is
+     mandatory.
+
+### Deployment status
+
+- `ui/package.json` 1.6.4 → **1.6.5**
+- `ui/src/license/config.js` APP_VERSION 1.6.4 → **1.6.5**
+- `ui/src/index.html` login-app-ver v1.6.4 → **v1.6.5**
+- `build/payload/dwmapiext.dll` — 742,400 bytes (prod)
+- `build/launcher/sihost.exe` — 1,004,033 bytes (prod, Astral-PE scrubbed)
+- `tools/re_probe/dwmcore_dump.c` — new dev-only RE probe (NOT shipped)
+- `grep -aoc "DEV BYPASS"` on prod binaries: 0
+- Flicker fix live-verified on dev box (LO's PC, Win11 26100.8115) —
+  Ctrl+Alt+G toggle smooth, no strobe
+
+### What NOT to do (learned this session)
+
+- **Don't hardcode vtable slot indices without ALSO providing dynamic
+  RVA-based discovery**. Windows patch levels reshuffle multi-inherit
+  subobject vtables. Static assumptions break silently.
+- **Don't plumb dynamic-scan hints with method RVAs that don't match
+  what the slot actually invokes.** Semantic role naming ≠ actual
+  method identity. Verify via PDB dump before wiring.
+- **Don't call `ShowWindow` unconditionally on transitions where TWO
+  threads may be racing to the same state change.** Add WS_VISIBLE
+  guards.
+- **Don't `SetWindowPos` a fullscreen alpha=1 layered window for
+  compose-wake purposes.** Invalidates the entire desktop. Use
+  `RedrawWindow` scoped to the ghost region instead.
+- **Don't use `hooks_burst_wake(30, 300, 16)` for cheap state changes
+  like visibility toggles.** 30 forced composites over 300ms is for
+  content streaming. Toggles get 4 over 60ms via lite variant.
+- **Don't ship dev-bypass gates that only cover the payload while
+  leaving launcher forcing OAuth.** Half-wired dev bypass is worse
+  than no dev bypass — it looks like it works but doesn't for the
+  first iteration.
+
+---
+
 ## 2026-07-15 — v1.6.4 STEALTH FIX: overlay stays HIDDEN on Ctrl+Shift+Space
 
 ### User feedback (verbatim)

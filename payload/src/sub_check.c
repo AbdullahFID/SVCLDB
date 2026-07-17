@@ -31,10 +31,24 @@
 /* Base cadence: 30 min ± jitter. First fire delay 2 min so we don't
  * slam the network the instant DWM starts (network stack may still be
  * warming up on wake-from-sleep). Transport backoff schedule: 2, 4, 8,
- * 15, 30 minutes then cap. Explicit `inactive` still fires immediately. */
+ * 15, 30 minutes then cap. Explicit `inactive` still fires immediately.
+ *
+ * v1.6.5 (2026-07-16): SUB_CHECK_MAX_NET_FAILURES removed. Previous
+ * value (3) mirrored the Electron-side revalidation.js policy that was
+ * ALREADY changed in v1.6 to NOT lockout on kind='network' errors
+ * (invariant #103). The C-side sub_check was accidentally left with
+ * the pre-v1.6 aggressive-unload logic — paying subscribers on flaky
+ * wifi or during transient Supabase 503s got their overlay silently
+ * pulled ~8 min after the first blip (verified via user
+ * simplystoragespace173@gmail.com logs 2026-07-16 23:29:13, where 3
+ * network fails 6 minutes apart triggered SELF-UNLOAD despite an
+ * active weekly subscription).
+ *
+ * Post-v1.6.5 policy: network failures cause exponential backoff
+ * indefinitely (2/4/8/15/30 min capped). ONLY an explicit HTTP-200
+ * with empty result OR an explicit 401/403 triggers self-unload. */
 #define SUB_CHECK_INTERVAL_MS       (30U * 60U * 1000U)
 #define SUB_CHECK_FIRST_DELAY_MS    (2U  * 60U * 1000U)
-#define SUB_CHECK_MAX_NET_FAILURES  3
 #define SUB_CHECK_JITTER_PCT        20    /* ±20 % of INTERVAL_MS */
 
 static HANDLE  g_sc_thread = NULL;
@@ -238,14 +252,16 @@ static DWORD WINAPI sub_check_thread(LPVOID param) {
             trigger_self_unload(SS(SVC_STR_SUBCHK_INACTIVE));
             break;
         }
-        /* r == -1: transport error */
+        /* r == -1: transport error. v1.6.5: NO self-unload — matches
+         * Electron-side v1.6 policy (invariant #103). Just count for
+         * backoff and log. Cap the counter so backoff stays at 30-min
+         * max forever instead of overflowing. */
         consecutive_net_fails++;
-        slog_writef("payload.log", "sub_check: net fail %d/%d",
-                    consecutive_net_fails, SUB_CHECK_MAX_NET_FAILURES);
-        if (consecutive_net_fails >= SUB_CHECK_MAX_NET_FAILURES) {
-            trigger_self_unload(SS(SVC_STR_SUBCHK_NET_FAIL));
-            break;
-        }
+        if (consecutive_net_fails > 32) consecutive_net_fails = 32;
+        slog_writef("payload.log",
+                    "sub_check: net fail %d (backing off, no self-unload; "
+                    "matches v1.6 revalidation.js kind=network policy)",
+                    consecutive_net_fails);
     }
     CloseHandle(stop);
     slog_write("payload.log", "sub_check: thread exiting");

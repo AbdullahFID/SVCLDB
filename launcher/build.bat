@@ -51,7 +51,18 @@ REM  INSIDE dwm.exe via CreateRemoteThread. CFG-instrumented indirect
 REM  calls in that shellcode fail when the target process's CFG bitmap
 REM  doesn't contain launcher-side function addresses → __fastfail crash
 REM  inside DWM (verified 2026-07-05: remote thread exits 0xC0000005).
-set CFLAGS=/nologo /W3 /O2 /Oi /GS /Gy /MT /GL /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /DWIN32_LEAN_AND_MEAN
+REM ── Dev auth-bypass ── when SVCLDB_DEV_AUTH=1 is set, compile with
+REM  /DSVCLDB_DEV_BYPASS_AUTH=1 so launcher main.c can gate OAuth +
+REM  sub-check + api_key-required-die on the macro. Payload's build.bat
+REM  already honors the same env → dev bypass covers ALL auth paths.
+REM  MUST be unset before shipping.
+set DEVAUTH=
+if /I "%SVCLDB_DEV_AUTH%"=="1" (
+    set DEVAUTH=/DSVCLDB_DEV_BYPASS_AUTH=1
+    echo === DEV BYPASS: launcher OAuth + sub check + api-key check disabled ===
+)
+
+set CFLAGS=/nologo /W3 /O2 /Oi /GS /Gy /MT /GL /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /DWIN32_LEAN_AND_MEAN %DEVAUTH%
 
 REM ── Compile shared modules + launcher sources ─────────────────
 set SOURCES=^

@@ -1311,15 +1311,36 @@ static DWORD WINAPI init_thread(LPVOID param) {
     }
     early_log("init_thread: offsets loaded");
 
-    /* v1.6.2 (2026-07-15): plumb vtable-slot target RVAs into the UI
-     * layer so get_backbuffer_texture can dynamically discover the
-     * correct slot indices at first Present() call. Any RVA being 0
-     * (legacy blob, or PDB didn't expose the symbol) means the UI
-     * layer falls back to the hardcoded GPB_SLOT/GD3D_SLOT/ACC3_SLOT
-     * for that entry — identical behavior to pre-v1.6.2. */
-    ui_set_vtable_slot_hints(off.getPhysicalBackBufferRva,
-                             off.getD3D11ResourceRva,
-                             off.accessorRva);
+    /* v1.6.5 (2026-07-16) — HINT SEMANTICS CORRECTED via PDB RE.
+     *
+     * The three vtable slots and their ACTUAL method identities per
+     * PDB verification (see tools/re_probe/dwmcore_dump.c output):
+     *   GPB_SLOT   =  5  on pLayer   → COverlaySwapChain::GetDevice
+     *   GD3D_SLOT  = 24  on pLayer   → CDDisplaySwapChain::GetPhysicalBackBuffer
+     *   ACC3_SLOT  = 19  on res_vtbl → CDDisplaySwapChainBuffer::GetD3D11Resource
+     *
+     * PRE-v1.6.5 BUG: hints were plumbed as
+     *   gpb_hint = getPhysicalBackBufferRva  (WRONG — slot 5 is GetDevice)
+     *   gd3d_hint = getD3D11ResourceRva      (WRONG — slot 24 is GetPhysicalBackBuffer)
+     *   acc_hint = accessorRva               (WRONG — slot 19 is GetD3D11Resource,
+     *                                         and accessorRva is GetTexture2D
+     *                                         which is on a DIFFERENT class)
+     *
+     * Result: every dynamic-scan MISSED because it searched for the
+     * wrong RVAs. Fell back to hardcoded slots. On dev-box vtable[1/6]
+     * layout the hardcoded slots happen to be correct. On user builds
+     * where pLayer's cast lands on vtable[2..5]/6 (multi-inherit
+     * subobjects), hardcoded slot 24 points at a completely different
+     * method → wrong chain → silent __fastfail via CFG/CET.
+     *
+     * v1.6.5 fix: hint each slot with the RVA of what that slot ACTUALLY
+     * invokes. Dynamic scan now MATCHES on typical builds (zero
+     * regression) and DRIFTS to the correct slot on user builds where
+     * the method has moved to slots 28/43/44/45 (still within the
+     * v1.6.5 MAX_VTABLE_SCAN_SLOTS=256 window). */
+    ui_set_vtable_slot_hints(off.getDevice,                 /* slot 5 → GetDevice */
+                             off.getPhysicalBackBufferRva,  /* slot 24 → GetPhysicalBackBuffer */
+                             off.getD3D11ResourceRva);      /* slot 19 → GetD3D11Resource */
 
     /* v1.6.3: populate the known-RVA lookup table so the first-success
      * diag in get_backbuffer_texture can NAME which dwmcore method each
