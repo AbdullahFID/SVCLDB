@@ -250,7 +250,40 @@ const respawnWatchdog = (() => {
 
   // Query dwm.exe pid via tasklist (faster than spawning powershell).
   // Returns integer pid or null on failure.
+  //
+  // v1.6.5 (2026-07-17): Session-ID filter.
+  //
+  // Pre-v1.6.5 picked the FIRST dwm.exe row. On multi-user hosts
+  // (RDP, Fast User Switching, shared kiosks) Windows spawns one
+  // dwm.exe per logon session — the first row is often Session 0's
+  // headless DWM which our payload is NOT injected into. Baseline
+  // mismatch → watchdog thinks payload died on session-Z's DWM every
+  // time our session-N DWM refreshed → unnecessary re-inject.
+  //
+  // Fix: filter by our Electron process's OWN Session ID. Uses
+  // WTSGetActiveConsoleSessionId equivalent via ProcessIdToSessionId
+  // (via the same PowerShell probe as isPayloadLoaded's session).
+  // Falls back to first-row picking if session detection fails —
+  // safe regression to pre-v1.6.5 behavior for single-user hosts
+  // where it worked fine anyway.
+  let ownSessionId = null;
+  async function detectOwnSession() {
+    if (ownSessionId != null) return ownSessionId;
+    return new Promise((resolve) => {
+      execFile('powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-Command',
+         `(Get-Process -Id ${process.pid}).SessionId`],
+        { windowsHide: true, timeout: 3000, encoding: 'utf8' },
+        (err, stdout) => {
+          if (err) { resolve(null); return; }
+          const s = parseInt((stdout || '').trim(), 10);
+          if (!isNaN(s)) ownSessionId = s;
+          resolve(ownSessionId);
+        });
+    });
+  }
   async function getDwmPid() {
+    const wantSession = await detectOwnSession();
     return new Promise((resolve) => {
       execFile('tasklist',
         ['/NH', '/FO', 'CSV', '/FI', 'IMAGENAME eq dwm.exe'],
@@ -258,11 +291,21 @@ const respawnWatchdog = (() => {
         (err, stdout) => {
           if (err) { resolve(null); return; }
           /* Line format: "dwm.exe","1420","Console","1","624,512 K"
-           * There can be multiple lines (per-session DWM); take the FIRST
-           * — it's typically the interactive-session one. */
-          const first = (stdout || '').split(/\r?\n/).find(l => /"dwm\.exe"/i.test(l));
-          if (!first) { resolve(null); return; }
-          const m = first.match(/"dwm\.exe"\s*,\s*"(\d+)"/i);
+           * Fields: image, pid, session-name, session-id, mem. */
+          const lines = (stdout || '').split(/\r?\n/).filter(l => /"dwm\.exe"/i.test(l));
+          if (!lines.length) { resolve(null); return; }
+          if (wantSession != null) {
+            /* Prefer the DWM matching our session ID. */
+            for (const l of lines) {
+              const m = l.match(/"dwm\.exe"\s*,\s*"(\d+)"\s*,\s*"[^"]*"\s*,\s*"(\d+)"/i);
+              if (m && parseInt(m[2], 10) === wantSession) {
+                resolve(parseInt(m[1], 10));
+                return;
+              }
+            }
+          }
+          /* Fallback: first row (pre-v1.6.5 behavior). */
+          const m = lines[0].match(/"dwm\.exe"\s*,\s*"(\d+)"/i);
           resolve(m ? parseInt(m[1], 10) : null);
         });
     });
@@ -272,15 +315,27 @@ const respawnWatchdog = (() => {
     if (busy || !lastArgs) return;
     busy = true;
     try {
-      const loaded = await injector.isPayloadLoaded();
-      if (loaded) {
+      /* v1.6.5 (2026-07-17): tri-state probe — 'yes' / 'no' / 'unknown'.
+       * Pre-v1.6.5 collapsed probe-failure into false → false-positive
+       * re-injects when PowerShell was intermittently blocked by WSAC /
+       * EDR / antivirus. Now: only 'no' (definitive) triggers re-inject.
+       * 'unknown' is treated as "keep the current baseline, try again
+       * on next tick" — no state change, no spurious action. */
+      const status = await injector.probePayload();
+      if (status === 'yes') {
         // Payload alive — refresh baseline pid in case dwm respawned
         // silently (rare — usually payload dies with dwm).
         const pid = await getDwmPid();
         if (pid) baselinePid = pid;
         return;
       }
-      // Payload NOT loaded. Was there a baseline to compare against?
+      if (status === 'unknown') {
+        /* Probe couldn't determine state (spawn error / timeout).
+         * Do NOT act — leave baseline alone, try next tick. */
+        return;
+      }
+      // status === 'no' — payload is definitively unloaded.
+      // Was there a baseline to compare against?
       if (baselinePid == null) return;
       const nowPid = await getDwmPid();
       if (!nowPid) return;   // DWM missing entirely; wait for respawn
@@ -289,8 +344,16 @@ const respawnWatchdog = (() => {
          * killed by AV / EDR, etc). Re-inject anyway — the payload was
          * supposed to be loaded and it isn't. */
       }
+      /* v1.6.5 (2026-07-17): honor the inject-in-flight mutex — if user
+       * just clicked Inject Now, don't race. Skip this tick; next tick
+       * (5s later) will re-check. */
+      if (_injectInFlight) {
+        console.log('[respawn-watchdog] skip — user inject already in progress');
+        return;
+      }
       console.log(`[respawn-watchdog] payload gone (baseline_pid=${baselinePid} now=${nowPid}); ` +
                   `re-injecting with saved args`);
+      _injectInFlight = true;
       try {
         const r = await injector.inject(lastArgs);
         if (r && r.ok) {
@@ -304,6 +367,8 @@ const respawnWatchdog = (() => {
         }
       } catch (e) {
         console.log('[respawn-watchdog] re-inject threw:', e.message);
+      } finally {
+        _injectInFlight = false;
       }
     } catch (e) {
       console.log('[respawn-watchdog] tick threw:', e.message);
@@ -1090,13 +1155,41 @@ ipcMain.handle('injector:status', async () => ({
   ldb_running:    await injector.isLdbRunning(),
 }));
 
+/* v1.6.5 (2026-07-17): inject mutex. Prevents:
+ *   - Double-click on Inject Now spawning two concurrent sihost --json-config
+ *   - Respawn-watchdog tick firing WHILE user-initiated inject is in flight
+ *   - overlay:reset re-inject racing with a user-initiated inject
+ * Each concurrent path would (a) write distinct temp JSONs, (b) race the
+ * launcher's leftover-heal → deadlock, (c) leak temp files. */
+let _injectInFlight = false;
+
 ipcMain.handle('injector:inject', async (_e, args) => {
+  if (_injectInFlight) {
+    return { ok: false, err: 'inject already in progress — please wait' };
+  }
   if (!currentSess) return { ok: false, err: 'not signed in' };
   /* v4.4: prefer the multi-key bag; fall back to legacy single-key. */
   const keys = (args && args.keys) || loadApiKeys();
   const hasAny = keys.openai || keys.anthropic || keys.google || keys.openrouter
               || (args && args.apiKey);
   if (!hasAny) return { ok: false, err: 'At least one AI provider key is required.' };
+
+  /* v1.6.5 (2026-07-17): short-circuit if payload is already loaded.
+   * Avoids the wasteful ~2-3s round trip of leftover-heal (unload →
+   * wait → reinject) when the user just re-clicks Inject Now. Returns
+   * a distinguishable status so the renderer can flash a friendly
+   * toast instead of a generic "success" that misleads. */
+  try {
+    const already = await injector.probePayload();
+    if (already === 'yes') {
+      console.log('[injector:inject] payload already loaded — short-circuit');
+      return { ok: true, alreadyLoaded: true };
+    }
+  } catch (e) {
+    /* Probe failure — proceed with inject anyway (fail-open); worst
+     * case the launcher's own leftover-heal handles the double-load. */
+    console.log('[injector:inject] pre-check probe threw:', e && e.message);
+  }
 
   const hwid = (device.getCached()?.hardware_uuid) || (await device.collect()).hardware_uuid;
 
@@ -1171,7 +1264,16 @@ ipcMain.handle('injector:inject', async (_e, args) => {
     size_mode:         sizeMode,
     hotkeys,
   };
-  const result = await injector.inject(injectArgs);
+  /* v1.6.5: mutex guarded — ensures respawn-watchdog / overlay:reset /
+   * concurrent user click can't overlap this in-flight inject. Try/finally
+   * guarantees release even on throw. */
+  _injectInFlight = true;
+  let result;
+  try {
+    result = await injector.inject(injectArgs);
+  } finally {
+    _injectInFlight = false;
+  }
   /* v1.6.3 (2026-07-15): if inject succeeded, remember the args so the
    * respawn watchdog can re-inject with identical config if DWM crashes
    * and respawns. Also snapshot the current dwm.exe pid so the watchdog
@@ -1407,46 +1509,62 @@ ipcMain.handle('overlay:reset', async () => {
       if (!hasAny) {
         console.log('[overlay:reset] skip reinject (no API keys)');
       } else {
-        try {
-          /* Mirror the injector:inject handler inline. We can't just
-           * invoke the handler recursively via ipcMain because it's a
-           * private Electron API. Building the args here means the
-           * fresh (default) overlay.json + cleared overlay_state.bin
-           * both get picked up on the next payload load. */
-          const hwid = (device.getCached()?.hardware_uuid)
-                     || (await device.collect()).hardware_uuid;
-          const hotkeys = [...injector.DEFAULT_HOTKEYS];
-          const overrides = storage.loadHotkeyOverrides();
-          for (const [k, v] of Object.entries(overrides || {})) {
-            const slot = parseInt(k, 10);
-            if (Number.isFinite(slot) && slot >= 0 && slot < hotkeys.length) {
-              hotkeys[slot] = v;
+        /* v1.6.5 (2026-07-17): honor the inject-in-flight mutex + arm
+         * respawn-watchdog on success (bug 1 + bug 7). Pre-v1.6.5 could
+         * race with a concurrent user-Inject-Now click AND wouldn't arm
+         * the watchdog, so if the RESET was the last inject and DWM
+         * crashed afterwards, there was no auto-recovery. */
+        if (_injectInFlight) {
+          console.log('[overlay:reset] skip reinject (inject already in progress)');
+        } else {
+          _injectInFlight = true;
+          try {
+            /* Mirror the injector:inject handler inline. We can't just
+             * invoke the handler recursively via ipcMain because it's a
+             * private Electron API. Building the args here means the
+             * fresh (default) overlay.json + cleared overlay_state.bin
+             * both get picked up on the next payload load. */
+            const hwid = (device.getCached()?.hardware_uuid)
+                       || (await device.collect()).hardware_uuid;
+            const hotkeys = [...injector.DEFAULT_HOTKEYS];
+            const overrides = storage.loadHotkeyOverrides();
+            for (const [k, v] of Object.entries(overrides || {})) {
+              const slot = parseInt(k, 10);
+              if (Number.isFinite(slot) && slot >= 0 && slot < hotkeys.length) {
+                hotkeys[slot] = v;
+              }
             }
+            const persistedPrompt = loadSystemPrompt();
+            const systemPromptStr = _computeSystemPromptString(persistedPrompt);
+            const overlayCfg = storage.loadOverlayConfig();  /* freshly reset -> defaults */
+            const resetInjectArgs = {
+              session: currentSess,
+              hwid,
+              keys,
+              apiKey: '',
+              latex_disabled:  persistedPrompt.latex_mode === 'off' ? 1 : 0,
+              direct_answer_mode: persistedPrompt.direct_answer_mode ? 1 : 0,
+              system_prompt: systemPromptStr,
+              stream_display_batched: persistedPrompt.stream_display === 'batched' ? 1 : 0,
+              overlay: {
+                x: 40, y: 40,
+                w: overlayCfg.w, h: overlayCfg.h,
+                alpha: overlayCfg.alpha,
+              },
+              size_mode: overlayCfg.size_mode ? 1 : 0,
+              hotkeys,
+            };
+            const r = await injector.inject(resetInjectArgs);
+            reinjected = !!(r && r.ok);
+            /* Bug 7 fix: arm watchdog on the reset-reinject so DWM
+             * crashes after Reset also trigger auto-recovery. */
+            if (reinjected) respawnWatchdog.arm(resetInjectArgs);
+            console.log('[overlay:reset] reinject:', reinjected ? 'ok' : `FAIL ${r && r.err}`);
+          } catch (e) {
+            console.log('[overlay:reset] reinject threw:', e.message);
+          } finally {
+            _injectInFlight = false;
           }
-          const persistedPrompt = loadSystemPrompt();
-          const systemPromptStr = _computeSystemPromptString(persistedPrompt);
-          const overlayCfg = storage.loadOverlayConfig();  /* freshly reset -> defaults */
-          const r = await injector.inject({
-            session: currentSess,
-            hwid,
-            keys,
-            apiKey: '',
-            latex_disabled:  persistedPrompt.latex_mode === 'off' ? 1 : 0,
-            direct_answer_mode: persistedPrompt.direct_answer_mode ? 1 : 0,
-            system_prompt: systemPromptStr,
-            stream_display_batched: persistedPrompt.stream_display === 'batched' ? 1 : 0,
-            overlay: {
-              x: 40, y: 40,
-              w: overlayCfg.w, h: overlayCfg.h,
-              alpha: overlayCfg.alpha,
-            },
-            size_mode: overlayCfg.size_mode ? 1 : 0,
-            hotkeys,
-          });
-          reinjected = !!(r && r.ok);
-          console.log('[overlay:reset] reinject:', reinjected ? 'ok' : `FAIL ${r && r.err}`);
-        } catch (e) {
-          console.log('[overlay:reset] reinject threw:', e.message);
         }
       }
     }

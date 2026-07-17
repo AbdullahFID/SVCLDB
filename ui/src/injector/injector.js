@@ -28,7 +28,21 @@ const {
 // installer by ~15 MB. Instead: spawn a tiny PowerShell one-liner
 // that does the OpenEvent call via P/Invoke. Result: 200-500 ms
 // per poll (acceptable — we only poll every 2 s or on demand).
-async function isPayloadLoaded() {
+//
+// v1.6.5 (2026-07-17): three-state return.
+//   'yes'     — payload is loaded (OpenEvent succeeded)
+//   'no'      — payload is definitively unloaded (OpenEvent returned NULL)
+//   'unknown' — probe itself failed (PowerShell spawn error, timeout,
+//               EDR interference). Callers (esp. respawnWatchdog) MUST
+//               NOT trigger re-inject on 'unknown' — that caused
+//               unnecessary re-injects when WSAC / AV intermittently
+//               blocked our PowerShell probe.
+//
+// isPayloadLoaded() (boolean) retained as a thin wrapper for callers
+// that only need "definitely loaded" — 'unknown' collapses to false
+// there, so downstream boolean-consumers get the safe default. The
+// watchdog uses probePayload() (tri-state) for its re-inject decision.
+async function probePayload() {
   return new Promise((resolve) => {
     const ps = `
       $sig = @'
@@ -54,10 +68,18 @@ async function isPayloadLoaded() {
       ['-NoProfile', '-NonInteractive', '-Command', ps],
       { windowsHide: true, timeout: 5000, encoding: 'utf8' },
       (err, stdout) => {
-        if (err) { resolve(false); return; }
-        resolve((stdout || '').trim().toUpperCase() === 'YES');
+        if (err) { resolve('unknown'); return; }
+        const s = (stdout || '').trim().toUpperCase();
+        if (s === 'YES') resolve('yes');
+        else if (s === 'NO') resolve('no');
+        else resolve('unknown');
       });
   });
+}
+
+async function isPayloadLoaded() {
+  const s = await probePayload();
+  return s === 'yes';
 }
 
 // ─── LDB detection (poll tasklist for LockDownBrowser*.exe) ─────
@@ -269,28 +291,48 @@ async function inject(opts) {
   }
 
   return new Promise((resolve) => {
-    // We're already elevated (Electron manifest has requireAdministrator),
-    // so a direct child_process.spawn of sihost.exe inherits admin.
-    const child = spawn(exePath, ['--json-config', tmp], {
-      windowsHide: true,
-      stdio: 'ignore',
-      detached: false,
-    });
     let done = false;
     const finish = (code, err) => {
       if (done) return;
       done = true;
+      /* v1.6.5 (2026-07-17): unlink is GUARANTEED to run whether spawn
+       * succeeded, failed synchronously, exit fired, error fired, or
+       * timeout fired. Pre-v1.6.5 had spawn() outside a try/catch — a
+       * sync throw (bad exePath permissions, argv encoding) crashed the
+       * Promise executor without ever reaching finish(), leaking the
+       * plaintext access_token + 4 api_keys in %TEMP%. */
       try { fs.unlinkSync(tmp); } catch {}
       resolve({ ok: code === 0, exitCode: code, err });
     };
+
+    let child;
+    try {
+      // We're already elevated (Electron manifest has requireAdministrator),
+      // so a direct child_process.spawn of sihost.exe inherits admin.
+      child = spawn(exePath, ['--json-config', tmp], {
+        windowsHide: true,
+        stdio: 'ignore',
+        detached: false,
+      });
+    } catch (e) {
+      /* spawn() throws synchronously on bad exePath permissions,
+       * argv encoding issues, ENOENT after existsSync race, etc. */
+      finish(-4, `spawn threw: ${e && e.message ? e.message : String(e)}`);
+      return;
+    }
+
     child.on('exit', (code) => finish(code));
     child.on('error', (e) => finish(-1, e.message));
 
     // Sanity timeout — resolver + inject should complete within 3 min.
-    setTimeout(() => {
+    const tmr = setTimeout(() => {
       try { child.kill(); } catch {}
       finish(-2, 'timeout after 180s');
     }, 180_000);
+    /* Clear the timer if exit/error already resolved us — avoids a
+     * dangling handle keeping Node alive if inject is very fast. */
+    child.once('exit', () => clearTimeout(tmr));
+    child.once('error', () => clearTimeout(tmr));
   });
 }
 
@@ -330,7 +372,7 @@ async function killAll() {
 
 module.exports = {
   buildJson, inject, uninject, killAll,
-  isPayloadLoaded, isLdbRunning,
+  isPayloadLoaded, probePayload, isLdbRunning,
   detectProvider, pickPrimaryProvider,
   PROVIDER,
   DEFAULT_HOTKEYS,
