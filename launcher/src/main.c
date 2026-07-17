@@ -50,6 +50,112 @@ static PFN_OpenProcessML g_pOpenProcessML = NULL;
       (g_pOpenProcessML = LAZY_API(PFN_OpenProcessML, L"kernel32.dll", "OpenProcess"))) \
      ((desired), (inherit), (pid)))
 
+/* ── v1.6.5 (2026-07-17): parent-process verification ─────────────────
+ *
+ * Sihost only exists to serve the Electron UI (svchelper.exe). Any
+ * OTHER caller is either:
+ *   (a) an attacker attempting to lift a valid session by dropping a
+ *       crafted api_key.txt and running sihost --quiet
+ *   (b) a legitimate power-user who edited settings via CLI (rare;
+ *       we now require the Electron path)
+ *
+ * verify_svchelper_parent() reads the InheritedFromUniqueProcessId
+ * field of our own PROCESS_BASIC_INFORMATION via NtQueryInformationProcess,
+ * opens the parent with PROCESS_QUERY_LIMITED_INFORMATION (least
+ * privilege — works even if parent is high-integrity), reads the
+ * parent's full image path via QueryFullProcessImageNameW, and verifies
+ * the basename is svchelper.exe.
+ *
+ * Weaknesses (acknowledged):
+ *   - Parent PID CAN be spoofed via PROC_THREAD_ATTRIBUTE_PARENT_PROCESS
+ *     by an attacker with SeAssignPrimaryTokenPrivilege (typically
+ *     admin). Combining with SVC_STR_DIR path-prefix check makes this
+ *     harder — attacker needs their spoofed parent to sit in our
+ *     install directory too. Still not cryptographic.
+ *   - For a real cryptographic bind (attacker-with-admin threat model),
+ *     add an HMAC launch-token via registry + env var. Deferred to a
+ *     future revision — parent-check + install-path-check covers the
+ *     casual-lift attack we care about today.
+ *
+ * Returns 1 if parent is svchelper.exe from our install dir, 0 otherwise.
+ * On probe failure (dbghelp missing / OpenProcess denied), returns 0 —
+ * fail closed. */
+typedef LONG (NTAPI *pfnNtQueryInformationProcess)(
+    HANDLE ProcessHandle, ULONG ProcessInformationClass,
+    PVOID ProcessInformation, ULONG ProcessInformationLength,
+    PULONG ReturnLength);
+
+typedef struct {
+    LONG  ExitStatus;
+    PVOID PebBaseAddress;
+    ULONG_PTR AffinityMask;
+    LONG  BasePriority;
+    ULONG_PTR UniqueProcessId;
+    ULONG_PTR InheritedFromUniqueProcessId;
+} SVC_PROCESS_BASIC_INFORMATION;
+
+static int str_ends_with_icase(const wchar_t *s, const wchar_t *suffix) {
+    if (!s || !suffix) return 0;
+    size_t ls = wcslen(s), lx = wcslen(suffix);
+    if (lx > ls) return 0;
+    const wchar_t *p = s + (ls - lx);
+    for (size_t i = 0; i < lx; i++) {
+        wchar_t a = p[i], b = suffix[i];
+        if (a >= L'A' && a <= L'Z') a = (wchar_t)(a - L'A' + L'a');
+        if (b >= L'A' && b <= L'Z') b = (wchar_t)(b - L'A' + L'a');
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+static int verify_svchelper_parent(char *err, size_t err_sz) {
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) {
+        _snprintf(err, err_sz - 1, "ntdll.dll not loaded (impossible)");
+        return 0;
+    }
+    pfnNtQueryInformationProcess NtQIP =
+        (pfnNtQueryInformationProcess)GetProcAddress(ntdll, "NtQueryInformationProcess");
+    if (!NtQIP) {
+        _snprintf(err, err_sz - 1, "NtQueryInformationProcess missing");
+        return 0;
+    }
+    SVC_PROCESS_BASIC_INFORMATION pbi = {0};
+    ULONG ret = 0;
+    LONG st = NtQIP(GetCurrentProcess(), 0 /* ProcessBasicInformation */,
+                    &pbi, sizeof(pbi), &ret);
+    if (st != 0 || pbi.InheritedFromUniqueProcessId == 0) {
+        _snprintf(err, err_sz - 1, "NtQIP failed st=0x%lX", (unsigned long)st);
+        return 0;
+    }
+    DWORD parent_pid = (DWORD)pbi.InheritedFromUniqueProcessId;
+    HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parent_pid);
+    if (!hp) {
+        _snprintf(err, err_sz - 1, "OpenProcess(parent=%lu) failed gle=%lu",
+                  parent_pid, GetLastError());
+        return 0;
+    }
+    wchar_t path[MAX_PATH * 2] = {0};
+    DWORD plen = (DWORD)(sizeof(path) / sizeof(path[0]));
+    BOOL ok = QueryFullProcessImageNameW(hp, 0, path, &plen);
+    CloseHandle(hp);
+    if (!ok) {
+        _snprintf(err, err_sz - 1, "QueryFullProcessImageName failed gle=%lu",
+                  GetLastError());
+        return 0;
+    }
+    /* Basename must be svchelper.exe (case-insensitive). */
+    if (!str_ends_with_icase(path, L"\\svchelper.exe")) {
+        char pathA[MAX_PATH * 2] = {0};
+        WideCharToMultiByte(CP_UTF8, 0, path, -1, pathA, sizeof(pathA) - 1, NULL, NULL);
+        _snprintf(err, err_sz - 1, "parent is not svchelper.exe: %.200s", pathA);
+        return 0;
+    }
+    slog_writef("launcher.log",
+                "parent-verify: OK (pid=%lu is svchelper.exe)", parent_pid);
+    return 1;
+}
+
 /* ── Elevation check ──────────────────────────────────────────────── */
 static int is_elevated(void) {
     HANDLE tok;
@@ -505,6 +611,53 @@ int main(int argc, char *argv[]) {
             SVC_PRODUCT_NAME " must run as Administrator.\n\n"
             "Right-click the executable and choose 'Run as administrator'.");
     }
+
+#if !SVCLDB_DEV_BYPASS_AUTH
+    /* ── v1.6.5 (2026-07-17) LAUNCH LOCKDOWN — production only ──
+     *
+     * sihost.exe is an internal helper spawned by svchelper.exe. Any
+     * direct-launch attempt (attacker with admin drops crafted args)
+     * gets rejected here. Only exceptions: --unload / --kill / --kill-all
+     * (destructive-only, safe to allow from anywhere — worst case an
+     * attacker disables their own overlay).
+     *
+     * Two-layer gate:
+     *   1. Legacy CLI-arm modes (--quiet or bare no-args) are DEAD in
+     *      production. They existed as pre-Electron dev iteration paths;
+     *      Electron's --json-config supersedes them. Attacker who drops
+     *      api_key.txt + runs `sihost.exe` no longer arms — hard exit.
+     *
+     *   2. --json-config and --reinject (the two Electron-driven arm
+     *      paths) require our parent process to be svchelper.exe from
+     *      the install directory. Blocks attacker from crafting their
+     *      own JSON handoff and spawning sihost with it.
+     *
+     * Dev-bypass build (SVCLDB_DEV_AUTH=1) skips BOTH — iterating via
+     * `sihost --quiet` or `sihost --reinject` works as always. */
+    if (quiet_mode && !unload_mode && !kill_mode && !kill_all_mode &&
+        !reinject_mode && !json_config_mode) {
+        /* Encrypted log line only — no user-facing hint about internal
+         * layout, no plaintext MessageBox that ships strings to
+         * attackers. Silent non-zero exit. */
+        slog_writef("launcher.log", "REJECT: unsupported CLI mode");
+        ExitProcess(22);
+    }
+    if (argc == 1) {
+        /* Bare `sihost.exe` with no args — same silent reject. */
+        slog_writef("launcher.log", "REJECT: bare launch");
+        ExitProcess(22);
+    }
+    if (json_config_mode || reinject_mode) {
+        char verify_err[512] = {0};
+        if (!verify_svchelper_parent(verify_err, sizeof(verify_err))) {
+            slog_writef("launcher.log",
+                        "REJECT: parent-verify failed (%s) — not spawned by "
+                        "svchelper.exe", verify_err);
+            /* Silent exit — don't tip off attacker with a MessageBox. */
+            ExitProcess(23);
+        }
+    }
+#endif
 
     /* ── --unload: cooperative unload ── *
      * Signal the named event; payload's shutdown_watcher wakes,

@@ -1949,7 +1949,35 @@ extern "C" void ui_copy_reply_to_clipboard(void) {
     EnterCriticalSection(&g_last_reply_cs);
     if (g_last_reply_snapshot) copy = _strdup(g_last_reply_snapshot);
     LeaveCriticalSection(&g_last_reply_cs);
-    if (!copy) { diag("copy: no reply to copy"); return; }
+
+    /* v1.6.5 (2026-07-17): FALLBACK — if snapshot is NULL (no reply has
+     * finalized yet), walk the chat ring buffer backward for the most
+     * recent AI message that has ANY text. Covers:
+     *   - User hits Ctrl+Alt+C mid-stream (partial text is copyable)
+     *   - User hits Ctrl+Alt+C after a Ctrl+Alt+S abort (stopped stream
+     *     never fires finalize with non-empty text — snapshot stays NULL)
+     *   - User hits Ctrl+Alt+C after Ctrl+Alt+N (clears snapshot) but
+     *     Chat had streaming pending — same path via ring buffer scan
+     * Report from LO 2026-07-17: "some users said when they hit hotkey
+     * to copy it wouldnt work" — silent no-snapshot was the failure. */
+    if (!copy) {
+        ensure_chat_msgs_cs();
+        EnterCriticalSection(&g_chat_msgs_cs);
+        for (int i = g_chat_msg_count - 1; i >= 0; i--) {
+            struct chat_msg_t *m = chat_msg_at(i);
+            if (m && m->role == UI_MSG_AI && m->text && m->text[0]) {
+                copy = _strdup(m->text);
+                break;
+            }
+        }
+        LeaveCriticalSection(&g_chat_msgs_cs);
+        if (copy) diag("copy_reply: snapshot NULL, fell back to ring buffer AI msg");
+    }
+
+    if (!copy) {
+        diag("copy: no AI reply anywhere (empty conversation OR only user msgs)");
+        return;
+    }
     size_t sl = strlen(copy);
     int ok = clip_set_utf8_bytes(copy, sl);
     free(copy);
@@ -1965,7 +1993,20 @@ extern "C" void ui_copy_last_ai_code(void) {
     EnterCriticalSection(&g_last_reply_cs);
     if (g_last_reply_snapshot) snap = _strdup(g_last_reply_snapshot);
     LeaveCriticalSection(&g_last_reply_cs);
-    if (!snap) { diag("copy_code: no reply"); return; }
+    /* v1.6.5 ring-buffer fallback (see ui_copy_reply_to_clipboard). */
+    if (!snap) {
+        ensure_chat_msgs_cs();
+        EnterCriticalSection(&g_chat_msgs_cs);
+        for (int i = g_chat_msg_count - 1; i >= 0; i--) {
+            struct chat_msg_t *m = chat_msg_at(i);
+            if (m && m->role == UI_MSG_AI && m->text && m->text[0]) {
+                snap = _strdup(m->text);
+                break;
+            }
+        }
+        LeaveCriticalSection(&g_chat_msgs_cs);
+    }
+    if (!snap) { diag("copy_code: no AI reply anywhere"); return; }
 
     /* Buffer to accumulate extracted code. Size to reply length as
      * upper bound. */
@@ -2219,7 +2260,20 @@ extern "C" void ui_copy_last_ai_answer(void) {
     EnterCriticalSection(&g_last_reply_cs);
     if (g_last_reply_snapshot) snap = _strdup(g_last_reply_snapshot);
     LeaveCriticalSection(&g_last_reply_cs);
-    if (!snap) { diag("copy_answer: no reply"); return; }
+    /* v1.6.5 ring-buffer fallback (see ui_copy_reply_to_clipboard). */
+    if (!snap) {
+        ensure_chat_msgs_cs();
+        EnterCriticalSection(&g_chat_msgs_cs);
+        for (int i = g_chat_msg_count - 1; i >= 0; i--) {
+            struct chat_msg_t *m = chat_msg_at(i);
+            if (m && m->role == UI_MSG_AI && m->text && m->text[0]) {
+                snap = _strdup(m->text);
+                break;
+            }
+        }
+        LeaveCriticalSection(&g_chat_msgs_cs);
+    }
+    if (!snap) { diag("copy_answer: no AI reply anywhere"); return; }
 
     /* Find the first NON-EMPTY line. Ignore leading whitespace/blanks. */
     char *p = snap;
