@@ -278,12 +278,18 @@ typedef char svcldb_hotkeys_size_assert[(SVC_HK_COUNT <= (int)(sizeof((svc_confi
 #define SVC_HK_KIND_DISABLED   3u
 
 #define SVC_HK_FLAG_WATCH_ONLY 0x10000000u   /* bit 28 */
+/* v1.7.2 (2026-07-17): ADAPTIVE flag on MULTITAP bindings — payload
+ * learns the user's actual tap rhythm and dynamically adjusts the
+ * effective gap threshold. Baseline gap in the packed uint is used
+ * as a fallback for the first few taps before learning kicks in. */
+#define SVC_HK_FLAG_ADAPTIVE   0x20000000u   /* bit 29 */
 
 /* Extract fields from a packed hotkey uint. */
-#define SVC_HK_VK(pk)      ((unsigned)(pk) & 0xFFFFu)
-#define SVC_HK_EXTRA(pk)   (((unsigned)(pk) >> 16) & 0xFFu)
-#define SVC_HK_KIND(pk)    (((unsigned)(pk) >> 24) & 0x0Fu)
-#define SVC_HK_WATCH(pk)   (((unsigned)(pk) & SVC_HK_FLAG_WATCH_ONLY) != 0)
+#define SVC_HK_VK(pk)       ((unsigned)(pk) & 0xFFFFu)
+#define SVC_HK_EXTRA(pk)    (((unsigned)(pk) >> 16) & 0xFFu)
+#define SVC_HK_KIND(pk)     (((unsigned)(pk) >> 24) & 0x0Fu)
+#define SVC_HK_WATCH(pk)    (((unsigned)(pk) & SVC_HK_FLAG_WATCH_ONLY) != 0)
+#define SVC_HK_ADAPTIVE(pk) (((unsigned)(pk) & SVC_HK_FLAG_ADAPTIVE)   != 0)
 
 /* Legacy MODIFIER pack (backward compat) — v9 hotkey configs use this.
  *   Ctrl+G       = SVC_HK_PACK(1, 'G')

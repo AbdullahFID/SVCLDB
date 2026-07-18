@@ -204,22 +204,52 @@ function resetOnboarding() {
 // secret and users may want to hand-edit the JSON if the UI breaks).
 const HOTKEYS_FILE = path.join(APPDATA_DIR, 'hotkeys.json');
 
-function loadHotkeyOverrides() {
+/* v1.7.2 (2026-07-17): file now supports two shapes for back-compat:
+ *   { "3": 66535, "24": ... }                                (legacy)
+ *   { "v":2, "overrides":{...}, "speed_mode":"adaptive" }    (v2)
+ * Callers use loadHotkeyOverrides / loadHotkeyPrefs and get either
+ * the flat override map or the full prefs object. Writers always
+ * emit v2 shape. */
+const SPEED_MODES = ['fast','normal','slow','adaptive'];
+
+function _readHotkeyFile() {
   try {
-    if (!fs.existsSync(HOTKEYS_FILE)) return {};
+    if (!fs.existsSync(HOTKEYS_FILE)) return { overrides: {}, speed_mode: 'adaptive' };
     const raw = fs.readFileSync(HOTKEYS_FILE, 'utf8');
     const obj = JSON.parse(raw);
-    if (obj && typeof obj === 'object') return obj;
+    if (!obj || typeof obj !== 'object') return { overrides: {}, speed_mode: 'adaptive' };
+    if (obj.v === 2 && obj.overrides && typeof obj.overrides === 'object') {
+      const speed = SPEED_MODES.includes(obj.speed_mode) ? obj.speed_mode : 'adaptive';
+      return { overrides: obj.overrides, speed_mode: speed };
+    }
+    // Legacy shape (flat map). Default speed = adaptive.
+    return { overrides: obj, speed_mode: 'adaptive' };
   } catch (e) {
     console.log('[storage] hotkey load failed:', e.message);
+    return { overrides: {}, speed_mode: 'adaptive' };
   }
-  return {};
+}
+
+function loadHotkeyOverrides() {
+  return _readHotkeyFile().overrides;
+}
+
+function loadHotkeyPrefs() {
+  return _readHotkeyFile();
 }
 
 function saveHotkeyOverrides(map) {
+  const prev = _readHotkeyFile();
+  return saveHotkeyPrefs({ overrides: map || {}, speed_mode: prev.speed_mode });
+}
+
+function saveHotkeyPrefs(prefs) {
   ensureDir(APPDATA_DIR);
   try {
-    fs.writeFileSync(HOTKEYS_FILE, JSON.stringify(map || {}, null, 2), 'utf8');
+    const speed = SPEED_MODES.includes(prefs && prefs.speed_mode) ? prefs.speed_mode : 'adaptive';
+    const overrides = (prefs && prefs.overrides && typeof prefs.overrides === 'object') ? prefs.overrides : {};
+    const doc = { v: 2, overrides, speed_mode: speed };
+    fs.writeFileSync(HOTKEYS_FILE, JSON.stringify(doc, null, 2), 'utf8');
     return true;
   } catch (e) {
     console.log('[storage] hotkey save failed:', e.message);
@@ -306,6 +336,7 @@ module.exports = {
   saveSubscriptionCache, loadSubscriptionCache, clearSubscriptionCache,
   isOnboardingComplete, setOnboardingComplete, resetOnboarding,
   loadHotkeyOverrides, saveHotkeyOverrides, clearHotkeyOverrides,
+  loadHotkeyPrefs, saveHotkeyPrefs,
   loadOverlayConfig, saveOverlayConfig, clearOverlayConfig,
   OVERLAY_DEFAULTS,
 };

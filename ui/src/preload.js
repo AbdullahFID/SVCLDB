@@ -88,6 +88,7 @@ contextBridge.exposeInMainWorld('svc', {
     /* overrides: { [slotIndex]: packedUInt }. Any slot not present
      * falls back to the default. */
     save:  (overrides)    => ipcRenderer.invoke('hotkeys:save', overrides),
+    saveSpeed: (mode)     => ipcRenderer.invoke('hotkeys:save-speed', mode),
     reset: ()             => ipcRenderer.invoke('hotkeys:reset'),
   },
   /* v1.2 (2026-07-06): overlay-appearance settings — user-picked

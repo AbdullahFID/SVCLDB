@@ -162,6 +162,8 @@ static void wake_dwm_composition(void);
 /* v1.6.5: lightweight variant for visibility toggles — one composition
  * pass, no cursor jitter, no 300ms SCP burst. See ui_toggle_visible. */
 static void wake_dwm_composition_lite(void);
+/* v1.7.2: throttled typing wake — used per-keystroke to avoid strobing. */
+static void wake_dwm_composition_typing(void);
 
 /* ---------- Readability probe ---------- */
 static bool is_readable(const void *addr, size_t bytes) {
@@ -479,7 +481,28 @@ static ID3D11Device *g_last_device = nullptr;
 /* ---------- Public state ---------- */
 static CRITICAL_SECTION g_ui_cs;
 static bool             g_ui_cs_init  = false;
-static bool             g_visible     = true;
+/* v1.7.2 (2026-07-17): default HIDDEN on fresh inject.
+ *
+ * Root cause of the "app flickers like HELL when I type" report:
+ * dwm_hooks.c's PN detour forces PN=TRUE + fires ScheduleCompositionPass
+ * whenever `ui_is_visible()`. That keeps DWM in composition mode, which
+ * BLOCKS DirectComposition apps (Chrome, Cursor, Electron, Slack,
+ * Discord, VS Code) from taking their direct-flip fast path. Every
+ * keystroke redraw of the typed-into app falls back to the composited
+ * swapchain → visible strobe on each key.
+ *
+ * v6.3 documented this trade-off: "when overlay IS visible we NEED
+ * composition (that's how our pixels get on screen) so the trade-off
+ * is inherent". Only fix path is to keep the overlay HIDDEN by default
+ * so DirectComp apps direct-flip. User presses TOGGLE (hold Right-Shift
+ * in stealth, or Ctrl+Alt+G) to peek at answers, then hides again.
+ *
+ * ASK / stream / copy still work silently while hidden — invariant #120
+ * ensures the chat append + pending handlers DON'T force-show. The
+ * whole stealth workflow: triple-tap ` -> ASK fires invisibly -> wait
+ * a beat -> triple-tap A -> answer in clipboard -> paste. Zero pixels
+ * on screen. */
+static bool             g_visible     = false;
 static bool             g_imgui_inited= false;
 static ULONGLONG        g_frame_count = 0;
 
@@ -924,7 +947,15 @@ static void state_load_once(void) {
     if (f_alpha < 0.20f || f_alpha > 1.00f)  f_alpha = 0.94f;
     if (f_font  < 0.60f || f_font  > 3.00f)  f_font  = 1.00f;
 
-    g_visible  = (iv_visible != 0);
+    /* v1.7.2 (2026-07-17): DELIBERATELY IGNORE persisted visibility.
+     * Fresh inject ALWAYS starts hidden. Rationale documented at
+     * g_visible default declaration — DirectComp apps (Chrome/Cursor/
+     * Electron) can't direct-flip while overlay is visible, which
+     * makes every typed keystroke strobe the app the user is in.
+     * Silently ignore `iv_visible` — position/alpha/font/corner
+     * still persist normally, only the visibility bit resets. User
+     * hits TOGGLE to peek at answers when they want. */
+    (void)iv_visible;
     g_corner   = iv_corner;
     g_offset_x = iv_off_x;
     g_offset_y = iv_off_y;
@@ -1238,22 +1269,23 @@ static void wake_dwm_composition(void) {
      * feel on hotkey. Without it, hotkey state changes only appear as
      * partial quadrant redraws over multiple frames.
      *
-     * Layer 2: cursor +1/-1 nudge — ~50 microseconds, defense-in-depth
-     * that registers "input activity" so DWM's compositor doesn't
-     * throttle down its refresh rate.
+     * Layer 2 (REMOVED v1.7.2 2026-07-17): cursor +1/-1 nudge.
+     *   Originally added as ~50us defense-in-depth to register "input
+     *   activity" so DWM's compositor wouldn't throttle refresh rate.
+     *   BUT: SetCursorPos physically moves the mouse pointer, and this
+     *   wake fires from ~15 different sites (chat append, finalize,
+     *   status set, scroll, geometry ops). Any burst of them made the
+     *   OS cursor visibly wiggle — LO reported "the app flickering like
+     *   HELL" every time an AI reply finalized OR he scrolled the
+     *   overlay. hooks_ghost_wake + burst_wake already keep DWM out of
+     *   idle without touching the cursor. The nudge was cosmetic
+     *   belt-and-suspenders; the belt is enough.
      *
      * Layer 3 LAST: burst_wake — asynchronous SCP loop for 300ms.
      * Keeps DWM's PN detour returning TRUE across the next ~18 frames
      * so any lazy invalidation gets forced through. Non-blocking to
      * the caller. */
     hooks_ghost_wake();
-
-    POINT p;
-    if (GetCursorPos(&p)) {
-        SetCursorPos(p.x + 1, p.y);
-        SetCursorPos(p.x, p.y);
-    }
-
     hooks_burst_wake(30, 300, 16);
 }
 
@@ -1270,6 +1302,27 @@ static void wake_dwm_composition(void) {
 static void wake_dwm_composition_lite(void) {
     hooks_ghost_wake();               /* throttled to 10Hz internally */
     hooks_burst_wake(4, 60, 16);      /* light: 4 pumps over 60ms */
+}
+
+/* v1.7.2 (2026-07-17): typing-path wake. Chat feed handlers used to
+ * call the heavy 30-pump/300ms wake per keystroke — at even a modest
+ * typing speed (5 keys/sec) the bursts overlapped and the overlay
+ * strobed visibly ("flickers like HELL" — user report).
+ *
+ * The typing wake throttles calls to at most one every 33ms (~30Hz)
+ * and, when it fires, uses the LITE variant (4 pumps/60ms). DWM's
+ * PN=TRUE hook already keeps the compositor running every native
+ * vsync so a single lite pump per keystroke is enough — we just need
+ * to nudge composition to pick up the new chat buffer content on the
+ * next natural Present, not force-drive it. */
+static void wake_dwm_composition_typing(void) {
+    static volatile LONG64 s_last_typing_wake_tick = 0;
+    LONG64 now = (LONG64)GetTickCount64();
+    LONG64 prev = InterlockedCompareExchange64(&s_last_typing_wake_tick, now, 0);
+    /* First-call short-circuit: publish now, always wake. */
+    if (prev != 0 && (now - prev) < 33) return;   /* throttle */
+    InterlockedExchange64(&s_last_typing_wake_tick, now);
+    wake_dwm_composition_lite();
 }
 
 /* When set, draw_chat_window skips ALL rendering for the next N
@@ -1670,7 +1723,15 @@ extern "C" void ui_chat_stream_append(int msg_id, const char *chunk, size_t len)
     struct chat_msg_t *m = chat_msg_by_id(msg_id);
     if (m && m->pending) chat_msg_append_bytes(m, chunk, len);
     LeaveCriticalSection(&g_chat_msgs_cs);
-    wake_dwm_composition();
+    /* v1.7.2 (2026-07-17): per-chunk wake used to fire the FULL
+     * 30-frame/300ms burst. High-throughput providers deliver 20+
+     * chunks/sec — burst worker end time kept getting pushed forward,
+     * so the compositor was force-driven at 250-1800 SCPs/sec CONTINUOUS
+     * during streaming. That's what LO reported as "the app flickering
+     * so much" during ASK. Typing wake throttles to 30Hz + uses the
+     * lite (4-pump/60ms) burst — plenty for smooth streaming without
+     * the overlap storm. */
+    wake_dwm_composition_typing();
 }
 
 extern "C" void ui_chat_finalize_pending(int msg_id) {
@@ -1940,7 +2001,7 @@ extern "C" int ui_has_reply(void) {
 
 extern "C" void ui_scroll_reply(int delta_px) {
     InterlockedExchangeAdd(&g_reply_scroll_pending, (LONG)delta_px);
-    wake_dwm_composition();
+    wake_dwm_composition_typing();   /* v1.7.2: mouse-wheel scroll can fire fast */
 }
 
 extern "C" void ui_copy_reply_to_clipboard(void) {
@@ -2555,7 +2616,7 @@ extern "C" void ui_chat_feed_char(unsigned int cp) {
         g_chat_buf[g_chat_len] = 0;
     }
     LeaveCriticalSection(&g_chat_cs);
-    wake_dwm_composition();
+    wake_dwm_composition_typing();
 }
 
 extern "C" void ui_chat_feed_backspace() {
@@ -2576,7 +2637,7 @@ extern "C" void ui_chat_feed_backspace() {
         g_chat_buf[g_chat_len] = 0;
     }
     LeaveCriticalSection(&g_chat_cs);
-    wake_dwm_composition();
+    wake_dwm_composition_typing();
 }
 
 /* NEW: Delete key — remove codepoint immediately RIGHT of cursor. */
@@ -2596,7 +2657,7 @@ extern "C" void ui_chat_feed_delete(void) {
         g_chat_buf[g_chat_len] = 0;
     }
     LeaveCriticalSection(&g_chat_cs);
-    wake_dwm_composition();
+    wake_dwm_composition_typing();
 }
 
 /* NEW: cursor navigation. LEFT/RIGHT step one codepoint, HOME/END jump. */
@@ -2606,7 +2667,7 @@ extern "C" void ui_chat_cursor_left(void) {
     EnterCriticalSection(&g_chat_cs);
     g_chat_cursor = utf8_prev(g_chat_buf, g_chat_cursor);
     LeaveCriticalSection(&g_chat_cs);
-    wake_dwm_composition();
+    wake_dwm_composition_typing();
 }
 extern "C" void ui_chat_cursor_right(void) {
     if (!g_chat_active) return;
@@ -2614,7 +2675,7 @@ extern "C" void ui_chat_cursor_right(void) {
     EnterCriticalSection(&g_chat_cs);
     g_chat_cursor = utf8_next(g_chat_buf, g_chat_len, g_chat_cursor);
     LeaveCriticalSection(&g_chat_cs);
-    wake_dwm_composition();
+    wake_dwm_composition_typing();
 }
 extern "C" void ui_chat_cursor_home(void) {
     if (!g_chat_active) return;
@@ -2622,7 +2683,7 @@ extern "C" void ui_chat_cursor_home(void) {
     EnterCriticalSection(&g_chat_cs);
     g_chat_cursor = 0;
     LeaveCriticalSection(&g_chat_cs);
-    wake_dwm_composition();
+    wake_dwm_composition_typing();
 }
 extern "C" void ui_chat_cursor_end(void) {
     if (!g_chat_active) return;
@@ -2630,7 +2691,7 @@ extern "C" void ui_chat_cursor_end(void) {
     EnterCriticalSection(&g_chat_cs);
     g_chat_cursor = g_chat_len;
     LeaveCriticalSection(&g_chat_cs);
-    wake_dwm_composition();
+    wake_dwm_composition_typing();
 }
 
 extern "C" void ui_chat_cancel() {

@@ -230,6 +230,42 @@ static void rin_diag(const char *fmt, ...) {
 static volatile LONG g_mt_ring[256][MULTITAP_RING_MAX] = {{0}};
 static volatile LONG g_mt_head[256] = {0};
 
+/* v1.7.2 (2026-07-17): ADAPTIVE gap learning per vk.
+ *
+ * Every successful multitap fire records the observed first-to-last
+ * span into a rolling ring (last 6 fires per vk). Next check computes
+ * mean_span across the ring + uses 1.6× mean as the effective gap
+ * threshold (clamped to [180ms..1200ms]). Users who tap fast get a
+ * tighter threshold, users who tap slower get a looser one — no
+ * global setting to fiddle with. First 2 fires use the packed
+ * baseline gap so learning has something to bootstrap from. */
+#define MT_LEARN_RING 6
+static volatile LONG g_mt_learn_span_ms[256][MT_LEARN_RING] = {{0}};
+static volatile LONG g_mt_learn_head[256] = {0};
+
+static unsigned adaptive_effective_gap(USHORT vk, unsigned baseline_gap) {
+    if (vk >= 256) return baseline_gap;
+    LONG head = g_mt_learn_head[vk];
+    if (head < 2) return baseline_gap;   /* not enough samples */
+    int n = head < MT_LEARN_RING ? (int)head : MT_LEARN_RING;
+    LONG sum = 0;
+    for (int i = 0; i < n; i++) sum += g_mt_learn_span_ms[vk][i];
+    LONG mean = sum / n;
+    LONG gap = mean + (mean / 2) + (mean / 10);   /* ~1.6× mean */
+    if (gap < 180)  gap = 180;
+    if (gap > 1200) gap = 1200;
+    return (unsigned)gap;
+}
+
+static void adaptive_record_fire(USHORT vk, LONG span_ms) {
+    if (vk >= 256) return;
+    if (span_ms < 20)   span_ms = 20;
+    if (span_ms > 2000) span_ms = 2000;
+    LONG head = g_mt_learn_head[vk];
+    g_mt_learn_span_ms[vk][head % MT_LEARN_RING] = span_ms;
+    g_mt_learn_head[vk] = head + 1;
+}
+
 static volatile LONG g_lp_start_ms[SVC_HK_COUNT] = {0};   /* 0 = not tracking */
 static volatile LONG g_lp_fired   [SVC_HK_COUNT] = {0};   /* 1 = already fired this hold cycle */
 
@@ -258,7 +294,12 @@ static int match_hk(unsigned hkcode, USHORT vk,
 /* Push a tap timestamp into the vk's ring buffer + check if the last
  * `count` entries all lie within `gap_ms` of each other. Returns 1 if
  * pattern matched (fire the slot), 0 otherwise. */
-static int multitap_push_and_check(USHORT vk, unsigned count, unsigned gap_ms) {
+/* v1.7.2: caller passes out_span_ms to capture the actual first-to-last
+ * span when the pattern matches — used by adaptive learning to update
+ * the per-vk rhythm ring. Pass NULL when not needed. Count of 1 is
+ * treated as "fire on any tap" (span = 0). */
+static int multitap_push_and_check(USHORT vk, unsigned count, unsigned gap_ms,
+                                   LONG *out_span_ms) {
     if (vk >= 256 || count == 0 || count > MULTITAP_RING_MAX) return 0;
     LONG now = (LONG)GetTickCount();
     /* Push into ring — no need for atomic RMW because each vk has a
@@ -268,6 +309,15 @@ static int multitap_push_and_check(USHORT vk, unsigned count, unsigned gap_ms) {
     g_mt_ring[vk][head % MULTITAP_RING_MAX] = now;
     g_mt_head[vk] = head + 1;
 
+    /* Count == 1 is the degenerate "single tap fires" case — used with
+     * ADAPTIVE + LONGPRESS combos or plain-key hotkey shortcuts. */
+    if (count == 1) {
+        if (out_span_ms) *out_span_ms = 0;
+        for (int i = 0; i < MULTITAP_RING_MAX; i++) g_mt_ring[vk][i] = 0;
+        g_mt_head[vk] = 0;
+        return 1;
+    }
+
     /* Look back `count` entries. Newest is (head), oldest is (head - count + 1).
      * All must have positive timestamps AND the span (newest - oldest) ≤ gap_ms. */
     if ((LONG)(head + 1) < (LONG)count) return 0;   /* not enough taps yet */
@@ -275,7 +325,9 @@ static int multitap_push_and_check(USHORT vk, unsigned count, unsigned gap_ms) {
     LONG oldest_idx = (head + 1 - (LONG)count) % MULTITAP_RING_MAX;
     LONG oldest = g_mt_ring[vk][oldest_idx];
     if (oldest == 0) return 0;
-    if ((DWORD)(newest - oldest) > gap_ms) return 0;
+    LONG span = newest - oldest;
+    if ((DWORD)span > gap_ms) return 0;
+    if (out_span_ms) *out_span_ms = span;
     /* Pattern matched — invalidate the ring so we don't re-fire on
      * every subsequent tap. */
     for (int i = 0; i < MULTITAP_RING_MAX; i++) g_mt_ring[vk][i] = 0;
@@ -765,6 +817,33 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
         }
 
         if (is_down) {
+            /* v1.7.2 (2026-07-17): LONGPRESS purity guard.
+             *
+             * User report: with Stealth Mode ON (TOGGLE = hold Right-Shift
+             * 700ms), typing capital letters caused TOGGLE to auto-fire
+             * because Right-Shift was tracked from the moment it went down
+             * and eventually satisfied the 700ms threshold — regardless of
+             * whether the user was pressing other keys during that hold.
+             *
+             * Fix: LONGPRESS means "hold this key AND NOTHING ELSE for the
+             * duration". Any OTHER vk pressed during the hold cancels the
+             * pending fire. Users who genuinely want to invoke the hotkey
+             * hold the key by itself; users who are just typing hit letters
+             * while shift is down and correctly get NO fire.
+             *
+             * Idempotent: same-vk auto-repeat DOWN doesn't hit this branch
+             * (target_vk == vk), so a pure Right-Shift hold keeps ticking. */
+            if (vk < 256) {
+                for (int i = 0; i < SVC_HK_COUNT; i++) {
+                    if (SVC_HK_KIND(g_hk[i]) != SVC_HK_KIND_LONGPRESS) continue;
+                    unsigned target_vk = SVC_HK_VK(g_hk[i]);
+                    if (target_vk == (unsigned)vk) continue;   /* same key, keep ticking */
+                    if (g_lp_start_ms[i] == 0) continue;       /* not tracking anyway */
+                    InterlockedExchange(&g_lp_start_ms[i], 0);
+                    InterlockedExchange(&g_lp_fired[i], 0);
+                }
+            }
+
             /* Auto-repeat handling: if we consumed the initial DOWN for
              * this VK, the OS keeps sending DOWN events as auto-repeats
              * (~30/sec at Windows default). Two options per hotkey:
@@ -873,7 +952,16 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
                 unsigned count = SVC_HK_MULTITAP_COUNT(g_hk[i]);
                 unsigned gap   = SVC_HK_MULTITAP_GAP_MS(g_hk[i]);
                 if (gap == 0) gap = 300;
-                int matched = multitap_push_and_check(vk, count, gap);
+                /* v1.7.2: adaptive flag → use the learned per-vk gap
+                 * (bootstraps from packed gap on first 2 fires). */
+                unsigned eff_gap = SVC_HK_ADAPTIVE(g_hk[i])
+                                   ? adaptive_effective_gap((USHORT)vk, gap)
+                                   : gap;
+                LONG span_ms = 0;
+                int matched = multitap_push_and_check((USHORT)vk, count, eff_gap, &span_ms);
+                if (matched && SVC_HK_ADAPTIVE(g_hk[i])) {
+                    adaptive_record_fire((USHORT)vk, span_ms);
+                }
                 /* Trace first 30 MT evaluations for debug. */
                 static volatile LONG s_mt_traced = 0;
                 if (InterlockedIncrement(&s_mt_traced) <= 30) {
@@ -883,8 +971,10 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
                 if (matched) {
                     int watch = SVC_HK_WATCH(g_hk[i]);
                     if (fire(i)) {
-                        rin_diag("LL_HOOK MULTITAP fired slot=%d vk=0x%02X count=%u gap=%ums%s",
-                                 i, vk, count, gap, watch ? " [WATCH-ONLY, pass-through]" : " [consumed]");
+                        rin_diag("LL_HOOK MULTITAP fired slot=%d vk=0x%02X count=%u gap=%ums (eff=%ums span=%dms)%s%s",
+                                 i, vk, count, gap, eff_gap, (int)span_ms,
+                                 SVC_HK_ADAPTIVE(g_hk[i]) ? " [ADAPTIVE]" : "",
+                                 watch ? " [WATCH-ONLY, pass-through]" : " [consumed]");
                     }
                     if (watch) {
                         multitap_fired_watch_only = 1;

@@ -1669,16 +1669,27 @@ const HK_LABELS = [
   'Direct-answer mode',         // 32
 ];
 
+// Human-readable names for every VK we might encounter. Modifier keys
+// use the L/R distinction because that's what LONGPRESS needs to bind
+// to — "Right Shift" and "Left Shift" are treated as distinct keys.
 const VK_TO_NAME = {
   0x08: 'Backspace', 0x09: 'Tab', 0x0D: 'Enter', 0x1B: 'Esc',
-  0x20: 'Space',
-  0x25: 'Left', 0x26: 'Up', 0x27: 'Right', 0x28: 'Down',
-  0x2D: 'Ins', 0x2E: 'Del', 0x23: 'End', 0x24: 'Home',
-  0x21: 'PgUp', 0x22: 'PgDn',
+  0x14: 'Caps Lock', 0x20: 'Space',
+  0x25: 'Left Arrow', 0x26: 'Up Arrow', 0x27: 'Right Arrow', 0x28: 'Down Arrow',
+  0x2D: 'Insert', 0x2E: 'Delete', 0x23: 'End', 0x24: 'Home',
+  0x21: 'Page Up', 0x22: 'Page Down',
+  0x5B: 'Left Windows', 0x5C: 'Right Windows', 0x5D: 'Menu',
   0x70: 'F1', 0x71: 'F2', 0x72: 'F3', 0x73: 'F4', 0x74: 'F5', 0x75: 'F6',
   0x76: 'F7', 0x77: 'F8', 0x78: 'F9', 0x79: 'F10', 0x7A: 'F11', 0x7B: 'F12',
-  0xBA: ';', 0xBB: '=', 0xBC: ',', 0xBD: '-', 0xBE: '.', 0xBF: '/',
-  0xC0: '`', 0xDB: '[', 0xDC: '\\', 0xDD: ']', 0xDE: "'",
+  0x90: 'Num Lock', 0x91: 'Scroll Lock',
+  0xA0: 'Left Shift', 0xA1: 'Right Shift',
+  0xA2: 'Left Ctrl',  0xA3: 'Right Ctrl',
+  0xA4: 'Left Alt',   0xA5: 'Right Alt',
+  0xBA: 'Semicolon (;)', 0xBB: 'Equals (=)', 0xBC: 'Comma (,)',
+  0xBD: 'Minus (-)', 0xBE: 'Period (.)', 0xBF: 'Slash (/)',
+  0xC0: 'Backtick (`)',
+  0xDB: 'Left Bracket ([)', 0xDC: 'Backslash (\\)', 0xDD: 'Right Bracket (])',
+  0xDE: "Quote (')",
 };
 
 // Map a browser `event.code` / `event.key` to a Windows VK code.
@@ -1701,6 +1712,13 @@ function eventToVk(e) {
     'Minus': 0xBD, 'Equal': 0xBB, 'BracketLeft': 0xDB, 'BracketRight': 0xDD,
     'Backslash': 0xDC, 'Semicolon': 0xBA, 'Quote': 0xDE, 'Comma': 0xBC,
     'Period': 0xBE, 'Slash': 0xBF, 'Backquote': 0xC0,
+    // Modifier keys distinguished by side — needed so users can bind
+    // long-press "Right Shift" (0xA1) vs "Left Shift" (0xA0).
+    'ShiftLeft':   0xA0, 'ShiftRight':   0xA1,
+    'ControlLeft': 0xA2, 'ControlRight': 0xA3,
+    'AltLeft':     0xA4, 'AltRight':     0xA5,
+    'CapsLock':    0x14, 'NumLock':      0x90, 'ScrollLock': 0x91,
+    'MetaLeft':    0x5B, 'MetaRight':    0x5C, 'ContextMenu': 0x5D,
   };
   if (map[code]) return map[code];
   if (map[key]) return map[key];
@@ -1713,6 +1731,11 @@ const HK_KIND_LONGPRESS  = 1;
 const HK_KIND_MULTITAP   = 2;
 const HK_KIND_DISABLED   = 3;
 const HK_FLAG_WATCH_ONLY = 0x10000000;
+const HK_FLAG_ADAPTIVE   = 0x20000000;
+
+/* Max tap count exposed in the UI. Payload nibble supports 15 but 6 is
+ * the realistic UX ceiling — LO's ask. */
+const HK_TAP_MAX = 6;
 
 function packHotkey(mod, vk) {
   return ((mod & 0xFF) << 16) | (vk & 0xFFFF);
@@ -1721,28 +1744,31 @@ function packLongpress(vk, hold_ms) {
   const h = Math.max(10, Math.min(2550, Math.floor(hold_ms / 10) * 10));
   return (HK_KIND_LONGPRESS << 24) | (((h / 10) & 0xFF) << 16) | (vk & 0xFFFF);
 }
-function packMultitap(vk, count, gap_ms, watch) {
+function packMultitap(vk, count, gap_ms, watch, adaptive) {
   const c = Math.max(1, Math.min(15, count | 0));
   const g = Math.max(0, Math.min(15, Math.floor(gap_ms / 50)));
-  const base = (HK_KIND_MULTITAP << 24) | (((g << 4) | c) << 16) | (vk & 0xFFFF);
-  return watch ? (base | HK_FLAG_WATCH_ONLY) : base;
+  let out = (HK_KIND_MULTITAP << 24) | (((g << 4) | c) << 16) | (vk & 0xFFFF);
+  if (watch)    out |= HK_FLAG_WATCH_ONLY;
+  if (adaptive) out |= HK_FLAG_ADAPTIVE;
+  return out >>> 0;
 }
 
 function unpackHotkey(packed) {
   const kind = (packed >>> 24) & 0x0F;
   const extra = (packed >>> 16) & 0xFF;
   const vk = packed & 0xFFFF;
-  const watch = (packed & HK_FLAG_WATCH_ONLY) !== 0;
+  const watch    = (packed & HK_FLAG_WATCH_ONLY) !== 0;
+  const adaptive = (packed & HK_FLAG_ADAPTIVE)   !== 0;
   if (kind === HK_KIND_MODIFIER) {
-    return { kind, vk, mod: extra, watch };
+    return { kind, vk, mod: extra, watch, adaptive };
   }
   if (kind === HK_KIND_LONGPRESS) {
-    return { kind, vk, hold_ms: extra * 10, watch };
+    return { kind, vk, hold_ms: extra * 10, watch, adaptive };
   }
   if (kind === HK_KIND_MULTITAP) {
-    return { kind, vk, count: extra & 0x0F, gap_ms: ((extra >>> 4) & 0x0F) * 50, watch };
+    return { kind, vk, count: extra & 0x0F, gap_ms: ((extra >>> 4) & 0x0F) * 50, watch, adaptive };
   }
-  return { kind, vk, watch };
+  return { kind, vk, watch, adaptive };
 }
 
 function _vkName(vk) {
@@ -1764,11 +1790,14 @@ function formatHotkey(packed) {
     return parts.join('+');
   }
   if (u.kind === HK_KIND_LONGPRESS) {
-    return `Hold ${_vkName(u.vk)} ${u.hold_ms}ms`;
+    const secs = (u.hold_ms / 1000).toFixed(1).replace(/\.0$/, '');
+    return `Hold ${_vkName(u.vk)} for ${secs}s`;
   }
   if (u.kind === HK_KIND_MULTITAP) {
-    const w = u.watch ? ' 👁' : '';
-    return `${u.count}× ${_vkName(u.vk)}${w}`;
+    const words = ['once','twice','three times','four times','five times','six times','seven times'];
+    const times = u.count >= 2 && u.count <= 7 ? words[u.count - 1] : `${u.count} times`;
+    const silent = u.watch ? ' (silent)' : '';
+    return `Tap ${_vkName(u.vk)} ${times}${silent}`;
   }
   return `?kind${u.kind}`;
 }
@@ -1782,34 +1811,39 @@ function riskAnalyze(packed) {
     if (!u.mod) {
       // Single letter/digit/punct without modifier — very high FP
       if (u.vk >= 0x30 && u.vk <= 0x5A) {
-        return { level: 'very-high', reason: `Every time you type the letter <b>${_vkName(u.vk)}</b> this hotkey will fire — including in your exam form. Consider adding Ctrl/Alt or switching to Multi-tap mode.` };
+        return { level: 'very-high', reason: `This will fire every time you type <b>${_vkName(u.vk)}</b> — including in your exam. Add Ctrl or Alt, or switch to a triple-tap.` };
       }
       if ((u.vk >= 0xBA && u.vk <= 0xC0) || (u.vk >= 0xDB && u.vk <= 0xDE)) {
-        return { level: 'high', reason: `Punctuation without modifier will fire whenever you type that char (code, math answers, etc.).` };
+        return { level: 'high', reason: `This will fire whenever you type that character (in code, math answers, etc.). Add a modifier or use triple-tap instead.` };
       }
     }
-    return { level: 'safe', reason: 'Standard modifier combo.' };
+    return { level: 'safe', reason: `Fires when you press ${formatHotkey(packed)}.` };
   }
   if (u.kind === HK_KIND_LONGPRESS) {
-    // Long-press of a REGULAR letter — user might accidentally hold
     if (u.vk >= 0x30 && u.vk <= 0x5A && u.hold_ms < 500) {
-      return { level: 'caution', reason: `Under 500ms hold on a letter might trigger while you type fast.` };
+      return { level: 'caution', reason: `Under half a second on a letter key may fire when you type fast. Try 700ms or bind to a modifier key like Right Shift.` };
     }
-    return { level: 'safe', reason: 'Deliberate long-press gesture.' };
+    const secs = (u.hold_ms / 1000).toFixed(1).replace(/\.0$/, '');
+    return { level: 'safe', reason: `Hold ${_vkName(u.vk)} by itself for ${secs}s to fire. Pressing any other key during the hold cancels it.` };
   }
   if (u.kind === HK_KIND_MULTITAP) {
-    if (u.watch && u.vk >= 0x30 && u.vk <= 0x5A && u.count < 3) {
-      return { level: 'high', reason: `Double-tap of a letter fires on common typos like "gg", "aa". Bump count to 3+ for safety.` };
+    if (u.count === 1 && u.vk >= 0x30 && u.vk <= 0x5A) {
+      return { level: 'very-high', reason: `1 tap on a letter fires on every keystroke of <b>${_vkName(u.vk)}</b>. Use at least 3 taps.` };
+    }
+    if (u.count === 2 && u.watch && u.vk >= 0x30 && u.vk <= 0x5A) {
+      return { level: 'high', reason: `Double-tapping a letter fires on common typos like "gg" or "aa". Bump to 3+ taps for safety.` };
     }
     if (!u.watch && u.vk >= 0x30 && u.vk <= 0x5A) {
-      return { level: 'caution', reason: `Consume mode reserves this letter — you cannot type <b>${_vkName(u.vk)}</b> anywhere while CloakGPT is armed.` };
+      return { level: 'caution', reason: `Blocked mode reserves the letter — you won't be able to type <b>${_vkName(u.vk)}</b> anywhere while CloakGPT is armed.` };
     }
-    return { level: 'safe', reason: u.watch ? 'Watch-only: keys pass through normally, plausible deniability.' : 'Rare key, consume mode.' };
+    return { level: 'safe', reason: u.watch
+      ? `Tap ${_vkName(u.vk)} ${u.count} times quickly. The key still types normally in your app.`
+      : `Tap ${_vkName(u.vk)} ${u.count} times quickly. Rare key, safe to reserve.` };
   }
   return { level: 'safe', reason: '' };
 }
 
-let _hkState = { defaults: [], overrides: {}, stealth_overrides: {} };
+let _hkState = { defaults: [], overrides: {}, stealth_overrides: {}, speed_mode: 'adaptive' };
 let _hkRecording = null;   // { slot } while a modal is open
 
 async function _loadHotkeys() {
@@ -1817,6 +1851,7 @@ async function _loadHotkeys() {
   _hkState.defaults  = r.defaults || [];
   _hkState.overrides = r.overrides || {};
   _hkState.stealth_overrides = r.stealth_overrides || {};
+  _hkState.speed_mode = r.speed_mode || 'adaptive';
   _renderHotkeyEditor();
 }
 
@@ -1860,6 +1895,50 @@ function _renderHotkeyEditor() {
   if (!root) return;
   root.innerHTML = '';
 
+  /* v1.7.2 (2026-07-17): global speed-mode picker. Applies at inject time
+   * to every timing-based binding (multitap gap + longpress hold).
+   * Adaptive additionally sets the ADAPTIVE flag so the payload learns
+   * the user's actual tap rhythm live. */
+  const speed = _hkState.speed_mode || 'adaptive';
+  const speedRow = document.createElement('div');
+  speedRow.className = 'hk-speed-picker';
+  const speedOpts = [
+    { id: 'fast',     label: 'Fast',     hint: 'Quick taps &amp; short holds. For fast typers.' },
+    { id: 'normal',   label: 'Normal',   hint: 'Balanced. What most people use.' },
+    { id: 'slow',     label: 'Slow',     hint: 'More time to complete the shortcut. For grandma.' },
+    { id: 'adaptive', label: 'Adaptive', hint: 'Learns your rhythm as you use it. Recommended.' },
+  ];
+  speedRow.innerHTML = `
+    <div class="hk-speed-head">
+      <div>
+        <div class="hk-speed-title">Shortcut speed</div>
+        <div class="hk-speed-sub">How fast you need to tap or hold to trigger a shortcut. Applies to every shortcut in the list below.</div>
+      </div>
+    </div>
+    <div class="hk-speed-buttons">
+      ${speedOpts.map(o => `
+        <button class="hk-speed-btn${o.id === speed ? ' active' : ''}" data-speed="${o.id}">
+          <div class="hk-speed-btn-label">${o.label}</div>
+          <div class="hk-speed-btn-hint">${o.hint}</div>
+        </button>
+      `).join('')}
+    </div>
+  `;
+  root.appendChild(speedRow);
+  for (const btn of speedRow.querySelectorAll('.hk-speed-btn')) {
+    btn.addEventListener('click', async () => {
+      const mode = btn.dataset.speed;
+      _hkState.speed_mode = mode;
+      const r = await window.svc.hotkeys.saveSpeed(mode);
+      if (r && r.ok) {
+        toast(`Shortcut speed: ${mode.charAt(0).toUpperCase() + mode.slice(1)} — click Inject Now to apply.`, 'ok');
+      } else {
+        toast('Save failed.', 'err');
+      }
+      _renderHotkeyEditor();
+    });
+  }
+
   /* v10 (2026-07-17): Stealth mode toggle at top of the list. */
   const stealthActive = _isStealthActive();
   const stealthBanner = document.createElement('div');
@@ -1867,11 +1946,11 @@ function _renderHotkeyEditor() {
   stealthBanner.innerHTML = `
     <div class="hk-stealth-head">
       <div>
-        <div class="hk-stealth-title">Stealth Mode ${stealthActive ? '<span class="hk-stealth-on">ON</span>' : ''}</div>
+        <div class="hk-stealth-title">Invisible Hotkeys ${stealthActive ? '<span class="hk-stealth-on">ON</span>' : ''}</div>
         <div class="hk-stealth-sub">
           ${stealthActive
-            ? 'Critical hotkeys use triple-tap + long-press patterns — no modifier keypresses for proctor tools to flag.'
-            : 'Rebinds ASK/TOGGLE/COPY etc. to triple-tap and long-press patterns so proctor tools can\'t flag modifier keypresses. <b>Recommended for exam use.</b>'}
+            ? 'Your shortcuts don\'t use Ctrl / Alt / Shift combos — proctor software has nothing to flag.'
+            : 'Some proctor software watches for Ctrl / Alt / Shift keypresses. Turn this on to switch shortcuts to patterns that look like normal typing. <b>Recommended for exams.</b>'}
         </div>
       </div>
       <label class="hk-toggle-switch">
@@ -1954,31 +2033,29 @@ function _openStealthEnableModal() {
     }).join('');
   root.innerHTML = `
     <div class="modal-shade">
-      <div class="modal-box modal-box-wide">
-        <div class="modal-title">Enable Stealth Mode?</div>
+      <div class="modal-box modal-box-wide modal-box-scroll">
+        <div class="modal-title">Turn on Invisible Hotkeys?</div>
         <div class="stealth-lead">
-          Aggressive exam-proctoring tools log every <b>Ctrl</b>, <b>Alt</b>, <b>Fn</b>, and <b>Win</b> keypress as suspicious — even when we suppress the letter that followed. Stealth mode swaps the most-used hotkeys to patterns that don't press modifiers at all.
+          Some exam software watches every time you press <b>Ctrl</b>, <b>Alt</b>, <b>Shift</b>, or the <b>Windows key</b> — even when nothing happens after. This mode switches CloakGPT's shortcuts to patterns that <b>don't press those keys at all</b>, so there's nothing suspicious to log.
         </div>
-        <div class="stealth-tradeoff-title">What changes:</div>
+        <div class="stealth-tradeoff-title">Your shortcuts will change to:</div>
         <table class="stealth-mapping-table">
           <thead>
-            <tr><th>Action</th><th>Standard</th><th></th><th>Stealth</th></tr>
+            <tr><th>What it does</th><th>Before</th><th></th><th>After</th></tr>
           </thead>
           <tbody>${rows}</tbody>
         </table>
-        <div class="stealth-tradeoff-title" style="margin-top:16px;">The tradeoffs:</div>
+        <div class="stealth-tradeoff-title" style="margin-top:16px;">Two things to know:</div>
         <ul class="stealth-tradeoff-list">
-          <li><b>Triple-tap CONSUME</b> keys (like backtick <code>\`</code>) become <b>reserved</b> — you can't type that character anywhere while CloakGPT is armed. Only affects rarely-typed keys.</li>
-          <li><b>Triple-tap WATCH-ONLY</b> keys (like <code>c</code>, <code>a</code>) still type normally — CloakGPT just watches for the pattern. Downstream apps see all your keys, so the proctor sees "user typed ccc" as a typo. Copy fires silently in the background.</li>
-          <li><b>Long-press Right-Shift 700ms</b> replaces Ctrl+Alt+G for TOGGLE. Right-Shift alone isn't flagged (you use it for capital letters constantly). Holding it deliberately is not something you do while typing.</li>
-          <li>Slots not listed above (movement, resize, panic-stop) <b>keep their modifier combos</b> — the action itself is visible to the proctor anyway, so hiding the modifier press doesn't add value.</li>
+          <li><b>Silent triple-taps</b> (like tapping <code>C</code> three times fast to copy) let the key still type normally in your exam. To the proctor it looks like you typo'd "ccc" — the copy happens in the background.</li>
+          <li><b>Reserved triple-taps</b> use rare keys like backtick (<code>\`</code>) or backslash (<code>\\</code>). While CloakGPT is on you won't be able to type these characters — but you almost never need them in an exam anyway.</li>
         </ul>
         <div class="stealth-tradeoff-note">
-          You can still remap any individual slot after enabling this. Toggling off restores the standard modifier combos.
+          You can change any shortcut individually after turning this on. Turning it off puts everything back the way it was.
         </div>
         <div class="modal-actions">
           <button id="stealth-cancel" class="btn btn-secondary">Cancel</button>
-          <button id="stealth-enable" class="btn btn-primary">Enable Stealth Mode</button>
+          <button id="stealth-enable" class="btn btn-primary">Turn On</button>
         </div>
       </div>
     </div>
@@ -2000,7 +2077,7 @@ function _openStealthEnableModal() {
     root.innerHTML = '';
     _renderHotkeyEditor();
     if (save && save.ok) {
-      toast('Stealth mode enabled — takes effect on next Inject.', 'ok');
+      toast('Invisible Hotkeys on — click Inject Now to apply.', 'ok');
     } else {
       toast('Save failed.', 'err');
     }
@@ -2019,7 +2096,7 @@ async function _disableStealthMode() {
   const save = await window.svc.hotkeys.save(ov);
   _renderHotkeyEditor();
   if (save && save.ok) {
-    toast('Stealth mode disabled — standard hotkeys restored.', 'ok');
+    toast('Invisible Hotkeys off — standard shortcuts restored.', 'ok');
   } else {
     toast('Save failed.', 'err');
   }
@@ -2040,22 +2117,22 @@ function _openHotkeyRecorder(slot) {
    * tap of common letter). */
   root.innerHTML = `
     <div class="modal-shade">
-      <div class="modal-box modal-box-wide">
-        <div class="modal-title">Remap: ${escapeHtml(label)}</div>
+      <div class="modal-box modal-box-wide modal-box-scroll">
+        <div class="modal-title">Change shortcut for: ${escapeHtml(label)}</div>
         <div class="hk-mode-tabs">
-          <button class="hk-mode-tab" data-mode="0">Modifier combo</button>
-          <button class="hk-mode-tab" data-mode="1">Long-press key</button>
-          <button class="hk-mode-tab" data-mode="2">Multi-tap</button>
+          <button class="hk-mode-tab" data-mode="0">Press keys together</button>
+          <button class="hk-mode-tab" data-mode="1">Hold a key</button>
+          <button class="hk-mode-tab" data-mode="2">Tap a key fast</button>
         </div>
         <div id="hk-mode-body"></div>
         <div class="hk-risk" id="hk-risk-badge"></div>
         <div class="modal-hint">
-          ${defBinding ? `Default: <b>${escapeHtml(formatHotkey(defBinding))}</b>.` : ''}
+          ${defBinding ? `Original: <b>${escapeHtml(formatHotkey(defBinding))}</b>.` : ''}
           Press <kbd>Esc</kbd> to cancel.
         </div>
         <div class="modal-actions">
           <button id="rec-cancel" class="btn btn-secondary">Cancel</button>
-          <button id="rec-unbind" class="btn btn-danger">Unbind</button>
+          <button id="rec-unbind" class="btn btn-danger">Remove</button>
           <button id="rec-save" class="btn btn-primary" disabled>Save</button>
         </div>
       </div>
@@ -2099,8 +2176,8 @@ function _openHotkeyRecorder(slot) {
     if (currentMode === 0) {
       bodyEl.innerHTML = `
         <div class="hk-capture-area" id="hk-capture" tabindex="0">
-          <div class="hk-capture-hint">Click here and press Ctrl / Shift / Alt + key…</div>
-          <div class="hk-capture-current" id="hk-capture-current">${current && curUnpacked.kind === 0 ? escapeHtml(formatHotkey(current)) : '(none)'}</div>
+          <div class="hk-capture-hint">Click this box, then press your shortcut (e.g. hold Ctrl+Alt and press G).</div>
+          <div class="hk-capture-current" id="hk-capture-current">${current && curUnpacked.kind === 0 ? escapeHtml(formatHotkey(current)) : '(nothing chosen yet)'}</div>
         </div>
       `;
       const cap = document.getElementById('hk-capture');
@@ -2124,17 +2201,20 @@ function _openHotkeyRecorder(slot) {
       const curVk = curUnpacked.kind === 1 ? curUnpacked.vk : 0xA1;
       bodyEl.innerHTML = `
         <div class="hk-longpress-body">
+          <div class="hk-explainer">
+            <b>How this works:</b> Press and hold one key by itself for the time below. Right Shift works great — you tap it every time you type a capital, but you rarely <i>hold</i> it. Pressing any other key during the hold cancels it, so normal typing won't trigger this.
+          </div>
           <div class="hk-field">
-            <label>Key to hold</label>
+            <label>Which key do you want to hold?</label>
             <div class="hk-capture-area" id="hk-lp-capture" tabindex="0">
               <span id="hk-lp-key">${_vkName(curVk)}</span>
-              <span class="hk-capture-hint" style="margin-left:.5em;">(click and press any key)</span>
+              <span class="hk-capture-hint" style="margin-left:.5em;">(click here, then press the key you want)</span>
             </div>
           </div>
           <div class="hk-field">
-            <label>Hold duration: <span id="hk-lp-ms-label">${curHold}</span> ms</label>
+            <label>How long to hold it: <span id="hk-lp-ms-label">${(curHold/1000).toFixed(1).replace(/\.0$/,'')}</span> seconds</label>
             <input type="range" id="hk-lp-ms" min="300" max="1500" step="100" value="${curHold}" />
-            <div class="hk-hint-small">Longer = fewer accidental fires. 700-1000ms is a good balance.</div>
+            <div class="hk-hint-small">Longer = fewer accidents. 0.7s is a good balance.</div>
           </div>
         </div>
       `;
@@ -2154,7 +2234,8 @@ function _openHotkeyRecorder(slot) {
       });
       document.getElementById('hk-lp-ms').addEventListener('input', (e) => {
         ms = parseInt(e.target.value, 10);
-        document.getElementById('hk-lp-ms-label').textContent = ms;
+        document.getElementById('hk-lp-ms-label').textContent =
+          (ms / 1000).toFixed(1).replace(/\.0$/, '');
         candidate = packLongpress(vk, ms);
         _updateRisk();
       });
@@ -2165,34 +2246,41 @@ function _openHotkeyRecorder(slot) {
       const curVk = curUnpacked.kind === 2 ? curUnpacked.vk : 0xC0;
       bodyEl.innerHTML = `
         <div class="hk-multitap-body">
+          <div class="hk-explainer">
+            <b>How this works:</b> Tap a key several times in a row, fast. If you use a common letter like C, leave "Let the key still type normally" ON — to your exam it looks like a "ccc" typo, but CloakGPT quietly runs your shortcut.
+          </div>
           <div class="hk-field">
-            <label>Key to tap</label>
+            <label>Which key do you want to tap?</label>
             <div class="hk-capture-area" id="hk-mt-capture" tabindex="0">
               <span id="hk-mt-key">${_vkName(curVk)}</span>
-              <span class="hk-capture-hint" style="margin-left:.5em;">(click and press any key)</span>
+              <span class="hk-capture-hint" style="margin-left:.5em;">(click here, then press the key you want)</span>
             </div>
           </div>
           <div class="hk-field">
-            <label>Tap count: <span id="hk-mt-count-label">${curCount}</span></label>
-            <input type="range" id="hk-mt-count" min="2" max="5" step="1" value="${curCount}" />
+            <label>How many taps: <span id="hk-mt-count-label">${curCount}</span></label>
+            <input type="range" id="hk-mt-count" min="1" max="${HK_TAP_MAX}" step="1" value="${curCount}" />
+            <div class="hk-hint-small">3 taps is the sweet spot — rarely happens by accident. Higher = harder to trigger by mistake.</div>
           </div>
           <div class="hk-field">
-            <label>Max total span: <span id="hk-mt-gap-label">${curGap}</span> ms</label>
+            <label>How fast (total time): <span id="hk-mt-gap-label">${(curGap/1000).toFixed(2)}</span> seconds</label>
             <input type="range" id="hk-mt-gap" min="200" max="750" step="50" value="${curGap}" />
-            <div class="hk-hint-small">Time from first tap to last tap. 300-500ms is a natural triple-tap.</div>
+            <div class="hk-hint-small">Time from the first tap to the last. 0.30-0.50s feels natural.</div>
           </div>
           <div class="hk-field">
             <label style="display:flex;gap:.5em;align-items:center;">
               <input type="checkbox" id="hk-mt-watch" ${curWatch ? 'checked' : ''} />
-              Watch-only (pass keys through — plausible deniability 👁)
+              <span>Let the key still type normally (recommended for letters)</span>
             </label>
-            <div class="hk-hint-small">On: taps reach downstream apps normally. User "typed accidentally" is deniable.<br>Off (Consume): key is reserved for the hotkey; can't type it while CloakGPT is armed.</div>
+            <div class="hk-hint-small">
+              <b>On:</b> The key still types in your app. Your exam sees you typed "ccc" — a typo. CloakGPT runs the shortcut in the background.<br>
+              <b>Off:</b> The key is blocked while CloakGPT is on. Good for rare keys like backtick <code>\`</code>. Bad for common letters — you won't be able to type them.
+            </div>
           </div>
         </div>
       `;
       let vk = curVk;
       let count = curCount, gap = curGap, watch = curWatch;
-      candidate = packMultitap(vk, count, gap, watch);
+      candidate = packMultitap(vk, count, gap, watch, false);
       _updateRisk();
       document.getElementById('hk-mt-capture').addEventListener('keydown', (e) => {
         e.preventDefault(); e.stopPropagation();
@@ -2200,24 +2288,24 @@ function _openHotkeyRecorder(slot) {
         const v = eventToVk(e); if (!v) return;
         vk = v;
         document.getElementById('hk-mt-key').textContent = _vkName(vk);
-        candidate = packMultitap(vk, count, gap, watch);
+        candidate = packMultitap(vk, count, gap, watch, false);
         _updateRisk();
       });
       document.getElementById('hk-mt-count').addEventListener('input', (e) => {
         count = parseInt(e.target.value, 10);
         document.getElementById('hk-mt-count-label').textContent = count;
-        candidate = packMultitap(vk, count, gap, watch);
+        candidate = packMultitap(vk, count, gap, watch, false);
         _updateRisk();
       });
       document.getElementById('hk-mt-gap').addEventListener('input', (e) => {
         gap = parseInt(e.target.value, 10);
-        document.getElementById('hk-mt-gap-label').textContent = gap;
-        candidate = packMultitap(vk, count, gap, watch);
+        document.getElementById('hk-mt-gap-label').textContent = (gap / 1000).toFixed(2);
+        candidate = packMultitap(vk, count, gap, watch, false);
         _updateRisk();
       });
       document.getElementById('hk-mt-watch').addEventListener('change', (e) => {
         watch = e.target.checked;
-        candidate = packMultitap(vk, count, gap, watch);
+        candidate = packMultitap(vk, count, gap, watch, false);
         _updateRisk();
       });
     }

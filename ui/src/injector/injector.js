@@ -117,6 +117,46 @@ const KIND_LONGPRESS = 1;
 const KIND_MULTITAP  = 2;
 const KIND_DISABLED  = 3;
 const FLAG_WATCH_ONLY = 0x10000000;
+const FLAG_ADAPTIVE   = 0x20000000;
+
+/** v1.7.2 (2026-07-17): global speed-mode transformer.
+ *
+ * User picks Fast / Normal / Slow / Adaptive at the top of the hotkey
+ * editor. At inject time we re-scale every multitap gap + longpress
+ * hold to match. Adaptive additionally sets FLAG_ADAPTIVE so the
+ * payload learns the user's tap rhythm live.
+ *
+ *   fast     → gap × 0.60, hold × 0.75
+ *   normal   → unchanged
+ *   slow     → gap × 1.50, hold × 1.30
+ *   adaptive → gap unchanged + FLAG_ADAPTIVE, hold unchanged
+ *
+ * Modifier-kind bindings are returned unchanged (no timing to scale). */
+function applySpeedMode(packed, mode) {
+  if (packed === 0) return 0;
+  const kind = (packed >>> 24) & 0x0F;
+  const vk   = packed & 0xFFFF;
+  const extra = (packed >>> 16) & 0xFF;
+  const watch = (packed & FLAG_WATCH_ONLY) !== 0;
+  if (kind === KIND_MODIFIER || kind === KIND_DISABLED) return packed;
+
+  if (kind === KIND_LONGPRESS) {
+    let ms = extra * 10;
+    if (mode === 'fast') ms = Math.max(200, Math.round(ms * 0.75));
+    else if (mode === 'slow') ms = Math.min(2500, Math.round(ms * 1.30));
+    return packLongpress(vk, ms);
+  }
+  if (kind === KIND_MULTITAP) {
+    const count = extra & 0x0F;
+    let gap = ((extra >>> 4) & 0x0F) * 50;
+    if (gap === 0) gap = 300;
+    if (mode === 'fast') gap = Math.max(200, Math.round(gap * 0.60));
+    else if (mode === 'slow') gap = Math.min(750, Math.round(gap * 1.50));
+    const adaptive = (mode === 'adaptive');
+    return packMultitap(vk, count, gap, watch, adaptive);
+  }
+  return packed;
+}
 
 /** MODIFIER-kind pack (backward compat with v9). */
 function pack(mod, vk) { return ((mod & 0xFF) << 16) | (vk & 0xFFFF); }
@@ -129,11 +169,13 @@ function packLongpress(vk, hold_ms) {
 /** MULTITAP pack — N taps of `vk` within `gap_ms` fire the action.
  *  `watch_only`: if true, taps pass through to other apps (plausible
  *  deniability). If false, all N taps are consumed. */
-function packMultitap(vk, count, gap_ms, watch_only) {
+function packMultitap(vk, count, gap_ms, watch_only, adaptive) {
   const c = Math.max(1, Math.min(15, count | 0));
   const g = Math.max(0, Math.min(15, Math.floor(gap_ms / 50)));
-  const base = (KIND_MULTITAP << 24) | (((g << 4) | c) << 16) | (vk & 0xFFFF);
-  return watch_only ? (base | FLAG_WATCH_ONLY) : base;
+  let out = (KIND_MULTITAP << 24) | (((g << 4) | c) << 16) | (vk & 0xFFFF);
+  if (watch_only) out |= FLAG_WATCH_ONLY;
+  if (adaptive)   out |= FLAG_ADAPTIVE;
+  return out >>> 0;
 }
 
 // Slot indices MUST match shared/config_types.h svc_hotkey_action_t.
@@ -443,9 +485,10 @@ module.exports = {
   PROVIDER,
   DEFAULT_HOTKEYS,
   STEALTH_OVERRIDES,          /* v10: opt-in stealth-mode mapping */
+  applySpeedMode,             /* v1.7.2: global timing scaler */
   /* v10: exposed for renderer.js hotkey editor UI. */
   pack, packLongpress, packMultitap,
   KIND_MODIFIER, KIND_LONGPRESS, KIND_MULTITAP, KIND_DISABLED,
-  FLAG_WATCH_ONLY,
+  FLAG_WATCH_ONLY, FLAG_ADAPTIVE,
   MOD_C, MOD_S, MOD_A, MOD_CS, MOD_CA, MOD_CSA,
 };

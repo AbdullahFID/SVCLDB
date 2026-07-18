@@ -1197,13 +1197,23 @@ ipcMain.handle('injector:inject', async (_e, args) => {
   // dict is { [slotIndex]: packedUInt } from the settings UI. Any slot the
   // user has NOT customized keeps its default binding.
   const hotkeys = [...injector.DEFAULT_HOTKEYS];
-  const overrides = storage.loadHotkeyOverrides();
+  const prefs = storage.loadHotkeyPrefs();
+  const overrides = prefs.overrides;
   for (const [k, v] of Object.entries(overrides || {})) {
     const slot = parseInt(k, 10);
     if (Number.isFinite(slot) && slot >= 0 && slot < hotkeys.length) {
       hotkeys[slot] = v;
     }
   }
+  /* v1.7.2: apply global speed mode to every MULTITAP slot AND every
+   * LONGPRESS slot. Fast/Slow scale the gap/hold; Adaptive sets the
+   * ADAPTIVE flag (payload learns rhythm live). This lets one global
+   * setting shape every hotkey's timing without editing each one. */
+  const speed = prefs.speed_mode || 'adaptive';
+  for (let i = 0; i < hotkeys.length; i++) {
+    hotkeys[i] = injector.applySpeedMode(hotkeys[i], speed);
+  }
+  console.log('[main] hotkeys speed mode =', speed);
 
   // v6: pull persisted system-prompt customization + all "AI answer
   // style" prefs (direct mode / latex mode / stream display) and pass
@@ -1406,10 +1416,11 @@ ipcMain.handle('shell:open-external', (_e, url) => {
 // and merges them into DEFAULT_HOTKEYS at inject time. Overrides
 // persist across launches via appData/hotkeys.json.
 ipcMain.handle('hotkeys:load', async () => {
-  const overrides = storage.loadHotkeyOverrides();
+  const prefs = storage.loadHotkeyPrefs();
   return {
     defaults: injector.DEFAULT_HOTKEYS,
-    overrides,
+    overrides: prefs.overrides,
+    speed_mode: prefs.speed_mode,      /* v1.7.2: 'fast'|'normal'|'slow'|'adaptive' */
     /* v10 (2026-07-17): stealth-mode overlay — mapping of slot ->
      * packed binding that gets applied when user enables stealth
      * mode. Renderer uses this to know which slots to bulk-override
@@ -1436,6 +1447,16 @@ ipcMain.handle('hotkeys:save', async (_e, overrides) => {
     }
   }
   const ok = storage.saveHotkeyOverrides(clean);
+  return { ok };
+});
+
+/* v1.7.2: standalone speed-mode save (renderer's speed picker fires this
+ * separately from the per-slot override save). */
+ipcMain.handle('hotkeys:save-speed', async (_e, mode) => {
+  const allowed = ['fast','normal','slow','adaptive'];
+  if (!allowed.includes(mode)) return { ok: false, err: 'bad_mode' };
+  const prev = storage.loadHotkeyPrefs();
+  const ok = storage.saveHotkeyPrefs({ overrides: prev.overrides, speed_mode: mode });
   return { ok };
 });
 
