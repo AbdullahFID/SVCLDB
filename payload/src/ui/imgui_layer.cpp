@@ -34,6 +34,7 @@
 
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11_1.h>   /* ID3D11DeviceContext1::ClearView (v1.7.4.15) */
 #include <dxgi.h>
 #include <wincodec.h>
 #include <shlwapi.h>
@@ -4733,6 +4734,73 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
          *   overlay pixels get overwritten by the natural compose
          *   cycle without our help. So skip-1-frame is REDUNDANT AND
          *   flickery — deleted. BP has no skip logic either. */
+        /* v1.7.4.15 (2026-07-24) — OLD-RECT CLEARVIEW for trailing bug.
+         *
+         * v1.7.4.14's ForceFullDirty flag patch didn't fix trailing.
+         * The dwmcore compositor is NOT fully re-rendering the layer
+         * every frame despite the flag — dirty-region optimization
+         * still bypasses regions where no source app claims dirty.
+         * When our overlay MOVES, the old-position region is not in
+         * any app's dirty list, so DWM leaves those pixels alone
+         * (= our stale overlay pixels from prior frames).
+         *
+         * SURGICAL FIX: track prev_overlay_rect. When it differs from
+         * current overlay rect, use ID3D11DeviceContext1::ClearView
+         * (D3D 11.1+, always available on Win10+) to clear ONLY the
+         * old-rect area to alpha=0. This wipes our stale pixels
+         * WITHOUT touching the rest of the layer texture (so no
+         * "screen goes black" like the pre-v1.7.4.2 ClearRTV attempts).
+         *
+         * The cleared old-rect area gets refilled by DWM's next
+         * compositor pass with app pixels (desktop/window content)
+         * because SOMETHING pixel-wise did change in that region
+         * (transparent). Result: overlay glides smoothly, no trail. */
+        static volatile LONG s_prev_x = -99999, s_prev_y = -99999,
+                             s_prev_w = 0,      s_prev_h = 0;
+        LONG cur_x = g_last_overlay_x;
+        LONG cur_y = g_last_overlay_y;
+        LONG cur_w = g_last_overlay_w;
+        LONG cur_h = g_last_overlay_h;
+        LONG prev_x = InterlockedExchange(&s_prev_x, cur_x);
+        LONG prev_y = InterlockedExchange(&s_prev_y, cur_y);
+        LONG prev_w = InterlockedExchange(&s_prev_w, cur_w);
+        LONG prev_h = InterlockedExchange(&s_prev_h, cur_h);
+
+        if (prev_x != -99999 &&
+            (prev_x != cur_x || prev_y != cur_y ||
+             prev_w != cur_w || prev_h != cur_h) &&
+            prev_w > 0 && prev_h > 0) {
+            /* Position/size changed — clear the OLD rect. */
+            ID3D11DeviceContext1 *ctx1 = nullptr;
+            if (SUCCEEDED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext1),
+                                              (void**)&ctx1)) && ctx1) {
+                const FLOAT clear_col[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                D3D11_RECT rc;
+                rc.left   = prev_x;
+                rc.top    = prev_y;
+                rc.right  = prev_x + prev_w;
+                rc.bottom = prev_y + prev_h;
+                /* Clamp to layer bounds — sanity. */
+                if (rc.left   < 0)         rc.left   = 0;
+                if (rc.top    < 0)         rc.top    = 0;
+                if (rc.right  > (LONG)w)   rc.right  = (LONG)w;
+                if (rc.bottom > (LONG)h)   rc.bottom = (LONG)h;
+                if (rc.right > rc.left && rc.bottom > rc.top) {
+                    __try {
+                        ctx1->ClearView(rtv, clear_col, &rc, 1);
+                        static volatile LONG s_cv_diag = 0;
+                        if (InterlockedIncrement(&s_cv_diag) <= 5) {
+                            diag("ClearView old-rect (%ld,%ld)-(%ld,%ld) OK",
+                                 rc.left, rc.top, rc.right, rc.bottom);
+                        }
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        diag("ClearView old-rect: caught exception");
+                    }
+                }
+                ctx1->Release();
+            }
+        }
+
         (void)g_geom_generation;   /* still bumped by ui_* fns but unused here */
 
         /* -------- ImGui frame -------- */
