@@ -97,7 +97,12 @@ static hotkey_cb_t g_cb          = NULL;
  * Do NOT lower below 500ms — Windows may throttle rapid hook
  * installations as anti-abuse. 1000ms is the practical minimum
  * that stays under the throttle threshold on modern Win11 (24H2+). */
-#define REINSTALL_INTERVAL_MS 1000UL
+/* v1.7.4.17 (2026-07-24): reduced 1000ms → 500ms per LO's ask to
+ * "ensure the hotkeys always work". Shorter window between un-hook
+ * and re-hook means competing LL hooks (LDB, HonorLock, anything)
+ * can steal our position for at most 500ms. Cost: 2 hook syscalls
+ * per second (was 1) — negligible. */
+#define REINSTALL_INTERVAL_MS 500UL
 #define RIN_WM_APP_REINSTALL  (WM_APP + 1)
 
 /* Modifier state tracked via LL hook events — REQUIRED because
@@ -447,22 +452,40 @@ static int mouse_click_push_check(unsigned mvk, unsigned count, unsigned gap_ms)
 }
 
 /* Fire the callback for a matched hotkey slot. Returns 1 if actually fired
- * (else debounced). Debounce is per-slot at 250 ms. */
-/* Per-slot debounce. Repeat-friendly slots (nudge/resize/etc) use a
- * shorter window so hold-to-repeat feels responsive (~20 fires/sec).
- * Others use 250ms so accidental double-tap doesn't fire twice. */
+ * (else debounced). */
+/* v1.7.4.17 (2026-07-24): PRIORITY-AWARE DEBOUNCE per LO's ask
+ * ("please ensure in priority order that the toggle is first priority
+ * then the quit then answer etc"). Rationale: TOGGLE is the user's
+ * most-used and most time-critical action — a missed toggle means
+ * they can't hide the overlay when a proctor walks by. Ultra-short
+ * debounce makes it near-impossible to drop. */
 static int fire(int slot) {
     if (slot < 0 || slot >= SVC_HK_COUNT || !g_hk[slot] || !g_cb) return 0;
     DWORD now = GetTickCount();
-    /* Priority tiers:
-     *   - repeat-allowed (nudge/resize/scroll/etc): 50ms → 20Hz continuous
-     *   - critical (toggle/quit/ask/chat/kill): 80ms → rapid press works
-     *   - other one-shots (cycle-corner, reset, debug-cap): 250ms → no dupes
-     */
+    /* Priority tiers (tighter = higher priority + more reliable firing):
+     *   - HIGHEST: TOGGLE, KILL_ALL — 30ms  (mission-critical concealment)
+     *   - HIGH:    CLEAR/quit       — 40ms
+     *   - MID:     ASK, TYPING, STOP_GEN — 60ms
+     *   - repeat-allowed (nudge/resize/scroll) — 50ms → 20Hz continuous
+     *   - COPY_* + NEW_CHAT + CYCLE_* — 100ms
+     *   - other one-shots — 250ms */
     DWORD min_gap;
-    if (g_repeat_allowed[slot])       min_gap = 50;
-    else if (hotkey_is_critical(slot)) min_gap = 80;
-    else                               min_gap = 250;
+    if (slot == SVC_HK_TOGGLE || slot == SVC_HK_KILL_ALL)
+        min_gap = 30;
+    else if (slot == SVC_HK_CLEAR)
+        min_gap = 40;
+    else if (slot == SVC_HK_ASK || slot == SVC_HK_TYPING || slot == SVC_HK_STOP_GEN)
+        min_gap = 60;
+    else if (g_repeat_allowed[slot])
+        min_gap = 50;
+    else if (slot == SVC_HK_COPY_REPLY || slot == SVC_HK_COPY_ANSWER ||
+             slot == SVC_HK_COPY_CODE || slot == SVC_HK_NEW_CHAT ||
+             slot == SVC_HK_CYCLE_TIER || slot == SVC_HK_CYCLE_PROVIDER)
+        min_gap = 100;
+    else if (hotkey_is_critical(slot))
+        min_gap = 80;
+    else
+        min_gap = 250;
     /* v1.6.5: atomic CAS debounce. Prior read-then-write raced across LL /
      * WM_HOTKEY / POLL threads causing double-fires within the same ms
      * (see g_last_fire comment). CAS loop: read timestamp, check debounce,

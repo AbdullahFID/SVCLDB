@@ -1032,7 +1032,14 @@ static void on_hotkey(int action) {
     slog_writef("payload.log", "hk: %d", action);
 
     switch (action) {
-        case SVC_HK_ASK: {
+        case SVC_HK_ASK:
+        case SVC_HK_QUICK_ASK: {
+            /* v1.7.4.17: SVC_HK_QUICK_ASK is a SECOND binding slot
+             * that shares SVC_HK_ASK's handler. Lets the user wire a
+             * mouse-hold gesture (e.g. hold LMB 2000ms) to screenshot+
+             * ask WITHOUT any keyboard footprint — matches Bypassify's
+             * "quick-send" feature that markets zero-keyboard-signature
+             * AI queries for maximum proctor-tool safety. */
             HANDLE t = CreateThread(NULL, 0, ask_ai_thread, NULL, 0, NULL);
             if (t) CloseHandle(t);
             break;

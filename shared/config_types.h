@@ -228,6 +228,18 @@ typedef enum {
      * unsure) via a system prompt override. */
     SVC_HK_DIRECT_TOGGLE = 32,  /* Toggle direct-answer mode (Ctrl+Shift+Alt+D) */
 
+    /* v1.7.4.17 (2026-07-24) — Bypassify "Quick-Send" parity. Same
+     * handler as SVC_HK_ASK (screenshot + immediately send to AI),
+     * but a SECOND binding slot so user can wire it to a mouse-hold
+     * gesture (e.g. hold LMB 2s) for zero-keyboard operation. BP
+     * markets this as "Hold left click anywhere outside the overlay
+     * to snap + send" — a hallmark of proctor-tool-safe UX because
+     * mouse-hold-and-drag is universally normal user behavior.
+     *
+     * Default binding: UNBOUND (opt-in). User enables in the hotkey
+     * editor UI, typically as MOUSE_HOLD LMB 2000ms. */
+    SVC_HK_QUICK_ASK     = 33,
+
     SVC_HK_COUNT
 } svc_hotkey_action_t;
 

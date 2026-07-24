@@ -1740,6 +1740,7 @@ const HK_LABELS = [
   'Toggle LaTeX',               // 30
   'Stop AI response',           // 31
   'Direct-answer mode',         // 32
+  'Quick-Ask (mouse-hold, opt-in)', // 33 — v1.7.4.17, BP parity
 ];
 
 // Human-readable names for every VK we might encounter. Modifier keys

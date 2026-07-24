@@ -350,6 +350,9 @@ const DEFAULT_HOTKEYS = [
   pack(MOD_CS,  0x4C),  // 30 LATEX_TOGGLE  Ctrl+Shift+L
   pack(MOD_CS,  0x53),  // 31 STOP_GEN      Ctrl+Shift+S (BP: Open Settings — repurposed)
   pack(MOD_CS,  0x44),  // 32 DIRECT_TOGGLE Ctrl+Shift+D
+  0,                    // 33 QUICK_ASK — UNBOUND by default (v1.7.4.17). User
+                        //    enables in hotkey editor as MOUSE_HOLD LMB 2000ms
+                        //    (or MMB/X1/X2/etc) for BP-parity "Quick-Send" UX.
 ];
 
 /* Old stealth-multitap map kept for users who preferred it. Flip

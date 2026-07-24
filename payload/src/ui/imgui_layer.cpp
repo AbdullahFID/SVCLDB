@@ -4651,6 +4651,52 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
                 if (sym) diag("font: Segoe UI Symbol merged for math coverage");
                 else     diag("font: seguisym.ttf load FAILED - math glyphs may render as ?");
             }
+
+            /* v1.7.4.17 (2026-07-24) — INTERNATIONAL FALLBACK per BP
+             * font-loading pattern. BP loads malgun.ttf (Korean),
+             * msyh.ttc (Chinese Simplified), YuGothM.ttc (Japanese).
+             * Without these, users typing/pasting CJK content see
+             * boxes/tofu. All ship with Windows since Vista+ so
+             * available on every target system. Failures are silent
+             * (missing = degraded UX, not crash). */
+            {
+                ImFontConfig mcfg;
+                mcfg.MergeMode = true;
+                mcfg.PixelSnapH = true;
+                /* Korean (Hangul + Hanja for context). */
+                static const ImWchar RANGES_KR[] = {
+                    0x1100, 0x11FF,   /* Hangul Jamo */
+                    0x3130, 0x318F,   /* Hangul Compatibility Jamo */
+                    0xAC00, 0xD7A3,   /* Hangul Syllables */
+                    0, 0
+                };
+                io.Fonts->AddFontFromFileTTF(
+                    "C:\\Windows\\Fonts\\malgun.ttf", UI_FONT_SIZE_PX,
+                    &mcfg, RANGES_KR);
+                /* Chinese Simplified (basic CJK Unified). */
+                static const ImWchar RANGES_ZH[] = {
+                    0x4E00, 0x9FFF,   /* CJK Unified Ideographs */
+                    0x3400, 0x4DBF,   /* CJK Extension A */
+                    0x3000, 0x303F,   /* CJK Symbols and Punctuation */
+                    0xFF00, 0xFFEF,   /* Halfwidth and Fullwidth Forms */
+                    0, 0
+                };
+                io.Fonts->AddFontFromFileTTF(
+                    "C:\\Windows\\Fonts\\msyh.ttc", UI_FONT_SIZE_PX,
+                    &mcfg, RANGES_ZH);
+                /* Japanese (Hiragana + Katakana; CJK Ideographs
+                 * shared with ZH above). */
+                static const ImWchar RANGES_JP[] = {
+                    0x3040, 0x309F,   /* Hiragana */
+                    0x30A0, 0x30FF,   /* Katakana */
+                    0x31F0, 0x31FF,   /* Katakana Phonetic Extensions */
+                    0, 0
+                };
+                io.Fonts->AddFontFromFileTTF(
+                    "C:\\Windows\\Fonts\\YuGothM.ttc", UI_FONT_SIZE_PX,
+                    &mcfg, RANGES_JP);
+                diag("font: CJK fallback merged (Korean/Chinese/Japanese)");
+            }
             /* Mono font — try Cascadia Mono, then Consolas. */
             g_font_mono = io.Fonts->AddFontFromFileTTF(
                 "C:\\Windows\\Fonts\\CascadiaMono.ttf", MONO_FONT_SIZE_PX,
