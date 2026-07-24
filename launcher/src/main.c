@@ -442,47 +442,50 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
     #define MOD_CA   (SVC_HK_MOD_CTRL | SVC_HK_MOD_ALT)
     #define MOD_CSA  (SVC_HK_MOD_CTRL | SVC_HK_MOD_SHIFT | SVC_HK_MOD_ALT)
     memset(cfg->hotkeys, 0, sizeof(cfg->hotkeys));
-    /* v1.7.4.5 (2026-07-24) — ALL WATCH-ONLY (never eat keys) + 500ms
-     * gap + ADAPTIVE flag. CONSUME on N/X ate user's typing letters.
-     * Wider gap makes accidental triggering harder; ADAPTIVE learns
-     * their tap rhythm live. */
-    unsigned mt = SVC_HK_FLAG_ADAPTIVE;
-    cfg->hotkeys[SVC_HK_ASK]           = SVC_HK_PACK_MULTITAP(3, 500, 0xC0, 1) | mt;
-    cfg->hotkeys[SVC_HK_TOGGLE]        = SVC_HK_PACK_MULTITAP(3, 500, 'G',  1) | mt;
-    cfg->hotkeys[SVC_HK_TYPING]        = SVC_HK_PACK_MULTITAP(3, 500, 0xDC, 1) | mt;
-    cfg->hotkeys[SVC_HK_COPY_REPLY]    = SVC_HK_PACK_MULTITAP(3, 500, 'C',  1) | mt;
-    cfg->hotkeys[SVC_HK_CLEAR]         = SVC_HK_PACK_MULTITAP(3, 500, 'X',  1) | mt;
-    cfg->hotkeys[SVC_HK_MOVE_LEFT]     = SVC_HK_PACK_MULTITAP(3, 500, 0x25, 1) | mt;
-    cfg->hotkeys[SVC_HK_MOVE_RIGHT]    = SVC_HK_PACK_MULTITAP(3, 500, 0x27, 1) | mt;
-    cfg->hotkeys[SVC_HK_MOVE_UP]       = SVC_HK_PACK_MULTITAP(3, 500, 0x26, 1) | mt;
-    cfg->hotkeys[SVC_HK_MOVE_DOWN]     = SVC_HK_PACK_MULTITAP(3, 500, 0x28, 1) | mt;
-    cfg->hotkeys[SVC_HK_RESIZE_WIDER]  = SVC_HK_PACK_MULTITAP(3, 500, 0xBB, 1) | mt;
-    cfg->hotkeys[SVC_HK_RESIZE_NARROW] = SVC_HK_PACK_MULTITAP(3, 500, 0xBD, 1) | mt;
-    cfg->hotkeys[SVC_HK_RESIZE_TALLER] = SVC_HK_PACK_MULTITAP(3, 500, 0xDD, 1) | mt;
-    cfg->hotkeys[SVC_HK_RESIZE_SHORT]  = SVC_HK_PACK_MULTITAP(3, 500, 0xDB, 1) | mt;
-    cfg->hotkeys[SVC_HK_CYCLE_CORNER]  = SVC_HK_PACK_MULTITAP(3, 500, 'Q',  1) | mt;
-    cfg->hotkeys[SVC_HK_ALPHA_UP]      = SVC_HK_PACK_MULTITAP(3, 500, 0xBE, 1) | mt;
-    cfg->hotkeys[SVC_HK_ALPHA_DOWN]    = SVC_HK_PACK_MULTITAP(3, 500, 0xBC, 1) | mt;
-    cfg->hotkeys[SVC_HK_FONT_UP]       = SVC_HK_PACK_MULTITAP(3, 500, 0xDE, 1) | mt;
-    cfg->hotkeys[SVC_HK_FONT_DOWN]     = SVC_HK_PACK_MULTITAP(3, 500, 0xBA, 1) | mt;
-    cfg->hotkeys[SVC_HK_RESET]         = SVC_HK_PACK_MULTITAP(3, 500, 'R',  1) | mt;
-    cfg->hotkeys[SVC_HK_DEBUG_CAP]     = SVC_HK_PACK_MULTITAP(3, 500, 0x2D, 1) | mt;
-    cfg->hotkeys[SVC_HK_KILL_ALL]      = SVC_HK_PACK_LONGPRESS(1200, 0x24);
-    cfg->hotkeys[SVC_HK_SCROLL_UP]     = SVC_HK_PACK_MULTITAP(3, 500, 0x21, 1) | mt;
-    cfg->hotkeys[SVC_HK_SCROLL_DOWN]   = SVC_HK_PACK_MULTITAP(3, 500, 0x22, 1) | mt;
-    cfg->hotkeys[SVC_HK_NEW_CHAT]      = SVC_HK_PACK_MULTITAP(3, 500, 'N',  1) | mt;
-    cfg->hotkeys[SVC_HK_CYCLE_TIER]    = SVC_HK_PACK_MULTITAP(3, 500, 'M',  1) | mt;
-    cfg->hotkeys[SVC_HK_CYCLE_PROVIDER]= SVC_HK_PACK_MULTITAP(3, 500, 'P',  1) | mt;
-    cfg->hotkeys[SVC_HK_REGENERATE]    = SVC_HK_PACK_MULTITAP(3, 500, 0x0D, 1) | mt;
-    cfg->hotkeys[SVC_HK_STREAM_TOGGLE] = SVC_HK_PACK_MULTITAP(3, 500, 'T',  1) | mt;
-    cfg->hotkeys[SVC_HK_COPY_CODE]     = SVC_HK_PACK_MULTITAP(3, 500, 'K',  1) | mt;
-    cfg->hotkeys[SVC_HK_COPY_ANSWER]   = SVC_HK_PACK_MULTITAP(3, 500, 'A',  1) | mt;
-    cfg->hotkeys[SVC_HK_LATEX_TOGGLE]  = SVC_HK_PACK_MULTITAP(3, 500, 'L',  1) | mt;
-    cfg->hotkeys[SVC_HK_STOP_GEN]      = SVC_HK_PACK_MULTITAP(3, 500, 'S',  1) | mt;
-    /* v6: DIRECT-ANSWER mode toggle. Ctrl+Shift+Alt+D = "direct". Free -
-     * no common app binds Ctrl+Shift+Alt+D. When ON the AI system
-     * prompt is replaced with a strict data-extraction contract. */
-    cfg->hotkeys[SVC_HK_DIRECT_TOGGLE] = SVC_HK_PACK(MOD_CSA, 'D');  /* Ctrl+Shift+Alt+D - direct-answer mode */
+    /* v1.7.5.1 (2026-07-24) — Bypassify-1:1 PARITY defaults in the launcher
+     * fallback path (mirror of ui/src/injector/injector.js DEFAULT_HOTKEYS).
+     * The launcher's env-var --quiet fallback used to install the old
+     * multitap-triple-tap map for every slot; that made "Ctrl+Left nudge"
+     * require THREE Ctrl+Left presses which is (a) not BP-parity, (b) the
+     * root cause of the "jaggy nudge" LO reported (each 3-tap window = one
+     * step). Now single Ctrl+key just like BP. Electron UI still overrides
+     * per-user via hotkey editor; this is only the launcher-only fallback
+     * used by dev-bypass and the initial-install --json-config write. */
+    cfg->hotkeys[SVC_HK_ASK]           = SVC_HK_PACK(MOD_C,   'U');       /*  0 Ctrl+U   Take Screenshot     */
+    cfg->hotkeys[SVC_HK_TOGGLE]        = SVC_HK_PACK(MOD_C,   'B');       /*  1 Ctrl+B   Hide/Show Overlay   */
+    cfg->hotkeys[SVC_HK_TYPING]        = SVC_HK_PACK(MOD_C,   'T');       /*  2 Ctrl+T   Text Input Mode     */
+    cfg->hotkeys[SVC_HK_COPY_REPLY]    = SVC_HK_PACK(MOD_C,   'C');       /*  3 Ctrl+C                       */
+    cfg->hotkeys[SVC_HK_CLEAR]         = SVC_HK_PACK(MOD_C,   'Q');       /*  4 Ctrl+Q   Quit                */
+    cfg->hotkeys[SVC_HK_MOVE_LEFT]     = SVC_HK_PACK(MOD_C,   0x25);      /*  5 Ctrl+Left                    */
+    cfg->hotkeys[SVC_HK_MOVE_RIGHT]    = SVC_HK_PACK(MOD_C,   0x27);      /*  6 Ctrl+Right                   */
+    cfg->hotkeys[SVC_HK_MOVE_UP]       = SVC_HK_PACK(MOD_C,   0x26);      /*  7 Ctrl+Up                      */
+    cfg->hotkeys[SVC_HK_MOVE_DOWN]     = SVC_HK_PACK(MOD_C,   0x28);      /*  8 Ctrl+Down                    */
+    cfg->hotkeys[SVC_HK_RESIZE_WIDER]  = SVC_HK_PACK(MOD_CA,  0xBB);      /*  9 Ctrl+Alt+=                   */
+    cfg->hotkeys[SVC_HK_RESIZE_NARROW] = SVC_HK_PACK(MOD_CA,  0xBD);      /* 10 Ctrl+Alt+-                   */
+    cfg->hotkeys[SVC_HK_RESIZE_TALLER] = SVC_HK_PACK(MOD_CA,  0xDD);      /* 11 Ctrl+Alt+]                   */
+    cfg->hotkeys[SVC_HK_RESIZE_SHORT]  = SVC_HK_PACK(MOD_CA,  0xDB);      /* 12 Ctrl+Alt+[                   */
+    cfg->hotkeys[SVC_HK_CYCLE_CORNER]  = SVC_HK_PACK(MOD_CA,  'Q');       /* 13 Ctrl+Alt+Q                   */
+    cfg->hotkeys[SVC_HK_ALPHA_UP]      = SVC_HK_PACK(MOD_CA,  0xBE);      /* 14 Ctrl+Alt+.                   */
+    cfg->hotkeys[SVC_HK_ALPHA_DOWN]    = SVC_HK_PACK(MOD_CA,  0xBC);      /* 15 Ctrl+Alt+,                   */
+    cfg->hotkeys[SVC_HK_FONT_UP]       = SVC_HK_PACK(MOD_CA,  0xDE);      /* 16 Ctrl+Alt+'                   */
+    cfg->hotkeys[SVC_HK_FONT_DOWN]     = SVC_HK_PACK(MOD_CA,  0xBA);      /* 17 Ctrl+Alt+;                   */
+    cfg->hotkeys[SVC_HK_RESET]         = SVC_HK_PACK(MOD_CA,  'R');       /* 18 Ctrl+Alt+R                   */
+    cfg->hotkeys[SVC_HK_DEBUG_CAP]     = SVC_HK_PACK(MOD_CSA, 0x7B);      /* 19 Ctrl+Shift+Alt+F12           */
+    cfg->hotkeys[SVC_HK_KILL_ALL]      = SVC_HK_PACK(MOD_CSA, 'K');       /* 20 Ctrl+Shift+Alt+K             */
+    cfg->hotkeys[SVC_HK_SCROLL_UP]     = SVC_HK_PACK(MOD_C,   0xDB);      /* 21 Ctrl+[   Scroll Chat Up      */
+    cfg->hotkeys[SVC_HK_SCROLL_DOWN]   = SVC_HK_PACK(MOD_C,   0xDD);      /* 22 Ctrl+]   Scroll Chat Down    */
+    cfg->hotkeys[SVC_HK_NEW_CHAT]      = SVC_HK_PACK(MOD_C,   'N');       /* 23 Ctrl+N                       */
+    cfg->hotkeys[SVC_HK_CYCLE_TIER]    = SVC_HK_PACK(MOD_C,   'M');       /* 24 Ctrl+M   Cycle AI Model      */
+    cfg->hotkeys[SVC_HK_CYCLE_PROVIDER]= SVC_HK_PACK(MOD_CS,  'P');       /* 25 Ctrl+Shift+P                 */
+    cfg->hotkeys[SVC_HK_REGENERATE]    = SVC_HK_PACK(MOD_C,   0x0D);      /* 26 Ctrl+Enter  Send to AI       */
+    cfg->hotkeys[SVC_HK_STREAM_TOGGLE] = SVC_HK_PACK(MOD_CS,  'T');       /* 27 Ctrl+Shift+T                 */
+    cfg->hotkeys[SVC_HK_COPY_CODE]     = SVC_HK_PACK(MOD_C,   'K');       /* 28 Ctrl+K                       */
+    cfg->hotkeys[SVC_HK_COPY_ANSWER]   = SVC_HK_PACK(MOD_C,   'A');       /* 29 Ctrl+A                       */
+    cfg->hotkeys[SVC_HK_LATEX_TOGGLE]  = SVC_HK_PACK(MOD_CS,  'L');       /* 30 Ctrl+Shift+L                 */
+    cfg->hotkeys[SVC_HK_STOP_GEN]      = SVC_HK_PACK(MOD_CS,  'S');       /* 31 Ctrl+Shift+S  Settings       */
+    cfg->hotkeys[SVC_HK_DIRECT_TOGGLE] = SVC_HK_PACK(MOD_CS,  'D');       /* 32 Ctrl+Shift+D                 */
+    /* 33 SVC_HK_QUICK_ASK left UNBOUND — user opt-in via editor as
+     * MOUSE_HOLD LMB 2000ms for Bypassify-parity Quick-Send UX. */
 
     cfg->overlay_x = 40; cfg->overlay_y = 40;
     cfg->overlay_w = 560; cfg->overlay_h = 420;
