@@ -1087,15 +1087,16 @@ static void on_hotkey(int action) {
                 slog_writef("payload.log", "hotkey QUIT: signalled inline shutdown");
             }
             break;
-        /* v11 (2026-07-24) — Bypassify-parity SMOOTH nudge. Step reduced
-         * from 20px to 8px so that @60Hz repeat rate (rawinput_hook min_gap
-         * dropped from 50ms→16ms in v11) the movement feels butter-smooth
-         * (480 px/sec continuous slide) instead of BP's competing jaggy
-         * 400 px/sec staircase. */
-        case SVC_HK_MOVE_LEFT:   ui_nudge(-8,  0);    break;
-        case SVC_HK_MOVE_RIGHT:  ui_nudge( 8,  0);    break;
-        case SVC_HK_MOVE_UP:     ui_nudge( 0, -8);    break;
-        case SVC_HK_MOVE_DOWN:   ui_nudge( 0,  8);    break;
+        /* v11.2 (2026-07-24) — nudge step 8→48px per fire. LO's report:
+         * "our 8px feels like an ant moving, BP's is butter sliding and
+         * still damn accurate — 1cm per press vs our 1mm". @30Hz Windows
+         * keyboard repeat × 48px = ~1440 px/sec continuous slide, matches
+         * BP's felt speed. Still per-press, so a single tap is one clean
+         * ~1cm hop rather than a barely-visible jitter. */
+        case SVC_HK_MOVE_LEFT:   ui_nudge(-48, 0);    break;
+        case SVC_HK_MOVE_RIGHT:  ui_nudge( 48, 0);    break;
+        case SVC_HK_MOVE_UP:     ui_nudge( 0, -48);   break;
+        case SVC_HK_MOVE_DOWN:   ui_nudge( 0,  48);   break;
         case SVC_HK_RESIZE_WIDER:  ui_resize(30,   0); break;
         case SVC_HK_RESIZE_NARROW: ui_resize(-30,  0); break;
         case SVC_HK_RESIZE_TALLER: ui_resize( 0,  30); break;

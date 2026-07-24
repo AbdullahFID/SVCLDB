@@ -1366,9 +1366,12 @@ async function _initOverlayCard() {
     });
   }
   if (rngA) {
+    /* v11.2 (2026-07-24) — live preview + refresh chip actives so the
+     * preset chip auto-lights when the slider lands on 100/85/60/35. */
     rngA.addEventListener('input', () => {
       _ovaState.alpha = (+rngA.value) / 100;
       _ovaRenderValues(); _ovaRenderPreview(); _ovaRenderStatus();
+      _ovaRefreshChipsActive();
     });
   }
 

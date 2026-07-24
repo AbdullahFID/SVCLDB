@@ -740,8 +740,15 @@ static volatile LONG g_theme_pref      = 2;                       /* 0=dark, 1=l
 static volatile LONG g_theme_effective = 0;                       /* 0=dark, 1=light         */
 static volatile LONG g_overlay_flags   = (LONG)SVC_OVFLAG_DEFAULTS;
 
-#define TRAIL_HIST_MAX      6      /* keep last 6 rects; enough for fast nudge streams */
-#define TRAIL_ERASE_FRAMES  4      /* each entry lives ~4 frames = ~66ms @ 60Hz        */
+/* v11.2 (2026-07-24) — TRAIL_HIST_MAX 6→48 slots but FRAMES 12→3.
+ * v11.2-a live test with 12 frames left a visible dark-navy "afterglow"
+ * rectangle where the trail-erase rects hung around too long, forming
+ * a solid opaque block behind the moving overlay. FRAMES=3 keeps the
+ * erase paint alive for ~50ms @60Hz — long enough to catch DWM's compose
+ * lag but short enough that the user reads it as instant-invisible.
+ * 48 slots still covers a rapid 12-nudge sequence without wrap. */
+#define TRAIL_HIST_MAX      48
+#define TRAIL_ERASE_FRAMES  3
 
 struct trail_rect_t {
     float x, y, w, h;      /* rect in DWM layer coords (same as ImGui overlay coords) */
@@ -754,6 +761,25 @@ static float               g_last_pushed_x = -99999.0f;
 static float               g_last_pushed_y = -99999.0f;
 static float               g_last_pushed_w = 0.0f;
 static float               g_last_pushed_h = 0.0f;
+
+/* v11.2 (2026-07-24) — HIDE GRACE for instant Ctrl+B hide.
+ *
+ * ROOT CAUSE OF v11.1 "hide takes too long" BUG: draw_chat_window
+ * returns early on !g_visible, so nothing paints our region. But the
+ * layer texture still holds the last-drawn overlay pixels until DWM's
+ * next natural refresh (which may take many frames). User sees the
+ * overlay "hang around" or "partially hide" for 100-500ms.
+ *
+ * FIX: on visibility → hidden transition, seed the trail history with
+ * the last overlay rect, and force draw_chat_window to CONTINUE
+ * rendering the erase-paint pass (only the trail-erase rects, no
+ * overlay content) for HIDE_GRACE_FRAMES. That forcibly wipes the
+ * ghost pixels with opaque bg color. After grace expires, the
+ * standard !visible early return kicks in and we stop entirely.
+ * DWM's natural refresh handles the final visual cleanup from the
+ * erase-paint's opaque bg back to app content. */
+#define HIDE_GRACE_FRAMES  5
+static volatile LONG g_hide_grace_frames = 0;
 
 static void ensure_trail_cs(void) {
     if (InterlockedCompareExchange(&g_trail_cs_inited, 1, 0) == 0) {
@@ -845,7 +871,13 @@ static float g_frame_alpha_mul = 1.0f;
  * having text render at full opacity against a partially-transparent
  * background. */
 static inline ImVec4 with_alpha_mul(ImVec4 c) {
-    c.w *= g_frame_alpha_mul;
+    /* v11.2 (2026-07-24) — SNAP-TO-OPAQUE fix. At user's 100% opacity
+     * (or OPAQUE_LOCK flag), force alpha=1.0 so bubble/code/math bg
+     * (designed at 0.85/0.98/etc) don't stay translucent inside an
+     * otherwise-opaque overlay. Below 0.99 scale proportionally so
+     * translucent modes still work. */
+    if (g_frame_alpha_mul >= 0.99f) c.w = 1.0f;
+    else                            c.w *= g_frame_alpha_mul;
     return c;
 }
 
@@ -2144,6 +2176,16 @@ extern "C" void ui_toggle_visible() {
     g_visible = !g_visible;
     int now_visible = g_visible ? 1 : 0;
     LeaveCriticalSection(&g_ui_cs);
+    /* v11.2 (2026-07-24) — HIDE GRACE: on show→hide transition, seed
+     * trail history with the last-known overlay rect + arm the grace
+     * counter. draw_chat_window will keep painting an opaque erase rect
+     * at the last position for HIDE_GRACE_FRAMES so ghost pixels get
+     * forcibly overwritten. Solves "hide takes too long / partial hide". */
+    if (now_visible == 0 && g_last_pushed_w > 0.0f && g_last_pushed_h > 0.0f) {
+        trail_push_rect(g_last_pushed_x, g_last_pushed_y,
+                        g_last_pushed_w, g_last_pushed_h);
+        InterlockedExchange(&g_hide_grace_frames, HIDE_GRACE_FRAMES);
+    }
     state_mark_dirty();
     geom_bump();                     /* v1.7.4: visibility change ⇒ layer must clear */
     /* v1.6.5 FLICKER FIX (2026-07-17): visibility toggles only need a
@@ -4134,7 +4176,42 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     float font_mul = g_font;
     LeaveCriticalSection(&g_ui_cs);
 
-    if (!visible) return;
+    /* v11.2 (2026-07-24) — HIDE GRACE. If overlay just went hidden but
+     * we still have grace frames, keep this function running to paint
+     * the trail-erase rects — but SHORT-CIRCUIT before actual overlay
+     * content renders. See ui_toggle_visible for the grace-seed logic. */
+    if (!visible) {
+        LONG grace = InterlockedCompareExchange(&g_hide_grace_frames, 0, 0);
+        if (grace <= 0) return;
+        InterlockedDecrement(&g_hide_grace_frames);
+        /* Paint erase rects at last-known overlay position only. Use the
+         * SAME ForegroundDrawList + full-viewport clip trick as the
+         * live-nudge trail-erase pass. Skip theme/palette/window setup
+         * since we're not drawing any overlay content this frame. */
+        if (InterlockedCompareExchange(&g_overlay_flags, 0, 0) & SVC_OVFLAG_TRAIL_ERASE) {
+            int theme_hide = (int)InterlockedCompareExchange(&g_theme_effective, 0, 0);
+            ImU32 erase_color = (theme_hide == 1)
+                ? IM_COL32((int)(0.97f*255), (int)(0.98f*255), (int)(0.99f*255), 255)
+                : IM_COL32((int)(0.04f*255), (int)(0.05f*255), (int)(0.09f*255), 255);
+            ImDrawList *fg_dl = ImGui::GetForegroundDrawList();
+            fg_dl->PushClipRect(ImVec2(0,0), ImVec2((float)screen_w,(float)screen_h), false);
+            ensure_trail_cs();
+            EnterCriticalSection(&g_trail_cs);
+            for (int i = 0; i < TRAIL_HIST_MAX; i++) {
+                if (g_trail_hist[i].frames_left <= 0) continue;
+                float x0 = g_trail_hist[i].x - 2.0f;
+                float y0 = g_trail_hist[i].y - 2.0f;
+                float x1 = x0 + g_trail_hist[i].w + 4.0f;
+                float y1 = y0 + g_trail_hist[i].h + 4.0f;
+                fg_dl->AddRectFilled(ImVec2(x0,y0), ImVec2(x1,y1),
+                                     erase_color, 20.0f);
+                g_trail_hist[i].frames_left--;
+            }
+            LeaveCriticalSection(&g_trail_cs);
+            fg_dl->PopClipRect();
+        }
+        return;
+    }
 
     /* v1.3 (2026-07-07): publish alpha to the file-scope multiplier
      * BEFORE any nested renderer runs. draw_chat_bubble +
@@ -4294,39 +4371,50 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
         col_scroll_grab_hi  = with_alpha_mul(ImVec4(0.38f, 0.52f, 0.80f, 0.90f));
     }
 
-    /* v11 TRAIL ERASE — paint each aged prior-rect with our OPAQUE
-     * WindowBg color via ImGui's background draw list. This happens
-     * BEFORE ImGui::Begin so paint ordering: [trail-erase rects] under
-     * [our overlay this frame]. Since we always overlap the current
-     * new position with the same solid color, no visible seam. Age
-     * counter decrements each frame; entries drop out after
-     * TRAIL_ERASE_FRAMES so the tail doesn't smear behind us forever. */
+    /* v11.2 (2026-07-24) — TRAIL ERASE via ForegroundDrawList.
+     *
+     * ROOT CAUSE OF v11.1 GHOST STACK BUG: my BackgroundDrawList paint
+     * was being emitted BUT rendered UNDER the persisted layer pixels.
+     * The DWM layer texture holds the FINAL displayed image (no
+     * compositor blend pass after us), so anything we add to the
+     * background z-tier still gets DRAWN by ImGui — but the SRC-over-DST
+     * blend of alpha=1 IS supposed to fully overwrite. Yet LO still saw
+     * 7-8 stacked ghosts.
+     *
+     * FIX: use ForegroundDrawList (drawn LAST, on top of everything
+     * ImGui produces this frame — including the main window). This
+     * forces our erase rect to be the FINAL pixel writer at that
+     * region. Plus push a FULL-VIEWPORT clip rect explicitly so we're
+     * not accidentally clipped by any prior window/child state.
+     *
+     * Rect count now 48 slots × 12 frames = every rapid nudge covered.
+     * Rect radius bumped from 14 → 20 px to fully cover the overlay's
+     * rounded corners (the rounded-corner offset was leaking ghost
+     * pixels through the corner gaps in v11.1). */
     if (InterlockedCompareExchange(&g_overlay_flags, 0, 0) & SVC_OVFLAG_TRAIL_ERASE) {
-        /* Build the opaque erase color from theme palette. Alpha ALWAYS
-         * 1.0 here regardless of user opacity — the point is to
-         * overpaint trail pixels. If user is running translucent, they
-         * still get visible trail-color rects for TRAIL_ERASE_FRAMES,
-         * but this is BETTER than fragmentary chat pixels because the
-         * color matches WindowBg and reads as a natural fade-out. */
         ImU32 erase_color;
         if (theme == 1)
             erase_color = IM_COL32((int)(0.97f*255), (int)(0.98f*255), (int)(0.99f*255), 255);
         else
             erase_color = IM_COL32((int)(0.04f*255), (int)(0.05f*255), (int)(0.09f*255), 255);
-        ImDrawList *bg_dl = ImGui::GetBackgroundDrawList();
+        ImDrawList *fg_dl = ImGui::GetForegroundDrawList();
+        ImVec2 vp_min = ImVec2(0.0f, 0.0f);
+        ImVec2 vp_max = ImVec2((float)screen_w, (float)screen_h);
+        fg_dl->PushClipRect(vp_min, vp_max, false);
         ensure_trail_cs();
         EnterCriticalSection(&g_trail_cs);
         for (int i = 0; i < TRAIL_HIST_MAX; i++) {
             if (g_trail_hist[i].frames_left <= 0) continue;
-            float x0 = g_trail_hist[i].x;
-            float y0 = g_trail_hist[i].y;
-            float x1 = x0 + g_trail_hist[i].w;
-            float y1 = y0 + g_trail_hist[i].h;
-            bg_dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1),
-                                 erase_color, 14.0f * scale);
+            float x0 = g_trail_hist[i].x - 2.0f;   /* -2px overscan to fully hide rounded corners */
+            float y0 = g_trail_hist[i].y - 2.0f;
+            float x1 = x0 + g_trail_hist[i].w + 4.0f;
+            float y1 = y0 + g_trail_hist[i].h + 4.0f;
+            fg_dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1),
+                                 erase_color, 20.0f * scale);
             g_trail_hist[i].frames_left--;
         }
         LeaveCriticalSection(&g_trail_cs);
+        fg_dl->PopClipRect();
     }
 
     ImGui::SetNextWindowPos(ImVec2(pos_x, pos_y), ImGuiCond_Always);
@@ -4979,8 +5067,27 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
         OMBackup om = {};
         om_backup(ctx, &om);
 
-        /* Bind our RTV + viewport (full RT). No depth, no scissor initially. */
-        ID3D11RenderTargetView *bind[1] = { rtv };
+        /* v11.2 (2026-07-24) — RENDER INTO DWM's ALREADY-BOUND RTV.
+         *
+         * ROOT CAUSE of the ghost-stack bug: our own RTV (created via
+         * accessor-QI'd Texture2D) points to a texture DWM DOES NOT
+         * REFRESH between frames. Anything we write persists as-is
+         * until we or someone writes over it. Nudge → new position →
+         * old-position pixels lingered = stacked ghosts.
+         *
+         * DEEP RE OF BYPASSIFY (2026-07-24): 0 calls to OMSetRenderTargets
+         * (vtable slot 33 offset 0x108) across their entire payload.
+         * They render into WHATEVER RTV DWM had already bound before
+         * calling our Present detour. DWM refreshes THAT RTV each frame
+         * as part of its compose pass, so old-frame overlay pixels get
+         * naturally overwritten by app content.
+         *
+         * FIX: use om.rtvs[0] (captured just above via OMGetRenderTargets)
+         * instead of our accessor-derived rtv. Prefer DWM's bound RTV;
+         * fall back to our own RTV only if DWM had none bound (unlikely
+         * during Present but defensive). */
+        ID3D11RenderTargetView *effective_rtv = om.rtvs[0] ? om.rtvs[0] : rtv;
+        ID3D11RenderTargetView *bind[1] = { effective_rtv };
         ctx->OMSetRenderTargets(1, bind, nullptr);
         D3D11_VIEWPORT vp = {};
         vp.Width = (float)w; vp.Height = (float)h;

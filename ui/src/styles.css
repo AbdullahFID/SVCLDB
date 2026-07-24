@@ -2351,41 +2351,64 @@ html, body {
   font-weight: 500; text-transform: none; letter-spacing: 0;
   color: var(--fg3); font-size: 11px;
 }
+/* v11.2 (2026-07-24) — preview redesigned for LIVE opacity visibility.
+ * Mock desktop bg is now a BRIGHT colorful gradient + a repeating grid
+ * pattern so translucent overlay shows the bg CLEARLY through it. Box
+ * itself is SOLID dark navy so its opacity change is the ONLY visual
+ * variable — user's slider drag = instant proportional see-through effect. */
 #overlay-appearance-card .ova-preview {
   position: relative;
   width: 100%;
   aspect-ratio: 16 / 9;
   background:
-    linear-gradient(135deg, rgba(30, 58, 138, 0.15) 0%, rgba(6, 182, 212, 0.08) 100%),
-    #0b1120;
-  border: 1px solid rgba(6, 182, 212, 0.22);
+    /* colorful photo-y mock wallpaper — vivid so opacity is legible */
+    linear-gradient(135deg,
+      #f97316 0%,     /* orange */
+      #ec4899 30%,    /* pink */
+      #8b5cf6 55%,    /* violet */
+      #06b6d4 80%,    /* cyan */
+      #10b981 100%);  /* emerald */
+  border: 1px solid rgba(6, 182, 212, 0.35);
   border-radius: 10px;
   overflow: hidden;
-  box-shadow: inset 0 0 24px rgba(0,0,0,0.4);
+  box-shadow: inset 0 0 24px rgba(0,0,0,0.25);
+}
+/* Grid overlay on preview to further disambiguate "see-through" from "empty" */
+#overlay-appearance-card .ova-preview::after {
+  content: '';
+  position: absolute; inset: 0;
+  background-image:
+    linear-gradient(rgba(255,255,255,0.16) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.16) 1px, transparent 1px);
+  background-size: 22px 22px;
+  pointer-events: none;
 }
 /* Fake taskbar strip at bottom for realism */
 #overlay-appearance-card .ova-preview::before {
   content: '';
   position: absolute; left: 0; right: 0; bottom: 0;
   height: 6%;
-  background: rgba(255,255,255,0.06);
-  border-top: 1px solid rgba(255,255,255,0.08);
+  background: rgba(15, 23, 42, 0.55);
+  border-top: 1px solid rgba(255,255,255,0.10);
+  z-index: 2;
 }
 #overlay-appearance-card .ova-preview-box {
   position: absolute;
   top: 3%;
   right: 3%;
-  background:
-    linear-gradient(135deg, rgba(15, 23, 42, 0.92) 0%, rgba(6, 182, 212, 0.10) 100%),
-    rgba(15, 23, 42, 0.85);
-  border: 1.5px solid rgba(34, 211, 238, 0.55);
+  /* SOLID dark navy — no alpha in the base so JS-driven `style.opacity`
+   * is the ONLY thing changing visibility. Border stays crisp so slider
+   * feedback reads instantly. */
+  background: #0b1120;
+  border: 1.5px solid #22d3ee;
   border-radius: 6px;
   box-shadow:
     0 2px 12px rgba(6, 182, 212, 0.35),
-    inset 0 0 8px rgba(6, 182, 212, 0.10);
+    inset 0 0 8px rgba(6, 182, 212, 0.15);
   display: flex; align-items: center; justify-content: center;
   min-width: 6px; min-height: 6px;
-  transition: width 0.18s, height 0.18s, opacity 0.18s;
+  z-index: 3;
+  transition: width 0.10s, height 0.10s, opacity 0.10s;
 }
 #overlay-appearance-card .ova-preview-w {
   font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
