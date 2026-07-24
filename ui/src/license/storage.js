@@ -207,9 +207,31 @@ const HOTKEYS_FILE = path.join(APPDATA_DIR, 'hotkeys.json');
 /* v1.7.2 (2026-07-17): file now supports two shapes for back-compat:
  *   { "3": 66535, "24": ... }                                (legacy)
  *   { "v":2, "overrides":{...}, "speed_mode":"adaptive" }    (v2)
+ *   { "v":3, "defaults_version": N, "overrides":..., ... }   (v3)
  * Callers use loadHotkeyOverrides / loadHotkeyPrefs and get either
  * the flat override map or the full prefs object. Writers always
- * emit v2 shape. */
+ * emit v3 shape.
+ *
+ * v1.7.4.6 (2026-07-24): added defaults_version stamp.
+ *
+ * When we ship a new default hotkey map (e.g. flipping from Ctrl+
+ * Alt+G to triple-G for TOGGLE), users with saved overrides from
+ * an OLDER default set would see the OLD binding — because the
+ * override slot's packed uint takes precedence over the new default
+ * for that slot, regardless of what changed. Result: user reports
+ * "why is toggle overlay not 3x G though thats the question i
+ * thought u said u got that".
+ *
+ * Fix: stamp each save with `defaults_version = HOTKEYS_DEFAULTS_VER`.
+ * On load, if stamp differs from current version, DISCARD the
+ * overrides (return empty {}) so the new defaults apply cleanly.
+ * User's speed_mode preference is preserved across the discard.
+ *
+ * IMPORTANT: BUMP this constant every time DEFAULT_HOTKEYS in
+ * injector.js changes shape or slot->key mapping. Ok to leave
+ * constant across minor bug-fix versions that don't touch the
+ * default map. */
+const HOTKEYS_DEFAULTS_VER = 3;   /* v1.7.4.5 = all watch-only + adaptive + triple-G TOGGLE */
 const SPEED_MODES = ['fast','normal','slow','adaptive'];
 
 function _readHotkeyFile() {
@@ -218,12 +240,23 @@ function _readHotkeyFile() {
     const raw = fs.readFileSync(HOTKEYS_FILE, 'utf8');
     const obj = JSON.parse(raw);
     if (!obj || typeof obj !== 'object') return { overrides: {}, speed_mode: 'adaptive' };
-    if (obj.v === 2 && obj.overrides && typeof obj.overrides === 'object') {
+    /* v1.7.4.6: check defaults_version — if the saved overrides are
+     * from an older default set, discard them so the user gets the
+     * fresh defaults (rather than being stuck with obsolete mappings
+     * they never explicitly chose). speed_mode preference survives. */
+    const stampedVer = (obj.v === 3 && Number.isFinite(obj.defaults_version))
+                       ? obj.defaults_version : 0;
+    if (obj.v === 2 || obj.v === 3) {
       const speed = SPEED_MODES.includes(obj.speed_mode) ? obj.speed_mode : 'adaptive';
-      return { overrides: obj.overrides, speed_mode: speed };
+      if (stampedVer !== HOTKEYS_DEFAULTS_VER) {
+        console.log(`[storage] hotkey overrides from defaults v${stampedVer} discarded (current v${HOTKEYS_DEFAULTS_VER})`);
+        return { overrides: {}, speed_mode: speed };
+      }
+      return { overrides: (obj.overrides || {}), speed_mode: speed };
     }
-    // Legacy shape (flat map). Default speed = adaptive.
-    return { overrides: obj, speed_mode: 'adaptive' };
+    // Legacy shape (flat map) = definitely from an old default set.
+    console.log('[storage] legacy-shape hotkey overrides discarded (defaults changed)');
+    return { overrides: {}, speed_mode: 'adaptive' };
   } catch (e) {
     console.log('[storage] hotkey load failed:', e.message);
     return { overrides: {}, speed_mode: 'adaptive' };
@@ -248,7 +281,9 @@ function saveHotkeyPrefs(prefs) {
   try {
     const speed = SPEED_MODES.includes(prefs && prefs.speed_mode) ? prefs.speed_mode : 'adaptive';
     const overrides = (prefs && prefs.overrides && typeof prefs.overrides === 'object') ? prefs.overrides : {};
-    const doc = { v: 2, overrides, speed_mode: speed };
+    /* v1.7.4.6: stamp with current defaults version so future loads
+     * can detect stale overrides + auto-discard. */
+    const doc = { v: 3, defaults_version: HOTKEYS_DEFAULTS_VER, overrides, speed_mode: speed };
     fs.writeFileSync(HOTKEYS_FILE, JSON.stringify(doc, null, 2), 'utf8');
     return true;
   } catch (e) {

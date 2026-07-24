@@ -2125,9 +2125,32 @@ function _renderHotkeyEditor() {
     row.dataset.slot = String(slot);
     const btnLabel = packed ? formatHotkey(packed) : '(unbound)';
     const pencilSvg = `<svg class="hk-pencil" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>`;
+    /* v1.7.4.6 (2026-07-24): per-row watch/consume toggle for MULTITAP
+     * bindings. LO's ask: "there should be an OPTION to swallow fully vs
+     * watch only rn zero option is given at least by default make it
+     * watch only". Default IS watch-only, but users couldn't SEE the
+     * option without opening the recorder modal. This chip lets them
+     * flip it in place with a single click. Only rendered for MULTITAP
+     * kinds — modifier/longpress/mouse don't consume the way multitap
+     * does (they either fire on hold-release or on click, not on every
+     * key edge). */
+    let modeChipHtml = '';
+    if (packed) {
+      const u = unpackHotkey(packed);
+      if (u.kind === HK_KIND_MULTITAP) {
+        const isWatch = !!u.watch;
+        const chipCls = isWatch ? 'hk-mode-chip hk-mode-silent' : 'hk-mode-chip hk-mode-blocked';
+        const chipLabel = isWatch ? '✍ silent' : '⛔ blocks key';
+        const chipTitle = isWatch
+          ? 'Silent mode ON — the key still types normally. Click to switch to BLOCKED (reserves the key).'
+          : 'BLOCKED mode ON — the key is reserved and won\'t type anywhere. Click to switch to SILENT.';
+        modeChipHtml = `<button class="${chipCls}" title="${escapeHtml(chipTitle)}" data-slot-mode-toggle="${slot}">${chipLabel}</button>`;
+      }
+    }
     row.innerHTML = `
       <div class="hk-editor-label" title="${escapeHtml(label)}">${escapeHtml(label)}</div>
       <div class="hk-editor-reset-cell">
+        ${modeChipHtml}
         <button class="hk-editor-btn${!packed ? ' unbound' : ''}" title="Click the pencil to remap${conflicts.length ? ' — CONFLICT with slot ' + conflicts.join(', ') : ''}">
           <span class="hk-editor-btn-text">${escapeHtml(btnLabel)}</span>
           ${pencilSvg}
@@ -2150,6 +2173,30 @@ function _renderHotkeyEditor() {
       await window.svc.hotkeys.save(_hkState.overrides);
       _renderHotkeyEditor();
       toast(`Reset ${HK_LABELS[slot]} to default.`, 'ok');
+    });
+  }
+  /* v1.7.4.6: per-row silent/blocked toggle for MULTITAP bindings. */
+  for (const chip of root.querySelectorAll('[data-slot-mode-toggle]')) {
+    chip.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const slot = parseInt(chip.dataset.slotModeToggle, 10);
+      const current = _bindingFor(slot);
+      const u = unpackHotkey(current);
+      if (u.kind !== HK_KIND_MULTITAP) return;
+      /* Flip WATCH-ONLY bit + preserve ADAPTIVE. Re-pack. */
+      const newWatch = !u.watch;
+      const newPacked = packMultitap(u.vk, u.count, u.gap_ms, newWatch, u.adaptive);
+      _hkState.overrides[slot] = newPacked;
+      const save = await window.svc.hotkeys.save(_hkState.overrides);
+      _renderHotkeyEditor();
+      if (save && save.ok) {
+        toast(newWatch
+          ? `${HK_LABELS[slot]}: switched to SILENT — key still types. Inject Now to apply.`
+          : `${HK_LABELS[slot]}: switched to BLOCKED — key is reserved. Inject Now to apply.`,
+          'ok');
+      } else {
+        toast('Save failed.', 'err');
+      }
     });
   }
 }

@@ -258,18 +258,29 @@ static volatile LONG g_mt_head[256] = {0};
  * threshold (clamped to [180ms..1200ms]). Users who tap fast get a
  * tighter threshold, users who tap slower get a looser one — no
  * global setting to fiddle with. First 2 fires use the packed
- * baseline gap so learning has something to bootstrap from. */
+ * baseline gap so learning has something to bootstrap from.
+ *
+ * v1.7.4.6 (2026-07-24): semantic changed to per-adjacent-pair gap
+ * (see multitap_push_and_check comment). Adaptive now stores per-pair
+ * span too. New records divide the observed total span by (count-1)
+ * to get the mean pair gap this hit. Bootstrap widens dramatically:
+ * first 2 fires use `max(baseline, 900ms)` per pair — a very
+ * forgiving triple-tap window for new keys before learning kicks in.
+ * After 2+ successful fires we tighten to ~1.6× learned mean pair gap. */
 #define MT_LEARN_RING 6
-static volatile LONG g_mt_learn_span_ms[256][MT_LEARN_RING] = {{0}};
+#define MT_BOOTSTRAP_GAP_MS 900   /* per-pair floor during first 2 fires */
+static volatile LONG g_mt_learn_pair_ms[256][MT_LEARN_RING] = {{0}};
 static volatile LONG g_mt_learn_head[256] = {0};
 
 static unsigned adaptive_effective_gap(USHORT vk, unsigned baseline_gap) {
     if (vk >= 256) return baseline_gap;
     LONG head = g_mt_learn_head[vk];
-    if (head < 2) return baseline_gap;   /* not enough samples */
+    unsigned floor_gap = baseline_gap;
+    if (floor_gap < MT_BOOTSTRAP_GAP_MS) floor_gap = MT_BOOTSTRAP_GAP_MS;
+    if (head < 2) return floor_gap;   /* not enough samples — be generous */
     int n = head < MT_LEARN_RING ? (int)head : MT_LEARN_RING;
     LONG sum = 0;
-    for (int i = 0; i < n; i++) sum += g_mt_learn_span_ms[vk][i];
+    for (int i = 0; i < n; i++) sum += g_mt_learn_pair_ms[vk][i];
     LONG mean = sum / n;
     LONG gap = mean + (mean / 2) + (mean / 10);   /* ~1.6× mean */
     if (gap < 180)  gap = 180;
@@ -277,12 +288,16 @@ static unsigned adaptive_effective_gap(USHORT vk, unsigned baseline_gap) {
     return (unsigned)gap;
 }
 
-static void adaptive_record_fire(USHORT vk, LONG span_ms) {
+static void adaptive_record_fire(USHORT vk, LONG span_ms, unsigned count) {
     if (vk >= 256) return;
-    if (span_ms < 20)   span_ms = 20;
-    if (span_ms > 2000) span_ms = 2000;
+    /* Convert observed total span → mean per-pair gap. count=1 has no
+     * adjacent pairs (no rhythm to learn); count>=2 divides by (count-1). */
+    LONG pair_ms = span_ms;
+    if (count > 1) pair_ms = span_ms / (LONG)(count - 1);
+    if (pair_ms < 20)   pair_ms = 20;
+    if (pair_ms > 2000) pair_ms = 2000;
     LONG head = g_mt_learn_head[vk];
-    g_mt_learn_span_ms[vk][head % MT_LEARN_RING] = span_ms;
+    g_mt_learn_pair_ms[vk][head % MT_LEARN_RING] = pair_ms;
     g_mt_learn_head[vk] = head + 1;
 }
 
@@ -317,7 +332,24 @@ static int match_hk(unsigned hkcode, USHORT vk,
 /* v1.7.2: caller passes out_span_ms to capture the actual first-to-last
  * span when the pattern matches — used by adaptive learning to update
  * the per-vk rhythm ring. Pass NULL when not needed. Count of 1 is
- * treated as "fire on any tap" (span = 0). */
+ * treated as "fire on any tap" (span = 0).
+ *
+ * v1.7.4.6 (2026-07-24) — SEMANTIC FIX. Pre-v1.7.4.6 `gap_ms` was
+ * enforced against the TOTAL span from oldest→newest of N taps. That's
+ * wrong for human triple-tap: with count=3 gap=500, all 3 taps had to
+ * fit inside 500ms window. Typical human tap rhythm is 200–400ms/tap →
+ * total span 500–1200ms. So triple-tap almost never fired unless user
+ * tapped RAPIDLY. LO's payload log (2026-07-24) confirms: 8+ triple-G
+ * attempts detected as EDGE events but ZERO MT-eval matches on vk=0x47.
+ *
+ * v1.7.4.6 fix: `gap_ms` is now the MAX GAP BETWEEN ADJACENT TAPS.
+ * All (count-1) intervals in the ring must each be ≤ gap_ms. Total
+ * span allowed is naturally gap_ms × (count-1). For triple-tap with
+ * gap=500ms this means each pair of taps must be ≤500ms apart, total
+ * up to 1000ms — matches natural human triple-tap rhythm cleanly.
+ *
+ * out_span_ms still reports the total first-to-last span so ADAPTIVE
+ * learning can converge to the user's true rhythm. */
 static int multitap_push_and_check(USHORT vk, unsigned count, unsigned gap_ms,
                                    LONG *out_span_ms) {
     if (vk >= 256 || count == 0 || count > MULTITAP_RING_MAX) return 0;
@@ -338,18 +370,29 @@ static int multitap_push_and_check(USHORT vk, unsigned count, unsigned gap_ms,
         return 1;
     }
 
-    /* Look back `count` entries. Newest is (head), oldest is (head - count + 1).
-     * All must have positive timestamps AND the span (newest - oldest) ≤ gap_ms. */
+    /* Look back `count` entries. Every adjacent pair must be ≤ gap_ms
+     * apart. Any pair that exceeds → no match. */
     if ((LONG)(head + 1) < (LONG)count) return 0;   /* not enough taps yet */
+    LONG oldest_idx_off = (LONG)count - 1;   /* how far back from newest */
+    LONG prev_ts = 0;
+    for (LONG i = oldest_idx_off; i >= 0; i--) {
+        LONG idx = (head - i) % MULTITAP_RING_MAX;
+        LONG ts = g_mt_ring[vk][idx];
+        if (ts == 0) return 0;   /* ring slot empty → not enough valid taps */
+        if (prev_ts != 0) {
+            LONG delta = ts - prev_ts;
+            if (delta < 0) delta = -delta;
+            if ((DWORD)delta > gap_ms) return 0;   /* this pair too slow */
+        }
+        prev_ts = ts;
+    }
+    /* All adjacent gaps ≤ gap_ms — pattern matched. Compute total span
+     * for adaptive learning + logging. */
     LONG newest = now;
     LONG oldest_idx = (head + 1 - (LONG)count) % MULTITAP_RING_MAX;
     LONG oldest = g_mt_ring[vk][oldest_idx];
-    if (oldest == 0) return 0;
-    LONG span = newest - oldest;
-    if ((DWORD)span > gap_ms) return 0;
-    if (out_span_ms) *out_span_ms = span;
-    /* Pattern matched — invalidate the ring so we don't re-fire on
-     * every subsequent tap. */
+    if (out_span_ms) *out_span_ms = newest - oldest;
+    /* Invalidate the ring so we don't re-fire on every subsequent tap. */
     for (int i = 0; i < MULTITAP_RING_MAX; i++) g_mt_ring[vk][i] = 0;
     g_mt_head[vk] = 0;
     return 1;
@@ -1067,7 +1110,7 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
                 LONG span_ms = 0;
                 int matched = multitap_push_and_check((USHORT)vk, count, eff_gap, &span_ms);
                 if (matched && SVC_HK_ADAPTIVE(g_hk[i])) {
-                    adaptive_record_fire((USHORT)vk, span_ms);
+                    adaptive_record_fire((USHORT)vk, span_ms, count);
                 }
                 /* Trace first 30 MT evaluations for debug. */
                 static volatile LONG s_mt_traced = 0;

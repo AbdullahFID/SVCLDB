@@ -151,17 +151,44 @@ static pfnRenderContent_t   g_orig_rc_visual  = NULL;   /* CVisual::RenderConten
  * the same compose cycle — sometimes SIGNIFICANTLY after) checks if the
  * timestamp is within CAPTURE_LATCH_MS and skips draw if so.
  *
- * CAPTURE_LATCH_MS = 15ms — narrow enough that a missed screen frame
- * is imperceptible (~1 frame at 60fps) but wide enough to cover the
- * gap between RC's decrement and Present's fire during a real capture
- * cycle. Combined with the live counter check (g_in_capture_render > 0)
- * we get most captures via zero-latency detection + this handles the
- * gap where RC returned but Present is still coming. */
-#define CAPTURE_LATCH_MS 15
+ * v1.7.4.6 (2026-07-24): CAPTURE_LATCH_MS was 15ms. LO's decrypted
+ * payload log showed 500+ RC[Window] "capture" events in a 1.5s
+ * burst = 333/sec on a machine with NOTHING actively capturing.
+ * That means our `[pDrawCtx+0x30] == NULL` heuristic false-positives
+ * on newer Windows 11 builds (26100.8115) for legitimate screen
+ * render paths (window minimize animations, taskbar thumbnails,
+ * task view previews, alt-tab peek, etc). With a 15ms latch, ONE
+ * false-positive kept the overlay hidden for 15ms; a burst of them
+ * kept overlay PERMANENTLY hidden → "overlay hides/shows on mouse
+ * move" flicker LO reported.
+ *
+ * FIX (LATCH REMOVED): rely entirely on the live counter g_in_capture_render.
+ * The RC detour increments before orig, decrements after orig, so any
+ * Present that fires DURING an RC call correctly sees > 0. Any Present
+ * firing AFTER the RC decremented (even 100µs later) sees 0 → overlay
+ * draws. The 15ms latch was covering an edge case (Present fires ~ms
+ * after RC returns) that basically never happens with the SEH-wrapped
+ * increment/decrement pair — and the false-positive damage from a
+ * 300-events/sec burst FAR outweighed the correctness gain.
+ *
+ * Additionally: added `svcldb_capture_seen_screen[]` whitelist. Any
+ * pDrawCtx we've EVER observed with non-NULL +0x30 (proving it's a
+ * real screen-render context) is remembered. False-positive checks
+ * against a whitelisted pDrawCtx are ignored — legitimate screen
+ * pixels flow. Only NEW (never-seen-as-screen) contexts with
+ * NULL +0x30 count as capture. This preserves LDB Monitor stealth
+ * (its capture pDrawCtx is genuinely never a screen context) while
+ * ignoring DWM's internal-render false positives. */
+#define CAPTURE_LATCH_MS 0
+#define CAPTURE_CTX_WHITELIST_SIZE 32   /* small ring; DWM has few active pDrawCtx per moment */
 static volatile LONG      g_in_capture_render     = 0;    /* live counter */
-static volatile ULONGLONG g_capture_seen_tick     = 0;    /* GetTickCount64() */
+static volatile ULONGLONG g_capture_seen_tick     = 0;    /* GetTickCount64(), legacy latch */
 static volatile LONG      g_capture_render_hits   = 0;
 static volatile LONG      g_present_skips_capture = 0;
+static volatile LONG      g_capture_false_positives = 0;
+/* Whitelist ring of pDrawCtx pointers we've observed as screen contexts. */
+static volatile ULONG_PTR g_ctx_whitelist[CAPTURE_CTX_WHITELIST_SIZE] = {0};
+static volatile LONG      g_ctx_whitelist_head    = 0;
 
 /* Hook target registry — cached in hooks_install so the integrity
  * monitor can verify each hook is still armed. Max 16 (we currently
@@ -682,12 +709,59 @@ static LONG __fastcall Detour_LegacyPresent(void *pThis) {
  * render target. For CAPTURE render passes (e.g., LDB Monitor snapshot),
  * this pointer is NULL because the capture uses a private off-screen
  * target. For NORMAL screen composition, this pointer references the
- * primary display's render target. */
+ * primary display's render target.
+ *
+ * v1.7.4.6 (2026-07-24) — WHITELIST-AWARE. The +0x30 check
+ * false-positives on Windows 11 26100.8115+ for internal-only render
+ * paths (window minimize animations, taskbar thumbnails, task-view
+ * previews, alt-tab peek). Fix: any pDrawCtx we've EVER observed with
+ * non-NULL +0x30 (a real screen render) gets remembered in a small
+ * ring. Subsequent NULL +0x30 observations for a whitelisted pDrawCtx
+ * are treated as noise (real captures use ephemeral pDrawCtx pointers
+ * that never appear as screen contexts).
+ *
+ * whitelist_pDrawCtx(): add pDrawCtx to the ring (called every time
+ * we see it with non-NULL +0x30).
+ * is_pDrawCtx_whitelisted(): O(N=32) linear scan. */
+static void svcldb_whitelist_ctx(void *pDrawCtx) {
+    if (!pDrawCtx) return;
+    ULONG_PTR key = (ULONG_PTR)pDrawCtx;
+    /* Check if already present first (avoid churning the ring). */
+    for (int i = 0; i < CAPTURE_CTX_WHITELIST_SIZE; i++) {
+        if (g_ctx_whitelist[i] == key) return;
+    }
+    LONG h = InterlockedIncrement(&g_ctx_whitelist_head) - 1;
+    g_ctx_whitelist[h % CAPTURE_CTX_WHITELIST_SIZE] = key;
+}
+
+static BOOL svcldb_ctx_is_whitelisted(void *pDrawCtx) {
+    if (!pDrawCtx) return FALSE;
+    ULONG_PTR key = (ULONG_PTR)pDrawCtx;
+    for (int i = 0; i < CAPTURE_CTX_WHITELIST_SIZE; i++) {
+        if (g_ctx_whitelist[i] == key) return TRUE;
+    }
+    return FALSE;
+}
+
+/* Returns 1 if this is a genuine capture render, 0 if screen render or
+ * suspected false-positive. Also updates the whitelist on non-NULL +0x30. */
 static BOOL svcldb_is_capture_render(void *pDrawCtx) {
     if (!pDrawCtx) return FALSE;
     __try {
         void *screen_rt = *(void **)((BYTE *)pDrawCtx + DRAWCTX_CAPTURE_FLAG_OFFSET);
-        return (screen_rt == NULL) ? TRUE : FALSE;
+        if (screen_rt != NULL) {
+            /* Legit screen render — memoize this pDrawCtx as trusted. */
+            svcldb_whitelist_ctx(pDrawCtx);
+            return FALSE;
+        }
+        /* +0x30 is NULL. Could be capture OR could be a false-positive
+         * from a DWM internal-only render on a pDrawCtx we've seen
+         * doing legit screen work before. */
+        if (svcldb_ctx_is_whitelisted(pDrawCtx)) {
+            InterlockedIncrement(&g_capture_false_positives);
+            return FALSE;   /* known-good context, don't skip Present */
+        }
+        return TRUE;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return FALSE;
     }
@@ -716,9 +790,10 @@ static LONG __fastcall Detour_CWindowNode_RenderContent(
                                   (LONG64)GetTickCount64());
             captured_this_call = 1;
             LONG n = InterlockedIncrement(&g_capture_render_hits);
+            LONG fp = g_capture_false_positives;
             if (n <= 5 || n % 500 == 0) {
-                hook_diag("RC[Window]: capture render #%ld pThis=%p tick=%llu",
-                          n, pThis, (unsigned long long)g_capture_seen_tick);
+                hook_diag("RC[Window]: capture render #%ld pThis=%p (false-positives filtered=%ld)",
+                          n, pThis, fp);
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { }
@@ -773,10 +848,15 @@ static LONG __fastcall Detour_CVisual_RenderContent(
     return ret;
 }
 
-/* svcldb_capture_active — check if we're within the latch window.
- * Called from Present detour. */
+/* svcldb_capture_active — check if we're within a capture render call.
+ * Called from Present detour. v1.7.4.6: latch fully removed; relies
+ * only on the live counter g_in_capture_render (RC detour's SEH-wrapped
+ * increment/decrement guarantees any Present firing DURING an orig RC
+ * call sees > 0). CAPTURE_LATCH_MS constant kept at 0 for the
+ * belt-and-suspenders tick check (compiles out at 0 gap). */
 static BOOL svcldb_capture_active(void) {
     if (g_in_capture_render > 0) return TRUE;
+    if (CAPTURE_LATCH_MS == 0) return FALSE;
     ULONGLONG now = GetTickCount64();
     ULONGLONG last = (ULONGLONG)g_capture_seen_tick;
     if (last == 0) return FALSE;

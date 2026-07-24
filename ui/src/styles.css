@@ -1462,6 +1462,40 @@ html, body {
   background: rgba(239,68,68,0.1);
 }
 
+/* v1.7.4.6 (2026-07-24): per-row silent/blocked toggle chip for
+ * MULTITAP bindings. Sits next to the binding label so users see the
+ * mode at a glance + can flip in place without opening the recorder. */
+.hk-mode-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 4px 10px; border-radius: 999px;
+  border: 1px solid transparent; cursor: pointer;
+  font-size: 11.5px; font-weight: 600; line-height: 1;
+  transition: transform 0.12s, box-shadow 0.12s, background 0.15s, color 0.15s, border-color 0.15s;
+  user-select: none; white-space: nowrap;
+}
+.hk-mode-chip:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 3px 10px rgba(0,0,0,0.28);
+}
+.hk-mode-silent {
+  background: rgba(34, 197, 94, 0.14);
+  color: #86efac;
+  border-color: rgba(34, 197, 94, 0.38);
+}
+.hk-mode-silent:hover {
+  background: rgba(34, 197, 94, 0.22);
+  color: #bbf7d0;
+}
+.hk-mode-blocked {
+  background: rgba(239, 68, 68, 0.14);
+  color: #fca5a5;
+  border-color: rgba(239, 68, 68, 0.38);
+}
+.hk-mode-blocked:hover {
+  background: rgba(239, 68, 68, 0.22);
+  color: #fecaca;
+}
+
 /* Hotkey record modal (opens when user clicks a hotkey binding) */
 #hk-record-modal-root .modal-shade {
   position: fixed; inset: 0;
