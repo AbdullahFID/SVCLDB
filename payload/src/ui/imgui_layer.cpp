@@ -5095,6 +5095,29 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
         tex->GetDevice(&dev);
         if (!dev) { tex->Release(); return; }
 
+        /* v1.7.10.4 (2026-07-24) — GPU TDR / DEVICE-REMOVED CHECK.
+         * BP-parity resilience — see bp_decomp2.c FUN_180008ac0 line 34:
+         * `iVar1 = pDevice->slot 0x138()` where slot 0x138 (=39) is
+         * ID3D11Device::GetDeviceRemovedReason. If non-zero, GPU driver
+         * has crashed / TDR event fired / fullscreen game reset the
+         * device — any further D3D calls will return E_INVALIDARG or
+         * DXGI_ERROR_DEVICE_REMOVED and may destabilize DWM. Skip the
+         * render entirely for this frame; DWM will re-create its device
+         * naturally on the next compose cycle and we'll pick up the new
+         * one via g_last_device change detection in get_or_create_rtv. */
+        HRESULT dev_state = dev->GetDeviceRemovedReason();
+        if (dev_state != S_OK) {
+            static volatile LONG s_first_removed = 0;
+            if (InterlockedCompareExchange(&s_first_removed, 1, 0) == 0) {
+                diag("GPU DEVICE REMOVED hr=0x%08lx — skipping render, "
+                     "will pick up new device on next cycle "
+                     "(BP-parity resilience)", dev_state);
+            }
+            dev->Release();
+            tex->Release();
+            return;
+        }
+
         UINT w = 0, h = 0;
         DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
         ID3D11RenderTargetView *rtv = get_or_create_rtv(dev, tex, &w, &h, &fmt);
