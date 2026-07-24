@@ -754,23 +754,26 @@ static volatile ULONGLONG g_capture_bucket_start  = 0;
 /* Forward decl — ldb_detect exports this. */
 extern int ldb_detect_active(void);
 
-/* Returns 1 if this is a genuine capture render, 0 if screen render or
- * suspected false-positive. Also updates the whitelist on non-NULL +0x30.
+/* v1.7.4.12 (2026-07-24) — CAPTURE DETECTION FULLY DISABLED.
  *
- * v1.7.4.7 (2026-07-24) — CAPTURE STEALTH IS NOW LDB-GATED.
- * When LockDownBrowser.exe / LockDownBrowserOEM.exe is NOT running,
- * capture-render detection is DISABLED entirely — the overlay always
- * renders regardless of any +0x30 heuristic. Rationale: false-positive
- * "capture" events from Windows visual effects (aero peek, thumbnails,
- * mouse-click ripples, minimize animations) were making the overlay
- * flicker on/off during normal use. Real threat is LDB Monitor's
- * captures during exams; if LDB isn't running we're not in an exam
- * so there's nothing to hide from. When LDB starts, ldb_detect's arm
- * callback triggers and this function goes back to full stealth mode.
+ * Bypassify has NO RC[Window]/RC[Visual] hooks and NO capture-active
+ * flag. Their overlay pixels appear in captures. They accept that
+ * trade-off because LDB v2.1.5 whitelists dwm.exe entirely (per our
+ * own audit doc) so LDB never scans DWM's memory or DWM's compose
+ * output for suspicious content. Same is true for us.
  *
- * Cost: LDB users get stealth. Non-LDB users get zero flicker. Both
- * populations are perfectly served. */
+ * Our capture detection was ADDING flicker: every RC[Window] fire
+ * caused a Present-skip decision path with latching + whitelist +
+ * rate-limit logic. Even with the LDB gate short-circuit (v1.7.4.7)
+ * the counter/hook overhead is unnecessary compositor pressure.
+ *
+ * ALWAYS return FALSE. If a future user genuinely needs capture
+ * stealth (e.g., proctor tool that DOES scan DWM), we can re-enable
+ * behind a config flag. */
 static BOOL svcldb_is_capture_render(void *pDrawCtx) {
+    (void)pDrawCtx;
+    return FALSE;
+    /* --- dead code below (kept so ldb_detect_active etc. still link) --- */
     if (!pDrawCtx) return FALSE;
     if (!ldb_detect_active()) return FALSE;   /* v1.7.4.7 LDB-gated */
     __try {
@@ -1380,50 +1383,19 @@ void hooks_uninstall(void) {
     hook_diag("hooks_uninstall: DONE");
 }
 
-void hooks_bump_wake(int frames) {
-    if (frames <= 0) return;
-    if (frames > 600) frames = 600;   /* cap ~10s @ 60Hz — sanity */
-    /* Set to max(current, frames) — never decrease. */
-    LONG cur;
-    do {
-        cur = g_wake_frames;
-        if (cur >= frames) return;
-    } while (InterlockedCompareExchange(&g_wake_frames, frames, cur) != cur);
-}
-
-void hooks_force_wake(void) {
-    /* Bump wake counter first so subsequent frames stay TRUE. */
-    hooks_bump_wake(6);
-
-    /* Direct-fire the DWM compositor by calling the ORIGINAL
-     * PresentNeeded with the captured pThis. This is the EXACT trick
-     * from hooksdll/dwm/dwm_payload.c::ForceCompositionPass (line
-     * 1478-1489, production for 800+ users with zero crashes) — the
-     * orig PresentNeeded is dwmcore-internal machinery that, when
-     * called, schedules a composition pass immediately. Safe to call
-     * from arbitrary threads (hooksdll calls it from a background
-     * poll thread). */
-    __try {
-        if (g_display_rt && g_orig_pn1)
-            g_orig_pn1((void *)g_display_rt);
-    } __except (EXCEPTION_EXECUTE_HANDLER) { }
-    __try {
-        if (g_legacy_rt && g_orig_pn2)
-            g_orig_pn2((void *)g_legacy_rt);
-    } __except (EXCEPTION_EXECUTE_HANDLER) { }
-
-    /* NOTE: NOT calling g_force_full_dirty() here. Production hooksdll
-     * (dwm_payload.c line 4346-4349) RESOLVES this pointer but NEVER
-     * calls it — deliberately. Empirically confirmed 2026-07-05: calling
-     * CCommonRegistryData::ForceFullDirtyRendering() from an arbitrary
-     * thread causes DWM to crash (auto-respawn takes down the overlay).
-     * The name is misleading: it's a MEMBER function that needs a valid
-     * `this` pointer OR relies on TLS state from a DWM-internal thread.
-     * We keep the resolved pointer for future experimentation but
-     * currently rely on the "return TRUE from PN" + "call orig PN" trick
-     * alone — which is what Bypassify uses too. */
-    (void)g_force_full_dirty;
-}
+/* v1.7.4.12 (2026-07-24) — WAKE APIs NEUTERED.
+ *
+ * Bypassify has ZERO code calling anything like hooks_bump_wake,
+ * hooks_force_wake, hooks_burst_wake. Their PN detour returns TRUE
+ * every time DWM asks → DWM composes every vsync → their draw fires
+ * on Present with fresh state. No external nudges needed.
+ *
+ * Our wake APIs were belt-and-suspenders from the era when we
+ * didn't fully understand PN=TRUE. They've caused every flicker
+ * report since. Kept as no-ops so callers don't need to be edited
+ * out one-by-one — they just do nothing. */
+void hooks_bump_wake(int frames) { (void)frames; }
+void hooks_force_wake(void)      { }
 
 /* ── Anti-idle keep-alive thread ──
  *
@@ -1560,29 +1532,24 @@ static DWORD WINAPI keepalive_thread(LPVOID param) {
                       cur_visible ? "visible" : "hidden");
         }
 
-        /* v1.7.4.5 (2026-07-24) — throttled keepalive SCP.
+        /* v1.7.4.12 (2026-07-24) — SCP KILLED.
          *
-         * Pre-fix: SCP fired at 20Hz (every 50ms). Combined with our
-         * per-hotkey burst_wake pumps + DWM's own compose ticks for
-         * cursor tracking on mouse move + high-refresh monitors,
-         * total compositor pressure caused DWM's device-state churn
-         * (visible as "screen flickering black" on mouse move).
+         * Bypassify has NO independent SCP-firing thread. They rely
+         * PURELY on PN=TRUE in the PresentNeeded detour to keep DWM
+         * composing every vsync. Our keepalive SCP was ADDITIONAL
+         * compose pressure on top of PN=TRUE + DWM's own compose
+         * ticks. On high-refresh monitors this piled up into flicker.
          *
-         * Post-fix: SCP fires at 4Hz (every 250ms). PN=TRUE in the
-         * Present detour ALREADY forces DWM to compose every native
-         * vsync when it does compose — the anti-idle SCP is only
-         * needed as belt-and-suspenders for when DWM would otherwise
-         * be fully idle (~0 frames/sec). 4Hz is plenty. */
-        if (cur_visible) {
-            __try {
-                if (g_schedule_composition) g_schedule_composition(0, -1);
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                hook_diag("keepalive: exception in SCP — thread exiting");
-                break;
-            }
-        }
+         * Zero SCP calls from keepalive_thread now. Thread only
+         * remains to keep the WinEvent hook message pump running
+         * for ghost visibility sync (which is off-by-default in
+         * v1.7.4.12, so the thread mostly no-ops).
+         *
+         * If DWM ever truly idles with our hook armed, the PN detour
+         * fires TRUE on next PN call → DWM composes → we draw. No
+         * external SCP needed. */
 
-        Sleep(cur_visible ? 250 : 400);   /* 4 Hz visible, 2.5 Hz hidden */
+        Sleep(cur_visible ? 500 : 1000);   /* very-low-freq idle */
     }
 
     if (fg_hook) UnhookWinEvent(fg_hook);
@@ -1615,6 +1582,11 @@ static DWORD WINAPI burst_wake_thread(LPVOID param) {
 }
 
 void hooks_burst_wake(int frames_per_pump, int duration_ms, int interval_ms) {
+    /* v1.7.4.12: NO-OP. See hooks_bump_wake comment.
+     * PN=TRUE alone drives DWM compose every vsync — no burst needed. */
+    (void)frames_per_pump; (void)duration_ms; (void)interval_ms;
+    return;
+    /* --- dead code below preserved so callers still link cleanly --- */
     if (!g_active || g_shutdown_flag) return;
     if (duration_ms <= 0 || duration_ms > 5000) duration_ms = 300;
     if (interval_ms <= 0 || interval_ms > 500)  interval_ms = 16;
@@ -1871,42 +1843,26 @@ static int ghost_is_enabled(void) {
         char buf[8];
         DWORD n = GetEnvironmentVariableA("DWM_EXT_GHOST",
                                           buf, sizeof(buf));
-        /* v1.7.4.8 (2026-07-24) — FLIPPED BACK to DEFAULT-ON.
+        /* v1.7.4.12 (2026-07-24) — GHOST OFF by default, again.
          *
-         * v1.7.4.4 turned this OFF because a bursty compose pattern on
-         * some GPUs caused "screen flickering black". Since then:
+         * v1.7.4.8 flipped ghost ON to fix z-order (overlay dropping
+         * behind DirectComposition apps). BUT: v1.7.4.11 fixed the
+         * REAL cause of that bug — IsOverlayPrevented was patched to
+         * return FALSE instead of TRUE. With IsOverlayPrevented=TRUE
+         * we're in software compositor path and our pixels are
+         * naturally on top. Ghost is no longer needed for z-order.
          *
-         *   - hooks_ghost_wake got 10Hz throttle (v1.6.5)
-         *   - RedrawWindow scoped, not fullscreen invalidate (v1.6.5)
-         *   - SetWindowPos uses SWP_NOMOVE|SWP_NOSIZE (z-order only,
-         *     no pixel invalidation) (v1.6.5)
-         *   - keepalive SCP throttled 20Hz→4Hz (v1.7.4.5)
-         *   - Ghost is HIDDEN when overlay hidden (v6.3), so during
-         *     the "chrome/cursor DComp direct-flip" fast-path there's
-         *     no ghost blocking that path
-         *   - Capture-render whitelist + LDB gate (v1.7.4.6/7) removed
-         *     the false-positive capture-active bursts that were the
-         *     actual root cause of most flicker LO complained about
-         *
-         * ALL of the mitigations that killed the v1.7.4.4 flicker are
-         * in place. Ghost's z-order-anchor role is critical to fix
-         * the "terminal moved on top of overlay → overlay disappears"
-         * bug LO reported 2026-07-24. Without a real HWND holding
-         * WS_EX_TOPMOST, our pixels-in-DWM-layer approach gets
-         * outranked by any app's higher-plane swap chain.
-         *
-         * When overlay hidden: ghost is SW_HIDE via keepalive thread
-         * → zero z-order impact, zero flicker risk.
-         * When overlay visible: ghost is SW_SHOWNA + TOPMOST → pulls
-         * our overlay pixels above other app planes → overlay stays
-         * above terminal / any other app the user moves on top.
-         *
-         * Opt-OUT via DWM_EXT_GHOST=0 for the max-stealth crowd who
-         * accept z-order fragility for one fewer enumerable HWND. */
-        if (n > 0 && (buf[0] == '0' || buf[0] == 'n' || buf[0] == 'N' || buf[0] == 'f' || buf[0] == 'F')) {
-            g_ghost_enabled = 0;
-        } else {
+         * Bypassify has NO ghost window and their overlay stays
+         * above everything with zero flicker. Our ghost was CAUSING
+         * flicker (fullscreen layered TOPMOST HWND periodic re-
+         * invalidations, ShowWindow races, WinEvent callback z-order
+         * fights). Matching BP: ghost is opt-in via DWM_EXT_GHOST=1
+         * for the rare user who needs the extra wake reliability. */
+        /* Default OFF (v1.7.4.12 revert). Opt-IN via DWM_EXT_GHOST=1. */
+        if (n > 0 && (buf[0] == '1' || buf[0] == 't' || buf[0] == 'T' || buf[0] == 'y' || buf[0] == 'Y')) {
             g_ghost_enabled = 1;
+        } else {
+            g_ghost_enabled = 0;
         }
     }
     return g_ghost_enabled;
