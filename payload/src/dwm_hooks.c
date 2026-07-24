@@ -405,6 +405,20 @@ static BYTE  g_iop_saved_bytes[6] = {0};
 static void *g_iop_patch_addr     = NULL;
 static BOOL  g_iop_patched        = FALSE;
 
+/* v1.7.4.14 (2026-07-24) — ForceFullDirtyRendering-adjacent byte-patch
+ * to force dwmcore into "always full-dirty compose" mode. BP does
+ * this at init (per docs/BYPASSIFY_v1.3_DWM_RE_DEEP.md OffsetTable
+ * slot [11] = 0x3fd7b9 = ForceFullDirtyRendering RVA - 0x60).
+ *
+ * Without this patch, DWM's compositor uses dirty-region tracking:
+ * only re-renders regions that changed. When our overlay moves via
+ * nudge, DWM DOESN'T re-render the old-position region → old
+ * overlay pixels linger in the layer texture → user sees a trailing
+ * "shadow" of the overlay along the movement path. */
+static BYTE  g_ffd_saved_byte     = 0;
+static void *g_ffd_patch_addr     = NULL;
+static BOOL  g_ffd_patched        = FALSE;
+
 /* Present-depth reentrancy guard — DWM sometimes re-enters Present
  * indirectly. Process-global counter (NOT __declspec(thread) — TLS is
  * broken under manual map). Worst case one dropped frame, no crash. */
@@ -1022,12 +1036,45 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
 
     /* ── 4. ForceFullDirtyRendering — RESOLVE ONLY (DO NOT CALL) ──
      * Confirmed 2026-07-05: calling this from any thread crashes DWM.
-     * Kept resolved for future experimentation only. */
+     * Kept resolved for future experimentation only.
+     *
+     * v1.7.4.14 (2026-07-24) — BUT patch the STATIC BYTE 0x60 before
+     * it. Per BP RE (docs/BYPASSIFY_v1.3_DWM_RE_DEEP.md) they patch
+     * a byte at RVA 0x3fd7b9 to 1 at init, which is ForceFullDirty
+     * RVA (0x3fd819) minus 0x60. This byte is a static bool that
+     * dwmcore reads inside its compose logic — when 1, dwmcore takes
+     * "always full-dirty" render paths → every compose re-renders
+     * the whole layer texture → old-position overlay pixels get
+     * overwritten by natural compose → NO TRAILING/SHADOW BUG. */
     if (off->forceFullDirty) {
         g_force_full_dirty = (pfnForceFullDirty_t)
             ((BYTE *)dwmcore + off->forceFullDirty);
         slog_writef("payload.log", "ForceFullDirty resolved @ %p (NOT CALLED — unsafe)",
                     (void *)g_force_full_dirty);
+
+        /* Full-dirty flag byte patch (BP slot [11]). Byte lives 0x60
+         * before the ForceFullDirtyRendering function itself. */
+        BYTE *ffd_flag = (BYTE *)dwmcore + off->forceFullDirty - 0x60;
+        DWORD old_prot = 0;
+        if (VirtualProtect(ffd_flag, 1, PAGE_EXECUTE_READWRITE, &old_prot)) {
+            g_ffd_saved_byte = ffd_flag[0];
+            g_ffd_patch_addr = ffd_flag;
+            ffd_flag[0]      = 1;    /* enable always-full-dirty mode */
+            DWORD tmp = 0;
+            VirtualProtect(ffd_flag, 1, old_prot, &tmp);
+            FlushInstructionCache(GetCurrentProcess(), ffd_flag, 1);
+            g_ffd_patched = TRUE;
+            slog_writef("payload.log",
+                        "ForceFullDirty flag byte patched @ %p — was 0x%02X now 1 "
+                        "(BP slot [11] = ForceFullDirty RVA - 0x60). Fixes trailing/"
+                        "shadow-flicker on nudge by forcing dwmcore into always-"
+                        "full-dirty compose mode.",
+                        ffd_flag, g_ffd_saved_byte);
+        } else {
+            slog_writef("payload.log",
+                        "ForceFullDirty flag byte VirtualProtect FAILED gle=%lu",
+                        GetLastError());
+        }
     }
 
     /* ── 5. ScheduleCompositionPass — THE MISSING PIECE (Bypassify slot [7]) ──
@@ -1376,6 +1423,20 @@ void hooks_uninstall(void) {
             FlushInstructionCache(GetCurrentProcess(), g_iop_patch_addr, 8);
             g_iop_patched = FALSE;
             hook_diag("hooks_uninstall: IsOverlayPrevented reverted (6 bytes)");
+        }
+    }
+
+    /* v1.7.4.14: revert the ForceFullDirty flag byte-patch. */
+    if (g_ffd_patched && g_ffd_patch_addr) {
+        DWORD old_prot = 0;
+        if (VirtualProtect(g_ffd_patch_addr, 1, PAGE_EXECUTE_READWRITE, &old_prot)) {
+            ((BYTE *)g_ffd_patch_addr)[0] = g_ffd_saved_byte;
+            DWORD tmp = 0;
+            VirtualProtect(g_ffd_patch_addr, 1, old_prot, &tmp);
+            FlushInstructionCache(GetCurrentProcess(), g_ffd_patch_addr, 1);
+            g_ffd_patched = FALSE;
+            hook_diag("hooks_uninstall: ForceFullDirty flag byte reverted (was 0x%02X)",
+                      g_ffd_saved_byte);
         }
     }
 
