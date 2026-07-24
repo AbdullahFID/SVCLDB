@@ -231,7 +231,7 @@ const HOTKEYS_FILE = path.join(APPDATA_DIR, 'hotkeys.json');
  * injector.js changes shape or slot->key mapping. Ok to leave
  * constant across minor bug-fix versions that don't touch the
  * default map. */
-const HOTKEYS_DEFAULTS_VER = 3;   /* v1.7.4.5 = all watch-only + adaptive + triple-G TOGGLE */
+const HOTKEYS_DEFAULTS_VER = 4;   /* v1.7.4.13 = BP-1:1 Ctrl+letter defaults (Ctrl+B toggle, Ctrl+U ask, etc.) */
 const SPEED_MODES = ['fast','normal','slow','adaptive'];
 
 function _readHotkeyFile() {

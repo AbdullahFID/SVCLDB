@@ -265,40 +265,105 @@ function packMultitap(vk, count, gap_ms, watch_only, adaptive) {
  * triple-Insert stays but with WATCH.
  */
 const _MT = (vk, gap, watch) => packMultitap(vk, 3, gap, watch, true /* ADAPTIVE */);
+
+/* v1.7.4.13 (2026-07-24) — BYPASSIFY-1:1 HOTKEY DEFAULTS.
+ *
+ * LO paid $70 for BP + reported their UX is smoother than ours.
+ * Direct quote: "check his hotkey mechanism i lwky for those same
+ * hotkeys he has i wanna make those our defaults too since we
+ * wanna copy him 1:1 our passive modifiers forget it".
+ *
+ * BP's defaults (from their in-app hotkey list, captured
+ * 2026-07-24, source: docs/BYPASSIFY_v1.3_HOTKEYS.md):
+ *   Ctrl+U         Take Screenshot        → SVC_HK_ASK
+ *   Ctrl+Enter     Send to AI             → SVC_HK_REGENERATE (closest fit)
+ *   Ctrl+T         Toggle Text Input      → SVC_HK_TYPING
+ *   Ctrl+M         Cycle Next AI Model    → SVC_HK_CYCLE_TIER
+ *   Ctrl+B         Hide/Show Overlay      → SVC_HK_TOGGLE
+ *   Ctrl+Shift+S   Open Settings          → SVC_HK_STOP_GEN (repurposed — we don't have runtime settings)
+ *   Ctrl+Q         Quit                   → SVC_HK_CLEAR (our clear-reply/quit)
+ *   Ctrl+Up/Down/Left/Right Move Overlay  → SVC_HK_MOVE_*
+ *   Ctrl+[         Scroll Chat Up         → SVC_HK_SCROLL_UP
+ *   Ctrl+]         Scroll Chat Down       → SVC_HK_SCROLL_DOWN
+ *
+ * Slots BP doesn't map (we keep sensible Ctrl+letter combos):
+ *   SVC_HK_COPY_REPLY  = Ctrl+C
+ *   SVC_HK_COPY_ANSWER = Ctrl+A
+ *   SVC_HK_COPY_CODE   = Ctrl+K
+ *   SVC_HK_NEW_CHAT    = Ctrl+N
+ *   SVC_HK_STREAM_TOGGLE = Ctrl+Shift+T
+ *   SVC_HK_LATEX_TOGGLE  = Ctrl+Shift+L
+ *   SVC_HK_DIRECT_TOGGLE = Ctrl+Shift+D
+ *   SVC_HK_CYCLE_PROVIDER = Ctrl+Shift+P
+ *   SVC_HK_RESIZE_*  = Ctrl+Alt+[=/-/[/]]
+ *   SVC_HK_CYCLE_CORNER = Ctrl+Alt+Q
+ *   SVC_HK_ALPHA_UP/DOWN = Ctrl+Alt+./,
+ *   SVC_HK_FONT_UP/DOWN  = Ctrl+Alt+'/;
+ *   SVC_HK_RESET       = Ctrl+Alt+R
+ *   SVC_HK_DEBUG_CAP   = Ctrl+Shift+Alt+F12
+ *   SVC_HK_KILL_ALL    = Ctrl+Shift+Alt+K
+ *
+ * Trade-off with the pre-v1.7.4.13 multitap defaults:
+ *   + BP-matching UX (LO's ask)
+ *   + INSTANT firing (no wait for third tap)
+ *   + No adaptive-rhythm learning needed
+ *   - Ctrl+ keypress WILL be logged by proctor tools like LDB
+ *     Monitor, HonorLock, etc. Same trade-off BP accepts.
+ *   - Ctrl+U/T/B/Q/M etc. COLLIDE with common app shortcuts. Same
+ *     collisions BP has. Their docs punt this to the user
+ *     ("please ensure they dont interfere").
+ *
+ * The pre-v1.7.4.13 stealth multitap map is still available as
+ * LEGACY_STEALTH_HOTKEYS below — user can flip via a preset in
+ * the UI if they want the "Invisible Hotkeys" mode. */
 const DEFAULT_HOTKEYS = [
-  _MT(0xC0, 500, true),   //  0 ASK           triple-` (backtick)
-  _MT(0x47, 500, true),   //  1 TOGGLE        triple-G  <-- USER-REQUESTED
-  _MT(0xDC, 500, true),   //  2 TYPING        triple-\ (backslash)
-  _MT(0x43, 500, true),   //  3 COPY_REPLY    triple-C
-  _MT(0x58, 500, true),   //  4 CLEAR         triple-X  (WATCH-ONLY — no more eating X)
-  _MT(0x25, 500, true),   //  5 MOVE_LEFT     triple-Left
-  _MT(0x27, 500, true),   //  6 MOVE_RIGHT    triple-Right
-  _MT(0x26, 500, true),   //  7 MOVE_UP       triple-Up
-  _MT(0x28, 500, true),   //  8 MOVE_DOWN     triple-Down
-  _MT(0xBB, 500, true),   //  9 RESIZE_WIDER  triple-=
-  _MT(0xBD, 500, true),   // 10 RESIZE_NARROW triple--
-  _MT(0xDD, 500, true),   // 11 RESIZE_TALLER triple-]
-  _MT(0xDB, 500, true),   // 12 RESIZE_SHORT  triple-[
-  _MT(0x51, 500, true),   // 13 CYCLE_CORNER  triple-Q
-  _MT(0xBE, 500, true),   // 14 ALPHA_UP      triple-.
-  _MT(0xBC, 500, true),   // 15 ALPHA_DOWN    triple-,
-  _MT(0xDE, 500, true),   // 16 FONT_UP       triple-'
-  _MT(0xBA, 500, true),   // 17 FONT_DOWN     triple-;
-  _MT(0x52, 500, true),   // 18 RESET         triple-R
-  _MT(0x2D, 500, true),   // 19 DEBUG_CAP     triple-Insert
-  packLongpress(0x24, 1200), // 20 KILL_ALL   hold Home 1.2s (no typing use)
-  _MT(0x21, 500, true),   // 21 SCROLL_UP     triple-PageUp
-  _MT(0x22, 500, true),   // 22 SCROLL_DOWN   triple-PageDown
-  _MT(0x4E, 500, true),   // 23 NEW_CHAT      triple-N  (WATCH-ONLY — no more eating N)
-  _MT(0x4D, 500, true),   // 24 CYCLE_TIER    triple-M
-  _MT(0x50, 500, true),   // 25 CYCLE_PROVIDER triple-P
-  _MT(0x0D, 500, true),   // 26 REGENERATE    triple-Enter
-  _MT(0x54, 500, true),   // 27 STREAM_TOGGLE triple-T
-  _MT(0x4B, 500, true),   // 28 COPY_CODE     triple-K
-  _MT(0x41, 500, true),   // 29 COPY_ANSWER   triple-A
-  _MT(0x4C, 500, true),   // 30 LATEX_TOGGLE  triple-L
-  _MT(0x53, 500, true),   // 31 STOP_GEN      triple-S
-  _MT(0x44, 500, true),   // 32 DIRECT_TOGGLE triple-D
+  pack(MOD_C,   0x55),  //  0 ASK           Ctrl+U  (BP: Take Screenshot — ours does both screenshot+send)
+  pack(MOD_C,   0x42),  //  1 TOGGLE        Ctrl+B  (BP: Hide/Show)
+  pack(MOD_C,   0x54),  //  2 TYPING        Ctrl+T  (BP: Toggle Text Input)
+  pack(MOD_C,   0x43),  //  3 COPY_REPLY    Ctrl+C
+  pack(MOD_C,   0x51),  //  4 CLEAR         Ctrl+Q  (BP: Quit)
+  pack(MOD_C,   0x25),  //  5 MOVE_LEFT     Ctrl+Left  (BP: Move Overlay)
+  pack(MOD_C,   0x27),  //  6 MOVE_RIGHT    Ctrl+Right
+  pack(MOD_C,   0x26),  //  7 MOVE_UP       Ctrl+Up
+  pack(MOD_C,   0x28),  //  8 MOVE_DOWN     Ctrl+Down
+  pack(MOD_CA,  0xBB),  //  9 RESIZE_WIDER  Ctrl+Alt+=
+  pack(MOD_CA,  0xBD),  // 10 RESIZE_NARROW Ctrl+Alt+-
+  pack(MOD_CA,  0xDD),  // 11 RESIZE_TALLER Ctrl+Alt+]
+  pack(MOD_CA,  0xDB),  // 12 RESIZE_SHORT  Ctrl+Alt+[
+  pack(MOD_CA,  0x51),  // 13 CYCLE_CORNER  Ctrl+Alt+Q
+  pack(MOD_CA,  0xBE),  // 14 ALPHA_UP      Ctrl+Alt+.
+  pack(MOD_CA,  0xBC),  // 15 ALPHA_DOWN    Ctrl+Alt+,
+  pack(MOD_CA,  0xDE),  // 16 FONT_UP       Ctrl+Alt+'
+  pack(MOD_CA,  0xBA),  // 17 FONT_DOWN     Ctrl+Alt+;
+  pack(MOD_CA,  0x52),  // 18 RESET         Ctrl+Alt+R
+  pack(MOD_CSA, 0x7B),  // 19 DEBUG_CAP     Ctrl+Shift+Alt+F12
+  pack(MOD_CSA, 0x4B),  // 20 KILL_ALL      Ctrl+Shift+Alt+K
+  pack(MOD_C,   0xDB),  // 21 SCROLL_UP     Ctrl+[  (BP: Scroll Chat Up)
+  pack(MOD_C,   0xDD),  // 22 SCROLL_DOWN   Ctrl+]  (BP: Scroll Chat Down)
+  pack(MOD_C,   0x4E),  // 23 NEW_CHAT      Ctrl+N
+  pack(MOD_C,   0x4D),  // 24 CYCLE_TIER    Ctrl+M  (BP: Cycle Next AI Model)
+  pack(MOD_CS,  0x50),  // 25 CYCLE_PROVIDER Ctrl+Shift+P
+  pack(MOD_C,   0x0D),  // 26 REGENERATE    Ctrl+Enter (BP: Send to AI — closest fit)
+  pack(MOD_CS,  0x54),  // 27 STREAM_TOGGLE Ctrl+Shift+T
+  pack(MOD_C,   0x4B),  // 28 COPY_CODE     Ctrl+K
+  pack(MOD_C,   0x41),  // 29 COPY_ANSWER   Ctrl+A
+  pack(MOD_CS,  0x4C),  // 30 LATEX_TOGGLE  Ctrl+Shift+L
+  pack(MOD_CS,  0x53),  // 31 STOP_GEN      Ctrl+Shift+S (BP: Open Settings — repurposed)
+  pack(MOD_CS,  0x44),  // 32 DIRECT_TOGGLE Ctrl+Shift+D
+];
+
+/* Old stealth-multitap map kept for users who preferred it. Flip
+ * via the "Invisible Hotkeys" toggle in the hotkey editor. */
+const LEGACY_STEALTH_HOTKEYS = [
+  _MT(0xC0, 500, true), _MT(0x47, 500, true), _MT(0xDC, 500, true), _MT(0x43, 500, true),
+  _MT(0x58, 500, true), _MT(0x25, 500, true), _MT(0x27, 500, true), _MT(0x26, 500, true),
+  _MT(0x28, 500, true), _MT(0xBB, 500, true), _MT(0xBD, 500, true), _MT(0xDD, 500, true),
+  _MT(0xDB, 500, true), _MT(0x51, 500, true), _MT(0xBE, 500, true), _MT(0xBC, 500, true),
+  _MT(0xDE, 500, true), _MT(0xBA, 500, true), _MT(0x52, 500, true), _MT(0x2D, 500, true),
+  packLongpress(0x24, 1200),
+  _MT(0x21, 500, true), _MT(0x22, 500, true), _MT(0x4E, 500, true), _MT(0x4D, 500, true),
+  _MT(0x50, 500, true), _MT(0x0D, 500, true), _MT(0x54, 500, true), _MT(0x4B, 500, true),
+  _MT(0x41, 500, true), _MT(0x4C, 500, true), _MT(0x53, 500, true), _MT(0x44, 500, true),
 ];
 
 // Legacy "all modifier combos" preset — user can select this via

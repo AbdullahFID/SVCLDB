@@ -4508,12 +4508,16 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
  * eliminates duplicates from smaller-but-still-fullscreen layers.
  * So even if this threshold underfires, we won't get duplicate
  * overlays from smaller fullscreen surfaces. */
+        /* v1.7.4.13: FRAME DEDUP REMOVED.
+         * BP has no per-frame dedup. They draw on every Present call
+         * that passes their layer filter. Our 3ms dedup was skipping
+         * legit rapid Present calls, causing visible flicker on
+         * high-refresh monitors. The RTV size-gate below still
+         * filters out non-desktop layers (mouse cursor, thumbnails)
+         * so we won't render on every layer indiscriminately. */
         ULONGLONG now = GetTickCount64();
-        if ((now - g_last_draw_tick) < FRAME_DEDUP_MS) {
-            dev->Release();
-            return;
-        }
-        g_last_draw_tick = now;
+        g_last_draw_tick = now;   /* still updated for diag only */
+        (void)FRAME_DEDUP_MS;
 
         ID3D11DeviceContext *ctx = nullptr;
         dev->GetImmediateContext(&ctx);
@@ -4714,37 +4718,22 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
          *              "AddDirtyRect DISABLED — CRASHED DWM in test
          *               2026-07-05"). Kill.
          *
-         * v1.7.4.6 (2026-07-24) — SKIP-1-FRAME approach.
-         * When geom_generation increments (user hit nudge / resize /
-         * cycle_corner / alpha / font / toggle / reset), skip our
-         * overlay render for exactly ONE frame. That frame DWM
-         * composites the layer WITHOUT our overlay → app pixels
-         * naturally flow into where our old overlay used to sit.
-         * Next frame we render at the new position → NO stacked
-         * ghost of prior positions.
+         * v1.7.4.6 (2026-07-24) — SKIP-1-FRAME approach: (REMOVED
+         *   in v1.7.4.13). Was: skip our overlay render for one
+         *   frame after any geom_generation bump so DWM composites
+         *   the layer without our overlay → old-pos pixels get
+         *   cleared. Worked for ghost-frame stacking BUT introduced
+         *   a visible one-frame gap per nudge = perceived flicker.
+         *   LO reported flicker even after v1.7.4.12 strip, so
+         *   this was the last remaining source.
          *
-         * Cost: single-frame invisibility (4ms at 240Hz, 16ms at 60Hz).
-         * Barely perceptible even at 60Hz. Way better than 8x stacked
-         * titlebars. Zero risk to DWM: we just don't call ImGui at
-         * all — safest possible mitigation.
-         *
-         * Cap at 1-frame skip (not 2+) so rapid-fire nudges don't
-         * strobe the overlay to full invisibility; each new nudge
-         * bumps generation → next frame skips → but subsequent
-         * frames render normally at the newest position, so the
-         * user still sees the overlay moving smoothly. */
-        static volatile LONG s_last_seen_gen = 0;
-        LONG cur_gen = g_geom_generation;
-        LONG last_gen = InterlockedExchange(&s_last_seen_gen, cur_gen);
-        if (cur_gen != last_gen) {
-            /* Geom changed since last Present — skip overlay this frame.
-             * On the very NEXT Present, cur_gen == last_gen → we render
-             * normally at the new position. */
-            om_restore(ctx, &om);
-            ctx->Release();
-            dev->Release();
-            return;
-        }
+         *   With IsOverlayPrevented=TRUE (v1.7.4.11) forcing DWM
+         *   into software compositor path, DWM re-composites the
+         *   layer texture from app pixels every vsync. Old-position
+         *   overlay pixels get overwritten by the natural compose
+         *   cycle without our help. So skip-1-frame is REDUNDANT AND
+         *   flickery — deleted. BP has no skip logic either. */
+        (void)g_geom_generation;   /* still bumped by ui_* fns but unused here */
 
         /* -------- ImGui frame -------- */
         ImGuiIO &io = ImGui::GetIO();
