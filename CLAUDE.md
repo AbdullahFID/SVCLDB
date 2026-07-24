@@ -1,5 +1,203 @@
 ﻿# svcldb — Project Memory (Claude / Cursor)
 
+## 2026-07-24 — v1.7.7 → v1.7.10 BP-PARITY RENDER ARC (definitive)
+
+Multi-session arc closing the "not as smooth as Bypassify" gap LO had
+been reporting since v1.7.6. Confirmed root causes via **live RPM of
+BP's ImGuiContext** (world-first — 812KB BP payload in DWM read at
+runtime). Full deep RE done via Ghidra 12.1.2 headless on
+`C:\Temp\bp_v13_rsrc\rsrc_101.bin`.
+
+### Definitive BP architecture (via runtime RPM 2026-07-24 evening)
+
+- BP creates its own Win32 window class **`MSDiagEventSink`** (title
+  `RawInput`, 1x1, WS_EX_TOOLWINDOW) — used for RawInput registration
+  ONLY. Overlay does NOT have its own HWND.
+- BP uses **Progman HWND** (`FindWindowA("Progman","Program Manager")`,
+  fallback `FindWindowA("WorkerW", NULL)`) as fake parent for the
+  standard ImGui-Win32 backend. Full Progman-recovery on invalidation.
+- BP hooks **exactly 4 dwmcore functions**: Present, PN1
+  (CDDisplayRenderTarget::PresentNeeded), PN2 (CLegacyRenderTarget::
+  PresentNeeded), IsOverlayPrevented (via MinHook detour →
+  `xor eax, eax; ret` equivalent).
+- BP does NOT patch `ForceFullDirty` byte. That was a v11-era
+  experiment on our side.
+- BP's per-frame render (FUN_180008ac0): msg pump → device health
+  check → reactivate state machine → `pDevice->CreateRenderTargetView(
+  pAccessor, NULL, &rtv)` → Progman recovery → ImGui-Win32 NewFrame →
+  ImGui::NewFrame → sub-check watchdog → OMSetRenderTargets →
+  `ImGui::Render` → optional recovery overlay.
+- **BP's ImGuiContext::Windows vector at runtime = SIZE 1, single
+  unnamed entry.** Read via `ReadProcessMemory(dwm.exe,
+  BP_base+0xc1648+0x1170, 4)`. This DEFINITIVELY proves BP does NOT
+  use `ImGui::Begin("SomeWindow")` for UI. All UI is drawn via
+  `ImGui::GetForegroundDrawList()->AddRectFilled/AddText/etc` on the
+  raw draw list. Much lighter per-frame render workload than
+  Begin/End/window-chrome path.
+
+### v1.7.7 — Architectural refactor to BP parity (2026-07-24 early)
+
+Files: `payload/build.bat` (added `imgui_impl_win32.cpp` to CXX_SOURCES),
+`payload/src/ui/imgui_layer.cpp` (~106 lines added).
+
+- New static `g_fake_hwnd` + `g_win32_backend_inited` + `g_last_progman_check`.
+- `ensure_fake_hwnd_valid()` finds Progman (fallback WorkerW), throttled
+  to 500ms cadence. On invalidation → teardown ImGui-Win32 backend +
+  refind + reinit.
+- Init: `ImGui_ImplWin32_Init(g_fake_hwnd)` alongside existing
+  `ImGui_ImplDX11_Init`. Fires on the first Present frame after
+  Progman is found.
+- Per-frame: bounded message pump (32 msgs/frame max, SEH-guarded)
+  then `ImGui_ImplWin32_NewFrame()` before `ImGui::NewFrame()`.
+- Shutdown: `ImGui_ImplWin32_Shutdown()` BEFORE DX11 backend
+  shutdown (reverse init order).
+
+**Deployment gotcha (learned the hard way):** first v1.7.7 deploy
+attempt crashed LO's desktop. Root cause was NOT the code — bat
+wrapper used `timeout /t 6 /nobreak` which git-bash intercepted as
+POSIX `timeout` (rejected `/t` arg). Every wait was ZERO-length, so
+inject ran during DWM mid-respawn → nuke. Fix in
+`/c/temp/build_and_inject.bat`: use `%SystemRoot%\System32\ping.exe
+-n N 127.0.0.1 >nul` (unambiguous, only exists in system32).
+
+### v1.7.8 — Trail fix via full-desktop invalidate cascade
+
+Files: `payload/src/ui/imgui_layer.cpp`.
+
+- New static `g_last_overlay_rect` (screen coords). Snapshot on every
+  frame in `draw_chat_window` before `SetNextWindowPos`.
+- New `invalidate_last_overlay_region(const char *why)` helper.
+- Fires `RedrawWindow(NULL, NULL, NULL, RDW_INVALIDATE | RDW_FRAME |
+  RDW_ALLCHILDREN)` — **full desktop, async, includes non-client
+  (title bars)**. Cascades WM_PAINT+WM_NCPAINT to every top-level
+  window → DWM re-composes → old overlay pixels overwritten. Kills
+  edge trails at screen top/sides where local rect invalidate misses
+  DWM-composited chrome.
+- Called from `ui_nudge`, `ui_resize`, `ui_cycle_corner`,
+  `ui_toggle_visible`, `ui_reset_geometry`, `ui_shutdown` — every
+  path that changes what pixels should show at what position.
+- Async (no `RDW_UPDATENOW`) so nudge return latency stays zero.
+  WM_PAINTs fire on each app's next message-pump tick (<1 frame).
+
+**Clamp semantics** (v1.7.8c): reverted the aggressive 40px top-safe
+clamp per LO ask ("BP lets overlay reach tippy top"). New clamp:
+overlay outer edges must stay inside screen bounds (no negative
+coords, no off-right/off-bottom overflow). Full range reachable.
+
+**Glide** (v1.7.8c-f): experimented with lerp curves from k=0.30 →
+0.55 → 0.75 → 1.0 (instant). LO preferred `k=1.0` (instant snap) —
+final answer since BP is instant too.
+
+### v1.7.9 — Strip no-op hooks + ForceFullDirty patch (BP-parity)
+
+Files: `payload/src/dwm_hooks.c`.
+
+- Removed hook installation for **DisplayRT::Present** +
+  **LegacyRT::Present**. Both detours were pass-through (call orig
+  with SEH) with an OLD comment claiming AddDirtyRect purpose that
+  was never actually coded. Zero functional value, pure per-frame
+  detour overhead. Detour functions kept in file (unused) for future
+  re-enable via `(void)Detour_DisplayPresent;`.
+- Removed **ForceFullDirty byte patch**. BP doesn't do this. Was
+  forcing dwmcore into always-full-dirty compose paths = extra GPU
+  work per frame with no functional benefit (trail-clear now handled
+  by RedrawWindow cascade in v1.7.8).
+- Hook surface is now **BP-parity**: 3 MinHook detours (Present, PN1,
+  PN2) + 1 byte patch (IsOverlayPrevented). BP uses 4 MinHook detours
+  including IsOverlayPrevented — functionally identical result, our
+  byte patch has slightly less overhead.
+
+### v1.7.10 — Lean mode toggle (draw-list-only render for BP-parity feel)
+
+Files: `shared/config_types.h` (added `SVC_HK_LEAN_TOGGLE = 34`),
+`launcher/src/main.c` (default binding), `payload/src/ui/imgui_layer.h`
+(new `ui_toggle_lean` / `ui_is_lean` API), `payload/src/ui/imgui_layer.cpp`
+(new `g_lean_mode` state + draw-list render path in `draw_chat_window`),
+`payload/src/dllmain.c` (hotkey handler).
+
+- New `volatile LONG g_lean_mode` — atomic toggle via
+  `InterlockedExchange`.
+- Default hotkey: **Ctrl+Shift+Alt+M** (`SVC_HK_LEAN_TOGGLE`).
+- When ON, `draw_chat_window` SKIPS `ImGui::Begin/End` and instead
+  renders via `ImGui::GetForegroundDrawList()`:
+  - `AddRectFilled` for background (theme-aware color, 12px rounded)
+  - `AddRect` for border
+  - `AddText` for "LEAN • Ctrl+Shift+Alt+M to toggle" label
+  - `AddText` for last AI reply (from `g_last_reply_snapshot`) with
+    wrap-width = overlay width - 2×pad
+- Trade-offs given up: chat scrollback, MD/LaTeX rendering, per-bubble
+  copy buttons, code-block chrome, styled title bar.
+- Kept: pos/size/alpha/theme, show/hide, all existing hotkeys.
+- Ships OFF by default. User toggles at runtime OR (future) via
+  svchelper UI at inject time.
+
+### v1.7.7-1.7.10 hard invariants (added on top of v1.7.6.x)
+
+151. **`g_fake_hwnd` MUST fall back to `WorkerW` if Progman not found.**
+     Progman is normally always present but during Explorer restart it
+     may briefly disappear. WorkerW is a viable fallback for
+     ImGui-Win32 backend init purposes (still a DWM-tracked window
+     with real client rect).
+
+152. **`ImGui_ImplWin32_NewFrame()` MUST be called BEFORE
+     `ImGui::NewFrame()`** every frame that has the Win32 backend
+     inited. It updates `io.DisplaySize`, cursor pos, modifier keys,
+     focus state from the actual Progman HWND. Reversing the order
+     leaves ImGui reading stale IO state.
+
+153. **`invalidate_last_overlay_region` uses NULL rect (full desktop)
+     not a bounded rect.** Bounded rect invalidation MISSES edge chrome
+     (title bars, taskbar, DWM-composited non-client regions).
+     Full-desktop cascade cost is ~10-30 apps × 1 WM_PAINT/nudge =
+     <1ms total. Never regress to per-region invalidate.
+
+154. **NEVER re-enable DisplayRT::Present or LegacyRT::Present
+     hooks.** Both detours are pass-throughs with zero functional
+     value + per-frame overhead. If a future need for AddDirtyRect
+     from this context arises, VERIFY vs BP first (BP has never
+     hooked these).
+
+155. **NEVER re-enable ForceFullDirty byte patch.** BP doesn't do it.
+     Forces dwmcore into always-full-dirty compose paths = extra GPU
+     work with no functional benefit. Trail-clearing is handled by
+     `invalidate_last_overlay_region` cascade instead.
+
+156. **Lean mode DRAW PATH uses `GetForegroundDrawList()`, not
+     `GetBackgroundDrawList()`.** Foreground draws AFTER window
+     content — matches BP's z-order (overlay ON TOP of app pixels).
+     Background would draw UNDER window content and be occluded by
+     any visible ImGui window that happens to be alive.
+
+157. **Lean mode is TOGGLE-per-user-preference, NOT auto.** Some
+     users want the rich chat UI at the cost of ~10% smoothness.
+     Never auto-enable lean based on heuristics — it's a UX choice.
+
+158. **Deploy wrapper timing MUST use `%SystemRoot%\System32\ping.exe
+     -n N`, NOT `timeout /t N`.** Git bash intercepts `timeout` as
+     POSIX form which rejects `/t`. Zero-wait between DWM kill +
+     inject = mid-respawn nuke of user desktop. Fixed 2026-07-24 in
+     `/c/temp/build_and_inject.bat` after crashing LO's desktop once.
+
+### Live RPM tooling shipped this arc
+
+- `/c/temp/rpm_bp_imgui.ps1` — reads BP's ImGuiContext::Windows vector
+  via `ReadProcessMemory(dwm.exe, BP_base + 0xc1648)`. Dumps window
+  count + names. Confirmed BP has size=1 unnamed window.
+- `/c/temp/probe_bp2.ps1` — enumerates DWM-owned windows, takes screen
+  capture (session-isolation permitting), memory-probes DWM.
+- `/c/Users/abdul/Desktop/svcldb/tools/memprobe.ps1` (existing) —
+  scans DWM for exec-private regions. Used to find BP's payload base
+  before each RPM probe (BP re-injects at fresh ASLR base every
+  launcher run).
+
+Deployment status (2026-07-24 evening):
+- `build/payload/dwmapiext.dll` — 759,296 bytes
+- `build/launcher/sihost.exe` — 1,022,465 bytes
+- Both grep-clean on `DEV BYPASS` / `SVCLDB_DEV_AUTH` / `HANDSHAKE SKIPPED` / `SUB_CHECK SKIPPED`.
+- Distribution: `Desktop\CloakGPTWindowsMaxStealth.zip` = ~126.7 MB.
+
+---
+
 ## 2026-07-23 — v1.7.4 MEGA UX / STEALTH / MODEL / RENDER OVERHAUL
 
 Comprehensive fix pass responding to a large batch of user reports

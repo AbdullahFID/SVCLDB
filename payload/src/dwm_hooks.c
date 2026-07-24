@@ -1046,35 +1046,18 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
      * "always full-dirty" render paths → every compose re-renders
      * the whole layer texture → old-position overlay pixels get
      * overwritten by natural compose → NO TRAILING/SHADOW BUG. */
+    /* v1.7.9 (2026-07-24) — FORCE-FULL-DIRTY PATCH REMOVED.
+     * Ghidra RE'd Bypassify's full DwmInit: they hook 4 functions total
+     * (Present, PN1, PN2, IsOverlayPrevented). They do NOT touch the
+     * ForceFullDirty byte AT ALL. Our patch adds compose overhead
+     * (dwmcore always taking full-dirty paths) which hurts frame-time
+     * consistency. Trail-clearing is handled by our RedrawWindow
+     * cascade in imgui_layer.cpp instead. */
     if (off->forceFullDirty) {
         g_force_full_dirty = (pfnForceFullDirty_t)
             ((BYTE *)dwmcore + off->forceFullDirty);
-        slog_writef("payload.log", "ForceFullDirty resolved @ %p (NOT CALLED — unsafe)",
+        slog_writef("payload.log", "ForceFullDirty resolved @ %p (v1.7.9 — NOT PATCHED, BP-parity)",
                     (void *)g_force_full_dirty);
-
-        /* Full-dirty flag byte patch (BP slot [11]). Byte lives 0x60
-         * before the ForceFullDirtyRendering function itself. */
-        BYTE *ffd_flag = (BYTE *)dwmcore + off->forceFullDirty - 0x60;
-        DWORD old_prot = 0;
-        if (VirtualProtect(ffd_flag, 1, PAGE_EXECUTE_READWRITE, &old_prot)) {
-            g_ffd_saved_byte = ffd_flag[0];
-            g_ffd_patch_addr = ffd_flag;
-            ffd_flag[0]      = 1;    /* enable always-full-dirty mode */
-            DWORD tmp = 0;
-            VirtualProtect(ffd_flag, 1, old_prot, &tmp);
-            FlushInstructionCache(GetCurrentProcess(), ffd_flag, 1);
-            g_ffd_patched = TRUE;
-            slog_writef("payload.log",
-                        "ForceFullDirty flag byte patched @ %p — was 0x%02X now 1 "
-                        "(BP slot [11] = ForceFullDirty RVA - 0x60). Fixes trailing/"
-                        "shadow-flicker on nudge by forcing dwmcore into always-"
-                        "full-dirty compose mode.",
-                        ffd_flag, g_ffd_saved_byte);
-        } else {
-            slog_writef("payload.log",
-                        "ForceFullDirty flag byte VirtualProtect FAILED gle=%lu",
-                        GetLastError());
-        }
     }
 
     /* ── 5. ScheduleCompositionPass — THE MISSING PIECE (Bypassify slot [7]) ──
@@ -1138,32 +1121,16 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
      * call AddDirtyRect from DWM's own compositor context, marking
      * the full RT dirty right before it composits — which forces
      * fullscreen re-composition every tick and fixes the "quadrant" bug. */
-    if (off->presentDisplay) {
-        void *target = (BYTE *)dwmcore + off->presentDisplay;
-        MH_STATUS s = MH_CreateHook(target, (LPVOID)Detour_DisplayPresent,
-                                    (LPVOID *)&g_orig_present_display);
-        if (s == MH_OK && MH_EnableHook(target) == MH_OK) {
-            slog_writef("payload.log", "DisplayRT::Present hooked @ %p", target);
-            hook_diag("hooks: DisplayRT::Present hooked");
-            hook_registry_add(target, "DispPresent");
-            g_ht_present_display = target;
-        } else {
-            slog_writef("payload.log", "DisplayRT::Present hook FAILED s=%d", s);
-        }
-    }
-    if (off->presentLegacy) {
-        void *target = (BYTE *)dwmcore + off->presentLegacy;
-        MH_STATUS s = MH_CreateHook(target, (LPVOID)Detour_LegacyPresent,
-                                    (LPVOID *)&g_orig_present_legacy);
-        if (s == MH_OK && MH_EnableHook(target) == MH_OK) {
-            slog_writef("payload.log", "LegacyRT::Present hooked @ %p", target);
-            hook_diag("hooks: LegacyRT::Present hooked");
-            hook_registry_add(target, "LegPresent");
-            g_ht_present_legacy = target;
-        } else {
-            slog_writef("payload.log", "LegacyRT::Present hook FAILED s=%d", s);
-        }
-    }
+    /* v1.7.9 (2026-07-24) — DisplayRT::Present + LegacyRT::Present
+     * HOOKS REMOVED. Ghidra RE proved Bypassify does NOT hook these.
+     * Our detours were pass-throughs (call orig + SEH) with an old
+     * comment claiming AddDirtyRect purpose that was never coded.
+     * Pure overhead — every dwmcore Present cycle went through 2
+     * extra detours doing nothing. Removing = fewer per-frame stack
+     * frames + better frame-time consistency. Detour functions kept
+     * in this file (unused) for reference / future re-enable. */
+    (void)Detour_DisplayPresent;
+    (void)Detour_LegacyPresent;
 
     /* ── 5c-2. CROWN JEWEL: RenderContent hooks for capture stealth ── *
      *

@@ -486,6 +486,7 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
     cfg->hotkeys[SVC_HK_DIRECT_TOGGLE] = SVC_HK_PACK(MOD_CS,  'D');       /* 32 Ctrl+Shift+D                 */
     /* 33 SVC_HK_QUICK_ASK left UNBOUND — user opt-in via editor as
      * MOUSE_HOLD LMB 2000ms for Bypassify-parity Quick-Send UX. */
+    cfg->hotkeys[SVC_HK_LEAN_TOGGLE]   = SVC_HK_PACK(MOD_CSA, 'M');       /* 34 Ctrl+Shift+Alt+M  Lean mode  */
 
     cfg->overlay_x = 40; cfg->overlay_y = 40;
     cfg->overlay_w = 560; cfg->overlay_h = 420;

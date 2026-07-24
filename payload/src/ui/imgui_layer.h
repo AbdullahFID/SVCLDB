@@ -111,6 +111,18 @@ void ui_clear_reply(void);
 void ui_toggle_visible(void);
 int  ui_is_visible(void);
 
+/* v1.7.10 (2026-07-24) — LEAN MODE toggle. When ON, draw_chat_window
+ * skips the standard ImGui::Begin/End window and instead renders the
+ * overlay via ImDrawList::AddRectFilled + AddText on
+ * ImGui::GetForegroundDrawList() — Bypassify's exact render pattern
+ * (verified via RPM: BP's ImGui Windows vector = 1 unnamed entry).
+ * Sacrifices chat scrollback, MD/LaTeX rendering, per-bubble buttons,
+ * code-block copy, styled chrome. Kept: last AI reply text, background
+ * rect, respect for pos/size/alpha/theme. Toggled via Ctrl+Shift+Alt+M
+ * or via svchelper UI. */
+void ui_toggle_lean(void);
+int  ui_is_lean(void);
+
 /* Reply pane scroll — signed pixel delta consumed on next frame.
  * Positive = scroll DOWN (toward end), negative = scroll UP. */
 void ui_scroll_reply(int delta_px);

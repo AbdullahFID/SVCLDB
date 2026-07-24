@@ -1272,6 +1272,33 @@ static void on_hotkey(int action) {
                         mcfg->direct_answer_mode ? "ON" : "OFF");
             break;
         }
+        case SVC_HK_LEAN_TOGGLE: {
+            /* v1.7.10: toggle LEAN MODE. Overlay switches between full
+             * ImGui Begin/End render (chat bubbles, MD, scrollback, buttons)
+             * and BP-parity draw-list-only render (raw AddRectFilled +
+             * AddText on GetForegroundDrawList — much lighter per-frame
+             * workload = smoother nudge feel). See ui_toggle_lean() in
+             * imgui_layer.cpp for the exact implementation. */
+            ui_toggle_lean();
+            int now_lean = ui_is_lean();
+            char msg[512];
+            if (now_lean) {
+                _snprintf(msg, sizeof(msg) - 1,
+                    "[LEAN mode **ON**] Overlay now renders via raw draw "
+                    "list (Bypassify parity). Chat scrollback / MD / bubbles "
+                    "hidden. Shows LAST AI reply as plain wrapped text. "
+                    "Smoother nudge feel. Toggle off: `Ctrl+Shift+Alt+M`.");
+            } else {
+                _snprintf(msg, sizeof(msg) - 1,
+                    "[LEAN mode **OFF**] Full overlay restored — chat "
+                    "scrollback, markdown, code blocks, buttons all back.");
+            }
+            msg[sizeof(msg) - 1] = 0;
+            ui_chat_append_message(UI_MSG_AI, msg);
+            slog_writef("payload.log", "hotkey LEAN_TOGGLE: %s",
+                        now_lean ? "ON" : "OFF");
+            break;
+        }
         case SVC_HK_KILL_ALL: {
             /* Emergency stop — DIRECT self-kill of DWM from inside DWM.
              *

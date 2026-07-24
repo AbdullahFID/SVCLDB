@@ -284,6 +284,14 @@ typedef enum {
      * editor UI, typically as MOUSE_HOLD LMB 2000ms. */
     SVC_HK_QUICK_ASK     = 33,
 
+    /* v1.7.10 (2026-07-24) — LEAN MODE toggle. When ON, overlay draws
+     * via ImDrawList::AddText/AddRectFilled on GetForegroundDrawList()
+     * (BP-parity render path — see bp-per-frame-render-decomp.md notes
+     * + RPM verification of BP's ImGui Windows vector = 1 unnamed).
+     * Sacrifices chat scrollback / MD rendering / bubbles / buttons
+     * for pure BP-parity smoothness. */
+    SVC_HK_LEAN_TOGGLE   = 34,
+
     SVC_HK_COUNT
 } svc_hotkey_action_t;
 

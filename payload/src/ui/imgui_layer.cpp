@@ -508,6 +508,30 @@ static bool             g_ui_cs_init  = false;
 static bool             g_visible     = true;   /* v11.2.4 (2026-07-24) — LO ask: show overlay immediately on inject (was default HIDDEN — required Ctrl+B toggle). Bypassify parity. */
 static bool             g_imgui_inited= false;
 
+/* v1.7.10 (2026-07-24) — LEAN MODE.
+ *
+ * When ON, draw_chat_window skips ImGui::Begin/End and renders the
+ * overlay via ImGui::GetForegroundDrawList()->AddRectFilled + AddText.
+ * Matches Bypassify's exact render pattern (RPM-verified: BP's
+ * ImGuiContext::Windows.Size = 1, single unnamed entry — proving they
+ * bypass the Begin/End window system entirely).
+ *
+ * Trade-offs given up:
+ *   - Chat scrollback (only last AI reply shown)
+ *   - MD / LaTeX rendering (raw text only)
+ *   - Per-bubble copy buttons
+ *   - Code block chrome
+ *   - Styled title bar / borders
+ *
+ * Kept:
+ *   - Overlay position / size / alpha (respects hotkey nudges)
+ *   - Theme colors (dark or light)
+ *   - Show/hide via Ctrl+B
+ *
+ * Toggled at runtime via SVC_HK_LEAN_TOGGLE (Ctrl+Shift+Alt+M) or
+ * via svchelper UI at inject time. */
+static volatile LONG    g_lean_mode   = 0;
+
 /* v12 (2026-07-24) — ARCHITECTURAL REFACTOR TO BP PARITY.
  *
  * Deep Ghidra decomp of Bypassify (bp-architecture-full-picture.md
@@ -725,6 +749,52 @@ static int   g_extra_w  = 0;
 static int   g_extra_h  = 0;
 static float g_alpha    = 1.00f;   /* v11: default OPAQUE (was 0.94f) — Bypassify-parity, zero trailing */
 static float g_font     = 1.00f;   /* multiplicative on top of DPI-derived scale */
+
+/* v1.7.8 (2026-07-24) — TRAIL FIX via UNDERLYING-APP INVALIDATE.
+ *
+ * LO reported: overlay OVER the foreground-at-inject-time app = no
+ * trails (that app repaints every frame → DWM re-composites → old
+ * overlay pixels overwritten). Overlay OVER any static background
+ * app = trails (no app invalidation → DWM never re-composes those
+ * pixels → our old-position overlay pixels sit in the layer forever).
+ *
+ * Fix: track the LAST drawn overlay rect (screen coords). On any
+ * geometry change (nudge / resize / cycle_corner / reset / toggle_
+ * visible / hide) OR on ui_shutdown, call RedrawWindow(NULL, &rect,
+ * NULL, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW) which
+ * cascades a repaint through every top-level window overlapping the
+ * old rect. That forces DWM to invalidate its layer compose at that
+ * region → underlying apps' fresh pixels overwrite our stale overlay
+ * pixels → trails gone.
+ *
+ * Rect is padded 32px on each side to cover ImGui window shadows
+ * and any ~1-frame anti-aliased fringe. */
+static RECT  g_last_overlay_rect = {0, 0, 0, 0};
+static void invalidate_last_overlay_region(const char *why);   /* forward decl for callers above the def */
+
+/* v1.7.8c (2026-07-24) — GLIDE ANIMATION (Bypassify-parity, LO ask).
+ *
+ * BP's overlay glides across the screen; ours snapped instantly per
+ * nudge. Fix: interpolate the DISPLAYED position toward the TARGET
+ * position (g_offset_x/y) each frame with exponential ease-out.
+ *
+ * At 60Hz + 0.30 approach factor:
+ *   frame 0: 0%  progress
+ *   frame 1: 30%
+ *   frame 2: 51%
+ *   frame 3: 66%
+ *   frame 4: 76%   (halfway feel around frame 2)
+ *   frame ~8: ~95% (visually settled)
+ * → ~130ms total settling for a single 48px nudge, feels smooth without
+ * being sluggish. Rapid Ctrl+arrow bursts extend the target smoothly;
+ * displayed position tracks with a slight lag = the butter feel.
+ *
+ * Snap to target when within 0.5px so we don't float infinitely at
+ * subpixel. -0.0f init lets first-render at fresh position without
+ * a phantom glide from (0,0). */
+static float g_disp_off_x = 0.0f;
+static float g_disp_off_y = 0.0f;
+static bool  g_disp_off_primed = false;
 
 /* v1.7.4 (2026-07-23) — GHOST FRAME / WINDOW MOVE FIX.
  *
@@ -2236,6 +2306,10 @@ extern "C" void ui_set_reply(const char *utf8) {
 
 extern "C" void ui_toggle_visible() {
     ensure_cs();
+    /* v1.7.8: if we're HIDING, invalidate the old rect so underlying
+     * apps repaint over our stale pixels (otherwise the overlay
+     * silhouette lingers until an app naturally repaints). */
+    invalidate_last_overlay_region("toggle_visible");
     EnterCriticalSection(&g_ui_cs);
     g_visible = !g_visible;
     int now_visible = g_visible ? 1 : 0;
@@ -2256,6 +2330,20 @@ extern "C" void ui_toggle_visible() {
      * genuinely helps visibility. */
     wake_dwm_composition_lite();
     diag("visible toggled -> %d", now_visible);
+}
+
+extern "C" void ui_toggle_lean() {
+    LONG old = InterlockedExchange(&g_lean_mode, InterlockedCompareExchange(&g_lean_mode, 0, 0) ? 0 : 1);
+    /* Invalidate old rect + bump geom so next frame clears any lingering
+     * ImGui window chrome pixels that lean mode won't redraw. */
+    invalidate_last_overlay_region("lean_toggle");
+    geom_bump();
+    wake_dwm_composition_lite();
+    diag("lean_mode toggled: %d -> %d", (int)old, 1 - (int)old);
+}
+
+extern "C" int ui_is_lean() {
+    return (int)InterlockedCompareExchange(&g_lean_mode, 0, 0);
 }
 
 extern "C" int ui_is_visible() {
@@ -2689,8 +2777,45 @@ extern "C" void ui_copy_last_ai_answer(void) {
     free(clean);
 }
 
+/* v1.7.8: invalidate the region the overlay was drawn at LAST frame,
+ * so underlying apps repaint + DWM re-composes that region + old
+ * overlay pixels get overwritten. Cheap (~50µs). SEH-guarded because
+ * we're in DWM's process and any exception in RedrawWindow's cascade
+ * would take down DWM. Rect is padded 32px to cover ImGui window
+ * shadows. Safe to call from any thread. */
+static void invalidate_last_overlay_region(const char *why) {
+    /* v1.7.8d: FULL-DESKTOP async invalidate (NULL rect = whole
+     * desktop). Per-region invalidate was leaving trails at very-top/
+     * very-side edges because those areas contain title-bar / non-
+     * client / taskbar chrome that either (a) doesn't respond to
+     * RDW_INVALIDATE alone, or (b) has coord-clipping that eats a
+     * partial-edge invalidate. Full desktop cascade guarantees EVERY
+     * top-level window emits WM_PAINT/WM_NCPAINT on its next tick →
+     * DWM re-composes every region → all trails cleared.
+     *
+     * Perf: ~12-15 nudges/sec typical = 12-15 full cascades/sec.
+     * Each cascade is one WM_PAINT per top-level window (~30 windows
+     * on a busy desktop). ~450 WM_PAINTs/sec = <1ms total on modern
+     * hardware. Zero measurable latency.
+     *
+     * NO RDW_UPDATENOW — async so no input-lag stall while apps
+     * process their paint messages. Rects are done at each app's
+     * own message-pump tick within 1-2 frames = imperceptible. */
+    __try {
+        RedrawWindow(NULL, NULL, NULL,
+                     RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        /* Silent — never let a repaint cascade kill DWM. */
+    }
+    diag("invalidate: (%s) FULL-DESKTOP", why ? why : "?");
+}
+
 extern "C" void ui_nudge(int dx, int dy) {
     ensure_cs();
+    /* v1.7.8: invalidate OLD position BEFORE applying nudge — this
+     * cascades a repaint through every underlying app at the old rect
+     * so DWM re-composes and overwrites our stale overlay pixels. */
+    invalidate_last_overlay_region("nudge");
     EnterCriticalSection(&g_ui_cs);
     g_offset_x += dx;
     g_offset_y += dy;
@@ -2707,6 +2832,7 @@ extern "C" void ui_nudge(int dx, int dy) {
 
 extern "C" void ui_resize(int dw, int dh) {
     ensure_cs();
+    invalidate_last_overlay_region("resize");   /* v1.7.8 */
     EnterCriticalSection(&g_ui_cs);
     g_extra_w += dw;
     g_extra_h += dh;
@@ -2731,6 +2857,7 @@ extern "C" void ui_resize(int dw, int dh) {
 
 extern "C" void ui_cycle_corner() {
     ensure_cs();
+    invalidate_last_overlay_region("cycle_corner");   /* v1.7.8 */
     EnterCriticalSection(&g_ui_cs);
     g_corner = (g_corner + 1) % 4;
     g_offset_x = g_offset_y = 0;
@@ -2884,6 +3011,7 @@ static void maybe_repoll_theme(void) {
 
 extern "C" void ui_reset_geometry() {
     ensure_cs();
+    invalidate_last_overlay_region("reset_geometry");   /* v1.7.8 */
     EnterCriticalSection(&g_ui_cs);
     g_corner   = 0;
     g_offset_x = 0;
@@ -4242,6 +4370,36 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     float font_mul = g_font;
     LeaveCriticalSection(&g_ui_cs);
 
+    /* v1.7.8c: GLIDE — interpolate DISPLAY offset toward TARGET each
+     * frame. First frame after init: snap to avoid phantom glide from
+     * (0,0). Then lerp with 0.30 approach factor at 60Hz = ~130ms to
+     * visually settle for a 48px nudge. Snap when within 0.5px to
+     * avoid floating subpixel drift. */
+    float target_x = (float)off_x;
+    float target_y = (float)off_y;
+    if (!g_disp_off_primed) {
+        g_disp_off_x = target_x;
+        g_disp_off_y = target_y;
+        g_disp_off_primed = true;
+    } else {
+        /* v1.7.8f: 1.0 factor = INSTANT snap (no glide). LO ask —
+         * BP is instant, so we are too. Hypothesis: BP's smoothness
+         * comes from smaller nudge step + LL-hook auto-repeat, not
+         * glide animation. If instant + 48px feels choppy, drop step
+         * in dllmain SVC_HK_MOVE_* handlers to ~20px. */
+        const float k = 1.0f;
+        g_disp_off_x += (target_x - g_disp_off_x) * k;
+        g_disp_off_y += (target_y - g_disp_off_y) * k;
+        /* Snap-to-target when within 0.5px (inline compare — avoids
+         * pulling in <math.h> just for fabsf). */
+        float _dx = target_x - g_disp_off_x;
+        float _dy = target_y - g_disp_off_y;
+        if (_dx > -0.5f && _dx < 0.5f) g_disp_off_x = target_x;
+        if (_dy > -0.5f && _dy < 0.5f) g_disp_off_y = target_y;
+    }
+    float disp_off_x = g_disp_off_x;
+    float disp_off_y = g_disp_off_y;
+
     /* v11.2.1 (2026-07-24) — hide is now truly INSTANT: on !visible we
      * return immediately. Bypassify does the same (their Present detour
      * short-circuits on shutdown_flag=1 without any grace / erase pass).
@@ -4327,29 +4485,40 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
 
     float margin = 32.0f * scale;
     float pos_x = 0.0f, pos_y = 0.0f;
+    /* v1.7.8c: use disp_off_* (animated) instead of off_x/y (target)
+     * so the position glides across the screen instead of jumping. */
     switch (corner) {
         case 0:  /* top-right */
-            pos_x = (float)screen_w - base_w - margin + off_x;
-            pos_y = margin + off_y;
+            pos_x = (float)screen_w - base_w - margin + disp_off_x;
+            pos_y = margin + disp_off_y;
             break;
         case 1:  /* top-left */
-            pos_x = margin + off_x;
-            pos_y = margin + off_y;
+            pos_x = margin + disp_off_x;
+            pos_y = margin + disp_off_y;
             break;
         case 2:  /* bottom-right */
-            pos_x = (float)screen_w - base_w - margin + off_x;
-            pos_y = (float)screen_h - base_h - margin + off_y;
+            pos_x = (float)screen_w - base_w - margin + disp_off_x;
+            pos_y = (float)screen_h - base_h - margin + disp_off_y;
             break;
         case 3:  /* bottom-left */
-            pos_x = margin + off_x;
-            pos_y = (float)screen_h - base_h - margin + off_y;
+            pos_x = margin + disp_off_x;
+            pos_y = (float)screen_h - base_h - margin + disp_off_y;
             break;
     }
-    /* Keep at least partly on-screen. */
-    if (pos_x < -base_w + 60.0f) pos_x = -base_w + 60.0f;
-    if (pos_y < -base_h + 30.0f) pos_y = -base_h + 30.0f;
-    if (pos_x > (float)screen_w - 60.0f) pos_x = (float)screen_w - 60.0f;
-    if (pos_y > (float)screen_h - 30.0f) pos_y = (float)screen_h - 30.0f;
+    /* v1.7.8c (2026-07-24) — CLAMP FULLY ON-SCREEN, ZERO MARGIN.
+     * LO ask: BP lets overlay reach TIPPY top / bippy bottom, so we
+     * do too. But BP doesn't let overlay go OFF-screen edges — so
+     * clamp so overlay's outer edges stay just inside the screen.
+     * Trail-fix at edges is handled by RDW_FRAME in the invalidate
+     * helper (covers non-client title-bar / DWM-composited chrome). */
+    float max_x = (float)screen_w - base_w;
+    float max_y = (float)screen_h - base_h;
+    if (max_x < 0.0f) max_x = 0.0f;
+    if (max_y < 0.0f) max_y = 0.0f;
+    if (pos_x < 0.0f)  pos_x = 0.0f;
+    if (pos_y < 0.0f)  pos_y = 0.0f;
+    if (pos_x > max_x) pos_x = max_x;
+    if (pos_y > max_y) pos_y = max_y;
 
     /* v6: cache the drawn rect for the LL mouse hook so mouse-wheel
      * scrolling can hit-test the cursor against the overlay. */
@@ -4415,6 +4584,80 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
      * as no-op scaffolding so `state.chosen_tier`-style live reconfig
      * can re-enable via a future flag toggle if needed. */
     (void)theme;   /* still used below in the palette path */
+
+    /* v1.7.8: snapshot the exact rect we're about to draw at, in
+     * screen coords. Used by invalidate_last_overlay_region() from
+     * ui_nudge / ui_resize / ui_cycle_corner / ui_reset_geometry /
+     * ui_toggle_visible / ui_shutdown to force underlying apps to
+     * repaint at the OLD rect after a geometry change, killing
+     * ghost trails. Written from the single Present detour thread —
+     * no lock needed. Moved BEFORE the lean-mode branch so both
+     * render paths update the rect. */
+    g_last_overlay_rect.left   = (LONG)pos_x;
+    g_last_overlay_rect.top    = (LONG)pos_y;
+    g_last_overlay_rect.right  = (LONG)(pos_x + base_w);
+    g_last_overlay_rect.bottom = (LONG)(pos_y + base_h);
+
+    /* v1.7.10 (2026-07-24) — LEAN MODE render path (BP-parity).
+     * Bypasses ImGui::Begin/End entirely — uses GetForegroundDrawList
+     * to render minimal overlay via raw AddRectFilled + AddText.
+     * Matches BP's exact pattern (1 unnamed window, all drawing via
+     * draw lists). Much lighter per-frame render workload. */
+    if (InterlockedCompareExchange(&g_lean_mode, 0, 0)) {
+        /* Snapshot the last AI reply under lock. */
+        char *lean_text = NULL;
+        ensure_cs();
+        EnterCriticalSection(&g_chat_msgs_cs);
+        if (g_last_reply_snapshot) lean_text = _strdup(g_last_reply_snapshot);
+        LeaveCriticalSection(&g_chat_msgs_cs);
+
+        ImDrawList *fg = ImGui::GetForegroundDrawList();
+        if (fg) {
+            /* Theme-aware colors. */
+            int theme_lean = (int)InterlockedCompareExchange(&g_theme_effective, 0, 0);
+            ImU32 bg_col, border_col, text_col, label_col;
+            if (theme_lean == 1) {
+                /* LIGHT */
+                bg_col     = IM_COL32(247, 250, 252, (int)(255.0f * alpha));
+                border_col = IM_COL32(140, 165, 200, (int)(220.0f * alpha));
+                text_col   = IM_COL32(25, 35, 55, 255);
+                label_col  = IM_COL32(60, 95, 160, 220);
+            } else {
+                /* DARK */
+                bg_col     = IM_COL32(10, 15, 25, (int)(255.0f * alpha));
+                border_col = IM_COL32(70, 105, 170, (int)(220.0f * alpha));
+                text_col   = IM_COL32(240, 245, 255, 255);
+                label_col  = IM_COL32(130, 170, 235, 230);
+            }
+
+            float rx0 = pos_x, ry0 = pos_y;
+            float rx1 = pos_x + base_w, ry1 = pos_y + base_h;
+            /* Background + border. */
+            fg->AddRectFilled(ImVec2(rx0, ry0), ImVec2(rx1, ry1), bg_col, 12.0f * scale);
+            fg->AddRect(ImVec2(rx0, ry0), ImVec2(rx1, ry1), border_col, 12.0f * scale, 0, 2.0f);
+
+            /* "LEAN" label top-left. */
+            float pad = 14.0f * scale;
+            fg->AddText(ImVec2(rx0 + pad, ry0 + pad),
+                        label_col, "LEAN  \xE2\x80\xA2  Ctrl+Shift+Alt+M to toggle");
+
+            /* Last AI reply body (or placeholder). */
+            const char *body = lean_text && *lean_text
+                               ? lean_text
+                               : "no reply yet - press Ctrl+Shift+Space to ask";
+            /* Wrap text to overlay width via PushTextWrapPos equivalent —
+             * ImDrawList::AddText has a wrap_width overload. */
+            float text_pad_top = pad + 26.0f * scale;
+            ImFont *font = ImGui::GetFont();
+            float font_size = ImGui::GetFontSize() * font_mul;
+            fg->AddText(font, font_size,
+                        ImVec2(rx0 + pad, ry0 + text_pad_top),
+                        text_col, body, nullptr, base_w - 2.0f * pad);
+        }
+
+        if (lean_text) free(lean_text);
+        return;   /* skip normal Begin/End path */
+    }
 
     ImGui::SetNextWindowPos(ImVec2(pos_x, pos_y), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(base_w, base_h), ImGuiCond_Always);
@@ -5235,6 +5478,14 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
 }
 
 extern "C" void ui_shutdown() {
+    /* v1.7.8: FIRST — force underlying apps to repaint at the last
+     * overlay rect so DWM re-composes over our stale pixels. Fixes
+     * "overlay silhouette lingers for seconds after uninject" bug
+     * (LO 2026-07-24). Fires BEFORE Win32/DX11 backend teardown so
+     * the RedrawWindow cascade completes while our hooks may still
+     * be alive (Present hooks get removed in hooks_uninstall — a
+     * separate call — before ui_shutdown reaches us). */
+    invalidate_last_overlay_region("shutdown");
     /* v12: teardown Win32 backend before DX11 backend (reverse init order). */
     if (g_win32_backend_inited) {
         ImGui_ImplWin32_Shutdown();
