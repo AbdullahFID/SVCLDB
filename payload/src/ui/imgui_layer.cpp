@@ -4834,7 +4834,20 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
             /* Free snapshots. */
             for (int i = 0; i < msg_n; i++) if (msgs[i].text) free(msgs[i].text);
 
-            /* Scroll handling. */
+            /* Scroll handling.
+             *
+             * v1.7.10.1 (2026-07-24) — AUTO-PIN BUG FIX.
+             * Pre-fix: `else` branch auto-pinned to bottom EVERY frame
+             * when scroll_delta == 0. So user Ctrl+[ scrolled up → next
+             * frame delta=0 → auto-pinned back to bottom → scroll up
+             * appeared broken. Fix: track when user last manually
+             * scrolled; skip auto-pin for 6 seconds after. User can
+             * scroll freely; auto-follow (for streaming new content)
+             * resumes 6s after user stops interacting. Auto-follow
+             * also resumes ANY time a NEW message arrives (see
+             * g_last_msg_id delta check below). */
+            static ULONGLONG s_last_user_scroll_tick = 0;
+            static int       s_last_seen_msg_count  = 0;
             LONG scroll_delta = InterlockedExchange(&g_reply_scroll_pending, 0);
             if (scroll_delta != 0) {
                 float cur = ImGui::GetScrollY();
@@ -4843,9 +4856,18 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
                 if (tgt < 0.0f) tgt = 0.0f;
                 if (tgt > mx)   tgt = mx;
                 ImGui::SetScrollY(tgt);
+                s_last_user_scroll_tick = GetTickCount64();
             } else {
-                if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
+                /* Only auto-follow if EITHER (a) user hasn't scrolled
+                 * in the last 6s AND is already at bottom, OR (b) a
+                 * new message just arrived (count went up). */
+                ULONGLONG since_scroll = GetTickCount64() - s_last_user_scroll_tick;
+                bool new_msg = (msg_n > s_last_seen_msg_count);
+                s_last_seen_msg_count = msg_n;
+                bool at_bottom = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4.0f;
+                if (new_msg || (since_scroll > 6000 && at_bottom)) {
                     ImGui::SetScrollHereY(1.0f);
+                }
             }
             ImGui::EndChild();
         }

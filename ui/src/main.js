@@ -337,6 +337,32 @@ const respawnWatchdog = (() => {
       // status === 'no' — payload is definitively unloaded.
       // Was there a baseline to compare against?
       if (baselinePid == null) return;
+
+      /* v1.7.10.1 (2026-07-24) — RESPECT USER-INITIATED QUIT.
+       * When user hits Ctrl+Q inside the overlay, payload writes
+       * `.dwm_clean_shutdown` sentinel at C:\ProgramData\WinAudioSvc\
+       * before setting shutdown event. If we see that sentinel here,
+       * the unload was USER INTENT — disarm the watchdog + delete
+       * sentinel + skip re-inject. Prior behavior: watchdog re-injected
+       * blindly, making Ctrl+Q feel broken (LO report 2026-07-24). */
+      try {
+        const fsSync = require('fs');
+        const sentinel = 'C:\\ProgramData\\WinAudioSvc\\.dwm_clean_shutdown';
+        if (fsSync.existsSync(sentinel)) {
+          console.log('[respawn-watchdog] sentinel found — user-quit intent, disarming');
+          try { fsSync.unlinkSync(sentinel); } catch {}
+          if (timer) { clearInterval(timer); timer = null; }
+          lastArgs = null;
+          baselinePid = null;
+          if (mainWin && !mainWin.isDestroyed()) {
+            mainWin.webContents.send('injector:user-quit');
+          }
+          return;
+        }
+      } catch (e) {
+        console.log('[respawn-watchdog] sentinel check threw:', e.message);
+      }
+
       const nowPid = await getDwmPid();
       if (!nowPid) return;   // DWM missing entirely; wait for respawn
       if (nowPid === baselinePid) {
@@ -383,6 +409,14 @@ const respawnWatchdog = (() => {
     async arm(args) {
       lastArgs = args;
       baselinePid = await getDwmPid();
+      /* v1.7.10.1: delete any stale user-quit sentinel from a prior
+       * session so the fresh inject arms cleanly (watchdog won't
+       * immediately disarm on the next tick from a leftover file). */
+      try {
+        const fsSync = require('fs');
+        const sentinel = 'C:\\ProgramData\\WinAudioSvc\\.dwm_clean_shutdown';
+        if (fsSync.existsSync(sentinel)) fsSync.unlinkSync(sentinel);
+      } catch {}
       if (!timer) {
         timer = setInterval(tick, POLL_MS);
         console.log(`[respawn-watchdog] armed (pid=${baselinePid}, poll=${POLL_MS}ms)`);
