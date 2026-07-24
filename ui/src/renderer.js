@@ -1906,8 +1906,10 @@ function formatHotkey(packed) {
   if (u.kind === HK_KIND_MULTITAP) {
     const words = ['once','twice','three times','four times','five times','six times','seven times'];
     const times = u.count >= 2 && u.count <= 7 ? words[u.count - 1] : `${u.count} times`;
-    const silent = u.watch ? ' (silent)' : '';
-    return `Tap ${_vkName(u.vk)} ${times}${silent}`;
+    /* v1.7.4.9: no more inline "(silent)" — the per-row mode chip carries
+     * that info explicitly + more clearly. Keeps the binding text short so
+     * it doesn't truncate in the row layout. */
+    return `Tap ${_vkName(u.vk)} ${times}`;
   }
   /* v1.7.4: mouse bindings — user-friendly labels. */
   if (u.kind === HK_KIND_MOUSE_HOLD) {
@@ -2039,37 +2041,57 @@ function _renderHotkeyEditor() {
   if (!root) return;
   root.innerHTML = '';
 
-  /* v1.7.2 (2026-07-17): global speed-mode picker. Applies at inject time
-   * to every timing-based binding (multitap gap + longpress hold).
-   * Adaptive additionally sets the ADAPTIVE flag so the payload learns
-   * the user's actual tap rhythm live. */
+  /* v1.7.4.9 (2026-07-24): compact controls row containing BOTH the
+   * speed picker and the invisible-hotkeys toggle. Prior design put
+   * these as two full-width stacked banners eating half the card
+   * before the user could even see any hotkey rows. */
   const speed = _hkState.speed_mode || 'adaptive';
-  const speedRow = document.createElement('div');
-  speedRow.className = 'hk-speed-picker';
+  const stealthActive = _isStealthActive();
+  const controlsRow = document.createElement('div');
+  controlsRow.className = 'hk-controls-row';
   const speedOpts = [
-    { id: 'fast',     label: 'Fast',     hint: 'Quick taps &amp; short holds. For fast typers.' },
-    { id: 'normal',   label: 'Normal',   hint: 'Balanced. What most people use.' },
-    { id: 'slow',     label: 'Slow',     hint: 'More time to complete the shortcut. For grandma.' },
-    { id: 'adaptive', label: 'Adaptive', hint: 'Learns your rhythm as you use it. Recommended.' },
+    { id: 'fast',     label: 'Fast' },
+    { id: 'normal',   label: 'Normal' },
+    { id: 'slow',     label: 'Slow' },
+    { id: 'adaptive', label: 'Adaptive' },
   ];
-  speedRow.innerHTML = `
-    <div class="hk-speed-head">
-      <div>
-        <div class="hk-speed-title">Shortcut speed</div>
-        <div class="hk-speed-sub">How fast you need to tap or hold to trigger a shortcut. Applies to every shortcut in the list below.</div>
+  const speedSub = {
+    fast:     'Quick taps &amp; short holds.',
+    normal:   'Balanced. Most people.',
+    slow:     'More time to complete.',
+    adaptive: 'Learns your rhythm live.',
+  }[speed] || '';
+  controlsRow.innerHTML = `
+    <div class="hk-speed-picker">
+      <div class="hk-speed-head">
+        <div class="hk-speed-title">Speed</div>
+        <div class="hk-speed-sub">${speedSub}</div>
+      </div>
+      <div class="hk-speed-buttons">
+        ${speedOpts.map(o => `
+          <button class="hk-speed-btn${o.id === speed ? ' active' : ''}" data-speed="${o.id}">${o.label}</button>
+        `).join('')}
       </div>
     </div>
-    <div class="hk-speed-buttons">
-      ${speedOpts.map(o => `
-        <button class="hk-speed-btn${o.id === speed ? ' active' : ''}" data-speed="${o.id}">
-          <div class="hk-speed-btn-label">${o.label}</div>
-          <div class="hk-speed-btn-hint">${o.hint}</div>
-        </button>
-      `).join('')}
+    <div class="hk-stealth-banner${stealthActive ? ' active' : ''}">
+      <div class="hk-stealth-head">
+        <div style="min-width:0;">
+          <div class="hk-stealth-title">Invisible Hotkeys ${stealthActive ? '<span class="hk-stealth-on">ON</span>' : ''}</div>
+          <div class="hk-stealth-sub">
+            ${stealthActive
+              ? 'Your shortcuts don\'t use Ctrl / Alt / Shift &mdash; nothing for proctor software to flag.'
+              : 'Switches shortcuts to typing-like patterns. <b>Recommended for exams.</b>'}
+          </div>
+        </div>
+        <label class="hk-toggle-switch">
+          <input type="checkbox" id="hk-stealth-toggle" ${stealthActive ? 'checked' : ''}>
+          <span class="hk-toggle-slider"></span>
+        </label>
+      </div>
     </div>
   `;
-  root.appendChild(speedRow);
-  for (const btn of speedRow.querySelectorAll('.hk-speed-btn')) {
+  root.appendChild(controlsRow);
+  for (const btn of controlsRow.querySelectorAll('.hk-speed-btn')) {
     btn.addEventListener('click', async () => {
       const mode = btn.dataset.speed;
       _hkState.speed_mode = mode;
@@ -2082,28 +2104,6 @@ function _renderHotkeyEditor() {
       _renderHotkeyEditor();
     });
   }
-
-  /* v10 (2026-07-17): Stealth mode toggle at top of the list. */
-  const stealthActive = _isStealthActive();
-  const stealthBanner = document.createElement('div');
-  stealthBanner.className = 'hk-stealth-banner' + (stealthActive ? ' active' : '');
-  stealthBanner.innerHTML = `
-    <div class="hk-stealth-head">
-      <div>
-        <div class="hk-stealth-title">Invisible Hotkeys ${stealthActive ? '<span class="hk-stealth-on">ON</span>' : ''}</div>
-        <div class="hk-stealth-sub">
-          ${stealthActive
-            ? 'Your shortcuts don\'t use Ctrl / Alt / Shift combos — proctor software has nothing to flag.'
-            : 'Some proctor software watches for Ctrl / Alt / Shift keypresses. Turn this on to switch shortcuts to patterns that look like normal typing. <b>Recommended for exams.</b>'}
-        </div>
-      </div>
-      <label class="hk-toggle-switch">
-        <input type="checkbox" id="hk-stealth-toggle" ${stealthActive ? 'checked' : ''}>
-        <span class="hk-toggle-slider"></span>
-      </label>
-    </div>
-  `;
-  root.appendChild(stealthBanner);
   document.getElementById('hk-stealth-toggle').addEventListener('change', (e) => {
     if (e.target.checked) {
       e.target.checked = false;   // wait for modal confirm
@@ -2134,29 +2134,30 @@ function _renderHotkeyEditor() {
      * kinds — modifier/longpress/mouse don't consume the way multitap
      * does (they either fire on hold-release or on click, not on every
      * key edge). */
-    let modeChipHtml = '';
+    let modeChipHtml = '<span></span>';   /* placeholder keeps grid alignment */
     if (packed) {
       const u = unpackHotkey(packed);
       if (u.kind === HK_KIND_MULTITAP) {
         const isWatch = !!u.watch;
         const chipCls = isWatch ? 'hk-mode-chip hk-mode-silent' : 'hk-mode-chip hk-mode-blocked';
-        const chipLabel = isWatch ? '✍ silent' : '⛔ blocks key';
+        const chipLabel = isWatch ? 'silent' : 'blocks';
         const chipTitle = isWatch
-          ? 'Silent mode ON — the key still types normally. Click to switch to BLOCKED (reserves the key).'
-          : 'BLOCKED mode ON — the key is reserved and won\'t type anywhere. Click to switch to SILENT.';
+          ? 'Silent mode — the key still types normally in your exam. Click to switch to BLOCKED (reserves the key).'
+          : 'BLOCKED mode — the key is reserved and won\'t type anywhere. Click to switch to SILENT.';
         modeChipHtml = `<button class="${chipCls}" title="${escapeHtml(chipTitle)}" data-slot-mode-toggle="${slot}">${chipLabel}</button>`;
       }
     }
+    const resetHtml = isOverride
+      ? `<button class="hk-editor-clear" title="Reset to default (${escapeHtml(formatHotkey(_hkState.defaults[slot]))})">↺</button>`
+      : `<span class="hk-editor-clear-placeholder"></span>`;
     row.innerHTML = `
       <div class="hk-editor-label" title="${escapeHtml(label)}">${escapeHtml(label)}</div>
-      <div class="hk-editor-reset-cell">
-        ${modeChipHtml}
-        <button class="hk-editor-btn${!packed ? ' unbound' : ''}" title="Click the pencil to remap${conflicts.length ? ' — CONFLICT with slot ' + conflicts.join(', ') : ''}">
-          <span class="hk-editor-btn-text">${escapeHtml(btnLabel)}</span>
-          ${pencilSvg}
-        </button>
-        ${isOverride ? `<button class="hk-editor-clear" title="Reset to default (${formatHotkey(_hkState.defaults[slot])})">↺</button>` : ''}
-      </div>
+      ${modeChipHtml}
+      <button class="hk-editor-btn${!packed ? ' unbound' : ''}" title="Click to remap${conflicts.length ? ' — CONFLICT with slot ' + conflicts.join(', ') : ''}">
+        <span class="hk-editor-btn-text">${escapeHtml(btnLabel)}</span>
+        ${pencilSvg}
+      </button>
+      ${resetHtml}
     `;
     root.appendChild(row);
   }

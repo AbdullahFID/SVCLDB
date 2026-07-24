@@ -1373,19 +1373,39 @@ html, body {
   color: var(--fg2);
 }
 .hk-hint b { color: var(--cyan-light); }
+/* v1.7.4.9 (2026-07-24) — hotkey editor UI rewrite.
+ *
+ * Prior design's failures:
+ *   1. Two-column grid at fixed 1fr 1fr → hotkey display buttons
+ *      truncated on the right column ("Tap G three times (silent)" cut off)
+ *   2. Speed picker was 4 giant cards eating half the card width
+ *   3. Stealth banner was oversized with the toggle floating far right
+ *   4. Mode chip (silent/blocked) sitting mid-row created visual chaos
+ *
+ * New design:
+ *   - hotkey rows: auto-fit two columns when there's room, single-column
+ *     when tight. Rows use CSS grid inside for stable label/chip/binding/
+ *     reset alignment — no more content overflow
+ *   - speed picker: compact horizontal segmented control
+ *   - stealth banner: single-row layout, title + short sub + toggle
+ *   - mode chip: small pill sitting AFTER the binding, only visible on
+ *     multitap bindings, doesn't disrupt row alignment */
 .hk-editor {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px 14px;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 6px 12px;
 }
 .hk-editor-row {
-  display: flex; align-items: center; justify-content: space-between;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  align-items: center;
   gap: 8px;
-  padding: 8px 12px;
+  padding: 7px 10px;
   border-radius: 8px;
   background: var(--surface);
   border: 1px solid transparent;
   transition: border-color 0.15s, background 0.15s;
+  min-height: 40px;
 }
 .hk-editor-row:hover {
   background: var(--surfaceH);
@@ -1395,9 +1415,10 @@ html, body {
   background: rgba(239,68,68,0.05);
 }
 .hk-editor-label {
-  font-size: 12px; color: var(--fg);
-  min-width: 0; flex: 1;
+  font-size: 12.5px; color: var(--fg);
+  min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-weight: 500;
 }
 .hk-editor-btn {
   font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
@@ -1408,17 +1429,15 @@ html, body {
   border-radius: 6px;
   color: var(--cyan-light);
   cursor: pointer;
-  transition: all 0.15s;
-  min-width: 130px; text-align: center;
+  transition: background 0.15s, border-color 0.15s;
   white-space: nowrap;
-  flex-shrink: 0;
-  display: inline-flex; align-items: center; justify-content: space-between; gap: 6px;
+  display: inline-flex; align-items: center; gap: 6px;
 }
-.hk-editor-btn .hk-editor-btn-text { flex: 1; text-align: left; }
+.hk-editor-btn .hk-editor-btn-text { text-align: left; }
 .hk-editor-btn .hk-pencil {
-  width: 12px; height: 12px;
+  width: 11px; height: 11px;
   color: var(--fg2);
-  opacity: 0.6;
+  opacity: 0.55;
   transition: opacity 0.15s, color 0.15s, transform 0.15s;
   flex-shrink: 0;
 }
@@ -1447,43 +1466,44 @@ html, body {
   0%, 100% { box-shadow: 0 0 0 0 rgba(245,158,11,0.4); }
   50%      { box-shadow: 0 0 0 4px rgba(245,158,11,0);  }
 }
-.hk-editor-reset-cell {
-  display: inline-flex; align-items: center; gap: 6px;
-}
 .hk-editor-clear {
   border: none; background: none; padding: 4px 6px;
   color: var(--fg3); cursor: pointer;
-  font-size: 12px; line-height: 1;
+  font-size: 13px; line-height: 1;
   border-radius: 4px;
-  opacity: 0.6; transition: opacity 0.15s, color 0.15s, background 0.15s;
+  opacity: 0.5; transition: opacity 0.15s, color 0.15s, background 0.15s;
 }
 .hk-editor-clear:hover {
   opacity: 1; color: #fca5a5;
   background: rgba(239,68,68,0.1);
+}
+/* Placeholder for the reset column when no override exists — keeps grid
+ * columns aligned across rows so the pencil button lines up. */
+.hk-editor-clear-placeholder {
+  width: 20px; height: 20px;
 }
 
 /* v1.7.4.6 (2026-07-24): per-row silent/blocked toggle chip for
  * MULTITAP bindings. Sits next to the binding label so users see the
  * mode at a glance + can flip in place without opening the recorder. */
 .hk-mode-chip {
-  display: inline-flex; align-items: center; gap: 4px;
-  padding: 4px 10px; border-radius: 999px;
+  display: inline-flex; align-items: center;
+  padding: 3px 8px; border-radius: 999px;
   border: 1px solid transparent; cursor: pointer;
-  font-size: 11.5px; font-weight: 600; line-height: 1;
-  transition: transform 0.12s, box-shadow 0.12s, background 0.15s, color 0.15s, border-color 0.15s;
+  font-size: 10.5px; font-weight: 600; line-height: 1.2;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
   user-select: none; white-space: nowrap;
 }
 .hk-mode-chip:hover {
-  transform: translateY(-1px);
-  box-shadow: 0 3px 10px rgba(0,0,0,0.28);
+  filter: brightness(1.15);
 }
 .hk-mode-silent {
-  background: rgba(34, 197, 94, 0.14);
+  background: rgba(34, 197, 94, 0.12);
   color: #86efac;
-  border-color: rgba(34, 197, 94, 0.38);
+  border-color: rgba(34, 197, 94, 0.32);
 }
 .hk-mode-silent:hover {
-  background: rgba(34, 197, 94, 0.22);
+  background: rgba(34, 197, 94, 0.20);
   color: #bbf7d0;
 }
 .hk-mode-blocked {
@@ -1769,90 +1789,106 @@ html, body {
   line-height: 1.5;
 }
 
-/* v1.7.2 (2026-07-17): global shortcut-speed picker (Fast/Normal/Slow/Adaptive)
- * shown at the very top of the hotkey editor, above the stealth banner. */
-.hk-speed-picker {
+/* v1.7.4.9 (2026-07-24): compact horizontal speed picker + stealth toggle
+ * combined into a single settings row above the hotkey list. */
+.hk-controls-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+  margin-bottom: 12px;
+}
+@media (max-width: 780px) {
+  .hk-controls-row { grid-template-columns: 1fr; }
+}
+.hk-speed-picker,
+.hk-stealth-banner {
   background: rgba(15, 23, 42, 0.55);
   border: 1px solid rgba(255,255,255,0.08);
-  border-radius: 12px;
-  padding: 14px 16px;
-  margin-bottom: 14px;
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 0;
+  min-width: 0;
 }
-.hk-speed-head { margin-bottom: 10px; }
+.hk-speed-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 10px; margin-bottom: 6px;
+}
 .hk-speed-title {
-  font-size: 14px; font-weight: 700; color: var(--fg); letter-spacing: 0.01em;
+  font-size: 12px; font-weight: 700; color: var(--fg);
+  letter-spacing: 0.06em; text-transform: uppercase;
 }
 .hk-speed-sub {
-  font-size: 12px; color: var(--fg2); line-height: 1.5; margin-top: 2px;
+  font-size: 10.5px; color: var(--fg3); line-height: 1.35;
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .hk-speed-buttons {
-  display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;
-}
-@media (max-width: 720px) {
-  .hk-speed-buttons { grid-template-columns: repeat(2, 1fr); }
+  display: flex; gap: 4px; padding: 3px;
+  background: rgba(0,0,0,0.22);
+  border-radius: 8px;
 }
 .hk-speed-btn {
-  background: rgba(6, 182, 212, 0.04);
-  border: 1.5px solid rgba(255,255,255,0.08);
-  border-radius: 10px;
-  padding: 10px 10px;
-  color: var(--fg);
+  flex: 1; min-width: 0;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 6px 4px;
+  color: var(--fg2);
   cursor: pointer;
-  text-align: left;
-  transition: border-color .14s, background .14s, transform .10s;
+  text-align: center;
+  transition: color .14s, background .14s, border-color .14s;
   font: inherit;
+  font-size: 11.5px; font-weight: 600;
+  white-space: nowrap;
 }
-.hk-speed-btn:hover {
-  border-color: rgba(6, 182, 212, 0.45);
-  background: rgba(6, 182, 212, 0.08);
+.hk-speed-btn:hover:not(.active) {
+  color: var(--fg);
+  background: rgba(255,255,255,0.04);
 }
 .hk-speed-btn.active {
-  border-color: var(--cyan-light);
-  background: rgba(6, 182, 212, 0.14);
-  box-shadow: 0 0 0 2px rgba(6, 182, 212, 0.10) inset;
+  background: rgba(6, 182, 212, 0.16);
+  border-color: rgba(6, 182, 212, 0.45);
+  color: var(--cyan-light);
 }
-.hk-speed-btn-label {
-  font-size: 13px; font-weight: 700; margin-bottom: 3px;
-}
-.hk-speed-btn.active .hk-speed-btn-label { color: var(--cyan-light); }
-.hk-speed-btn-hint {
-  font-size: 11px; color: var(--fg2); line-height: 1.4;
-}
+/* Old .hk-speed-btn-label / .hk-speed-btn-hint no longer used; kept
+ * as no-ops for back-compat with any external CSS override. */
+.hk-speed-btn-label { display: inline; font: inherit; }
+.hk-speed-btn-hint  { display: none; }
 
-/* v10 (2026-07-17): Stealth-mode banner at top of the hotkey editor. */
+/* Stealth banner: same compact row shape as the speed picker so they
+ * line up in the .hk-controls-row grid. */
 .hk-stealth-banner {
   background: linear-gradient(135deg, rgba(6,182,212,0.06) 0%, rgba(139,92,246,0.05) 100%);
-  border: 1px solid rgba(6, 182, 212, 0.25);
-  border-radius: 12px;
-  padding: 16px 18px;
-  margin-bottom: 16px;
+  border: 1px solid rgba(6, 182, 212, 0.22);
   transition: border-color .16s, background .16s;
 }
 .hk-stealth-banner.active {
-  border-color: rgba(34, 197, 94, 0.45);
-  background: linear-gradient(135deg, rgba(34,197,94,0.08) 0%, rgba(6,182,212,0.06) 100%);
+  border-color: rgba(34, 197, 94, 0.42);
+  background: linear-gradient(135deg, rgba(34,197,94,0.09) 0%, rgba(6,182,212,0.05) 100%);
 }
 .hk-stealth-head {
-  display: flex; align-items: center; justify-content: space-between; gap: 20px;
+  display: grid; grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center; gap: 12px;
 }
 .hk-stealth-title {
-  font-size: 14px; font-weight: 700;
-  color: var(--fg);
+  font-size: 12px; font-weight: 700; color: var(--fg);
   display: flex; align-items: center; gap: 8px;
+  letter-spacing: 0.06em; text-transform: uppercase;
 }
 .hk-stealth-on {
-  font-size: 10px; font-weight: 800;
-  padding: 2px 8px;
+  font-size: 9px; font-weight: 800;
+  padding: 2px 6px;
   border-radius: 999px;
-  background: rgba(34,197,94,0.20);
+  background: rgba(34,197,94,0.22);
   color: #4ade80;
   letter-spacing: 0.08em;
 }
 .hk-stealth-sub {
-  font-size: 12px; color: var(--fg2);
-  margin-top: 4px; line-height: 1.5;
+  font-size: 10.5px; color: var(--fg3);
+  margin-top: 3px; line-height: 1.4;
+  overflow: hidden; text-overflow: ellipsis;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
 }
-.hk-stealth-sub b { color: var(--fg); }
+.hk-stealth-sub b { color: var(--fg2); }
 .hk-toggle-switch {
   position: relative;
   width: 42px; height: 22px;
