@@ -1825,31 +1825,42 @@ static int ghost_is_enabled(void) {
         char buf[8];
         DWORD n = GetEnvironmentVariableA("DWM_EXT_GHOST",
                                           buf, sizeof(buf));
-        /* v1.7.4.4 (2026-07-23) — FLIPPED to DEFAULT-OFF.
+        /* v1.7.4.8 (2026-07-24) — FLIPPED BACK to DEFAULT-ON.
          *
-         * Pre-v1.7.4.4 was default-ON: a fullscreen alpha=1/255
-         * layered TOPMOST window. Every hooks_ghost_wake call fires
-         * RedrawWindow(RDW_INVALIDATE) on it. Under bursty use, this
-         * appears to trigger DWM to invalidate the whole screen
-         * region and re-composite — on lower-end GPUs the compositor
-         * falls behind and presents black frames while catching up.
+         * v1.7.4.4 turned this OFF because a bursty compose pattern on
+         * some GPUs caused "screen flickering black". Since then:
          *
-         * User bug: "screen flickering black like a horror movie zero
-         * stability ... had to fight to squeeze to click emergency
-         * stop". Repro'd nowhere in dev; only in production.
+         *   - hooks_ghost_wake got 10Hz throttle (v1.6.5)
+         *   - RedrawWindow scoped, not fullscreen invalidate (v1.6.5)
+         *   - SetWindowPos uses SWP_NOMOVE|SWP_NOSIZE (z-order only,
+         *     no pixel invalidation) (v1.6.5)
+         *   - keepalive SCP throttled 20Hz→4Hz (v1.7.4.5)
+         *   - Ghost is HIDDEN when overlay hidden (v6.3), so during
+         *     the "chrome/cursor DComp direct-flip" fast-path there's
+         *     no ghost blocking that path
+         *   - Capture-render whitelist + LDB gate (v1.7.4.6/7) removed
+         *     the false-positive capture-active bursts that were the
+         *     actual root cause of most flicker LO complained about
          *
-         * PN=TRUE + SCP already keeps DWM composing every native
-         * vsync (Bypassify's exact approach). Ghost was belt-and-
-         * suspenders. Belt is enough — flipping OFF eliminates the
-         * flicker risk entirely + removes one fullscreen enumerable
-         * top-level HWND as a bonus stealth win.
+         * ALL of the mitigations that killed the v1.7.4.4 flicker are
+         * in place. Ghost's z-order-anchor role is critical to fix
+         * the "terminal moved on top of overlay → overlay disappears"
+         * bug LO reported 2026-07-24. Without a real HWND holding
+         * WS_EX_TOPMOST, our pixels-in-DWM-layer approach gets
+         * outranked by any app's higher-plane swap chain.
          *
-         * Opt-IN via DWM_EXT_GHOST=1 for users who need the extra
-         * wake reliability (rare on modern hardware). */
-        if (n > 0 && (buf[0] == '1' || buf[0] == 't' || buf[0] == 'T' || buf[0] == 'y' || buf[0] == 'Y')) {
-            g_ghost_enabled = 1;
-        } else {
+         * When overlay hidden: ghost is SW_HIDE via keepalive thread
+         * → zero z-order impact, zero flicker risk.
+         * When overlay visible: ghost is SW_SHOWNA + TOPMOST → pulls
+         * our overlay pixels above other app planes → overlay stays
+         * above terminal / any other app the user moves on top.
+         *
+         * Opt-OUT via DWM_EXT_GHOST=0 for the max-stealth crowd who
+         * accept z-order fragility for one fewer enumerable HWND. */
+        if (n > 0 && (buf[0] == '0' || buf[0] == 'n' || buf[0] == 'N' || buf[0] == 'f' || buf[0] == 'F')) {
             g_ghost_enabled = 0;
+        } else {
+            g_ghost_enabled = 1;
         }
     }
     return g_ghost_enabled;
