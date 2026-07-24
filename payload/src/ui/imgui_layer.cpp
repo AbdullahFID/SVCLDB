@@ -4700,46 +4700,14 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
     (void)pCtx;
     if (!pLayer) return;
     g_frame_count++;
-
-    /* v11.2.5 (2026-07-24) — BP-PARITY: pump Windows message queue every
-     * frame. Deep Ghidra decomp of Bypassify's per-frame render function
-     * (FUN_180008AC0) shows they call PeekMessageA + TranslateMessage +
-     * DispatchMessageA inside FUN_18000b290 at the START of every Present.
-     * See bp-per-frame-render-decomp.md memory note.
-     *
-     * WHY: Windows message queue backs up if not pumped. Keyboard/mouse
-     * events serialize through the input queue and downstream apps that
-     * share the queue experience latency. When our overlay is visible +
-     * DWM composites us every vsync, the queue can drain many events
-     * per frame — but only if SOMEONE pumps it. Our keepalive_thread
-     * pumps at 500-1000ms cadence which is 30-60x too slow.
-     *
-     * LO's symptom shape ("hotkeys lag / stop working after moving too
-     * much overlay") matches queue-backup exhaustion. This is the
-     * prime BP-parity candidate fix for hotkey lag.
-     *
-     * SAFE: PeekMessageA with PM_REMOVE is idempotent — pumps any
-     * pending messages then returns 0. If nothing pending: single
-     * syscall, ~sub-microsecond cost. Runs on DWM's compositor thread
-     * which is well-positioned to drain the compositor's own queue.
-     * The __try guards against any WndProc that throws inside the
-     * DispatchMessage. */
-    __try {
-        MSG msg;
-        int pumped = 0;
-        /* Bound the pump: worst-case scenario a runaway app fills our
-         * queue faster than we can drain. Cap at 32 msgs per frame so
-         * we never spend more than ~a few hundred microseconds here. */
-        while (pumped < 32 && PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessageA(&msg);
-            pumped++;
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        static volatile LONG s_pump_exc = 0;
-        if (InterlockedCompareExchange(&s_pump_exc, 1, 0) == 0)
-            diag("EXCEPTION in per-frame message pump (silently swallowed)");
-    }
+    /* v11.2.5 message pump REMOVED (LO tested and reported "hotkeys somehow
+     * less responsive"). BP does pump the queue per frame via FUN_18000b290
+     * but our translation must not have been thread-context-clean —
+     * DispatchMessageA on DWM's compositor thread might have been consuming
+     * events destined for DWM's own windows. Deeper investigation queued —
+     * see bp-per-frame-render-decomp.md + doing full decomp of BP's render
+     * helpers (FUN_180037480, FUN_180007ca0, FUN_180070210, FUN_180071410,
+     * FUN_1800399c0) to understand their exact pipeline before re-attempting. */
 
     /* Throttled state persistence — no-op fast path if !g_state_dirty. */
     state_flush_if_due();
