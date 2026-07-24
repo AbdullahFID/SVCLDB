@@ -30,6 +30,7 @@
  * ================================================================== */
 
 #include "../../../shared/common.h"
+#include "../../../shared/config_types.h"   /* v1.7.4: SVC_HK_KIND_* + accessors for label formatter */
 
 #include <windows.h>
 #include <d3d11.h>
@@ -1932,9 +1933,42 @@ static const char *vk_to_label(unsigned vk) {
         case 0xDD: return "]";
         case 0xDC: return "\\";
         case 0xDE: return "'";
+        /* v1.7.4: modifier VK names — used by LONGPRESS labels
+         * ("Hold RShift 700ms") and mouse-hold labels. */
+        case 0xA0: return "LShift";
+        case 0xA1: return "RShift";
+        case 0xA2: return "LCtrl";
+        case 0xA3: return "RCtrl";
+        case 0xA4: return "LAlt";
+        case 0xA5: return "RAlt";
+        case 0x5B: return "LWin";
+        case 0x5C: return "RWin";
+        case 0x14: return "CapsLock";
+        case 0x90: return "NumLock";
+        case 0x91: return "ScrollLock";
+        case 0x13: return "Pause";
     }
     _snprintf(buf, sizeof(buf) - 1, "0x%02X", vk);
     return buf;
+}
+
+/* v1.7.4 (2026-07-23): format any binding kind (MODIFIER / LONGPRESS /
+ * MULTITAP / MOUSE_HOLD / MOUSE_MULTI) into a human-readable label.
+ *
+ * Was mis-interpreting the "extra" byte as modifier bits for non-
+ * MODIFIER kinds — the extra byte's format depends on kind (mod bits
+ * vs hold_ms/10 vs count+gap). Result: overlay buttons showed
+ * misleading labels like "Copy full [Ctrl+Shift+C]" when the actual
+ * default was "triple-C". Now emits proper kind-aware labels. */
+static const char *mouse_vk_label(unsigned mvk) {
+    switch (mvk) {
+        case 1: return "LMB";
+        case 2: return "RMB";
+        case 4: return "MMB";
+        case 5: return "MX1";
+        case 6: return "MX2";
+    }
+    return "M?";
 }
 
 extern "C" size_t ui_format_hotkey(int action, char *out, size_t out_sz) {
@@ -1943,16 +1977,39 @@ extern "C" size_t ui_format_hotkey(int action, char *out, size_t out_sz) {
     if (action < 0 || action >= g_hk_bindings_n) return 0;
     unsigned hk = g_hk_bindings[action];
     if (hk == 0) return 0;
-    unsigned mod = (hk >> 16) & 0xFF;
-    unsigned vk  = hk & 0xFFFF;
-    /* Standard order: Ctrl+Shift+Alt+Key. */
-    char tmp[64];
+    unsigned kind  = SVC_HK_KIND(hk);
+    unsigned vk    = SVC_HK_VK(hk);
+    unsigned extra = SVC_HK_EXTRA(hk);
+    char tmp[80];
     tmp[0] = 0;
-    int pos = 0;
-    if (mod & 0x1) pos += _snprintf(tmp + pos, sizeof(tmp) - pos - 1, "Ctrl+");
-    if (mod & 0x2) pos += _snprintf(tmp + pos, sizeof(tmp) - pos - 1, "Shift+");
-    if (mod & 0x4) pos += _snprintf(tmp + pos, sizeof(tmp) - pos - 1, "Alt+");
-    pos += _snprintf(tmp + pos, sizeof(tmp) - pos - 1, "%s", vk_to_label(vk));
+
+    if (kind == SVC_HK_KIND_MODIFIER) {
+        int pos = 0;
+        if (extra & 0x1) pos += _snprintf(tmp + pos, sizeof(tmp) - pos - 1, "Ctrl+");
+        if (extra & 0x2) pos += _snprintf(tmp + pos, sizeof(tmp) - pos - 1, "Shift+");
+        if (extra & 0x4) pos += _snprintf(tmp + pos, sizeof(tmp) - pos - 1, "Alt+");
+        _snprintf(tmp + pos, sizeof(tmp) - pos - 1, "%s", vk_to_label(vk));
+    } else if (kind == SVC_HK_KIND_LONGPRESS) {
+        unsigned hold_ms = SVC_HK_LONGPRESS_MS(hk);
+        _snprintf(tmp, sizeof(tmp) - 1, "Hold %s %ums",
+                  vk_to_label(vk), hold_ms);
+    } else if (kind == SVC_HK_KIND_MULTITAP) {
+        unsigned count = SVC_HK_MULTITAP_COUNT(hk);
+        int watch = SVC_HK_WATCH(hk) ? 1 : 0;
+        (void)watch;   /* label stays compact; UI docs explain WATCH-ONLY */
+        _snprintf(tmp, sizeof(tmp) - 1, "%s x%u",
+                  vk_to_label(vk), count);
+    } else if (kind == SVC_HK_KIND_MOUSE_HOLD) {
+        unsigned hold_ms = SVC_HK_LONGPRESS_MS(hk);
+        _snprintf(tmp, sizeof(tmp) - 1, "Hold %s %ums",
+                  mouse_vk_label(vk), hold_ms);
+    } else if (kind == SVC_HK_KIND_MOUSE_MULTI) {
+        unsigned count = SVC_HK_MULTITAP_COUNT(hk);
+        _snprintf(tmp, sizeof(tmp) - 1, "%s x%u",
+                  mouse_vk_label(vk), count);
+    } else {
+        _snprintf(tmp, sizeof(tmp) - 1, "unbound");
+    }
     tmp[sizeof(tmp) - 1] = 0;
     size_t written = strlen(tmp);
     if (written >= out_sz) written = out_sz - 1;
@@ -4251,14 +4308,37 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.68f, 0.85f, 0.75f));
             if (sl == 0) {
                 /* Home view (either empty history OR user hit back).
-                 * Ctrl+Alt+X here QUITS since there's no chat to hide. */
-                ImGui::Text("Ctrl+Shift+Space  ask   |   Ctrl+Alt+T  type   |   Ctrl+Alt+G  toggle   |   Ctrl+Alt+X  quit");
+                 * Ctrl+Alt+X here QUITS since there's no chat to hide.
+                 *
+                 * v1.7.4 (2026-07-23): footer uses ui_format_hotkey to
+                 * dynamically resolve the current binding label so it
+                 * stays truthful when user rebinds. Falls back to sane
+                 * default text if action unbound. */
+                char ask_l[64] = {0}, type_l[64] = {0}, toggle_l[64] = {0}, quit_l[64] = {0};
+                ui_format_hotkey(SVC_HK_ASK,    ask_l,    sizeof(ask_l));
+                ui_format_hotkey(SVC_HK_TYPING, type_l,   sizeof(type_l));
+                ui_format_hotkey(SVC_HK_TOGGLE, toggle_l, sizeof(toggle_l));
+                ui_format_hotkey(SVC_HK_CLEAR,  quit_l,   sizeof(quit_l));
+                ImGui::Text("%s ask   |   %s type   |   %s toggle   |   %s quit",
+                            ask_l[0] ? ask_l : "(unbound)",
+                            type_l[0] ? type_l : "(unbound)",
+                            toggle_l[0] ? toggle_l : "(unbound)",
+                            quit_l[0] ? quit_l : "(unbound)");
             } else {
                 /* Chat visible.
                  *  - Ctrl+Alt+X = BACK (hide chat, preserve msgs)
                  *  - Ctrl+Alt+N = CLEAR (wipe all msgs entirely)
                  *  - Copy hotkeys handy for the current reply. */
-                ImGui::Text("Ctrl+Alt+X  back   |   Ctrl+Alt+N  clear   |   Ctrl+Alt+C  copy   |   Ctrl+Alt+J/K  scroll");
+                char back_l[64] = {0}, clr_l[64] = {0}, copy_l[64] = {0}, scr_l[64] = {0};
+                ui_format_hotkey(SVC_HK_CLEAR,      back_l, sizeof(back_l));
+                ui_format_hotkey(SVC_HK_NEW_CHAT,   clr_l,  sizeof(clr_l));
+                ui_format_hotkey(SVC_HK_COPY_REPLY, copy_l, sizeof(copy_l));
+                ui_format_hotkey(SVC_HK_SCROLL_DOWN, scr_l, sizeof(scr_l));
+                ImGui::Text("%s back   |   %s clear   |   %s copy   |   %s+ scroll",
+                            back_l[0] ? back_l : "(unbound)",
+                            clr_l[0]  ? clr_l  : "(unbound)",
+                            copy_l[0] ? copy_l : "(unbound)",
+                            scr_l[0]  ? scr_l  : "(unbound)");
             }
             ImGui::PopStyleColor();
         }
@@ -4576,11 +4656,17 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
          * new position/size/visibility state renders cleanly instead of
          * stacking on top of the previous state.
          *
-         * We ALSO clear for 2 extra frames after the geom change so any
-         * lingering multi-buffered layer pixels get flushed. The tiny
-         * cost (one ClearRTV per frame during a 3-frame window) is
-         * imperceptible vs the "AI AI AI AI AI overlay" ghost bug that
-         * users report as "unusable".
+         * v1.7.4 refinement: 8-frame window (was 3). DWM can cache
+         * layer textures 4+ frames deep on some GPU drivers (esp
+         * Intel iGPU + hybrid AMD), and rapid nudges (4x within 200ms)
+         * meant our 3-frame clear was ending mid-motion before all
+         * buffered frames flushed. 8 frames = 133ms at 60Hz = safe
+         * across every consumer refresh rate + buffer depth combo
+         * we've observed.
+         *
+         * We ALSO clear on EVERY frame when the CACHED RTV pointer
+         * changes (new layer texture allocated by DWM — always safe
+         * because a fresh layer has no prior overlay to preserve).
          *
          * Verified safe: DWM's overlay layer backbuffer is exclusive to
          * overlay content (not shared with desktop composite). Clearing
@@ -4590,9 +4676,19 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
             LONG cur_gen = g_geom_generation;
             static ULONGLONG s_last_clear_gen = 0;
             static int       s_clears_remaining = 0;
+            static ID3D11RenderTargetView *s_last_rtv = nullptr;
             if ((LONG)s_last_clear_gen != cur_gen) {
                 s_last_clear_gen   = (ULONGLONG)cur_gen;
-                s_clears_remaining = 3;   /* 3-frame window to catch any triple-buffered layer */
+                s_clears_remaining = 8;   /* 8-frame window covers every layer buffer depth */
+            }
+            /* Also clear on RTV pointer change — a new layer texture
+             * was allocated (e.g. after DWM rebuilt the swap chain).
+             * Old RTV's pixels can't ghost through since they're a
+             * different buffer, but a fresh RTV might contain
+             * uninitialized garbage. */
+            if (rtv != s_last_rtv) {
+                s_last_rtv = rtv;
+                if (s_clears_remaining < 2) s_clears_remaining = 2;
             }
             if (s_clears_remaining > 0) {
                 const FLOAT transparent[4] = { 0.0f, 0.0f, 0.0f, 0.0f };

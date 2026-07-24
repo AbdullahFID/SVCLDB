@@ -1589,6 +1589,86 @@ html, body {
   font-size: 11px; color: var(--fg2);
   margin-top: 4px; line-height: 1.45;
 }
+
+/* v1.7.4 (2026-07-23) — mouse-binding picker styles. */
+#hk-record-modal-root .hk-mouse-body { margin-top: 4px; }
+#hk-record-modal-root .hk-explainer {
+  background: rgba(6, 182, 212, 0.06);
+  border-left: 3px solid rgba(6, 182, 212, 0.5);
+  padding: 10px 14px;
+  border-radius: 6px;
+  font-size: 12px; line-height: 1.55; color: var(--fg2);
+  margin-bottom: 14px;
+}
+#hk-record-modal-root .hk-explainer b { color: var(--cyan-light); }
+#hk-record-modal-root .hk-mouse-btn-grid {
+  display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px;
+  margin-bottom: 4px;
+}
+@media (max-width: 720px) {
+  #hk-record-modal-root .hk-mouse-btn-grid { grid-template-columns: repeat(2, 1fr); }
+}
+#hk-record-modal-root .hk-mouse-btn {
+  background: rgba(15, 23, 42, 0.65);
+  border: 1.5px solid rgba(255,255,255,0.10);
+  border-radius: 10px;
+  padding: 12px 8px;
+  color: var(--fg);
+  cursor: pointer;
+  transition: border-color .12s, background .12s, transform .10s;
+  font: inherit;
+  text-align: center;
+}
+#hk-record-modal-root .hk-mouse-btn:hover {
+  border-color: rgba(6, 182, 212, 0.55);
+  background: rgba(6, 182, 212, 0.08);
+}
+#hk-record-modal-root .hk-mouse-btn.active {
+  border-color: var(--cyan-light);
+  background: rgba(6, 182, 212, 0.18);
+  transform: translateY(-1px);
+}
+#hk-record-modal-root .hk-mouse-btn-short {
+  font-family: 'SF Mono', 'Cascadia Code', monospace;
+  font-size: 14px; font-weight: 700;
+  color: var(--cyan-light);
+}
+#hk-record-modal-root .hk-mouse-btn-full {
+  font-size: 10.5px; color: var(--fg2);
+  margin-top: 3px; line-height: 1.25;
+}
+#hk-record-modal-root .hk-mouse-subkind {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+}
+@media (max-width: 720px) {
+  #hk-record-modal-root .hk-mouse-subkind { grid-template-columns: 1fr; }
+}
+#hk-record-modal-root .hk-mouse-subkind-btn {
+  background: rgba(15, 23, 42, 0.65);
+  border: 1.5px solid rgba(255,255,255,0.10);
+  border-radius: 10px;
+  padding: 12px 14px;
+  color: var(--fg);
+  cursor: pointer;
+  transition: border-color .12s, background .12s;
+  font: inherit;
+  text-align: left;
+}
+#hk-record-modal-root .hk-mouse-subkind-btn:hover {
+  border-color: rgba(6, 182, 212, 0.55);
+  background: rgba(6, 182, 212, 0.08);
+}
+#hk-record-modal-root .hk-mouse-subkind-btn.active {
+  border-color: var(--cyan-light);
+  background: rgba(6, 182, 212, 0.18);
+}
+#hk-record-modal-root .hk-mouse-subkind-label {
+  font-size: 13px; font-weight: 700; color: var(--fg);
+}
+#hk-record-modal-root .hk-mouse-subkind-hint {
+  font-size: 11px; color: var(--fg2); line-height: 1.4;
+  margin-top: 3px;
+}
 #hk-record-modal-root .hk-risk {
   margin: 16px 0 12px 0;
   min-height: 20px;

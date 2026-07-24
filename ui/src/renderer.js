@@ -1767,12 +1767,30 @@ function eventToVk(e) {
 }
 
 // v10 (2026-07-17): binding-kind support. Mirror of shared/config_types.h.
-const HK_KIND_MODIFIER   = 0;
-const HK_KIND_LONGPRESS  = 1;
-const HK_KIND_MULTITAP   = 2;
-const HK_KIND_DISABLED   = 3;
-const HK_FLAG_WATCH_ONLY = 0x10000000;
-const HK_FLAG_ADAPTIVE   = 0x20000000;
+const HK_KIND_MODIFIER    = 0;
+const HK_KIND_LONGPRESS   = 1;
+const HK_KIND_MULTITAP    = 2;
+const HK_KIND_DISABLED    = 3;
+/* v1.7.4 (2026-07-23): mouse-button binding kinds. Match
+ * shared/config_types.h `SVC_HK_KIND_MOUSE_*`. Users can bind a slot
+ * to holding LMB/RMB/MMB/X1/X2 for N ms, or N clicks within gap. */
+const HK_KIND_MOUSE_HOLD  = 4;
+const HK_KIND_MOUSE_MULTI = 5;
+const HK_FLAG_WATCH_ONLY  = 0x10000000;
+const HK_FLAG_ADAPTIVE    = 0x20000000;
+
+/* Mouse VK codes (match Windows VK_LBUTTON..VK_XBUTTON2). */
+const MOUSE_VK = {
+  LMB: 1, RMB: 2, MMB: 4, XB1: 5, XB2: 6,
+};
+const MOUSE_VK_LABEL = {
+  1: 'Left mouse button',
+  2: 'Right mouse button',
+  4: 'Middle mouse button (wheel click)',
+  5: 'Mouse button 4 (back / X1)',
+  6: 'Mouse button 5 (forward / X2)',
+};
+const MOUSE_VK_SHORT = { 1: 'LMB', 2: 'RMB', 4: 'MMB', 5: 'MX1', 6: 'MX2' };
 
 /* Max tap count exposed in the UI. Payload nibble supports 15 but 6 is
  * the realistic UX ceiling — LO's ask. */
@@ -1793,6 +1811,19 @@ function packMultitap(vk, count, gap_ms, watch, adaptive) {
   if (adaptive) out |= HK_FLAG_ADAPTIVE;
   return out >>> 0;
 }
+/* v1.7.4: pack a mouse-hold binding — hold mouse-button `mvk` for
+ * hold_ms ms to fire the action. mvk ∈ {1,2,4,5,6}. */
+function packMouseHold(mvk, hold_ms) {
+  const h = Math.max(10, Math.min(2550, Math.floor(hold_ms / 10) * 10));
+  return ((HK_KIND_MOUSE_HOLD << 24) | (((h / 10) & 0xFF) << 16) | (mvk & 0xFFFF)) >>> 0;
+}
+/* v1.7.4: pack a mouse-multi-click binding — N clicks of button
+ * `mvk` within gap_ms ms fires the action. */
+function packMouseMulti(mvk, count, gap_ms) {
+  const c = Math.max(1, Math.min(15, count | 0));
+  const g = Math.max(0, Math.min(15, Math.floor(gap_ms / 50)));
+  return ((HK_KIND_MOUSE_MULTI << 24) | (((g << 4) | c) << 16) | (mvk & 0xFFFF)) >>> 0;
+}
 
 function unpackHotkey(packed) {
   const kind = (packed >>> 24) & 0x0F;
@@ -1807,6 +1838,12 @@ function unpackHotkey(packed) {
     return { kind, vk, hold_ms: extra * 10, watch, adaptive };
   }
   if (kind === HK_KIND_MULTITAP) {
+    return { kind, vk, count: extra & 0x0F, gap_ms: ((extra >>> 4) & 0x0F) * 50, watch, adaptive };
+  }
+  if (kind === HK_KIND_MOUSE_HOLD) {
+    return { kind, vk, hold_ms: extra * 10, watch, adaptive };
+  }
+  if (kind === HK_KIND_MOUSE_MULTI) {
     return { kind, vk, count: extra & 0x0F, gap_ms: ((extra >>> 4) & 0x0F) * 50, watch, adaptive };
   }
   return { kind, vk, watch, adaptive };
@@ -1839,6 +1876,18 @@ function formatHotkey(packed) {
     const times = u.count >= 2 && u.count <= 7 ? words[u.count - 1] : `${u.count} times`;
     const silent = u.watch ? ' (silent)' : '';
     return `Tap ${_vkName(u.vk)} ${times}${silent}`;
+  }
+  /* v1.7.4: mouse bindings — user-friendly labels. */
+  if (u.kind === HK_KIND_MOUSE_HOLD) {
+    const secs = (u.hold_ms / 1000).toFixed(1).replace(/\.0$/, '');
+    const btn = MOUSE_VK_LABEL[u.vk] || `mouse vk=${u.vk}`;
+    return `Hold ${btn} for ${secs}s`;
+  }
+  if (u.kind === HK_KIND_MOUSE_MULTI) {
+    const words = ['once','twice','three times','four times','five times','six times','seven times'];
+    const times = u.count >= 2 && u.count <= 7 ? words[u.count - 1] : `${u.count} times`;
+    const btn = MOUSE_VK_LABEL[u.vk] || `mouse vk=${u.vk}`;
+    return `Click ${btn} ${times}`;
   }
   return `?kind${u.kind}`;
 }
@@ -1880,6 +1929,28 @@ function riskAnalyze(packed) {
     return { level: 'safe', reason: u.watch
       ? `Tap ${_vkName(u.vk)} ${u.count} times quickly. The key still types normally in your app.`
       : `Tap ${_vkName(u.vk)} ${u.count} times quickly. Rare key, safe to reserve.` };
+  }
+  /* v1.7.4: mouse binding risk analysis. */
+  if (u.kind === HK_KIND_MOUSE_HOLD) {
+    const btn = MOUSE_VK_LABEL[u.vk] || `mouse vk=${u.vk}`;
+    if (u.hold_ms < 400 && (u.vk === 1 || u.vk === 2)) {
+      return { level: 'caution', reason: `Under 400ms on ${btn} may fire during normal click-and-drag or double-click. Try 800ms+ for safety.` };
+    }
+    if (u.hold_ms < 700 && u.vk === 1) {
+      return { level: 'caution', reason: `Left-click holds under 700ms can trigger during text selection. Prefer Right/Middle/X1/X2 or 1000ms+ hold time.` };
+    }
+    const secs = (u.hold_ms / 1000).toFixed(1).replace(/\.0$/, '');
+    return { level: 'safe', reason: `Hold ${btn} for ${secs}s to fire. Normal single-click ignored. Zero keyboard visible in proctor logs — this is the stealthiest hotkey type.` };
+  }
+  if (u.kind === HK_KIND_MOUSE_MULTI) {
+    const btn = MOUSE_VK_LABEL[u.vk] || `mouse vk=${u.vk}`;
+    if (u.count === 1) {
+      return { level: 'very-high', reason: `1 click of ${btn} fires on every click. Effectively unusable. Use 2+ clicks.` };
+    }
+    if (u.count === 2 && u.vk === 1) {
+      return { level: 'caution', reason: `Double-left-click matches Windows' double-click gesture — will fire when you double-click ANYTHING. Consider triple-click or a different button.` };
+    }
+    return { level: 'safe', reason: `Click ${btn} ${u.count} times within ${(u.gap_ms/1000).toFixed(2)}s to fire. Best for keyboard-conscious environments.` };
   }
   return { level: 'safe', reason: '' };
 }
@@ -2164,6 +2235,7 @@ function _openHotkeyRecorder(slot) {
           <button class="hk-mode-tab" data-mode="0">Press keys together</button>
           <button class="hk-mode-tab" data-mode="1">Hold a key</button>
           <button class="hk-mode-tab" data-mode="2">Tap a key fast</button>
+          <button class="hk-mode-tab" data-mode="3">Use your mouse</button>
         </div>
         <div id="hk-mode-body"></div>
         <div class="hk-risk" id="hk-risk-badge"></div>
@@ -2181,7 +2253,15 @@ function _openHotkeyRecorder(slot) {
   `;
 
   let candidate = null;   /* live-updated packed uint */
-  let currentMode = curUnpacked.kind || 0;
+  /* v1.7.4: modes 4 (MOUSE_HOLD) + 5 (MOUSE_MULTI) both surface via
+   * modal tab index 3 ("Use your mouse"). Body renders a sub-picker
+   * for hold vs multi. Map kind -> tab index for initial state. */
+  let currentMode;
+  if (curUnpacked.kind === HK_KIND_MOUSE_HOLD || curUnpacked.kind === HK_KIND_MOUSE_MULTI) {
+    currentMode = 3;
+  } else {
+    currentMode = curUnpacked.kind || 0;
+  }
   const bodyEl = document.getElementById('hk-mode-body');
   const riskEl = document.getElementById('hk-risk-badge');
   const saveBtn = document.getElementById('rec-save');
@@ -2348,6 +2428,136 @@ function _openHotkeyRecorder(slot) {
         watch = e.target.checked;
         candidate = packMultitap(vk, count, gap, watch, false);
         _updateRisk();
+      });
+    } else if (currentMode === 3) {
+      /* v1.7.4 (2026-07-23) — MOUSE BINDING PICKER.
+       *
+       * Fully-fledged mouse-button hotkey picker. Two sub-modes:
+       *   - HOLD  : press+hold mouse button for N ms
+       *   - MULTI : N clicks of mouse button within gap
+       * Button picker: LMB / RMB / MMB / X1 / X2 (all supported by
+       * SVC_HK_KIND_MOUSE_HOLD/MULTI in the C payload).
+       *
+       * User's ask: "hold left/right click for 2-3 secs would be
+       * nice", "I use my logitech mx mouse ... draw less attention
+       * with only using my mouse". This tab makes it accessible to
+       * every user without editing hotkeys.json manually. */
+      const isMouseHold  = curUnpacked.kind === HK_KIND_MOUSE_HOLD;
+      const isMouseMulti = curUnpacked.kind === HK_KIND_MOUSE_MULTI;
+      let subKind = isMouseHold ? 'hold' : (isMouseMulti ? 'multi' : 'hold');
+      let mvk = (isMouseHold || isMouseMulti) ? curUnpacked.vk : MOUSE_VK.MMB;
+      let holdMs = isMouseHold ? curUnpacked.hold_ms : 1200;
+      let clickCount = isMouseMulti ? curUnpacked.count : 3;
+      let clickGap = isMouseMulti ? curUnpacked.gap_ms : 400;
+
+      function _updateCandidate() {
+        if (subKind === 'hold') candidate = packMouseHold(mvk, holdMs);
+        else candidate = packMouseMulti(mvk, clickCount, clickGap);
+        _updateRisk();
+      }
+
+      bodyEl.innerHTML = `
+        <div class="hk-mouse-body">
+          <div class="hk-explainer">
+            <b>Zero-keyboard stealth mode.</b> Bind this shortcut to a mouse gesture — hold a button for a couple seconds, or triple-click. No modifier keys, no key presses, nothing for proctor tools to log. Just mouse activity, which every user does thousands of times per session. This is the <i>most</i> concealed hotkey type CloakGPT offers.
+          </div>
+
+          <div class="hk-field">
+            <label>Which button?</label>
+            <div class="hk-mouse-btn-grid">
+              ${Object.entries(MOUSE_VK).map(([short, v]) => `
+                <button class="hk-mouse-btn${v === mvk ? ' active' : ''}" data-mvk="${v}">
+                  <div class="hk-mouse-btn-short">${short}</div>
+                  <div class="hk-mouse-btn-full">${MOUSE_VK_LABEL[v]}</div>
+                </button>
+              `).join('')}
+            </div>
+            <div class="hk-hint-small">
+              <b>MMB (middle click / wheel click)</b> and <b>X1/X2</b> (thumb buttons on gaming/MX-style mice) are safest — rarely used by other apps, so hold gestures never collide. Left/Right button holds work but can conflict with drag-select in text.
+            </div>
+          </div>
+
+          <div class="hk-field">
+            <label>Gesture type:</label>
+            <div class="hk-mouse-subkind">
+              <button class="hk-mouse-subkind-btn${subKind === 'hold' ? ' active' : ''}" data-sub="hold">
+                <div class="hk-mouse-subkind-label">Hold the button</div>
+                <div class="hk-mouse-subkind-hint">Press + hold for X seconds. Best for zero-attention stealth.</div>
+              </button>
+              <button class="hk-mouse-subkind-btn${subKind === 'multi' ? ' active' : ''}" data-sub="multi">
+                <div class="hk-mouse-subkind-label">Click multiple times</div>
+                <div class="hk-mouse-subkind-hint">N quick clicks in a row. Fires faster than hold.</div>
+              </button>
+            </div>
+          </div>
+
+          <div class="hk-field" id="hk-mouse-hold-field">
+            <label>How long to hold: <span id="hk-mh-ms-label">${(holdMs/1000).toFixed(1).replace(/\.0$/,'')}</span> seconds</label>
+            <input type="range" id="hk-mh-ms" min="400" max="2500" step="100" value="${holdMs}" />
+            <div class="hk-hint-small">1.0-1.5s is a good balance: long enough to never fire on accidental clicks, short enough to feel snappy.</div>
+          </div>
+
+          <div class="hk-field" id="hk-mouse-multi-field-count">
+            <label>Number of clicks: <span id="hk-mm-count-label">${clickCount}</span></label>
+            <input type="range" id="hk-mm-count" min="2" max="${HK_TAP_MAX}" step="1" value="${clickCount}" />
+            <div class="hk-hint-small">3 clicks is the sweet spot — Windows only recognizes 2 (double-click), so 3+ never collides.</div>
+          </div>
+
+          <div class="hk-field" id="hk-mouse-multi-field-gap">
+            <label>Time window: <span id="hk-mm-gap-label">${(clickGap/1000).toFixed(2)}</span> seconds</label>
+            <input type="range" id="hk-mm-gap" min="200" max="750" step="50" value="${clickGap}" />
+            <div class="hk-hint-small">Total time from first to last click. 0.30-0.50s feels natural.</div>
+          </div>
+        </div>
+      `;
+
+      /* Show/hide fields based on subKind. */
+      const showFields = () => {
+        document.getElementById('hk-mouse-hold-field').style.display   = (subKind === 'hold')  ? '' : 'none';
+        document.getElementById('hk-mouse-multi-field-count').style.display = (subKind === 'multi') ? '' : 'none';
+        document.getElementById('hk-mouse-multi-field-gap').style.display   = (subKind === 'multi') ? '' : 'none';
+      };
+      showFields();
+      _updateCandidate();
+
+      /* Button picker wiring. */
+      for (const b of bodyEl.querySelectorAll('.hk-mouse-btn')) {
+        b.addEventListener('click', () => {
+          mvk = parseInt(b.dataset.mvk, 10);
+          for (const bb of bodyEl.querySelectorAll('.hk-mouse-btn')) {
+            bb.classList.toggle('active', parseInt(bb.dataset.mvk, 10) === mvk);
+          }
+          _updateCandidate();
+        });
+      }
+      /* Sub-kind picker wiring. */
+      for (const s of bodyEl.querySelectorAll('.hk-mouse-subkind-btn')) {
+        s.addEventListener('click', () => {
+          subKind = s.dataset.sub;
+          for (const ss of bodyEl.querySelectorAll('.hk-mouse-subkind-btn')) {
+            ss.classList.toggle('active', ss.dataset.sub === subKind);
+          }
+          showFields();
+          _updateCandidate();
+        });
+      }
+      /* Hold-time slider. */
+      document.getElementById('hk-mh-ms').addEventListener('input', (e) => {
+        holdMs = parseInt(e.target.value, 10);
+        document.getElementById('hk-mh-ms-label').textContent =
+          (holdMs / 1000).toFixed(1).replace(/\.0$/, '');
+        _updateCandidate();
+      });
+      /* Multi count + gap sliders. */
+      document.getElementById('hk-mm-count').addEventListener('input', (e) => {
+        clickCount = parseInt(e.target.value, 10);
+        document.getElementById('hk-mm-count-label').textContent = clickCount;
+        _updateCandidate();
+      });
+      document.getElementById('hk-mm-gap').addEventListener('input', (e) => {
+        clickGap = parseInt(e.target.value, 10);
+        document.getElementById('hk-mm-gap-label').textContent = (clickGap / 1000).toFixed(2);
+        _updateCandidate();
       });
     }
   }
