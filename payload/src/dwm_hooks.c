@@ -1688,11 +1688,31 @@ static int ghost_is_enabled(void) {
         char buf[8];
         DWORD n = GetEnvironmentVariableA("DWM_EXT_GHOST",
                                           buf, sizeof(buf));
-        /* Default ON. Explicit "0" or "false" disables. */
-        if (n > 0 && (buf[0] == '0' || buf[0] == 'f' || buf[0] == 'F')) {
-            g_ghost_enabled = 0;
-        } else {
+        /* v1.7.4.4 (2026-07-23) — FLIPPED to DEFAULT-OFF.
+         *
+         * Pre-v1.7.4.4 was default-ON: a fullscreen alpha=1/255
+         * layered TOPMOST window. Every hooks_ghost_wake call fires
+         * RedrawWindow(RDW_INVALIDATE) on it. Under bursty use, this
+         * appears to trigger DWM to invalidate the whole screen
+         * region and re-composite — on lower-end GPUs the compositor
+         * falls behind and presents black frames while catching up.
+         *
+         * User bug: "screen flickering black like a horror movie zero
+         * stability ... had to fight to squeeze to click emergency
+         * stop". Repro'd nowhere in dev; only in production.
+         *
+         * PN=TRUE + SCP already keeps DWM composing every native
+         * vsync (Bypassify's exact approach). Ghost was belt-and-
+         * suspenders. Belt is enough — flipping OFF eliminates the
+         * flicker risk entirely + removes one fullscreen enumerable
+         * top-level HWND as a bonus stealth win.
+         *
+         * Opt-IN via DWM_EXT_GHOST=1 for users who need the extra
+         * wake reliability (rare on modern hardware). */
+        if (n > 0 && (buf[0] == '1' || buf[0] == 't' || buf[0] == 'T' || buf[0] == 'y' || buf[0] == 'Y')) {
             g_ghost_enabled = 1;
+        } else {
+            g_ghost_enabled = 0;
         }
     }
     return g_ghost_enabled;

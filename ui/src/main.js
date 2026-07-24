@@ -644,7 +644,10 @@ ipcMain.handle('license:load', async () => {
   const secResult = await security.runChecks();
   if (!secResult.ok) {
     console.log('[main] security check FAILED:', secResult.reason);
-    return { session: null, subscription: null, clearReason: 'security_failed',
+    let hwid = null;
+    try { hwid = device.getCached()?.hardware_uuid || (await device.collect()).hardware_uuid || null; }
+    catch {}
+    return { session: null, subscription: null, hwid, clearReason: 'security_failed',
              securityReason: secResult.reason };
   }
 
@@ -655,8 +658,16 @@ ipcMain.handle('license:load', async () => {
   const mitmResult = await mitm.checkForMitm();
   if (!mitmResult.ok) {
     console.log('[main] MITM check FAILED:', mitmResult.tool, mitmResult.kind);
+    /* v1.7.4.4 (2026-07-23): populate hwid on the MITM-refuse return
+     * so the login screen doesn't render "unknown" for the device ID.
+     * User feedback: "why does it say unknown?" — root cause was this
+     * early-return branch never called device.getCached / collect. */
+    let hwid = null;
+    try { hwid = device.getCached()?.hardware_uuid || (await device.collect()).hardware_uuid || null; }
+    catch { /* device probe can fail on very locked-down machines */ }
     return {
       session: null, subscription: null,
+      hwid,
       clearReason: 'mitm_detected',
       mitmKind:    mitmResult.kind,
       mitmTool:    mitmResult.tool,

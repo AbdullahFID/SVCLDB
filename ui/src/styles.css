@@ -614,6 +614,53 @@ html, body {
   opacity: 0.55; cursor: default;
   background: rgba(245, 158, 11, 0.12);
 }
+
+/* v1.7.4.4 (2026-07-23): Retry-check button next to Fix-now. Blue
+ * (info) instead of orange so users can visually distinguish "do
+ * the fix" (orange) from "re-run detection" (blue). */
+#screen-login .login-error-recheck {
+  display: inline-block;
+  margin-top: 12px;
+  margin-left: 8px;
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: 1px solid rgba(6, 182, 212, 0.55);
+  background: linear-gradient(135deg, rgba(6, 182, 212, 0.20), rgba(8, 145, 178, 0.28));
+  color: #cffafe;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.14s ease, box-shadow 0.14s ease, background 0.14s ease;
+}
+#screen-login .login-error-recheck:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 14px rgba(6, 182, 212, 0.25);
+  background: linear-gradient(135deg, rgba(6, 182, 212, 0.30), rgba(8, 145, 178, 0.40));
+}
+#screen-login .login-error-recheck:active:not(:disabled) { transform: translateY(0); }
+#screen-login .login-error-recheck:disabled {
+  opacity: 0.55; cursor: default;
+  background: rgba(6, 182, 212, 0.12);
+}
+
+/* v1.7.4.4 (2026-07-23) — scrollable login screen so tall error
+ * banners (MITM disclosure paragraph + Fix + Recheck buttons)
+ * don't clip the "Sign in" button off-screen. User bug:
+ * "app showed open to a size that's [not] appropriate to show
+ * the full contents of the page either that or allow an overflow
+ * scroll so u can scroll".
+ *
+ * Fix: make #screen-login itself scrollable + shrink internal
+ * padding so on a small window everything fits in-view but if
+ * NOT fits, user can scroll to the sign-in button. */
+#screen-login {
+  overflow-y: auto;
+  padding: 8px 12px;
+}
+#screen-login .login-card {
+  margin: 8px auto;
+  max-height: none;   /* was implicitly limited by parent */
+}
 @keyframes fadeUp {
   from { opacity: 0; transform: translateY(6px); }
   to   { opacity: 1; transform: translateY(0);   }

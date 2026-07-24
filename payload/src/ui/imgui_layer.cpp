@@ -1325,7 +1325,27 @@ static void wake_dwm_composition(void) {
      * so any lazy invalidation gets forced through. Non-blocking to
      * the caller. */
     hooks_ghost_wake();
-    hooks_burst_wake(30, 300, 16);
+    /* v1.7.4.4 (2026-07-23) — FLICKER MITIGATION.
+     *
+     * User reported "screen flickering black like a horror movie". Log
+     * showed 500-1000 capture-render events per second under load,
+     * combined with our 30-pump-over-300ms SCP forcing at every hotkey
+     * fire = extreme GPU pressure on lower-end machines. The compositor
+     * fell behind + presented intermediate BLACK frames during device-
+     * state churn.
+     *
+     * Fix: reduce burst from 30/300ms → 6/100ms. PN=TRUE + a single
+     * SCP already keeps DWM composing every native vsync (Bypassify's
+     * approach per RE); the extra 24 pumps per hotkey were pure
+     * pressure with no visible benefit. Chat/AI/screenshot paths
+     * that legitimately need long compose windows use their own
+     * multi-fire scheme (ui_chat_stream_append throttles wakes to
+     * 30Hz via wake_dwm_composition_typing already).
+     *
+     * Trade-off: on GPU-idle systems, hotkey-triggered state changes
+     * take AT MOST one extra vsync (~16ms at 60Hz) to be visible.
+     * Imperceptible. */
+    hooks_burst_wake(6, 100, 16);
 }
 
 /* v1.6.5 (2026-07-17): light wake — used exclusively for visibility

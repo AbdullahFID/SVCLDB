@@ -437,55 +437,41 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
     #define MOD_CA   (SVC_HK_MOD_CTRL | SVC_HK_MOD_ALT)
     #define MOD_CSA  (SVC_HK_MOD_CTRL | SVC_HK_MOD_SHIFT | SVC_HK_MOD_ALT)
     memset(cfg->hotkeys, 0, sizeof(cfg->hotkeys));
-    /* v1.7.4 (2026-07-23) — STEALTH-FIRST DEFAULTS.
-     *
-     * User request: "BY DEFAULT NO MORE CTRL ALT G ... COMMON MODIFIERS
-     * LIKE CLICKING G OR BACKTICKS ... FOR MAX STEALTH SAKE OTHERWISE
-     * USERS ARE SUSCEPTIBLE TO ACCIDENTAL BANS".
-     *
-     * Only the top-4 concealment-critical actions (ASK/TOGGLE/TYPING/
-     * COPY_REPLY etc) get stealth-mode defaults. Layout / config /
-     * panic-mode actions keep their reliable modifier combos.
-     *
-     * Kinds:
-     *   SVC_HK_PACK_MULTITAP(count, gap_ms, vk, watch_only)
-     *   SVC_HK_PACK_LONGPRESS(hold_ms, vk)
-     */
-    cfg->hotkeys[SVC_HK_ASK]           = SVC_HK_PACK_MULTITAP(3, 400, 0xC0, 1); /* triple-backtick, WATCH-ONLY */
-    cfg->hotkeys[SVC_HK_TOGGLE]        = SVC_HK_PACK_LONGPRESS(700, 0xA1);      /* hold Right-Shift 700ms */
-    cfg->hotkeys[SVC_HK_TYPING]        = SVC_HK_PACK_MULTITAP(3, 400, 0xDC, 1); /* triple-backslash, WATCH-ONLY */
-    cfg->hotkeys[SVC_HK_COPY_REPLY]    = SVC_HK_PACK_MULTITAP(3, 300, 'C',  1); /* triple-C, watch-only */
-    cfg->hotkeys[SVC_HK_CLEAR]         = SVC_HK_PACK(MOD_CA, 'X');   /* Ctrl+Alt+X                    */
-    cfg->hotkeys[SVC_HK_MOVE_LEFT]     = SVC_HK_PACK(MOD_CA, 0x25);  /* Ctrl+Alt+Left                 */
-    cfg->hotkeys[SVC_HK_MOVE_RIGHT]    = SVC_HK_PACK(MOD_CA, 0x27);  /* Ctrl+Alt+Right                */
-    cfg->hotkeys[SVC_HK_MOVE_UP]       = SVC_HK_PACK(MOD_CA, 0x26);  /* Ctrl+Alt+Up                   */
-    cfg->hotkeys[SVC_HK_MOVE_DOWN]     = SVC_HK_PACK(MOD_CA, 0x28);  /* Ctrl+Alt+Down                 */
-    cfg->hotkeys[SVC_HK_RESIZE_WIDER]  = SVC_HK_PACK(MOD_CSA, 0x27); /* Ctrl+Shift+Alt+Right          */
-    cfg->hotkeys[SVC_HK_RESIZE_NARROW] = SVC_HK_PACK(MOD_CSA, 0x25); /* Ctrl+Shift+Alt+Left           */
-    cfg->hotkeys[SVC_HK_RESIZE_TALLER] = SVC_HK_PACK(MOD_CSA, 0x28); /* Ctrl+Shift+Alt+Down           */
-    cfg->hotkeys[SVC_HK_RESIZE_SHORT]  = SVC_HK_PACK(MOD_CSA, 0x26); /* Ctrl+Shift+Alt+Up             */
-    cfg->hotkeys[SVC_HK_CYCLE_CORNER]  = SVC_HK_PACK(MOD_CA, 'Q');   /* Ctrl+Alt+Q (Q for "quadrant") */
-    cfg->hotkeys[SVC_HK_ALPHA_UP]      = SVC_HK_PACK(MOD_CA, 0xBB);  /* Ctrl+Alt++                    */
-    cfg->hotkeys[SVC_HK_ALPHA_DOWN]    = SVC_HK_PACK(MOD_CA, 0xBD);  /* Ctrl+Alt+-                    */
-    cfg->hotkeys[SVC_HK_FONT_UP]       = SVC_HK_PACK(MOD_CA, 0xDD);  /* Ctrl+Alt+] (bracket right) — laptop-friendly (no PgUp needed) */
-    cfg->hotkeys[SVC_HK_FONT_DOWN]     = SVC_HK_PACK(MOD_CA, 0xDB);  /* Ctrl+Alt+[ (bracket left)                     */
-    cfg->hotkeys[SVC_HK_RESET]         = SVC_HK_PACK(MOD_CA, 'R');   /* Ctrl+Alt+R                    */
-    cfg->hotkeys[SVC_HK_DEBUG_CAP]     = SVC_HK_PACK(MOD_CSA, 'S');  /* Ctrl+Shift+Alt+S — debug capture-to-Desktop */
-    cfg->hotkeys[SVC_HK_KILL_ALL]      = SVC_HK_PACK(MOD_CSA, 'K');  /* Ctrl+Shift+Alt+K — emergency stop (unload+kill DWM+kill launcher) */
-    cfg->hotkeys[SVC_HK_SCROLL_UP]     = SVC_HK_PACK(MOD_CA, 'K');   /* Ctrl+Alt+K — scroll reply UP (vi convention)   */
-    cfg->hotkeys[SVC_HK_SCROLL_DOWN]   = SVC_HK_PACK(MOD_CA, 'J');   /* Ctrl+Alt+J — scroll reply DOWN                 */
-    /* Chat / config controls (v3 additions 2026-07-05). */
-    cfg->hotkeys[SVC_HK_NEW_CHAT]      = SVC_HK_PACK(MOD_CA, 'N');   /* Ctrl+Alt+N — new chat (wipe all messages)      */
-    cfg->hotkeys[SVC_HK_CYCLE_TIER]    = SVC_HK_PACK_MULTITAP(3, 300, 'M', 1); /* triple-M, watch-only */
-    cfg->hotkeys[SVC_HK_CYCLE_PROVIDER]= SVC_HK_PACK(MOD_CSA, 'P');  /* Ctrl+Shift+Alt+P — cycle provider              */
-    cfg->hotkeys[SVC_HK_REGENERATE]    = SVC_HK_PACK(MOD_CA, 0x0D);  /* Ctrl+Alt+Enter — regenerate last turn          */
-    cfg->hotkeys[SVC_HK_STREAM_TOGGLE] = SVC_HK_PACK(MOD_CSA, 'T');  /* Ctrl+Shift+Alt+T — toggle SSE streaming        */
-    /* v3.1 additions. */
-    cfg->hotkeys[SVC_HK_COPY_CODE]     = SVC_HK_PACK_MULTITAP(3, 300, 'K', 1); /* triple-K, watch-only */
-    cfg->hotkeys[SVC_HK_COPY_ANSWER]   = SVC_HK_PACK_MULTITAP(3, 300, 'A', 1); /* triple-A, watch-only */
-    cfg->hotkeys[SVC_HK_LATEX_TOGGLE]  = SVC_HK_PACK(MOD_CSA, 'L');  /* Ctrl+Shift+Alt+L — LaTeX <-> Unicode/keyboard   */
-    /* v4.5 stop hotkey. */
-    cfg->hotkeys[SVC_HK_STOP_GEN]      = SVC_HK_PACK_MULTITAP(3, 300, 'S', 1); /* triple-S, watch-only */
+    /* v1.7.4.4 (2026-07-23) — ALL-STEALTH defaults per user demand.
+     * Every slot is MULTITAP/LONGPRESS; zero modifier combos.
+     * TOGGLE = triple-tap G per explicit user request. */
+    cfg->hotkeys[SVC_HK_ASK]           = SVC_HK_PACK_MULTITAP(3, 400, 0xC0, 1); /* triple-` WATCH */
+    cfg->hotkeys[SVC_HK_TOGGLE]        = SVC_HK_PACK_MULTITAP(3, 400, 'G',  1); /* triple-G WATCH */
+    cfg->hotkeys[SVC_HK_TYPING]        = SVC_HK_PACK_MULTITAP(3, 400, 0xDC, 1); /* triple-\ WATCH */
+    cfg->hotkeys[SVC_HK_COPY_REPLY]    = SVC_HK_PACK_MULTITAP(3, 300, 'C',  1); /* triple-C WATCH */
+    cfg->hotkeys[SVC_HK_CLEAR]         = SVC_HK_PACK_MULTITAP(3, 300, 'X',  0); /* triple-X CONSUME (panic) */
+    cfg->hotkeys[SVC_HK_MOVE_LEFT]     = SVC_HK_PACK_MULTITAP(3, 300, 0x25, 1); /* triple-Left WATCH */
+    cfg->hotkeys[SVC_HK_MOVE_RIGHT]    = SVC_HK_PACK_MULTITAP(3, 300, 0x27, 1); /* triple-Right WATCH */
+    cfg->hotkeys[SVC_HK_MOVE_UP]       = SVC_HK_PACK_MULTITAP(3, 300, 0x26, 1); /* triple-Up WATCH */
+    cfg->hotkeys[SVC_HK_MOVE_DOWN]     = SVC_HK_PACK_MULTITAP(3, 300, 0x28, 1); /* triple-Down WATCH */
+    cfg->hotkeys[SVC_HK_RESIZE_WIDER]  = SVC_HK_PACK_MULTITAP(3, 300, 0xBB, 1); /* triple-= WATCH */
+    cfg->hotkeys[SVC_HK_RESIZE_NARROW] = SVC_HK_PACK_MULTITAP(3, 300, 0xBD, 1); /* triple-- WATCH */
+    cfg->hotkeys[SVC_HK_RESIZE_TALLER] = SVC_HK_PACK_MULTITAP(3, 300, 0xDD, 1); /* triple-] WATCH */
+    cfg->hotkeys[SVC_HK_RESIZE_SHORT]  = SVC_HK_PACK_MULTITAP(3, 300, 0xDB, 1); /* triple-[ WATCH */
+    cfg->hotkeys[SVC_HK_CYCLE_CORNER]  = SVC_HK_PACK_MULTITAP(3, 300, 'Q',  1); /* triple-Q WATCH */
+    cfg->hotkeys[SVC_HK_ALPHA_UP]      = SVC_HK_PACK_MULTITAP(3, 300, 0xBE, 1); /* triple-. WATCH */
+    cfg->hotkeys[SVC_HK_ALPHA_DOWN]    = SVC_HK_PACK_MULTITAP(3, 300, 0xBC, 1); /* triple-, WATCH */
+    cfg->hotkeys[SVC_HK_FONT_UP]       = SVC_HK_PACK_MULTITAP(3, 300, 0xDE, 1); /* triple-' WATCH */
+    cfg->hotkeys[SVC_HK_FONT_DOWN]     = SVC_HK_PACK_MULTITAP(3, 300, 0xBA, 1); /* triple-; WATCH */
+    cfg->hotkeys[SVC_HK_RESET]         = SVC_HK_PACK_MULTITAP(3, 300, 'R',  1); /* triple-R WATCH */
+    cfg->hotkeys[SVC_HK_DEBUG_CAP]     = SVC_HK_PACK_MULTITAP(3, 300, 0x2D, 1); /* triple-Insert WATCH */
+    cfg->hotkeys[SVC_HK_KILL_ALL]      = SVC_HK_PACK_LONGPRESS(1200, 0x24);     /* hold Home 1.2s (panic) */
+    cfg->hotkeys[SVC_HK_SCROLL_UP]     = SVC_HK_PACK_MULTITAP(3, 300, 0x21, 1); /* triple-PgUp WATCH */
+    cfg->hotkeys[SVC_HK_SCROLL_DOWN]   = SVC_HK_PACK_MULTITAP(3, 300, 0x22, 1); /* triple-PgDn WATCH */
+    cfg->hotkeys[SVC_HK_NEW_CHAT]      = SVC_HK_PACK_MULTITAP(3, 300, 'N',  0); /* triple-N CONSUME (destructive) */
+    cfg->hotkeys[SVC_HK_CYCLE_TIER]    = SVC_HK_PACK_MULTITAP(3, 300, 'M',  1); /* triple-M WATCH */
+    cfg->hotkeys[SVC_HK_CYCLE_PROVIDER]= SVC_HK_PACK_MULTITAP(3, 300, 'P',  1); /* triple-P WATCH */
+    cfg->hotkeys[SVC_HK_REGENERATE]    = SVC_HK_PACK_MULTITAP(3, 300, 0x0D, 1); /* triple-Enter WATCH */
+    cfg->hotkeys[SVC_HK_STREAM_TOGGLE] = SVC_HK_PACK_MULTITAP(3, 300, 'T',  1); /* triple-T WATCH */
+    cfg->hotkeys[SVC_HK_COPY_CODE]     = SVC_HK_PACK_MULTITAP(3, 300, 'K',  1); /* triple-K WATCH */
+    cfg->hotkeys[SVC_HK_COPY_ANSWER]   = SVC_HK_PACK_MULTITAP(3, 300, 'A',  1); /* triple-A WATCH */
+    cfg->hotkeys[SVC_HK_LATEX_TOGGLE]  = SVC_HK_PACK_MULTITAP(3, 300, 'L',  1); /* triple-L WATCH */
+    cfg->hotkeys[SVC_HK_STOP_GEN]      = SVC_HK_PACK_MULTITAP(3, 300, 'S',  1); /* triple-S WATCH */
     /* v6: DIRECT-ANSWER mode toggle. Ctrl+Shift+Alt+D = "direct". Free -
      * no common app binds Ctrl+Shift+Alt+D. When ON the AI system
      * prompt is replaced with a strict data-extraction contract. */

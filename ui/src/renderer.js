@@ -233,6 +233,23 @@ function showLoginError(msg, opts) {
       _REMEDIATE_LABEL[opts.remediate.kind](opts.remediate.tool);
     btn.addEventListener('click', () => _handleRemediateClick(btn, opts.remediate));
     el.appendChild(btn);
+
+    /* v1.7.4.4 (2026-07-23) — manual RECHECK button.
+     *
+     * User feedback: "after removal it should either periodically
+     * recheck or allow users to force recheck cause once i closed
+     * exe and reopened it showed [the same MITM banner]".
+     *
+     * Fix: add "Recheck now" button next to "Fix now". Runs the
+     * whole boot() again (which re-runs security.runChecks +
+     * mitm.checkForMitm). If nothing bad is detected this time, the
+     * banner clears + sign-in unlocks. Zero app-restart required. */
+    const recheck = document.createElement('button');
+    recheck.className = 'login-error-recheck';
+    recheck.type = 'button';
+    recheck.textContent = '\u21BB Retry check';
+    recheck.addEventListener('click', () => _handleRecheckClick(recheck));
+    el.appendChild(recheck);
   }
 
   el.classList.add('show');
@@ -269,19 +286,34 @@ async function _handleRemediateClick(btn, remediate) {
       kind: remediate.kind,
       tool: remediate.tool,
     });
-    if (r && r.ok) {
-      toast(r.message || 'Fixed. Re-checking\u2026', 'ok');
-      // Re-run the whole boot check - if the ONLY issue was the one
-      // we just fixed, sign-in becomes available again.
-      setTimeout(() => { boot().catch(e => console.log('[renderer] boot after fix:', e.message)); }, 400);
-    } else {
-      const err = (r && r.message) || 'remediation failed';
-      toast(`Fix failed: ${err}`, 'err');
-      btn.disabled = false;
-      btn.textContent = origLabel;
-    }
+    /* v1.7.4.4: r.ok now correctly returns true when nothing needed
+     * removal (mitm.js fixed to treat "already-clean" as success). We
+     * show the message from the remediate result (positive framing)
+     * and re-boot to re-check. */
+    const positive = r && r.ok;
+    toast((r && r.message) || (positive ? 'Fixed. Re-checking\u2026' : 'Nothing to fix — re-checking'), positive ? 'ok' : 'err');
+    // Re-run the whole boot check - if the ONLY issue was the one
+    // we just fixed, sign-in becomes available again.
+    setTimeout(() => { boot().catch(e => console.log('[renderer] boot after fix:', e.message)); }, 400);
   } catch (e) {
     toast(`Fix failed: ${e.message || e}`, 'err');
+    btn.disabled = false;
+    btn.textContent = origLabel;
+  }
+}
+
+/* v1.7.4.4 (2026-07-23) — manual RECHECK handler. */
+async function _handleRecheckClick(btn) {
+  const origLabel = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Checking\u2026';
+  try {
+    await boot();
+    // If boot() completes without re-showing the login-error banner,
+    // sign-in is unlocked. If banner reappears, boot() re-rendered it.
+    // Either way, our button state was replaced by boot()'s render.
+  } catch (e) {
+    toast(`Recheck failed: ${e.message || e}`, 'err');
     btn.disabled = false;
     btn.textContent = origLabel;
   }

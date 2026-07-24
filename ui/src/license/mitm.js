@@ -320,29 +320,57 @@ async function remediate(kind, tool) {
       const needle = _TOOL_TO_NEEDLE[tool] || tool || 'nomatch';
       // Escape single quotes for PowerShell string literal.
       const psEsc = needle.replace(/'/g, "''");
+      // v1.7.4.4 (2026-07-23): scan ALL cert stores (LM + CU × Root+CA+
+      // AuthRoot+Trust+Disallowed+TrustedPublisher+TrustedPeople+My+etc)
+      // because some proxy tools stealth-install into non-standard
+      // stores (Fiddler classic writes to Root; mitmproxy has been seen
+      // in CA; Charles in AuthRoot). Broader sweep = fewer misses.
       const script =
-        "$hits = Get-ChildItem Cert:\\CurrentUser\\Root, Cert:\\LocalMachine\\Root " +
-        "-EA SilentlyContinue | Where-Object { $_.Subject -match '" + psEsc + "' }\n" +
+        "$stores = @()\n" +
+        "foreach ($scope in 'LocalMachine','CurrentUser') {\n" +
+        "  Get-ChildItem \"Cert:\\$scope\" -EA SilentlyContinue | " +
+        "ForEach-Object { $stores += \"Cert:\\$scope\\$($_.Name)\" }\n" +
+        "}\n" +
+        "$hits = @()\n" +
+        "foreach ($s in $stores) {\n" +
+        "  $hits += Get-ChildItem $s -EA SilentlyContinue | " +
+        "Where-Object { $_.Subject -match '" + psEsc + "' -or " +
+        "$_.Issuer -match '" + psEsc + "' -or " +
+        "$_.FriendlyName -match '" + psEsc + "' }\n" +
+        "}\n" +
         "$deleted = 0; $failed = 0\n" +
         "foreach ($c in $hits) {\n" +
         "  try { Remove-Item -Path $c.PSPath -Force -EA Stop; $deleted++ }\n" +
         "  catch { $failed++; Write-Output \"FAIL: $($c.Subject) - $($_.Exception.Message)\" }\n" +
         "}\n" +
-        "Write-Output \"DELETED=$deleted FAILED=$failed\"";
-      const r = await _runPS(script, 20000);
-      // Extract the summary from the PowerShell output.
+        "Write-Output \"DELETED=$deleted FAILED=$failed SCANNED=$($stores.Count)\"";
+      const r = await _runPS(script, 25000);
       const m = /DELETED=(\d+)\s+FAILED=(\d+)/.exec(r.stdout);
       const deleted = m ? parseInt(m[1], 10) : 0;
       const failed  = m ? parseInt(m[2], 10) : 0;
+      /* v1.7.4.4 semantics fix: SUCCESS = "no MITM cert exists after
+       * this call". That's true when:
+       *   - we deleted some (deleted > 0, no failures) — active removal
+       *   - we found none (deleted == 0, no failures) — nothing to
+       *     remove; user's system is CLEAN, the check that flagged it
+       *     was stale (browser cached banner) or the cert was already
+       *     removed by another means.
+       * Only FAIL when actual removal attempts failed. Pre-v1.7.4.4
+       * incorrectly reported FAIL when nothing needed removal, which
+       * is the reverse of the truth. */
+      const success = r.ok && failed === 0;
+      let msg;
+      if (deleted > 0) {
+        msg = `Removed ${deleted} ${tool} root certificate${deleted === 1 ? '' : 's'} from Windows trust store. Try signing in again.`;
+      } else if (failed === 0) {
+        msg = `No ${tool} certificates found in any Windows cert store. The prior warning was stale — you can sign in now. Click "Retry check" if the warning is still shown.`;
+      } else {
+        msg = `${failed} deletion${failed === 1 ? '' : 's'} failed. You may need to remove the ${tool} certificate manually via "Manage user certificates" in Windows.`;
+      }
       return {
-        ok:      r.ok && failed === 0 && deleted > 0,
+        ok:      success,
         action:  'delete_ca',
-        message: (deleted > 0
-          ? `Removed ${deleted} ${tool} root certificate(s) from Windows trust store.`
-          : `No matching ${tool} certificates found - it may have been removed already.`) +
-          (failed > 0
-            ? ` ${failed} deletion(s) failed - see details.`
-            : ''),
+        message: msg,
         details: r.stdout,
       };
     }
