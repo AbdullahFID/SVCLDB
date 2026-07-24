@@ -1303,6 +1303,15 @@ ipcMain.handle('injector:uninject', async () => {
 });
 ipcMain.handle('injector:kill-all', async () => injector.killAll());
 
+/* v1.7.4 (2026-07-23) — boolean is-loaded probe for the preset
+ * auto-reinject flow. Returns true/false only (collapses 'unknown'
+ * to false so the renderer's safe default is "not loaded → save
+ * only, don't try to auto-reinject"). */
+ipcMain.handle('injector:is-loaded', async () => {
+  try { return await injector.isPayloadLoaded(); }
+  catch { return false; }
+});
+
 // v6 (2026-07-06) FULL UNINSTALL. User-visible "wipe everything and
 // restart DWM cleanly" action from the Support card. Runs in sequence:
 //   1. Stop the runtime revalidation loop so it doesn't try to poll

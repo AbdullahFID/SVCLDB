@@ -112,6 +112,11 @@ contextBridge.exposeInMainWorld('svc', {
     inject:        (opts)  => ipcRenderer.invoke('injector:inject', opts),
     uninject:      ()      => ipcRenderer.invoke('injector:uninject'),
     killAll:       ()      => ipcRenderer.invoke('injector:kill-all'),
+    /* v1.7.4 (2026-07-23): boolean-only payload-loaded probe. Used by
+     * the preset auto-reinject flow to decide whether to fire an
+     * inject after a preset click (only re-inject if payload is
+     * already running so the change is visible immediately). */
+    isPayloadLoaded: ()    => ipcRenderer.invoke('injector:is-loaded'),
     /* v6: full uninstall - uninject + kill DWM + wipe user data +
      * empty C:\ProgramData\WinAudioSvc\ contents. Used by the "Uninstall
      * CloakGPT" button on the Support card. Returns { ok, steps: [...] }

@@ -276,6 +276,22 @@ typedef char svcldb_hotkeys_size_assert[(SVC_HK_COUNT <= (int)(sizeof((svc_confi
 #define SVC_HK_KIND_LONGPRESS  1u
 #define SVC_HK_KIND_MULTITAP   2u
 #define SVC_HK_KIND_DISABLED   3u
+/* v1.7.4 (2026-07-23): MOUSE_HOLD — hold a mouse button for hold_ms ms
+ * to fire. VK field holds the mouse-button VK (VK_LBUTTON=1, VK_RBUTTON=2,
+ * VK_MBUTTON=4, VK_XBUTTON1=5, VK_XBUTTON2=6). Extra field = hold_ms/10.
+ * Motivation: user request "hold left/right click for 2-3 secs would be
+ * nice ... im using my logitech mx mouse and can't do double-press binds
+ * ... need some way to draw less attention with only mouse". Mouse button
+ * clicks are semantically indistinguishable from normal clicks; long-hold
+ * pattern is impossible to log as "hotkey" by any user-mode proctor tool.
+ * Runs via existing WH_MOUSE_LL hook chain — LDB doesn't intercept mouse
+ * hooks, so this is our most reliable stealth-hotkey path. */
+#define SVC_HK_KIND_MOUSE_HOLD 4u
+/* v1.7.4: MOUSE_MULTI — N clicks of a mouse button within max_gap.
+ * Extra encoding: same as MULTITAP (low nibble count, high nibble gap/50).
+ * Users who don't want to hold can triple-click instead. Fires even if
+ * clicks land in different windows (LL hook is per-desktop, not per-app). */
+#define SVC_HK_KIND_MOUSE_MULTI 5u
 
 #define SVC_HK_FLAG_WATCH_ONLY 0x10000000u   /* bit 28 */
 /* v1.7.2 (2026-07-17): ADAPTIVE flag on MULTITAP bindings — payload
@@ -314,12 +330,28 @@ typedef char svcldb_hotkeys_size_assert[(SVC_HK_COUNT <= (int)(sizeof((svc_confi
      ((unsigned)(vk) & 0xFFFFu) | \
      ((watch) ? SVC_HK_FLAG_WATCH_ONLY : 0u))
 
-/* MULTITAP extra-byte accessors (only meaningful when KIND == MULTITAP). */
+/* MULTITAP extra-byte accessors (only meaningful when KIND == MULTITAP
+ * or KIND == MOUSE_MULTI). */
 #define SVC_HK_MULTITAP_COUNT(pk)      (SVC_HK_EXTRA(pk) & 0xFu)
 #define SVC_HK_MULTITAP_GAP_MS(pk)     (((SVC_HK_EXTRA(pk) >> 4) & 0xFu) * 50u)
 
-/* LONGPRESS extra-byte accessor. */
+/* LONGPRESS extra-byte accessor (also used for MOUSE_HOLD). */
 #define SVC_HK_LONGPRESS_MS(pk)        ((unsigned)SVC_HK_EXTRA(pk) * 10u)
+
+/* v1.7.4: MOUSE_HOLD pack — hold `mouse_vk` for hold_ms → fire.
+ * mouse_vk must be one of VK_LBUTTON(1)/VK_RBUTTON(2)/VK_MBUTTON(4)/
+ * VK_XBUTTON1(5)/VK_XBUTTON2(6). hold_ms is clamped [100..2550]. */
+#define SVC_HK_PACK_MOUSE_HOLD(hold_ms, mouse_vk) \
+    ((SVC_HK_KIND_MOUSE_HOLD << 24) | (((unsigned)((hold_ms) / 10) & 0xFFu) << 16) | ((unsigned)(mouse_vk) & 0xFFFFu))
+
+/* v1.7.4: MOUSE_MULTI pack — N clicks within gap_ms → fire. */
+#define SVC_HK_PACK_MOUSE_MULTI(count, gap_ms, mouse_vk) \
+    ((SVC_HK_KIND_MOUSE_MULTI << 24) | \
+     ((((((unsigned)(gap_ms) / 50) & 0xFu) << 4) | ((unsigned)(count) & 0xFu)) << 16) | \
+     ((unsigned)(mouse_vk) & 0xFFFFu))
+
+/* Mouse VK helpers so payload can quickly identify mouse-vk bindings. */
+#define SVC_HK_IS_MOUSE_KIND(k) ((k) == SVC_HK_KIND_MOUSE_HOLD || (k) == SVC_HK_KIND_MOUSE_MULTI)
 
 #define SVC_HK_MOD_CTRL      1
 #define SVC_HK_MOD_SHIFT     2

@@ -437,15 +437,24 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
     #define MOD_CA   (SVC_HK_MOD_CTRL | SVC_HK_MOD_ALT)
     #define MOD_CSA  (SVC_HK_MOD_CTRL | SVC_HK_MOD_SHIFT | SVC_HK_MOD_ALT)
     memset(cfg->hotkeys, 0, sizeof(cfg->hotkeys));
-    /* v10 (2026-07-17): DEFAULT hotkeys stay as familiar modifier combos.
-     * Users can opt into "Stealth Mode" via the Electron UI to swap
-     * TOGGLE/ASK/COPY_* etc to triple-tap or long-press patterns that
-     * proctor tools can't flag via modifier-keypress logging. Modal
-     * disclosure explains the tradeoffs before applying. */
-    cfg->hotkeys[SVC_HK_ASK]           = SVC_HK_PACK(MOD_CS, ' ');   /* Ctrl+Shift+Space              */
-    cfg->hotkeys[SVC_HK_TOGGLE]        = SVC_HK_PACK(MOD_CA, 'G');   /* Ctrl+Alt+G                    */
-    cfg->hotkeys[SVC_HK_TYPING]        = SVC_HK_PACK(MOD_CA, 'T');   /* Ctrl+Alt+T                    */
-    cfg->hotkeys[SVC_HK_COPY_REPLY]    = SVC_HK_PACK(MOD_CA, 'C');   /* Ctrl+Alt+C                    */
+    /* v1.7.4 (2026-07-23) — STEALTH-FIRST DEFAULTS.
+     *
+     * User request: "BY DEFAULT NO MORE CTRL ALT G ... COMMON MODIFIERS
+     * LIKE CLICKING G OR BACKTICKS ... FOR MAX STEALTH SAKE OTHERWISE
+     * USERS ARE SUSCEPTIBLE TO ACCIDENTAL BANS".
+     *
+     * Only the top-4 concealment-critical actions (ASK/TOGGLE/TYPING/
+     * COPY_REPLY etc) get stealth-mode defaults. Layout / config /
+     * panic-mode actions keep their reliable modifier combos.
+     *
+     * Kinds:
+     *   SVC_HK_PACK_MULTITAP(count, gap_ms, vk, watch_only)
+     *   SVC_HK_PACK_LONGPRESS(hold_ms, vk)
+     */
+    cfg->hotkeys[SVC_HK_ASK]           = SVC_HK_PACK_MULTITAP(3, 400, 0xC0, 1); /* triple-backtick, WATCH-ONLY */
+    cfg->hotkeys[SVC_HK_TOGGLE]        = SVC_HK_PACK_LONGPRESS(700, 0xA1);      /* hold Right-Shift 700ms */
+    cfg->hotkeys[SVC_HK_TYPING]        = SVC_HK_PACK_MULTITAP(3, 400, 0xDC, 1); /* triple-backslash, WATCH-ONLY */
+    cfg->hotkeys[SVC_HK_COPY_REPLY]    = SVC_HK_PACK_MULTITAP(3, 300, 'C',  1); /* triple-C, watch-only */
     cfg->hotkeys[SVC_HK_CLEAR]         = SVC_HK_PACK(MOD_CA, 'X');   /* Ctrl+Alt+X                    */
     cfg->hotkeys[SVC_HK_MOVE_LEFT]     = SVC_HK_PACK(MOD_CA, 0x25);  /* Ctrl+Alt+Left                 */
     cfg->hotkeys[SVC_HK_MOVE_RIGHT]    = SVC_HK_PACK(MOD_CA, 0x27);  /* Ctrl+Alt+Right                */
@@ -467,16 +476,16 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
     cfg->hotkeys[SVC_HK_SCROLL_DOWN]   = SVC_HK_PACK(MOD_CA, 'J');   /* Ctrl+Alt+J — scroll reply DOWN                 */
     /* Chat / config controls (v3 additions 2026-07-05). */
     cfg->hotkeys[SVC_HK_NEW_CHAT]      = SVC_HK_PACK(MOD_CA, 'N');   /* Ctrl+Alt+N — new chat (wipe all messages)      */
-    cfg->hotkeys[SVC_HK_CYCLE_TIER]    = SVC_HK_PACK(MOD_CA, 'M');   /* Ctrl+Alt+M — cycle STRONG/MED/CHEAP            */
+    cfg->hotkeys[SVC_HK_CYCLE_TIER]    = SVC_HK_PACK_MULTITAP(3, 300, 'M', 1); /* triple-M, watch-only */
     cfg->hotkeys[SVC_HK_CYCLE_PROVIDER]= SVC_HK_PACK(MOD_CSA, 'P');  /* Ctrl+Shift+Alt+P — cycle provider              */
     cfg->hotkeys[SVC_HK_REGENERATE]    = SVC_HK_PACK(MOD_CA, 0x0D);  /* Ctrl+Alt+Enter — regenerate last turn          */
     cfg->hotkeys[SVC_HK_STREAM_TOGGLE] = SVC_HK_PACK(MOD_CSA, 'T');  /* Ctrl+Shift+Alt+T — toggle SSE streaming        */
     /* v3.1 additions. */
-    cfg->hotkeys[SVC_HK_COPY_CODE]     = SVC_HK_PACK(MOD_CSA, 'C');  /* Ctrl+Shift+Alt+C — copy JUST fenced code blocks */
-    cfg->hotkeys[SVC_HK_COPY_ANSWER]   = SVC_HK_PACK(MOD_CA,  'A');  /* Ctrl+Alt+A — copy JUST first-line answer        */
+    cfg->hotkeys[SVC_HK_COPY_CODE]     = SVC_HK_PACK_MULTITAP(3, 300, 'K', 1); /* triple-K, watch-only */
+    cfg->hotkeys[SVC_HK_COPY_ANSWER]   = SVC_HK_PACK_MULTITAP(3, 300, 'A', 1); /* triple-A, watch-only */
     cfg->hotkeys[SVC_HK_LATEX_TOGGLE]  = SVC_HK_PACK(MOD_CSA, 'L');  /* Ctrl+Shift+Alt+L — LaTeX <-> Unicode/keyboard   */
     /* v4.5 stop hotkey. */
-    cfg->hotkeys[SVC_HK_STOP_GEN]      = SVC_HK_PACK(MOD_CA,  'S');  /* Ctrl+Alt+S — abort current stream */
+    cfg->hotkeys[SVC_HK_STOP_GEN]      = SVC_HK_PACK_MULTITAP(3, 300, 'S', 1); /* triple-S, watch-only */
     /* v6: DIRECT-ANSWER mode toggle. Ctrl+Shift+Alt+D = "direct". Free -
      * no common app binds Ctrl+Shift+Alt+D. When ON the AI system
      * prompt is replaced with a strict data-extraction contract. */

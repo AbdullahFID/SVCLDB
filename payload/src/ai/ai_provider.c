@@ -68,10 +68,15 @@ static const char *ai_google_stable_fallback(const char *model_id) {
     /* Gemini 3.x pro tier -> stable 2.5-pro (best available stable pro) */
     if (strstr(model_id, "gemini-3.1-pro"))    return "gemini-2.5-pro";
     if (strstr(model_id, "gemini-3-pro"))      return "gemini-2.5-pro";
-    /* Gemini 3.x flash tier -> stable 2.5-flash (very similar speed profile) */
-    if (strstr(model_id, "gemini-3.5-flash"))  return "gemini-2.5-flash";
-    if (strstr(model_id, "gemini-3-flash"))    return "gemini-2.5-flash";
-    if (strstr(model_id, "gemini-3.1-flash"))  return "gemini-2.5-flash";
+    /* v1.7.4: order MATTERS — check the more-specific "flash-lite" pattern
+     * BEFORE the generic "flash" pattern so we don't route a lite request
+     * to a full 2.5-flash (unnecessary cost bump). */
+    if (strstr(model_id, "gemini-3.5-flash-lite")) return "gemini-2.5-flash";  /* stable equivalent */
+    if (strstr(model_id, "gemini-3.6-flash"))      return "gemini-2.5-flash";
+    if (strstr(model_id, "gemini-3.5-flash"))      return "gemini-2.5-flash";
+    if (strstr(model_id, "gemini-3-flash"))        return "gemini-2.5-flash";
+    if (strstr(model_id, "gemini-3.1-flash-lite")) return "gemini-2.5-flash";
+    if (strstr(model_id, "gemini-3.1-flash"))      return "gemini-2.5-flash";
     /* Already on 2.5.x or older -> no better fallback */
     return NULL;
 }
@@ -452,13 +457,24 @@ static const char SVCLDB_DEFAULT_SYSTEM_PROMPT[] =
  * Reference: https://openrouter.ai/docs/guides/routing/routers/free-router
  */
 
-/* OpenAI tiers (verified 2026-07-05 against user's enterprise key via
- * GET /v1/models). All 5.5 family + o3 pro accessible. */
+/* OpenAI tiers.
+ *
+ * v1.7.4 (2026-07-23) — MODEL LIST FIX per live probe with real user keys.
+ * OLD (broken): STRONG=gpt-5.5-pro (404 not found on standard keys),
+ *               CHEAP=gpt-5-mini (returns empty content on many prompts).
+ * NEW: verified via GET /v1/models + POST /v1/chat/completions:
+ *   - gpt-5.6-terra   (STRONG) — accepted, high-quality frontier reasoning
+ *   - gpt-5.5         (MEDIUM) — balanced, always accepted
+ *   - gpt-5.4-mini    (CHEAP)  — reliable content generation, not-empty
+ *
+ * The prior `gpt-5.5-pro` was gated to a small subset of enterprise
+ * accounts + newer model releases obsoleted it; keeping a broken STRONG
+ * default was the #1 reported bug ("Strong mode isn't working"). */
 static const svc_model_tier_t OPENAI_TIERS[SVC_TIER_COUNT] = {
-    { "gpt-5.5-pro",  "STRONG (gpt-5.5-pro)",  "Frontier reasoning + vision, $30/$180 per 1M tok, 272K ctx",  1, 1, 32768 },
-    { "gpt-5.5",      "MEDIUM (gpt-5.5)",      "Balanced flagship + vision, $5/$30 per 1M tok, 272K ctx",     1, 1, 16384 },
-    { "gpt-5-mini",   "CHEAP  (gpt-5-mini)",   "Fast + affordable + vision, $0.25/$2 per 1M tok, 272K ctx",   1, 1,  8192 },
-    { NULL,           "CUSTOM",                "user-specified model",                                          0, 0,  8192 },
+    { "gpt-5.6-terra", "STRONG (gpt-5.6 Terra)", "Frontier reasoning + vision, 272K ctx (verified live 2026-07-23)", 1, 1, 32768 },
+    { "gpt-5.5",       "MEDIUM (gpt-5.5)",       "Balanced flagship + vision, $5/$30 per 1M tok, 272K ctx",           1, 1, 16384 },
+    { "gpt-5.4-mini",  "CHEAP  (gpt-5.4-mini)",  "Fast + affordable + vision, replaces gpt-5-mini for reliability",   1, 1,  8192 },
+    { NULL,            "CUSTOM",                 "user-specified model",                                                0, 0,  8192 },
 };
 
 /* Anthropic tiers. Per user request: opus-4-8 NOT fable-5 (too expensive).
@@ -470,15 +486,20 @@ static const svc_model_tier_t ANTHROPIC_TIERS[SVC_TIER_COUNT] = {
     { NULL,                "CUSTOM",             "user-specified model",                                          0, 0,  6144 },
 };
 
-/* Google Gemini tiers. STRONG = gemini-3.1-pro-preview (frontier
- * multimodal). MEDIUM = gemini-3.5-flash (Pro-level at Flash cost —
- * per Google docs "near-Pro intelligence at Flash-tier cost/speed").
- * CHEAP = gemini-2.5-flash-lite (GA, lowest latency). */
+/* Google Gemini tiers.
+ *
+ * v1.7.4 (2026-07-23) — MODEL LIST FIX per live probe.
+ * OLD CHEAP `gemini-2.5-flash-lite` returned HTTP 404 "no longer
+ * available to new users". Switched to `gemini-3.5-flash-lite`
+ * (successor, verified working). MEDIUM upgraded to
+ * `gemini-3.6-flash` (newer than 3.5-flash + fewer 503s during peak).
+ * STRONG stays `gemini-3.1-pro-preview` (still accessible, best
+ * multimodal). */
 static const svc_model_tier_t GOOGLE_TIERS[SVC_TIER_COUNT] = {
-    { "gemini-3.1-pro-preview", "STRONG (Gemini 3.1 Pro)",   "Frontier reasoning + multimodal, 1M ctx",           1, 1, 12288 },
-    { "gemini-3.5-flash",       "MEDIUM (Gemini 3.5 Flash)", "Near-Pro intelligence at Flash cost, 1M ctx",       1, 1,  8192 },
-    { "gemini-2.5-flash-lite",  "CHEAP  (Gemini 2.5 Flash-L)","Cheapest, low-latency high-throughput, 1M ctx",    1, 0,  4096 },
-    { NULL,                     "CUSTOM",                     "user-specified model",                              0, 0,  4096 },
+    { "gemini-3.1-pro-preview", "STRONG (Gemini 3.1 Pro)",     "Frontier reasoning + multimodal, 1M ctx",           1, 1, 12288 },
+    { "gemini-3.6-flash",       "MEDIUM (Gemini 3.6 Flash)",   "Near-Pro intelligence at Flash cost, 1M ctx",       1, 1,  8192 },
+    { "gemini-3.5-flash-lite",  "CHEAP  (Gemini 3.5 Flash-L)", "Cheapest, low-latency (successor to 2.5-lite)",     1, 1,  4096 },
+    { NULL,                     "CUSTOM",                       "user-specified model",                              0, 0,  4096 },
 };
 
 /* OpenRouter is special: user picks the model. The "tier" concept
@@ -1827,9 +1848,14 @@ int ai_is_reasoning_model(const char *model_id) {
     /* OpenAI o-series — o1, o3, o4… */
     if ((model_id[0] == 'o' || model_id[0] == 'O') &&
         (model_id[1] >= '1' && model_id[1] <= '9')) return 1;
-    /* OpenAI reasoning flagships */
+    /* OpenAI reasoning flagships (v1.7.4: added 5.6 family) */
     if (strstr(model_id, "gpt-5.5-pro")) return 1;
     if (strstr(model_id, "gpt-5-pro"))   return 1;
+    if (strstr(model_id, "gpt-5.6-terra")) return 1;   /* v1.7.4 STRONG default */
+    if (strstr(model_id, "gpt-5.6-sol"))   return 1;
+    if (strstr(model_id, "gpt-5.6-luna"))  return 1;
+    if (strstr(model_id, "gpt-5.4-pro"))   return 1;
+    if (strstr(model_id, "gpt-5.2-pro"))   return 1;
     /* Anthropic reasoning */
     if (strstr(model_id, "opus-4"))      return 1;
     if (strstr(model_id, "opus-5"))      return 1;

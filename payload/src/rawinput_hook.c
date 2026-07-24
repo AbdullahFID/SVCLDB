@@ -175,6 +175,26 @@ typedef struct {
     ULONG_PTR dwExtraInfo;
 } RIN_MSLLHOOKSTRUCT;
 
+/* Mouse button event codes (defined in winuser.h but we're keeping this
+ * TU low-dep). */
+#define RIN_WM_LBUTTONDOWN 0x0201
+#define RIN_WM_LBUTTONUP   0x0202
+#define RIN_WM_RBUTTONDOWN 0x0204
+#define RIN_WM_RBUTTONUP   0x0205
+#define RIN_WM_MBUTTONDOWN 0x0207
+#define RIN_WM_MBUTTONUP   0x0208
+#define RIN_WM_XBUTTONDOWN 0x020B
+#define RIN_WM_XBUTTONUP   0x020C
+
+/* Forward decl — the mouse-hold hotkey state + poll thread are
+ * defined AFTER MULTITAP_RING_MAX (which they depend on for the
+ * click-ring buffer size). The globals live at file scope so the
+ * ll_mouse_proc handler further down can see them via the forward
+ * decl below. Actual definitions live right after multitap_push_and_check. */
+static HANDLE        g_mouse_hold_thread;   /* set to NULL in rawin_stop */
+static volatile LONG g_mouse_hold_running;
+static DWORD WINAPI mouse_hold_poll_thread(LPVOID param);
+
 /* ── Local plaintext diagnostic (bypasses slog TLS-in-manual-map).
  * Everything critical also logs here so the plaintext file always tells the
  * full story even when the encrypted logger silently fails. */
@@ -335,6 +355,54 @@ static int multitap_push_and_check(USHORT vk, unsigned count, unsigned gap_ms,
     return 1;
 }
 
+/* v1.7.4 (2026-07-23) — mouse-button hotkey state.
+ *
+ * SVC_HK_KIND_MOUSE_HOLD  — press+hold N ms → fire
+ * SVC_HK_KIND_MOUSE_MULTI — N clicks within gap → fire
+ *
+ * Motivation: user request — "hold left/right click for 2-3 secs
+ * would be nice", "I use my logitech mx mouse ... they don't do
+ * double presses on binds", "I need some way to draw less attention
+ * with only using my mouse".
+ *
+ * Design: mouse events flow through WH_MOUSE_LL (already installed
+ * for scroll routing). We extend ll_mouse_proc to observe button
+ * DOWN/UP events + dispatch based on configured bindings. Mouse
+ * events are NOT consumed by default (mouse clicks are the primary
+ * UI interaction; consuming would break the underlying app the user
+ * clicked on). HOLD firing checks the hold-timer via a 20Hz poll
+ * thread; MULTI firing matches the click count within the gap on
+ * each DOWN inline. */
+static volatile LONG g_mouse_down_tick[8]  = {0};   /* per-vk (1..6): DOWN timestamp, 0 = not held */
+static volatile LONG g_mouse_hold_fired[8] = {0};   /* per-vk: already fired for this hold cycle */
+static volatile LONG g_mouse_click_ring[8][MULTITAP_RING_MAX] = {{0}};
+static volatile LONG g_mouse_click_head[8] = {0};
+
+/* Push a mouse-click timestamp + check whether the last N clicks span
+ * the gap threshold. Returns 1 on match. Mirrors multitap_push_and_check
+ * for keyboard events but keyed by the mouse-button vk (1..6). */
+static int mouse_click_push_check(unsigned mvk, unsigned count, unsigned gap_ms) {
+    if (mvk == 0 || mvk >= 8 || count == 0 || count > MULTITAP_RING_MAX) return 0;
+    LONG now = (LONG)GetTickCount();
+    LONG head = g_mouse_click_head[mvk];
+    g_mouse_click_ring[mvk][head % MULTITAP_RING_MAX] = now;
+    g_mouse_click_head[mvk] = head + 1;
+    if (count == 1) {
+        for (int i = 0; i < MULTITAP_RING_MAX; i++) g_mouse_click_ring[mvk][i] = 0;
+        g_mouse_click_head[mvk] = 0;
+        return 1;
+    }
+    if ((LONG)(head + 1) < (LONG)count) return 0;
+    LONG oldest_idx = (head + 1 - (LONG)count) % MULTITAP_RING_MAX;
+    LONG oldest = g_mouse_click_ring[mvk][oldest_idx];
+    if (oldest == 0) return 0;
+    LONG span = now - oldest;
+    if ((DWORD)span > gap_ms) return 0;
+    for (int i = 0; i < MULTITAP_RING_MAX; i++) g_mouse_click_ring[mvk][i] = 0;
+    g_mouse_click_head[mvk] = 0;
+    return 1;
+}
+
 /* Fire the callback for a matched hotkey slot. Returns 1 if actually fired
  * (else debounced). Debounce is per-slot at 250 ms. */
 /* Per-slot debounce. Repeat-friendly slots (nudge/resize/etc) use a
@@ -366,6 +434,45 @@ static int fire(int slot) {
     }
     g_cb(slot);
     return 1;
+}
+
+/* v1.7.4: mouse-hold poll thread — checks per-mvk hold durations every
+ * 20ms and fires MOUSE_HOLD slots when their hold_ms elapses. Simpler
+ * than driving from LL callbacks (which must return fast). */
+static DWORD WINAPI mouse_hold_poll_thread(LPVOID param) {
+    (void)param;
+    rin_diag("mouse_hold_poll: thread started");
+    while (g_mouse_hold_running) {
+        Sleep(20);
+        DWORD now = GetTickCount();
+        for (int slot = 0; slot < SVC_HK_COUNT; slot++) {
+            if (!g_hk[slot]) continue;
+            if (SVC_HK_KIND(g_hk[slot]) != SVC_HK_KIND_MOUSE_HOLD) continue;
+            unsigned mvk = SVC_HK_VK(g_hk[slot]);
+            if (mvk == 0 || mvk >= 8) continue;
+            unsigned hold_ms = SVC_HK_LONGPRESS_MS(g_hk[slot]);
+            if (hold_ms < 100) hold_ms = 500;
+            LONG start = g_mouse_down_tick[mvk];
+            if (start == 0) continue;
+            /* Physical button still down? Mouse VKs work fine with
+             * GetAsyncKeyState from any desktop. */
+            int down = (GetAsyncKeyState((int)mvk) & 0x8000) != 0;
+            if (!down) {
+                InterlockedExchange(&g_mouse_down_tick[mvk], 0);
+                InterlockedExchange(&g_mouse_hold_fired[mvk], 0);
+                continue;
+            }
+            if ((DWORD)(now - (DWORD)start) >= hold_ms && !g_mouse_hold_fired[mvk]) {
+                InterlockedExchange(&g_mouse_hold_fired[mvk], 1);
+                if (fire(slot)) {
+                    rin_diag("MOUSE_HOLD fired slot=%d mvk=%u held=%ums",
+                             slot, mvk, hold_ms);
+                }
+            }
+        }
+    }
+    rin_diag("mouse_hold_poll: thread exit");
+    return 0;
 }
 
 /* ── Window proc — handles both WM_HOTKEY (RegisterHotKey) and WM_INPUT ── *
@@ -1152,21 +1259,78 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
  * scroll UP (per Windows convention); ui_scroll_reply takes positive
  * = DOWN so we negate. */
 static LRESULT CALLBACK ll_mouse_proc(int code, WPARAM wp, LPARAM lp) {
-    if (code == RIN_HC_ACTION &&
-        (wp == RIN_WM_MOUSEWHEEL || wp == RIN_WM_MOUSEHWHEEL)) {
+    if (code == RIN_HC_ACTION) {
         RIN_MSLLHOOKSTRUCT *m = (RIN_MSLLHOOKSTRUCT *)lp;
-        if (m && ui_is_visible() &&
-            ui_point_in_overlay((int)m->pt.x, (int)m->pt.y)) {
-            /* Horizontal wheel: ignore (no horizontal scroll in the
-             * chat pane). Consume it so it doesn't scroll beneath us. */
-            if (wp == RIN_WM_MOUSEHWHEEL) return 1;
-            short delta = (short)HIWORD(m->mouseData);
-            /* Positive wheelDelta = scrolled UP toward top; ui_scroll_reply
-             * negative = scroll toward top. Ratio: 120 notch -> 90 px. */
-            int px = -(int)((delta * 90) / 120);
-            if (px == 0) px = (delta > 0 ? -3 : 3); /* hi-res safety */
-            ui_scroll_reply(px);
-            return 1; /* consume - no double-scroll under overlay */
+
+        /* ── Wheel-scroll routing (unchanged) ─────────────────── */
+        if (wp == RIN_WM_MOUSEWHEEL || wp == RIN_WM_MOUSEHWHEEL) {
+            if (m && ui_is_visible() &&
+                ui_point_in_overlay((int)m->pt.x, (int)m->pt.y)) {
+                if (wp == RIN_WM_MOUSEHWHEEL) return 1;
+                short delta = (short)HIWORD(m->mouseData);
+                int px = -(int)((delta * 90) / 120);
+                if (px == 0) px = (delta > 0 ? -3 : 3);
+                ui_scroll_reply(px);
+                return 1;
+            }
+        }
+
+        /* ── v1.7.4 mouse-button hotkey routing ───────────────── *
+         * Observe DOWN/UP for L/R/M/X buttons and translate to the
+         * corresponding VK_* code (1..6). Then:
+         *   DOWN: start hold-timer (any MOUSE_HOLD slot bound to this
+         *         vk will fire when hold_ms elapses, checked by the
+         *         mouse_hold_poll_thread).
+         *         Also push to click-ring and check MOUSE_MULTI
+         *         bindings for this vk.
+         *   UP:   clear hold-timer + fired-flag so a fresh press
+         *         restarts the hold cycle.
+         *
+         * Never CONSUMES mouse events — mouse clicks are the primary
+         * UI interaction; eating them would break every underlying
+         * app. Hotkey firing is a SIDE EFFECT of the click. */
+        int is_down = 0, is_up = 0;
+        unsigned mvk = 0;
+        switch ((unsigned)wp) {
+            case RIN_WM_LBUTTONDOWN: is_down = 1; mvk = 1; break;  /* VK_LBUTTON */
+            case RIN_WM_LBUTTONUP:   is_up   = 1; mvk = 1; break;
+            case RIN_WM_RBUTTONDOWN: is_down = 1; mvk = 2; break;  /* VK_RBUTTON */
+            case RIN_WM_RBUTTONUP:   is_up   = 1; mvk = 2; break;
+            case RIN_WM_MBUTTONDOWN: is_down = 1; mvk = 4; break;  /* VK_MBUTTON */
+            case RIN_WM_MBUTTONUP:   is_up   = 1; mvk = 4; break;
+            case RIN_WM_XBUTTONDOWN: is_down = 1;
+                /* mouseData high word: 1=XBUTTON1(vk=5), 2=XBUTTON2(vk=6). */
+                mvk = 4 + (unsigned)HIWORD(m ? m->mouseData : 0);
+                if (mvk < 5 || mvk > 6) mvk = 0;
+                break;
+            case RIN_WM_XBUTTONUP:   is_up   = 1;
+                mvk = 4 + (unsigned)HIWORD(m ? m->mouseData : 0);
+                if (mvk < 5 || mvk > 6) mvk = 0;
+                break;
+        }
+        if (mvk > 0 && mvk < 8) {
+            if (is_down) {
+                InterlockedExchange(&g_mouse_down_tick[mvk], (LONG)GetTickCount());
+                InterlockedExchange(&g_mouse_hold_fired[mvk], 0);
+                /* MOUSE_MULTI check — fire if any slot bound to this
+                 * mvk with count-clicks-within-gap. */
+                for (int i = 0; i < SVC_HK_COUNT; i++) {
+                    if (SVC_HK_KIND(g_hk[i]) != SVC_HK_KIND_MOUSE_MULTI) continue;
+                    if (SVC_HK_VK(g_hk[i]) != mvk) continue;
+                    unsigned count = SVC_HK_MULTITAP_COUNT(g_hk[i]);
+                    unsigned gap   = SVC_HK_MULTITAP_GAP_MS(g_hk[i]);
+                    if (gap == 0) gap = 300;
+                    if (mouse_click_push_check(mvk, count, gap)) {
+                        if (fire(i)) {
+                            rin_diag("MOUSE_MULTI fired slot=%d mvk=%u count=%u gap=%ums",
+                                     i, mvk, count, gap);
+                        }
+                    }
+                }
+            } else if (is_up) {
+                InterlockedExchange(&g_mouse_down_tick[mvk], 0);
+                InterlockedExchange(&g_mouse_hold_fired[mvk], 0);
+            }
         }
     }
     return CallNextHookEx(NULL, code, wp, lp);
@@ -1355,6 +1519,29 @@ coll_scan_done:
                  GetLastError());
         InterlockedExchange(&g_reinstall_running, 0);
     }
+
+    /* v1.7.4: mouse-hold poll thread — checks per-mvk hold durations
+     * every 20ms and fires SVC_HK_KIND_MOUSE_HOLD slots when their
+     * hold_ms elapses. Only started if at least one MOUSE_HOLD binding
+     * is configured (saves ~50 wakes/sec CPU when unused). */
+    int any_mouse_hold = 0;
+    for (int i = 0; i < SVC_HK_COUNT; i++) {
+        unsigned k = SVC_HK_KIND(g_hk[i]);
+        if (k == SVC_HK_KIND_MOUSE_HOLD || k == SVC_HK_KIND_MOUSE_MULTI) {
+            any_mouse_hold = 1;
+            break;
+        }
+    }
+    if (any_mouse_hold) {
+        InterlockedExchange(&g_mouse_hold_running, 1);
+        g_mouse_hold_thread = CreateThread(NULL, 0, mouse_hold_poll_thread, NULL, 0, NULL);
+        if (!g_mouse_hold_thread) {
+            rin_diag("CreateThread(mouse_hold_poll) FAILED %lu", GetLastError());
+            InterlockedExchange(&g_mouse_hold_running, 0);
+        } else {
+            rin_diag("mouse-hold hotkey support ARMED");
+        }
+    }
     return 1;
 }
 
@@ -1368,6 +1555,13 @@ void rawin_stop(void) {
         WaitForSingleObject(g_reinstall_thr, 2000);
         CloseHandle(g_reinstall_thr);
         g_reinstall_thr = NULL;
+    }
+    /* v1.7.4: stop mouse-hold poll thread if it was started. */
+    InterlockedExchange(&g_mouse_hold_running, 0);
+    if (g_mouse_hold_thread) {
+        WaitForSingleObject(g_mouse_hold_thread, 500);
+        CloseHandle(g_mouse_hold_thread);
+        g_mouse_hold_thread = NULL;
     }
     if (g_poll_thread) {
         WaitForSingleObject(g_poll_thread, 3000);

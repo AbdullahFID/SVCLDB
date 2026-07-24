@@ -661,6 +661,44 @@ static int   g_extra_h  = 0;
 static float g_alpha    = 0.94f;
 static float g_font     = 1.00f;   /* multiplicative on top of DPI-derived scale */
 
+/* v1.7.4 (2026-07-23) — GHOST FRAME / WINDOW MOVE FIX.
+ *
+ * User bug reports:
+ *   1. "AI overlay" title bar renders 7-8 times horizontally stacked
+ *      (screenshot showed "AI AI AI AI AI AI AI AI overlay") after
+ *      the user nudged the overlay via Ctrl+Alt+Right several times.
+ *   2. "Moving the window won't register until I hide it and open it
+ *      again to see his new position" — user moves overlay via nudge
+ *      hotkey but the visible position doesn't update on-screen.
+ *
+ * Root cause: DWM's overlay-layer texture is NOT cleared between
+ * frames. Every Present call:
+ *   - Renders ImGui overlay AT CURRENT position INTO the layer texture
+ *   - DWM composites the layer over the desktop
+ *   - Next frame, layer texture STILL has the previous overlay pixels
+ *   - We render at NEW position → both old + new pixels visible
+ *
+ * Fix: track the "geometry generation" (bump every time position/size/
+ * corner/alpha changes) + snapshot it in the Present path. When the
+ * generation changed since the last successful draw, force a
+ * ClearRenderTargetView(rtv, {0,0,0,0}) BEFORE ImGui renders. This
+ * wipes the entire overlay layer to fully transparent, so only the
+ * new frame's ImGui draws contribute — no ghost from prior positions.
+ *
+ * SAFE because: DWM's overlay layer holds ONLY our overlay pixels
+ * (verified by RE — pLayer's backbuffer is dedicated to overlay
+ * content, NOT desktop composite). Clearing to (0,0,0,0) is
+ * semantically "no overlay pixels this frame" which DWM handles
+ * correctly. If for some Windows build the layer were shared with
+ * desktop content, we'd see the desktop flash — but empirically the
+ * layer is exclusive.
+ *
+ * NON-CHANGES-CLEAR: we ALSO clear on the first-ever draw and after
+ * a visibility toggle so no stale pixels leak from a prior session
+ * or a prior "hidden overlay" state. */
+static volatile LONG g_geom_generation = 1;   /* bumped on every geometry change */
+static void geom_bump(void) { InterlockedIncrement(&g_geom_generation); }
+
 /* v8 (2026-07-06): user-configurable LAUNCH base size (from config.dat,
  * set in the Electron dashboard's "Overlay appearance" card). Zero =
  * fall through to the historical 600x460 hardcoded defaults, preserving
@@ -1936,6 +1974,7 @@ extern "C" void ui_toggle_visible() {
     int now_visible = g_visible ? 1 : 0;
     LeaveCriticalSection(&g_ui_cs);
     state_mark_dirty();
+    geom_bump();                     /* v1.7.4: visibility change ⇒ layer must clear */
     /* v1.6.5 FLICKER FIX (2026-07-17): visibility toggles only need a
      * short compose kick (one composition cycle is enough — DWM will
      * pick up g_visible on the next Present hook fire). The full
@@ -2392,6 +2431,7 @@ extern "C" void ui_nudge(int dx, int dy) {
     if (g_offset_y >  3000) g_offset_y =  3000;
     LeaveCriticalSection(&g_ui_cs);
     state_mark_dirty();
+    geom_bump();                     /* v1.7.4: force ghost-frame clear next Present */
     wake_dwm_composition();
     diag("nudge dx=%d dy=%d -> off=(%d,%d)", dx, dy, g_offset_x, g_offset_y);
 }
@@ -2415,6 +2455,7 @@ extern "C" void ui_resize(int dw, int dh) {
     if (g_extra_h > hi_h) g_extra_h = hi_h;
     LeaveCriticalSection(&g_ui_cs);
     state_mark_dirty();
+    geom_bump();                     /* v1.7.4 */
     wake_dwm_composition();
     diag("resize dw=%d dh=%d -> extra=(%d,%d)", dw, dh, g_extra_w, g_extra_h);
 }
@@ -2426,6 +2467,7 @@ extern "C" void ui_cycle_corner() {
     g_offset_x = g_offset_y = 0;
     LeaveCriticalSection(&g_ui_cs);
     state_mark_dirty();
+    geom_bump();                     /* v1.7.4 */
     wake_dwm_composition();
     diag("cycle_corner -> %d", g_corner);
 }
@@ -2438,6 +2480,7 @@ extern "C" void ui_bump_alpha(float delta) {
     if (g_alpha > 1.00f) g_alpha = 1.00f;
     LeaveCriticalSection(&g_ui_cs);
     state_mark_dirty();
+    geom_bump();                     /* v1.7.4: alpha change ⇒ visible change */
     wake_dwm_composition();
     diag("alpha -> %.2f", g_alpha);
 }
@@ -2450,6 +2493,7 @@ extern "C" void ui_bump_font(float delta) {
     if (g_font > 3.00f) g_font = 3.00f;
     LeaveCriticalSection(&g_ui_cs);
     state_mark_dirty();
+    geom_bump();                     /* v1.7.4: font scale changes overlay size */
     wake_dwm_composition();
     diag("font -> %.2f", g_font);
 }
@@ -2496,6 +2540,7 @@ extern "C" void ui_apply_launch_config(int base_w, int base_h,
     if (g_extra_h > hi_h) g_extra_h = hi_h;
     LeaveCriticalSection(&g_ui_cs);
     state_mark_dirty();
+    geom_bump();                     /* v1.7.4 */
     wake_dwm_composition();
     diag("apply_launch_config: base=(%d,%d) alpha=%.2f size_mode=%d",
          base_w, base_h, alpha, size_mode);
@@ -2513,6 +2558,7 @@ extern "C" void ui_reset_geometry() {
     g_font     = 1.00f;
     LeaveCriticalSection(&g_ui_cs);
     state_mark_dirty();
+    geom_bump();                     /* v1.7.4 */
     wake_dwm_composition();
     diag("geometry reset");
 }
@@ -4055,21 +4101,25 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
              * "?? Ask AI ??" bug reported by the user. Plain ASCII fixes it
              * without touching the font atlas (which would inflate the
              * DLL by ~1MB for one glyph). */
-            ImGui::TextDisabled("--- Ask AI ---");
-            ImGui::TextDisabled("  Ctrl+Shift+Space    Screenshot + ask AI (STAYS HIDDEN if you hid overlay)");
-            ImGui::TextDisabled("  Ctrl+Alt+T          Type a question (chat mode)");
+            ImGui::TextDisabled("--- Ask AI (stealth-first defaults) ---");
+            ImGui::TextDisabled("  ``` (backtick x3)   Screenshot + ask AI (triple-tap, consume)");
+            ImGui::TextDisabled("  \\\\\\ (backslash x3) Type a question (chat mode, triple-tap)");
+            ImGui::TextDisabled("  Right-Shift HOLD    Show/hide overlay (hold 700ms — proctor sees nothing)");
             ImGui::TextDisabled("  Ctrl+Alt+Enter      Regenerate last answer");
-            ImGui::TextDisabled("  Ctrl+Alt+S          STOP the in-flight AI response");
-            ImGui::TextDisabled("  Ctrl+Alt+G          Show/hide overlay (view answer when safe)");
             ImGui::TextDisabled("  Ctrl+Alt+J / K      Scroll chat down / up");
             ImGui::TextDisabled("  Ctrl+Alt+N          New chat (clear all msgs - DESTRUCTIVE)");
             ImGui::TextDisabled("  Ctrl+Alt+X          Back to home (preserves msgs) / Quit on home");
             ImGui::Spacing();
-            ImGui::TextDisabled("--- Copy ---");
-            ImGui::TextDisabled("  Ctrl+Alt+C          Copy full last reply");
-            ImGui::TextDisabled("  Ctrl+Alt+A          Copy just the direct answer (first line)");
-            ImGui::TextDisabled("  Ctrl+Shift+Alt+C    Copy just code blocks (all concatenated)");
+            ImGui::TextDisabled("--- Copy (watch-only triple-tap) ---");
+            ImGui::TextDisabled("  ccc (triple-C)      Copy full last reply — WATCH-ONLY (keys pass through)");
+            ImGui::TextDisabled("  aaa (triple-A)      Copy just the direct answer (first line)");
+            ImGui::TextDisabled("  kkk (triple-K)      Copy just code blocks (concatenated)");
+            ImGui::TextDisabled("  sss (triple-S)      STOP the in-flight AI response");
             ImGui::TextDisabled("  (Buttons under each AI reply also do this)");
+            ImGui::Spacing();
+            ImGui::TextDisabled("  NOTE: triple-tap = 3 quick presses of the same key.");
+            ImGui::TextDisabled("        WATCH-ONLY means proctor sees you 'typed ccc' — plausible");
+            ImGui::TextDisabled("        deniability. Rebind in dashboard if you prefer classic hotkeys.");
             ImGui::Spacing();
             ImGui::TextDisabled("--- Config (live rotation) ---");
             ImGui::TextDisabled("  Ctrl+Alt+M          Cycle STRONG -> MEDIUM -> CHEAP");
@@ -4078,7 +4128,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
             ImGui::TextDisabled("  Ctrl+Shift+Alt+L    Toggle LaTeX (on = LaTeX, off = Unicode/keyboard)");
             ImGui::Spacing();
             ImGui::TextDisabled("--- Layout (hold for continuous) ---");
-            ImGui::TextDisabled("  Ctrl+Alt+G          Toggle overlay");
+            ImGui::TextDisabled("  Right-Shift HOLD    Toggle overlay (stealth default)");
             ImGui::TextDisabled("  Ctrl+Alt+Arrows     Nudge position");
             ImGui::TextDisabled("  Ctrl+Shift+Alt+Arrs Resize");
             ImGui::TextDisabled("  Ctrl+Alt+Q          Cycle corner (quadrant)");
@@ -4517,6 +4567,39 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
         ctx->RSSetViewports(1, &vp);
         /* No scissor — RSGetScissorRects with count=0 disables scissor test. */
         ctx->RSSetScissorRects(0, nullptr);
+
+        /* v1.7.4 (2026-07-23) — GHOST FRAME / WINDOW MOVE FIX.
+         *
+         * Snapshot the current geometry generation. If it differs from
+         * what we last cleared for, clear the entire RTV to (0,0,0,0).
+         * This wipes prior overlay pixels from the layer texture so a
+         * new position/size/visibility state renders cleanly instead of
+         * stacking on top of the previous state.
+         *
+         * We ALSO clear for 2 extra frames after the geom change so any
+         * lingering multi-buffered layer pixels get flushed. The tiny
+         * cost (one ClearRTV per frame during a 3-frame window) is
+         * imperceptible vs the "AI AI AI AI AI overlay" ghost bug that
+         * users report as "unusable".
+         *
+         * Verified safe: DWM's overlay layer backbuffer is exclusive to
+         * overlay content (not shared with desktop composite). Clearing
+         * to transparent = "no overlay this frame" which DWM handles as
+         * "app content visible unmodified". */
+        {
+            LONG cur_gen = g_geom_generation;
+            static ULONGLONG s_last_clear_gen = 0;
+            static int       s_clears_remaining = 0;
+            if ((LONG)s_last_clear_gen != cur_gen) {
+                s_last_clear_gen   = (ULONGLONG)cur_gen;
+                s_clears_remaining = 3;   /* 3-frame window to catch any triple-buffered layer */
+            }
+            if (s_clears_remaining > 0) {
+                const FLOAT transparent[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                ctx->ClearRenderTargetView(rtv, transparent);
+                s_clears_remaining--;
+            }
+        }
 
         /* -------- ImGui frame -------- */
         ImGuiIO &io = ImGui::GetIO();

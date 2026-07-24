@@ -1176,6 +1176,7 @@ const _OVA_BOUNDS = {
 };
 let _ovaState  = { size_mode: 0, w: 560, h: 420, alpha: 0.94 };
 let _ovaSaved  = { ...(_ovaState) };   // last-saved snapshot for dirty check
+let _ovaPresetReinject = null;         // v1.7.4: debounce timer for preset auto-reinject
 
 function _ovaBounds() { return _OVA_BOUNDS[_ovaState.size_mode] || _OVA_BOUNDS[0]; }
 
@@ -1303,12 +1304,52 @@ async function _initOverlayCard() {
   }
 
   document.querySelectorAll('#overlay-appearance-card .ova-preset').forEach((chip) => {
-    chip.addEventListener('click', () => {
+    chip.addEventListener('click', async () => {
       const w = +chip.dataset.w, h = +chip.dataset.h;
       const ultra = chip.dataset.ultra === '1' ? 1 : 0;
       _ovaState = { size_mode: ultra, w, h, alpha: _ovaState.alpha };
       if (chkUltra) chkUltra.checked = !!ultra;
       _ovaRefreshAll();
+      /* v1.7.4 (2026-07-23) — LIVE APPLY.
+       *
+       * User bug: "I clicked small when I injected and it's not doing
+       * anything". Old behavior: preset click only updated the local
+       * preview DIV, requiring the user to also click Save + then
+       * Inject Now (three-step process, most users didn't discover).
+       *
+       * New: auto-save the new dimensions immediately. If the payload
+       * is currently loaded, also fire a background re-inject so the
+       * change is visible on screen within ~2s. If not loaded (user
+       * is prepping), just save + toast "click Inject Now".
+       *
+       * We use a debounced approach: back-to-back preset clicks are
+       * coalesced so we don't spam re-inject. */
+      try {
+        await window.svc.overlay.save(_ovaState);
+        _ovaSaved = { ..._ovaState };
+        _ovaRenderStatus();
+        clearTimeout(_ovaPresetReinject);
+        _ovaPresetReinject = setTimeout(async () => {
+          const loaded = await window.svc.injector.isPayloadLoaded();
+          if (loaded) {
+            toast(`${chip.textContent} preset: re-injecting overlay…`, 'ok');
+            try {
+              /* Fire an inject with current settings — main.js will
+               * see the payload already loaded, uninject + reinject
+               * with the new overlay dimensions from cfg. */
+              const bag = _readAllKeys();
+              await window.svc.injector.inject({ keys: bag, tier: state.chosen_tier });
+              toast(`${chip.textContent} preset applied.`, 'ok');
+            } catch (e) {
+              toast(`${chip.textContent}: preset saved but auto-reinject failed. Click Inject Now.`, 'err');
+            }
+          } else {
+            toast(`${chip.textContent} preset saved. Click Inject Now to apply.`, 'ok');
+          }
+        }, 350);
+      } catch (e) {
+        toast(`Preset save failed: ${e.message || e}`, 'err');
+      }
     });
   });
 

