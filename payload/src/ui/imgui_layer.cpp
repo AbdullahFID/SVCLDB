@@ -4714,17 +4714,37 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
          *              "AddDirtyRect DISABLED — CRASHED DWM in test
          *               2026-07-05"). Kill.
          *
-         * CONCLUSION: title-bar ghost during rapid hotkey nudge is a
-         * COSMETIC bug we accept. Bypassify has the same behavior when
-         * you rapid-nudge (they just don't expose nudge as a hotkey
-         * publicly, so users don't hit it). Rendering the overlay is
-         * FAR more important than eliminating this cosmetic issue.
+         * v1.7.4.6 (2026-07-24) — SKIP-1-FRAME approach.
+         * When geom_generation increments (user hit nudge / resize /
+         * cycle_corner / alpha / font / toggle / reset), skip our
+         * overlay render for exactly ONE frame. That frame DWM
+         * composites the layer WITHOUT our overlay → app pixels
+         * naturally flow into where our old overlay used to sit.
+         * Next frame we render at the new position → NO stacked
+         * ghost of prior positions.
          *
-         * The g_geom_generation counter stays wired but is now
-         * UNUSED — kept for future safer approaches (e.g. per-region
-         * D3D clear that only touches OUR overlay's rect). See
-         * bump_gen() calls in ui_nudge / ui_resize / etc. */
-        (void)g_geom_generation;   /* silence unused warning if any */
+         * Cost: single-frame invisibility (4ms at 240Hz, 16ms at 60Hz).
+         * Barely perceptible even at 60Hz. Way better than 8x stacked
+         * titlebars. Zero risk to DWM: we just don't call ImGui at
+         * all — safest possible mitigation.
+         *
+         * Cap at 1-frame skip (not 2+) so rapid-fire nudges don't
+         * strobe the overlay to full invisibility; each new nudge
+         * bumps generation → next frame skips → but subsequent
+         * frames render normally at the newest position, so the
+         * user still sees the overlay moving smoothly. */
+        static volatile LONG s_last_seen_gen = 0;
+        LONG cur_gen = g_geom_generation;
+        LONG last_gen = InterlockedExchange(&s_last_seen_gen, cur_gen);
+        if (cur_gen != last_gen) {
+            /* Geom changed since last Present — skip overlay this frame.
+             * On the very NEXT Present, cur_gen == last_gen → we render
+             * normally at the new position. */
+            om_restore(ctx, &om);
+            ctx->Release();
+            dev->Release();
+            return;
+        }
 
         /* -------- ImGui frame -------- */
         ImGuiIO &io = ImGui::GetIO();
