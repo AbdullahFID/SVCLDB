@@ -544,7 +544,7 @@ function buildJson(opts) {
      * Both come from storage.loadOverlayConfig() which now populates them
      * with defaults on missing fields so stale overlay.json still works. */
     theme:               (opts.theme != null ? (opts.theme | 0) : 2),
-    overlay_flags:       (opts.overlay_flags != null ? (opts.overlay_flags | 0) : 0x7 /* trail+smooth+uniform */),
+    overlay_flags:       (opts.overlay_flags != null ? (opts.overlay_flags | 0) : 0xE /* v11.2.3 smooth+uniform+opaque_lock (trail-erase OFF, force opaque) */),
     hwid:                tokFields.hwid,
     handshake_epoch_day: tokFields.handshake_epoch_day,
     handshake_token_hex: tokFields.handshake_token_hex,

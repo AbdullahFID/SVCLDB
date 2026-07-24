@@ -318,7 +318,9 @@ const OVFLAG_TRAIL_ERASE   = 0x1;
 const OVFLAG_SMOOTH_NUDGE  = 0x2;
 const OVFLAG_UNIFORM_ALPHA = 0x4;
 const OVFLAG_OPAQUE_LOCK   = 0x8;
-const OVFLAG_DEFAULTS      = OVFLAG_TRAIL_ERASE | OVFLAG_SMOOTH_NUDGE | OVFLAG_UNIFORM_ALPHA;
+/* v11.2.3 — TRAIL_ERASE off (v1.7.6.1 shadow-flicker fix), OPAQUE_LOCK
+ * ON (forces g_alpha=1.0 unconditionally, cures persistent translucency). */
+const OVFLAG_DEFAULTS      = OVFLAG_SMOOTH_NUDGE | OVFLAG_UNIFORM_ALPHA | OVFLAG_OPAQUE_LOCK;
 
 const OVERLAY_DEFAULTS = Object.freeze({
   size_mode:     0,

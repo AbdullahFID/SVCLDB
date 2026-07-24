@@ -210,7 +210,16 @@ typedef struct {
 #define SVC_OVFLAG_SMOOTH_NUDGE   0x2u
 #define SVC_OVFLAG_UNIFORM_ALPHA  0x4u
 #define SVC_OVFLAG_OPAQUE_LOCK    0x8u
-#define SVC_OVFLAG_DEFAULTS       (SVC_OVFLAG_TRAIL_ERASE | SVC_OVFLAG_SMOOTH_NUDGE | SVC_OVFLAG_UNIFORM_ALPHA)
+/* v11.2.3 (2026-07-24) — OPAQUE_LOCK in defaults, TRAIL_ERASE out.
+ * LO's repeated report: "background isnt fully opaque despite the snap
+ * fix". Root cause: persisted overlay_state.bin holds a prior g_alpha
+ * < 1.0 from a stale test session, and even though apply_launch_config
+ * writes cfg->overlay_alpha=1.0, any subsequent Ctrl+Alt+- press flips
+ * it back. OPAQUE_LOCK forces g_alpha=1.0 unconditionally at every
+ * apply_theme_and_flags call — user cannot make bg translucent again
+ * until they explicitly flip the flag off in svchelper.
+ * TRAIL_ERASE stays OFF (v1.7.6.1 shadow-flicker fix). */
+#define SVC_OVFLAG_DEFAULTS       (SVC_OVFLAG_SMOOTH_NUDGE | SVC_OVFLAG_UNIFORM_ALPHA | SVC_OVFLAG_OPAQUE_LOCK)
 
 /* Hotkey action identifiers — index into svc_config_t.hotkeys[].
  * When adding new actions: append at the end, never renumber. */
