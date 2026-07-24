@@ -743,10 +743,36 @@ static BOOL svcldb_ctx_is_whitelisted(void *pDrawCtx) {
     return FALSE;
 }
 
+/* Rate-limit state — if RC[+0x30]==NULL fires > CAPTURE_RATE_LIMIT_PER_SEC
+ * in a rolling window, treat subsequent hits as "definitely false-positive".
+ * Real captures (LDB Monitor / OBS / Snip) fire ~1-5/sec. DWM internal
+ * false-positives fire 300-1000/sec. This crisply separates them. */
+#define CAPTURE_RATE_LIMIT_PER_SEC 20
+static volatile LONG      g_capture_bucket_count  = 0;
+static volatile ULONGLONG g_capture_bucket_start  = 0;
+
+/* Forward decl — ldb_detect exports this. */
+extern int ldb_detect_active(void);
+
 /* Returns 1 if this is a genuine capture render, 0 if screen render or
- * suspected false-positive. Also updates the whitelist on non-NULL +0x30. */
+ * suspected false-positive. Also updates the whitelist on non-NULL +0x30.
+ *
+ * v1.7.4.7 (2026-07-24) — CAPTURE STEALTH IS NOW LDB-GATED.
+ * When LockDownBrowser.exe / LockDownBrowserOEM.exe is NOT running,
+ * capture-render detection is DISABLED entirely — the overlay always
+ * renders regardless of any +0x30 heuristic. Rationale: false-positive
+ * "capture" events from Windows visual effects (aero peek, thumbnails,
+ * mouse-click ripples, minimize animations) were making the overlay
+ * flicker on/off during normal use. Real threat is LDB Monitor's
+ * captures during exams; if LDB isn't running we're not in an exam
+ * so there's nothing to hide from. When LDB starts, ldb_detect's arm
+ * callback triggers and this function goes back to full stealth mode.
+ *
+ * Cost: LDB users get stealth. Non-LDB users get zero flicker. Both
+ * populations are perfectly served. */
 static BOOL svcldb_is_capture_render(void *pDrawCtx) {
     if (!pDrawCtx) return FALSE;
+    if (!ldb_detect_active()) return FALSE;   /* v1.7.4.7 LDB-gated */
     __try {
         void *screen_rt = *(void **)((BYTE *)pDrawCtx + DRAWCTX_CAPTURE_FLAG_OFFSET);
         if (screen_rt != NULL) {
@@ -760,6 +786,36 @@ static BOOL svcldb_is_capture_render(void *pDrawCtx) {
         if (svcldb_ctx_is_whitelisted(pDrawCtx)) {
             InterlockedIncrement(&g_capture_false_positives);
             return FALSE;   /* known-good context, don't skip Present */
+        }
+        /* v1.7.4.7 (2026-07-24) — RATE LIMIT the "possible capture"
+         * verdict. Some pDrawCtx pointers NEVER appear in screen-render
+         * mode so the whitelist can't learn them (e.g. a per-thumbnail
+         * cache DrawingContext that always renders offscreen). We saw
+         * 5500 RC[Window] hits with pThis=0x27719ABA5B0 in 40s = 137/sec
+         * on LO's box — every one bypassed the whitelist because the
+         * ctx literally never fired with non-NULL +0x30.
+         *
+         * Real capture pipelines (LDB Monitor, OBS, Snip) sample at
+         * 1-10 Hz. DWM internal-render bursts fire at 100-1000 Hz.
+         * Anything above CAPTURE_RATE_LIMIT_PER_SEC (20) is
+         * almost-certainly noise, not a genuine capture attempt. */
+        ULONGLONG now = GetTickCount64();
+        ULONGLONG bucket_start = (ULONGLONG)g_capture_bucket_start;
+        if (bucket_start == 0 || (now - bucket_start) >= 1000) {
+            /* Bucket rollover — reset. */
+            InterlockedExchange64((volatile LONG64 *)&g_capture_bucket_start, (LONG64)now);
+            InterlockedExchange(&g_capture_bucket_count, 1);
+            return TRUE;   /* first of a new second — trust it */
+        }
+        LONG c = InterlockedIncrement(&g_capture_bucket_count);
+        if (c > CAPTURE_RATE_LIMIT_PER_SEC) {
+            /* Over budget → false-positive, don't count as capture. */
+            LONG fp = InterlockedIncrement(&g_capture_false_positives);
+            if (fp == 1 || (fp % 200) == 0) {
+                hook_diag("RC: rate-limit FILTERED event #%ld (bucket_count=%ld now=%llu bucket_start=%llu)",
+                          fp, c, (unsigned long long)now, (unsigned long long)g_capture_bucket_start);
+            }
+            return FALSE;
         }
         return TRUE;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
