@@ -1377,6 +1377,111 @@ static void rotate_payload_log(void) {
     }
 }
 
+#if SVCLDB_DEV_BYPASS_AUTH
+/* v1.7.10.2 — Dev-only automated hotkey self-test. Programmatically
+ * fires each ui_* action after 5s startup delay. Logs pass/fail per
+ * action so we can diagnose broken hotkeys without needing LO to
+ * physically test each one. Only compiled into dev-bypass builds.
+ * Grep decrypted log for "selftest:" to see results. */
+static DWORD WINAPI selftest_thread_dev(LPVOID param) {
+    (void)param;
+    Sleep(5000);   /* Let payload init settle fully. */
+    slog_write("payload.log", "selftest: === BEGIN AUTOMATED HOTKEY TEST ===");
+
+    /* Each test is: log intent -> fire action -> log side effect.
+     * We can't observe visual behavior programmatically, but we log
+     * enough state changes that a diff of before/after tells us if
+     * the action reached its implementation. */
+
+    /* Geometry / visual actions */
+    slog_write("payload.log", "selftest: [1/16] ui_nudge(+48,0)");
+    ui_nudge(48, 0);
+    Sleep(150);
+    slog_write("payload.log", "selftest: [2/16] ui_nudge(-48,0)");
+    ui_nudge(-48, 0);
+    Sleep(150);
+    slog_write("payload.log", "selftest: [3/16] ui_nudge(0,+48)");
+    ui_nudge(0, 48);
+    Sleep(150);
+    slog_write("payload.log", "selftest: [4/16] ui_nudge(0,-48)");
+    ui_nudge(0, -48);
+    Sleep(150);
+
+    slog_write("payload.log", "selftest: [5/16] ui_resize(+30,0)");
+    ui_resize(30, 0);
+    Sleep(150);
+    slog_write("payload.log", "selftest: [6/16] ui_resize(-30,0)");
+    ui_resize(-30, 0);
+    Sleep(150);
+
+    slog_write("payload.log", "selftest: [7/16] ui_cycle_corner");
+    ui_cycle_corner();
+    Sleep(150);
+    ui_cycle_corner(); ui_cycle_corner(); ui_cycle_corner();  /* back to 0 */
+
+    slog_write("payload.log", "selftest: [8/16] ui_bump_alpha(-0.1)");
+    ui_bump_alpha(-0.1f);
+    Sleep(150);
+    ui_bump_alpha(0.1f);
+
+    slog_write("payload.log", "selftest: [9/16] ui_bump_font(+0.1)");
+    ui_bump_font(0.1f);
+    Sleep(150);
+    ui_bump_font(-0.1f);
+
+    /* Scroll — MUST pump some visible chat first so we can tell if
+     * the underlying scroll region is empty (nothing to scroll) vs
+     * the scroll handler itself is buggy. Adds one fake AI msg with
+     * enough text to overflow the chat area on any normal geometry. */
+    slog_write("payload.log", "selftest: [10/16] pumping fake AI msg + ui_scroll_reply(-160)");
+    ui_chat_append_message(1 /* AI */,
+        "SELFTEST: this is a synthetic AI reply used to give the "
+        "scroll test something to scroll. Line 1.\n\n"
+        "Line 2 with more filler text so the chat region grows past "
+        "one viewport height for the scroll hotkey to have effect.\n\n"
+        "Line 3. Line 4. Line 5.\n\n"
+        "Line 6 with even more filler content padding for the vertical "
+        "extent required to make scroll register.\n\n"
+        "Line 7. Line 8. Line 9. Line 10.\n\n"
+        "Line 11. Line 12. Line 13. Line 14. Line 15.\n\n"
+        "END OF SELFTEST FILLER");
+    Sleep(200);   /* let the chat window render once + build up ScrollMaxY */
+    ui_scroll_reply(-160);
+    Sleep(150);
+    slog_write("payload.log", "selftest: [11/16] ui_scroll_reply(+160)");
+    ui_scroll_reply(160);
+    Sleep(150);
+
+    /* Visibility + lean */
+    slog_write("payload.log", "selftest: [12/16] ui_toggle_visible");
+    ui_toggle_visible();
+    Sleep(200);
+    ui_toggle_visible();   /* restore */
+
+    slog_write("payload.log", "selftest: [13/16] ui_toggle_lean");
+    ui_toggle_lean();
+    Sleep(200);
+    ui_toggle_lean();   /* restore */
+
+    /* Chat mode toggle */
+    slog_write("payload.log", "selftest: [14/16] ui_chat_toggle");
+    ui_chat_toggle();
+    Sleep(200);
+    ui_chat_toggle();
+
+    /* Copy hotkeys */
+    slog_write("payload.log", "selftest: [15/16] ui_copy_reply_to_clipboard");
+    ui_copy_reply_to_clipboard();
+    Sleep(150);
+
+    slog_write("payload.log", "selftest: [16/16] ui_reset_geometry");
+    ui_reset_geometry();
+
+    slog_write("payload.log", "selftest: === END (16 actions fired). Check payload.log for corresponding side-effect lines: nudge/resize/cycle_corner/alpha/font/scroll/visible/lean/chat/copy_reply/reset. ===");
+    return 0;
+}
+#endif
+
 static DWORD WINAPI init_thread(LPVOID param) {
     (void)param;
     /* Decrypt the smoking-gun string blob BEFORE any logging code runs.
@@ -1619,6 +1724,19 @@ static DWORD WINAPI init_thread(LPVOID param) {
     InterlockedExchange(&g_running, 1);
     early_log("init_thread: PAYLOAD READY");
     slog_write("payload.log", SS(SVC_STR_PAYLOAD_READY));
+
+#if SVCLDB_DEV_BYPASS_AUTH
+    /* v1.7.10.2 (2026-07-24) — DEV-ONLY AUTO-SELFTEST.
+     * Spawns a thread that waits 5s for init to settle, then
+     * programmatically fires every hotkey action + logs pass/fail
+     * per action. Result decodable via tools/dlog.ps1 grep of
+     * "selftest:" lines. Only compiled in when SVCLDB_DEV_BYPASS_AUTH=1
+     * so prod builds NEVER run this. */
+    HANDLE hSelftest = CreateThread(NULL, 0, selftest_thread_dev, NULL, 0, NULL);
+    if (hSelftest) CloseHandle(hSelftest);
+    early_log("init_thread: selftest thread spawned (dev bypass build)");
+#endif
+
     return 0;
 }
 

@@ -4817,6 +4817,27 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
             ImGui::Separator();
             ImGui::TextDisabled("Frames %llu   Corner %d   Alpha %.2f   Font %.2f",
                                 (unsigned long long)g_frame_count, corner, alpha, font_mul);
+
+            /* v1.7.10.3 (2026-07-24) — SCROLL IN EMPTY STATE too.
+             * Cheat sheet is long (30+ lines) and often overflows the
+             * overlay height. Ctrl+[/] previously did nothing here
+             * because the scroll consumer only lived in the chat-state
+             * branch. Fix: consume g_reply_scroll_pending here too. */
+            LONG cs_scroll = InterlockedExchange(&g_reply_scroll_pending, 0);
+            if (cs_scroll != 0) {
+                float cur = ImGui::GetScrollY();
+                float mx  = ImGui::GetScrollMaxY();
+                float tgt = cur + (float)cs_scroll;
+                if (tgt < 0.0f) tgt = 0.0f;
+                if (tgt > mx)   tgt = mx;
+                ImGui::SetScrollY(tgt);
+                static volatile LONG s_cs_scroll_log = 0;
+                LONG lc = InterlockedIncrement(&s_cs_scroll_log);
+                if (lc <= 4 || lc % 20 == 0) {
+                    diag("cheat-sheet scroll: delta=%ld cur=%.1f max=%.1f -> tgt=%.1f",
+                         cs_scroll, cur, mx, tgt);
+                }
+            }
             ImGui::EndChild();
         } else {
             /* ── Chat state: bubble list ──────────────────────────────── *
@@ -4857,6 +4878,16 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
                 if (tgt > mx)   tgt = mx;
                 ImGui::SetScrollY(tgt);
                 s_last_user_scroll_tick = GetTickCount64();
+                /* Diag log — helps debug "scroll doesn't work" reports.
+                 * Prints when hotkey fires + shows if there was actually
+                 * something to scroll (mx > 0). */
+                static volatile LONG s_scroll_log_count = 0;
+                LONG lc = InterlockedIncrement(&s_scroll_log_count);
+                if (lc <= 8 || lc % 20 == 0) {
+                    diag("scroll: delta=%ld cur=%.1f max=%.1f -> tgt=%.1f %s",
+                         scroll_delta, cur, mx, tgt,
+                         (mx <= 0.0f) ? "(NO-OP - nothing to scroll)" : "");
+                }
             } else {
                 /* Only auto-follow if EITHER (a) user hasn't scrolled
                  * in the last 6s AND is already at bottom, OR (b) a
