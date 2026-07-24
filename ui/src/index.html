@@ -513,19 +513,55 @@
                 <span class="ova-val" id="val-ova-h">420 px</span>
               </div>
               <div class="ova-slider-row">
-                <label for="rng-ova-alpha">Alpha</label>
-                <input id="rng-ova-alpha" type="range" min="20" max="100" step="1" value="94">
-                <span class="ova-val" id="val-ova-alpha">94%</span>
+                <label for="rng-ova-alpha">Opacity</label>
+                <input id="rng-ova-alpha" type="range" min="20" max="100" step="1" value="100">
+                <span class="ova-val" id="val-ova-alpha">100%</span>
               </div>
 
               <div class="ova-presets">
-                <span class="ova-presets-label">Presets:</span>
+                <span class="ova-presets-label">Size:</span>
                 <button class="chip ova-preset" data-w="120"  data-h="100"  data-ultra="1">Pip</button>
                 <button class="chip ova-preset" data-w="380"  data-h="280"  data-ultra="0">Small</button>
                 <button class="chip ova-preset" data-w="560"  data-h="420"  data-ultra="0">Default</button>
                 <button class="chip ova-preset" data-w="820"  data-h="620"  data-ultra="0">Large</button>
                 <button class="chip ova-preset" data-w="1200" data-h="900"  data-ultra="0">XL</button>
                 <button class="chip ova-preset" data-w="1800" data-h="1200" data-ultra="1">Huge</button>
+              </div>
+
+              <!-- v11 (2026-07-24) Bypassify-parity: opacity quick-presets
+                   for common looks. Clicking snaps the slider + auto-saves. -->
+              <div class="ova-presets" style="margin-top:6px">
+                <span class="ova-presets-label">Opacity:</span>
+                <button class="chip ova-alpha-preset" data-alpha="1.00"
+                        title="Zero trailing when nudged; matches Bypassify's default look.">Solid (100%)</button>
+                <button class="chip ova-alpha-preset" data-alpha="0.85">Frosted (85%)</button>
+                <button class="chip ova-alpha-preset" data-alpha="0.60">Translucent (60%)</button>
+                <button class="chip ova-alpha-preset" data-alpha="0.35"
+                        title="Barely visible over apps — may leave a slight ghost tail during nudge; trade-off for see-through UX.">See-through (35%)</button>
+              </div>
+
+              <!-- v11: theme selector — dark / light / auto -->
+              <div class="ova-presets" style="margin-top:6px">
+                <span class="ova-presets-label">Theme:</span>
+                <button class="chip ova-theme-preset" data-theme="0"
+                        title="Dark navy background + white text (svcldb classic).">Dark</button>
+                <button class="chip ova-theme-preset" data-theme="1"
+                        title="Soft white background + dark text — pairs well with light-mode apps.">Light</button>
+                <button class="chip ova-theme-preset" data-theme="2"
+                        title="Follows Windows AppsUseLightTheme; payload re-polls every 2s so it flips live when you change your Windows theme.">Auto (follow Windows)</button>
+              </div>
+
+              <!-- v11: advanced overlay behavior flags -->
+              <div class="ova-presets" style="margin-top:6px">
+                <span class="ova-presets-label">Behavior:</span>
+                <button class="chip ova-flag-toggle" data-flag="1"
+                        title="Paint over old overlay positions with opaque background color to eliminate trailing pixels during nudge. Default ON.">Trail-erase</button>
+                <button class="chip ova-flag-toggle" data-flag="2"
+                        title="Small 8-pixel nudge steps at 60Hz repeat rate = butter-smooth slide (matches Bypassify). Off = 20-pixel steps at 20Hz (jaggy).">Smooth nudge</button>
+                <button class="chip ova-flag-toggle" data-flag="4"
+                        title="Opacity slider affects the WHOLE overlay uniformly (bubbles, code, math, borders) instead of just the outer background.">Uniform alpha</button>
+                <button class="chip ova-flag-toggle" data-flag="8"
+                        title="Force alpha = 100% regardless of the slider. Guarantees zero trailing but overrides your opacity preference.">Opaque lock</button>
               </div>
             </div>
 

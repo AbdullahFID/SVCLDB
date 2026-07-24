@@ -199,6 +199,22 @@ void ui_set_known_rva_table(const ui_rva_symbol_t *table, int count);
 void ui_apply_launch_config(int base_w, int base_h,
                             float alpha, int size_mode);
 
+/* v11 (2026-07-24) — theme + overlay-flags apply, called from dllmain right
+ * after ui_apply_launch_config with the values from cfg->theme + cfg->overlay_flags.
+ *   theme         : 0=dark, 1=light, 2=auto (payload polls Windows Personalize
+ *                   registry every ~2s and follows AppsUseLightTheme).
+ *   overlay_flags : bitfield of SVC_OVFLAG_* — controls trail-erase (paint
+ *                   over prior positions with opaque bg color), smooth-nudge
+ *                   (8px @ 60Hz vs 20px @ 20Hz), uniform-alpha, opaque-lock.
+ * Thread-safe (guarded by g_ui_cs). */
+void ui_apply_theme_and_flags(int theme, unsigned overlay_flags);
+
+/* v11: read-only accessors — used by rawinput_hook to pick nudge repeat
+ * rate based on user's SMOOTH_NUDGE preference. Non-locking, returns
+ * the current cached value (Interlocked read). */
+unsigned ui_get_overlay_flags(void);
+int      ui_get_theme_effective(void);
+
 /* Request a DWM-side screen capture. Blocks up to `timeout_ms` for a fresh
  * frame to be grabbed from the compositor's layer backbuffer (the same
  * texture we render into). Returns 1 on success with *png_out / *len_out

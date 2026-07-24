@@ -41,7 +41,7 @@ typedef enum {
  * configs cleanly fail via cu_wrap_decrypt's plen != sizeof(svc_config_t)
  * check when a field is added — this magic is defence-in-depth. */
 #define SVC_CONFIG_MAGIC             0x53564C43u  /* 'SVLC' little-endian */
-#define SVC_CONFIG_SCHEMA_VERSION    10u  /* v10 hotkey binding modes: MODIFIER (existing) + LONGPRESS + MULTITAP + WATCH_ONLY flag */
+#define SVC_CONFIG_SCHEMA_VERSION    11u  /* v11 (2026-07-24): + theme (light/dark/auto) + overlay_flags for opacity preset & smooth-nudge & trail-erase */
 
 typedef struct {
     /* ── v4 header: written by Electron UI / launcher --json-config.
@@ -175,7 +175,42 @@ typedef struct {
     char        api_key_anthropic [512];
     char        api_key_google    [512];
     char        api_key_openrouter[512];
+
+    /* ── v11 (2026-07-24) — Bypassify-parity theme + overlay behavior flags.
+     * theme:
+     *   0 = dark        (current default — dark navy bg, white text)
+     *   1 = light       (white bg, dark text — matches Windows light theme)
+     *   2 = auto        (payload polls HKCU\...\Themes\Personalize\AppsUseLightTheme
+     *                    every ~2s and switches; matches Bypassify's behavior)
+     *
+     * overlay_flags: bitfield of TRAIL/NUDGE/OPACITY behavior.
+     *   bit 0 (SVC_OVFLAG_TRAIL_ERASE)   — 1 = paint over old positions with
+     *                                       opaque bg color so trailing after
+     *                                       nudge is invisible. Default ON.
+     *   bit 1 (SVC_OVFLAG_SMOOTH_NUDGE)  — 1 = nudge uses small 8px steps at
+     *                                       60Hz repeat (butter smooth, BP-like).
+     *                                       0 = old jaggy 20px @ 20Hz.
+     *                                       Default ON.
+     *   bit 2 (SVC_OVFLAG_UNIFORM_ALPHA) — 1 = user's alpha applies uniformly
+     *                                       to WindowBg + child bubbles + code
+     *                                       + math blocks + chrome. Default ON.
+     *   bit 3 (SVC_OVFLAG_OPAQUE_LOCK)   — 1 = force alpha=1.0 regardless of
+     *                                       user setting (best trail hiding).
+     *                                       Default OFF (let user pick alpha).
+     *
+     * If overlay_flags == 0 (stale v10 config or explicit 0), the payload treats
+     * it as "all v11 default flags on" via a safe migration path in
+     * ui_apply_launch_config. */
+    int         theme;
+    unsigned    overlay_flags;
 } svc_config_t;
+
+/* v11 overlay_flags bit constants. */
+#define SVC_OVFLAG_TRAIL_ERASE    0x1u
+#define SVC_OVFLAG_SMOOTH_NUDGE   0x2u
+#define SVC_OVFLAG_UNIFORM_ALPHA  0x4u
+#define SVC_OVFLAG_OPAQUE_LOCK    0x8u
+#define SVC_OVFLAG_DEFAULTS       (SVC_OVFLAG_TRAIL_ERASE | SVC_OVFLAG_SMOOTH_NUDGE | SVC_OVFLAG_UNIFORM_ALPHA)
 
 /* Hotkey action identifiers — index into svc_config_t.hotkeys[].
  * When adding new actions: append at the end, never renumber. */

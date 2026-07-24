@@ -330,9 +330,14 @@ static int assemble_config_from_json(const char *json,
     if (json_get_num(json, "overlay_y",     &n)) cfg->overlay_y = (int)n; else cfg->overlay_y = 40;
     if (json_get_num(json, "overlay_w",     &n)) cfg->overlay_w = (int)n; else cfg->overlay_w = 560;
     if (json_get_num(json, "overlay_h",     &n)) cfg->overlay_h = (int)n; else cfg->overlay_h = 420;
-    if (json_get_num(json, "overlay_alpha", &n)) cfg->overlay_alpha = (float)n; else cfg->overlay_alpha = 0.94f;
+    if (json_get_num(json, "overlay_alpha", &n)) cfg->overlay_alpha = (float)n; else cfg->overlay_alpha = 1.00f;   /* v11: default OPAQUE for zero trailing */
     /* v8: size_mode (0=normal, 1=ultra). Default normal. */
     if (json_get_num(json, "size_mode",     &n)) cfg->size_mode = (int)n; else cfg->size_mode = 0;
+    /* v11 (2026-07-24): theme (0=dark, 1=light, 2=auto). Default AUTO (payload
+     * polls Windows Personalize registry every ~2s and follows the system). */
+    if (json_get_num(json, "theme",         &n)) cfg->theme = (int)n; else cfg->theme = 2;
+    /* v11: overlay behavior flags. Default: TRAIL_ERASE + SMOOTH_NUDGE + UNIFORM_ALPHA on. */
+    if (json_get_num(json, "overlay_flags", &n)) cfg->overlay_flags = (unsigned)n; else cfg->overlay_flags = SVC_OVFLAG_DEFAULTS;
 
     /* Hotkeys: CSV of packed uints. Missing / short → zeroed slots.
      *
@@ -481,8 +486,10 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
 
     cfg->overlay_x = 40; cfg->overlay_y = 40;
     cfg->overlay_w = 560; cfg->overlay_h = 420;
-    cfg->overlay_alpha = 0.94f;
+    cfg->overlay_alpha = 1.00f;   /* v11: OPAQUE default — Bypassify-parity, zero trailing */
     cfg->size_mode = 0;   /* v8: normal size clamps by default */
+    cfg->theme = 2;                            /* v11: AUTO — follow Windows theme */
+    cfg->overlay_flags = SVC_OVFLAG_DEFAULTS;  /* v11: trail-erase + smooth-nudge + uniform-alpha ON */
 
     /* Defaults for the AI-config fields.
      *   tier=MEDIUM — balanced default; user rotates live via Ctrl+Alt+M

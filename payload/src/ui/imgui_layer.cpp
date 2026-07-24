@@ -660,7 +660,7 @@ static int   g_offset_x = 0;
 static int   g_offset_y = 0;
 static int   g_extra_w  = 0;
 static int   g_extra_h  = 0;
-static float g_alpha    = 0.94f;
+static float g_alpha    = 1.00f;   /* v11: default OPAQUE (was 0.94f) — Bypassify-parity, zero trailing */
 static float g_font     = 1.00f;   /* multiplicative on top of DPI-derived scale */
 
 /* v1.7.4 (2026-07-23) — GHOST FRAME / WINDOW MOVE FIX.
@@ -717,6 +717,99 @@ static int   g_base_h_cfg = 0;   /* 0 = use fallback 460 */
  * Controls the RUNTIME clamp range for both the launch base + user's
  * live resize hotkeys. Ultra allows tiny 80x60 pip AND near-fullscreen. */
 static volatile LONG g_size_mode = 0;   /* 0 normal, 1 ultra */
+
+/* v11 (2026-07-24) — Bypassify-parity theme + behavior flags.
+ *   g_theme_pref: 0=dark, 1=light, 2=auto (poll AppsUseLightTheme every 2s)
+ *   g_theme_effective: 0=dark, 1=light — the CURRENT rendering theme after
+ *                      auto-resolution. Consulted every frame by
+ *                      draw_chat_window to pick color palette.
+ *   g_overlay_flags: bitfield of SVC_OVFLAG_* (see shared/config_types.h).
+ *                    Default SVC_OVFLAG_DEFAULTS on until launch config
+ *                    overrides.
+ *   g_trail_hist:    ring buffer of last N overlay rects, each with age
+ *                    counter. On each frame we paint each entry with our
+ *                    opaque WindowBg color via ImGui::GetBackgroundDrawList()
+ *                    to overwrite trailing pixels from prior positions.
+ *                    Entries age out after TRAIL_ERASE_FRAMES frames — long
+ *                    enough for DWM natural compose to catch up, short
+ *                    enough to not leave a visible "solid navy tail".
+ *
+ * All accesses via Interlocked* — read-hot from Present thread,
+ * write-cold from ui_* handlers and the theme poll thread. */
+static volatile LONG g_theme_pref      = 2;                       /* 0=dark, 1=light, 2=auto */
+static volatile LONG g_theme_effective = 0;                       /* 0=dark, 1=light         */
+static volatile LONG g_overlay_flags   = (LONG)SVC_OVFLAG_DEFAULTS;
+
+#define TRAIL_HIST_MAX      6      /* keep last 6 rects; enough for fast nudge streams */
+#define TRAIL_ERASE_FRAMES  4      /* each entry lives ~4 frames = ~66ms @ 60Hz        */
+
+struct trail_rect_t {
+    float x, y, w, h;      /* rect in DWM layer coords (same as ImGui overlay coords) */
+    LONG  frames_left;     /* atomic counter; 0 = slot empty                          */
+};
+static struct trail_rect_t g_trail_hist[TRAIL_HIST_MAX] = {};
+static CRITICAL_SECTION    g_trail_cs;
+static volatile LONG       g_trail_cs_inited = 0;
+static float               g_last_pushed_x = -99999.0f;
+static float               g_last_pushed_y = -99999.0f;
+static float               g_last_pushed_w = 0.0f;
+static float               g_last_pushed_h = 0.0f;
+
+static void ensure_trail_cs(void) {
+    if (InterlockedCompareExchange(&g_trail_cs_inited, 1, 0) == 0) {
+        InitializeCriticalSection(&g_trail_cs);
+    }
+}
+
+/* Push a trail-erase rect. Called from draw_chat_window when the rendered
+ * rect differs from the previous frame's rect (i.e. overlay moved/resized).
+ * Cheap: linear scan of TRAIL_HIST_MAX small slots + one CS. */
+static void trail_push_rect(float x, float y, float w, float h) {
+    if (!(InterlockedCompareExchange(&g_overlay_flags, 0, 0) & SVC_OVFLAG_TRAIL_ERASE))
+        return;   /* feature disabled */
+    ensure_trail_cs();
+    EnterCriticalSection(&g_trail_cs);
+    /* Find empty slot OR oldest slot (min frames_left). */
+    int   victim = 0;
+    LONG  min_left = 0x7FFFFFFF;
+    for (int i = 0; i < TRAIL_HIST_MAX; i++) {
+        if (g_trail_hist[i].frames_left <= 0) { victim = i; break; }
+        if (g_trail_hist[i].frames_left < min_left) {
+            min_left = g_trail_hist[i].frames_left;
+            victim = i;
+        }
+    }
+    g_trail_hist[victim].x = x;
+    g_trail_hist[victim].y = y;
+    g_trail_hist[victim].w = w;
+    g_trail_hist[victim].h = h;
+    g_trail_hist[victim].frames_left = TRAIL_ERASE_FRAMES;
+    LeaveCriticalSection(&g_trail_cs);
+}
+
+/* Windows registry polling for auto theme (called ~every 2s from the
+ * DWM Present hook; cost = single RegQueryValue, sub-microsecond). */
+static int query_windows_apps_use_light_theme(void) {
+    HKEY hk = NULL;
+    DWORD val = 0, sz = sizeof(val);
+    /* Personalize is under HKCU — but payload runs in DWM's session which
+     * is SYSTEM. DWM impersonates the interactive user for Personalize
+     * reads via HKEY_CURRENT_USER but that may not always work from
+     * an arbitrary thread. We try HKCU first, then fall back to reading
+     * the interactive user's hive under HKU\<active-sid>. Failure → 0
+     * (dark theme) which matches the pre-v11 rendering. */
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        0, KEY_READ, &hk) == ERROR_SUCCESS) {
+        if (RegQueryValueExW(hk, L"AppsUseLightTheme", NULL, NULL,
+                             (LPBYTE)&val, &sz) == ERROR_SUCCESS) {
+            RegCloseKey(hk);
+            return val ? 1 : 0;
+        }
+        RegCloseKey(hk);
+    }
+    return 0;   /* dark theme default when we can't read */
+}
 
 /* v1.3 (2026-07-07): per-frame alpha multiplier — snapshotted from
  * g_alpha at the top of draw_chat_window and used by nested
@@ -2624,6 +2717,63 @@ extern "C" void ui_apply_launch_config(int base_w, int base_h,
          base_w, base_h, alpha, size_mode);
 }
 
+/* v11 (2026-07-24) — apply theme + overlay-flags from launch config.
+ * Called from dllmain after ui_apply_launch_config. Fresh install / stale
+ * v10 config passes overlay_flags=0 which we auto-migrate to
+ * SVC_OVFLAG_DEFAULTS so users get the new UX without opt-in. */
+extern "C" void ui_apply_theme_and_flags(int theme, unsigned overlay_flags) {
+    if (theme < 0 || theme > 2) theme = 2;   /* clamp to valid range */
+    InterlockedExchange(&g_theme_pref, (LONG)theme);
+    /* Migration: schema-v10 configs pass overlay_flags=0. Treat as
+     * "use v11 defaults" so users benefit from the new UX without
+     * needing to re-inject through the updated svchelper. */
+    unsigned effective_flags = overlay_flags ? overlay_flags : SVC_OVFLAG_DEFAULTS;
+    InterlockedExchange(&g_overlay_flags, (LONG)effective_flags);
+    /* Force-lock alpha=1.0 if OPAQUE_LOCK is set. Overrides user's
+     * persisted alpha until they flip the flag off. */
+    if (effective_flags & SVC_OVFLAG_OPAQUE_LOCK) {
+        ensure_cs();
+        EnterCriticalSection(&g_ui_cs);
+        g_alpha = 1.00f;
+        LeaveCriticalSection(&g_ui_cs);
+    }
+    /* Initial theme resolution — 2s poller updates from here. */
+    int resolved;
+    if (theme == 2) resolved = query_windows_apps_use_light_theme();   /* auto */
+    else            resolved = theme;                                  /* 0 or 1 */
+    InterlockedExchange(&g_theme_effective, (LONG)resolved);
+    geom_bump();
+    wake_dwm_composition();
+    diag("apply_theme_and_flags: theme=%d(->%s) flags=0x%x", theme,
+         resolved ? "LIGHT" : "DARK", effective_flags);
+}
+
+extern "C" unsigned ui_get_overlay_flags(void) {
+    return (unsigned)InterlockedCompareExchange(&g_overlay_flags, 0, 0);
+}
+
+extern "C" int ui_get_theme_effective(void) {
+    return (int)InterlockedCompareExchange(&g_theme_effective, 0, 0);
+}
+
+/* v11: inline theme poll — no separate thread. Called from ui_present_frame
+ * once every ~2s of frames (throttled by wall-clock tick counter). Zero-cost
+ * unless preference is AUTO. */
+static void maybe_repoll_theme(void) {
+    static ULONGLONG s_last_theme_tick = 0;
+    if (InterlockedCompareExchange(&g_theme_pref, 0, 0) != 2) return;   /* not auto */
+    ULONGLONG now = GetTickCount64();
+    if (now - s_last_theme_tick < 2000) return;                          /* throttle */
+    s_last_theme_tick = now;
+    int t = query_windows_apps_use_light_theme();
+    LONG prev = InterlockedExchange(&g_theme_effective, (LONG)t);
+    if (prev != (LONG)t) {
+        geom_bump();
+        wake_dwm_composition();
+        diag("theme_poll: auto -> %s", t ? "LIGHT" : "DARK");
+    }
+}
+
 extern "C" void ui_reset_geometry() {
     ensure_cs();
     EnterCriticalSection(&g_ui_cs);
@@ -2632,7 +2782,7 @@ extern "C" void ui_reset_geometry() {
     g_offset_y = 0;
     g_extra_w  = 0;
     g_extra_h  = 0;
-    g_alpha    = 0.94f;
+    g_alpha    = 1.00f;   /* v11: OPAQUE default — matches new config default */
     g_font     = 1.00f;
     LeaveCriticalSection(&g_ui_cs);
     state_mark_dirty();
@@ -4095,6 +4245,90 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     InterlockedExchange(&g_last_overlay_w, (LONG)base_w);
     InterlockedExchange(&g_last_overlay_h, (LONG)base_h);
 
+    /* v11 (2026-07-24) — TRAIL ERASE.
+     *
+     * Compare current rect vs previous frame's rendered rect. If they differ,
+     * push the PRIOR rect onto the trail history so we paint over it with
+     * opaque bg color this frame. This eliminates the "solid ghost trail"
+     * that persisted from prior overlay positions after nudge.
+     *
+     * See trail_push_rect + trail history globals near line ~740. */
+    if (pos_x != g_last_pushed_x || pos_y != g_last_pushed_y ||
+        base_w != g_last_pushed_w || base_h != g_last_pushed_h) {
+        if (g_last_pushed_w > 0.0f && g_last_pushed_h > 0.0f) {
+            trail_push_rect(g_last_pushed_x, g_last_pushed_y,
+                            g_last_pushed_w, g_last_pushed_h);
+        }
+        g_last_pushed_x = pos_x;
+        g_last_pushed_y = pos_y;
+        g_last_pushed_w = base_w;
+        g_last_pushed_h = base_h;
+    }
+
+    /* v11: THEME PALETTE — dark (existing) or light.
+     * Light theme colors ported from Windows Fluent light with adjustments
+     * for text contrast at translucent alpha. */
+    int   theme = (int)InterlockedCompareExchange(&g_theme_effective, 0, 0);
+    ImVec4 col_window_bg, col_title_bg, col_title_bg_active, col_border, col_text, col_sep, col_scroll_bg, col_scroll_grab, col_scroll_grab_hi;
+    if (theme == 1) {
+        /* LIGHT theme — soft white bg, dark navy text. */
+        col_window_bg       = ImVec4(0.97f, 0.98f, 0.99f, alpha);
+        col_title_bg        = with_alpha_mul(ImVec4(0.90f, 0.93f, 0.97f, 0.98f));
+        col_title_bg_active = with_alpha_mul(ImVec4(0.82f, 0.88f, 0.95f, 0.98f));
+        col_border          = with_alpha_mul(ImVec4(0.55f, 0.65f, 0.80f, 0.85f));
+        col_text            = ImVec4(0.10f, 0.14f, 0.22f, 1.00f);
+        col_sep             = with_alpha_mul(ImVec4(0.60f, 0.70f, 0.85f, 0.55f));
+        col_scroll_bg       = with_alpha_mul(ImVec4(0.90f, 0.92f, 0.95f, 0.60f));
+        col_scroll_grab     = with_alpha_mul(ImVec4(0.55f, 0.65f, 0.80f, 0.85f));
+        col_scroll_grab_hi  = with_alpha_mul(ImVec4(0.40f, 0.55f, 0.75f, 0.90f));
+    } else {
+        /* DARK theme — the historical default. */
+        col_window_bg       = ImVec4(0.04f, 0.05f, 0.09f, alpha);
+        col_title_bg        = with_alpha_mul(ImVec4(0.07f, 0.09f, 0.14f, 0.98f));
+        col_title_bg_active = with_alpha_mul(ImVec4(0.10f, 0.14f, 0.22f, 0.98f));
+        col_border          = with_alpha_mul(ImVec4(0.28f, 0.42f, 0.68f, 0.85f));
+        col_text            = ImVec4(0.94f, 0.96f, 0.99f, 1.00f);
+        col_sep             = with_alpha_mul(ImVec4(0.20f, 0.28f, 0.42f, 0.80f));
+        col_scroll_bg       = with_alpha_mul(ImVec4(0.06f, 0.08f, 0.12f, 0.60f));
+        col_scroll_grab     = with_alpha_mul(ImVec4(0.28f, 0.42f, 0.68f, 0.85f));
+        col_scroll_grab_hi  = with_alpha_mul(ImVec4(0.38f, 0.52f, 0.80f, 0.90f));
+    }
+
+    /* v11 TRAIL ERASE — paint each aged prior-rect with our OPAQUE
+     * WindowBg color via ImGui's background draw list. This happens
+     * BEFORE ImGui::Begin so paint ordering: [trail-erase rects] under
+     * [our overlay this frame]. Since we always overlap the current
+     * new position with the same solid color, no visible seam. Age
+     * counter decrements each frame; entries drop out after
+     * TRAIL_ERASE_FRAMES so the tail doesn't smear behind us forever. */
+    if (InterlockedCompareExchange(&g_overlay_flags, 0, 0) & SVC_OVFLAG_TRAIL_ERASE) {
+        /* Build the opaque erase color from theme palette. Alpha ALWAYS
+         * 1.0 here regardless of user opacity — the point is to
+         * overpaint trail pixels. If user is running translucent, they
+         * still get visible trail-color rects for TRAIL_ERASE_FRAMES,
+         * but this is BETTER than fragmentary chat pixels because the
+         * color matches WindowBg and reads as a natural fade-out. */
+        ImU32 erase_color;
+        if (theme == 1)
+            erase_color = IM_COL32((int)(0.97f*255), (int)(0.98f*255), (int)(0.99f*255), 255);
+        else
+            erase_color = IM_COL32((int)(0.04f*255), (int)(0.05f*255), (int)(0.09f*255), 255);
+        ImDrawList *bg_dl = ImGui::GetBackgroundDrawList();
+        ensure_trail_cs();
+        EnterCriticalSection(&g_trail_cs);
+        for (int i = 0; i < TRAIL_HIST_MAX; i++) {
+            if (g_trail_hist[i].frames_left <= 0) continue;
+            float x0 = g_trail_hist[i].x;
+            float y0 = g_trail_hist[i].y;
+            float x1 = x0 + g_trail_hist[i].w;
+            float y1 = y0 + g_trail_hist[i].h;
+            bg_dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1),
+                                 erase_color, 14.0f * scale);
+            g_trail_hist[i].frames_left--;
+        }
+        LeaveCriticalSection(&g_trail_cs);
+    }
+
     ImGui::SetNextWindowPos(ImVec2(pos_x, pos_y), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(base_w, base_h), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(alpha);
@@ -4111,16 +4345,19 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
      * scrollbar) scale with the user's opacity setting via
      * with_alpha_mul so the whole overlay looks uniformly transparent
      * instead of "transparent frame with opaque titlebar + scrollbar".
-     * TEXT alone stays at full opacity to preserve readability. */
-    ImGui::PushStyleColor(ImGuiCol_WindowBg,      ImVec4(0.04f, 0.05f, 0.09f, alpha));
-    ImGui::PushStyleColor(ImGuiCol_TitleBg,       with_alpha_mul(ImVec4(0.07f, 0.09f, 0.14f, 0.98f)));
-    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, with_alpha_mul(ImVec4(0.10f, 0.14f, 0.22f, 0.98f)));
-    ImGui::PushStyleColor(ImGuiCol_Border,        with_alpha_mul(ImVec4(0.28f, 0.42f, 0.68f, 0.85f)));
-    ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(0.94f, 0.96f, 0.99f, 1.0f));  /* full opacity */
-    ImGui::PushStyleColor(ImGuiCol_Separator,     with_alpha_mul(ImVec4(0.20f, 0.28f, 0.42f, 0.80f)));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarBg,   with_alpha_mul(ImVec4(0.06f, 0.08f, 0.12f, 0.60f)));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, with_alpha_mul(ImVec4(0.28f, 0.42f, 0.68f, 0.85f)));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered, with_alpha_mul(ImVec4(0.38f, 0.52f, 0.80f, 0.90f)));
+     * TEXT alone stays at full opacity to preserve readability.
+     *
+     * v11 (2026-07-24): palette is now theme-aware — see col_* vars
+     * assigned above based on g_theme_effective. */
+    ImGui::PushStyleColor(ImGuiCol_WindowBg,             col_window_bg);
+    ImGui::PushStyleColor(ImGuiCol_TitleBg,              col_title_bg);
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive,        col_title_bg_active);
+    ImGui::PushStyleColor(ImGuiCol_Border,               col_border);
+    ImGui::PushStyleColor(ImGuiCol_Text,                 col_text);
+    ImGui::PushStyleColor(ImGuiCol_Separator,            col_sep);
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarBg,          col_scroll_bg);
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab,        col_scroll_grab);
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered, col_scroll_grab_hi);
 
     if (ImGui::Begin("AI overlay", nullptr,
         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
@@ -4441,6 +4678,8 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
     g_frame_count++;
     /* Throttled state persistence — no-op fast path if !g_state_dirty. */
     state_flush_if_due();
+    /* v11: throttled auto-theme re-poll (2s cadence, only when pref=AUTO). */
+    maybe_repoll_theme();
 
     /* First-time markers so we can see the pipeline is executing. */
     static volatile LONG s_first_call = 0;

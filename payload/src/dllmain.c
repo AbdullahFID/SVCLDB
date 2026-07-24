@@ -1087,10 +1087,15 @@ static void on_hotkey(int action) {
                 slog_writef("payload.log", "hotkey QUIT: signalled inline shutdown");
             }
             break;
-        case SVC_HK_MOVE_LEFT:   ui_nudge(-20,  0);   break;  /* small step — held key repeats @20Hz for continuous */
-        case SVC_HK_MOVE_RIGHT:  ui_nudge( 20,  0);   break;
-        case SVC_HK_MOVE_UP:     ui_nudge(  0,-20);   break;
-        case SVC_HK_MOVE_DOWN:   ui_nudge(  0, 20);   break;
+        /* v11 (2026-07-24) — Bypassify-parity SMOOTH nudge. Step reduced
+         * from 20px to 8px so that @60Hz repeat rate (rawinput_hook min_gap
+         * dropped from 50ms→16ms in v11) the movement feels butter-smooth
+         * (480 px/sec continuous slide) instead of BP's competing jaggy
+         * 400 px/sec staircase. */
+        case SVC_HK_MOVE_LEFT:   ui_nudge(-8,  0);    break;
+        case SVC_HK_MOVE_RIGHT:  ui_nudge( 8,  0);    break;
+        case SVC_HK_MOVE_UP:     ui_nudge( 0, -8);    break;
+        case SVC_HK_MOVE_DOWN:   ui_nudge( 0,  8);    break;
         case SVC_HK_RESIZE_WIDER:  ui_resize(30,   0); break;
         case SVC_HK_RESIZE_NARROW: ui_resize(-30,  0); break;
         case SVC_HK_RESIZE_TALLER: ui_resize( 0,  30); break;
@@ -1542,6 +1547,11 @@ static DWORD WINAPI init_thread(LPVOID param) {
      * are respected. */
     ui_apply_launch_config(cfg->overlay_w, cfg->overlay_h,
                            cfg->overlay_alpha, cfg->size_mode);
+    /* v11 (2026-07-24): theme + overlay behavior flags — Bypassify parity.
+     * Reads cfg->theme + cfg->overlay_flags from the config that svchelper
+     * wrote. Stale v10 configs pass 0 for both which auto-migrates to
+     * AUTO theme + SVC_OVFLAG_DEFAULTS. */
+    ui_apply_theme_and_flags(cfg->theme, cfg->overlay_flags);
 
     /* Shutdown watcher — event must be openable from elevated Admin
      * launcher process, so we build a world-writable DACL via SDDL. */

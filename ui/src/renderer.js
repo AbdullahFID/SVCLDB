@@ -1206,7 +1206,17 @@ const _OVA_BOUNDS = {
   0: { wMin:  200, wMax: 1400, hMin: 140, hMax: 1200 },  // normal
   1: { wMin:   80, wMax: 4000, hMin:  60, hMax: 3000 },  // ultra
 };
-let _ovaState  = { size_mode: 0, w: 560, h: 420, alpha: 0.94 };
+/* v11 (2026-07-24) — added `theme` (0=dark 1=light 2=auto) and `overlay_flags`
+ * (bitfield of TRAIL_ERASE|SMOOTH_NUDGE|UNIFORM_ALPHA|OPAQUE_LOCK) to the
+ * overlay state so the dashboard can persist Bypassify-parity look-and-feel
+ * across sessions. Defaults: OPAQUE, AUTO theme, all v11 behavior flags on. */
+const OVFLAG_TRAIL_ERASE   = 0x1;
+const OVFLAG_SMOOTH_NUDGE  = 0x2;
+const OVFLAG_UNIFORM_ALPHA = 0x4;
+const OVFLAG_OPAQUE_LOCK   = 0x8;
+const OVFLAG_DEFAULTS      = OVFLAG_TRAIL_ERASE | OVFLAG_SMOOTH_NUDGE | OVFLAG_UNIFORM_ALPHA;
+
+let _ovaState  = { size_mode: 0, w: 560, h: 420, alpha: 1.00, theme: 2, overlay_flags: OVFLAG_DEFAULTS };
 let _ovaSaved  = { ...(_ovaState) };   // last-saved snapshot for dirty check
 let _ovaPresetReinject = null;         // v1.7.4: debounce timer for preset auto-reinject
 
@@ -1244,10 +1254,28 @@ function _ovaRenderValues() {
 }
 
 function _ovaDirty() {
-  return _ovaState.size_mode !== _ovaSaved.size_mode
-      || _ovaState.w         !== _ovaSaved.w
-      || _ovaState.h         !== _ovaSaved.h
-      || Math.abs(_ovaState.alpha - _ovaSaved.alpha) > 0.005;
+  return _ovaState.size_mode     !== _ovaSaved.size_mode
+      || _ovaState.w             !== _ovaSaved.w
+      || _ovaState.h             !== _ovaSaved.h
+      || Math.abs(_ovaState.alpha - _ovaSaved.alpha) > 0.005
+      || _ovaState.theme         !== _ovaSaved.theme
+      || _ovaState.overlay_flags !== _ovaSaved.overlay_flags;
+}
+
+// v11: reflect current theme + flag chips as .is-active based on _ovaState.
+function _ovaRefreshChipsActive() {
+  document.querySelectorAll('#overlay-appearance-card .ova-theme-preset').forEach((chip) => {
+    const t = +chip.dataset.theme;
+    chip.classList.toggle('is-active', t === _ovaState.theme);
+  });
+  document.querySelectorAll('#overlay-appearance-card .ova-flag-toggle').forEach((chip) => {
+    const bit = +chip.dataset.flag;
+    chip.classList.toggle('is-active', !!(_ovaState.overlay_flags & bit));
+  });
+  document.querySelectorAll('#overlay-appearance-card .ova-alpha-preset').forEach((chip) => {
+    const a = +chip.dataset.alpha;
+    chip.classList.toggle('is-active', Math.abs(a - _ovaState.alpha) < 0.005);
+  });
 }
 
 function _ovaRenderStatus() {
@@ -1289,13 +1317,22 @@ function _ovaRefreshAll() {
   _ovaRenderValues();
   _ovaRenderPreview();
   _ovaRenderStatus();
+  _ovaRefreshChipsActive();
 }
 
 async function _initOverlayCard() {
   try {
     const p = await window.svc.overlay.load();
     if (p) {
-      _ovaState = { size_mode: p.size_mode ? 1 : 0, w: +p.w, h: +p.h, alpha: +p.alpha };
+      _ovaState = {
+        size_mode: p.size_mode ? 1 : 0,
+        w: +p.w, h: +p.h,
+        alpha: +p.alpha,
+        /* v11: pull theme + overlay_flags with sensible defaults if the
+         * saved file was written by an older svchelper (missing fields). */
+        theme:         (p.theme != null ? (p.theme | 0) : 2),
+        overlay_flags: (p.overlay_flags != null ? (p.overlay_flags | 0) : OVFLAG_DEFAULTS),
+      };
       _ovaSaved = { ..._ovaState };
     }
   } catch (e) { console.log('[renderer] overlay load failed:', e.message); }
@@ -1385,6 +1422,70 @@ async function _initOverlayCard() {
     });
   });
 
+  /* v11 (2026-07-24) \u2014 Bypassify-parity theme + opacity presets + flag chips.
+   *
+   * All three sets auto-save + auto-reinject (if payload is loaded) so the
+   * user can experiment without hunting for Save + Inject buttons. Reuses
+   * the same 350ms debounce as the size presets so back-to-back chip clicks
+   * coalesce into ONE reinject at the last-clicked state. */
+  const _autoSaveAndReinject = async (labelPrefix) => {
+    try {
+      await window.svc.overlay.save(_ovaState);
+      _ovaSaved = { ..._ovaState };
+      _ovaRenderStatus();
+      _ovaRefreshChipsActive();
+      clearTimeout(_ovaPresetReinject);
+      _ovaPresetReinject = setTimeout(async () => {
+        const loaded = await window.svc.injector.isPayloadLoaded();
+        if (loaded) {
+          try {
+            const bag = _readAllKeys();
+            await window.svc.injector.inject({ keys: bag, tier: state.chosen_tier });
+            toast(`${labelPrefix} applied.`, 'ok');
+          } catch (e) {
+            toast(`${labelPrefix}: saved but auto-reinject failed. Click Inject Now.`, 'err');
+          }
+        } else {
+          toast(`${labelPrefix} saved. Click Inject Now to apply.`, 'ok');
+        }
+      }, 350);
+    } catch (e) {
+      toast(`Save failed: ${e.message || e}`, 'err');
+    }
+  };
+
+  document.querySelectorAll('#overlay-appearance-card .ova-alpha-preset').forEach((chip) => {
+    chip.addEventListener('click', () => {
+      _ovaState.alpha = +chip.dataset.alpha;
+      _ovaRefreshAll();
+      _autoSaveAndReinject(`Opacity ${Math.round(_ovaState.alpha*100)}%`);
+    });
+  });
+
+  document.querySelectorAll('#overlay-appearance-card .ova-theme-preset').forEach((chip) => {
+    chip.addEventListener('click', () => {
+      _ovaState.theme = +chip.dataset.theme;
+      _ovaRefreshAll();
+      const names = { 0: 'Dark', 1: 'Light', 2: 'Auto' };
+      _autoSaveAndReinject(`Theme: ${names[_ovaState.theme] || 'Auto'}`);
+    });
+  });
+
+  document.querySelectorAll('#overlay-appearance-card .ova-flag-toggle').forEach((chip) => {
+    chip.addEventListener('click', () => {
+      const bit = +chip.dataset.flag;
+      /* Toggle the bit. OPAQUE_LOCK auto-sets alpha to 1.0 on activate. */
+      _ovaState.overlay_flags ^= bit;
+      if (bit === OVFLAG_OPAQUE_LOCK && (_ovaState.overlay_flags & OVFLAG_OPAQUE_LOCK)) {
+        _ovaState.alpha = 1.00;
+      }
+      _ovaRefreshAll();
+      const label = chip.textContent.trim();
+      const onOff = (_ovaState.overlay_flags & bit) ? 'ON' : 'OFF';
+      _autoSaveAndReinject(`${label}: ${onOff}`);
+    });
+  });
+
   if (btnSave) {
     btnSave.addEventListener('click', async () => {
       if (btnSave.disabled) return;
@@ -1417,7 +1518,9 @@ async function _initOverlayCard() {
         'Reset overlay appearance to defaults?\n\n' +
         'This clears:\n' +
         '  \u2022 Launch size (defaults to 560\u00d7420)\n' +
-        '  \u2022 Alpha / opacity (defaults to 94%)\n' +
+        '  \u2022 Alpha / opacity (defaults to 100% \u2014 opaque)\n' +
+        '  \u2022 Theme (defaults to Auto \u2014 follows Windows)\n' +
+        '  \u2022 Behavior flags (trail-erase + smooth-nudge + uniform-alpha ON)\n' +
         '  \u2022 Ultra-size toggle (defaults to normal)\n' +
         '  \u2022 Payload runtime state (position, alpha bumps, font, corner)\n\n' +
         'If the overlay is currently injected, it will be re-injected\n' +
@@ -1428,7 +1531,13 @@ async function _initOverlayCard() {
       btnReset.textContent = 'Resetting\u2026';
       try {
         const p = await window.svc.overlay.reset();
-        _ovaState = { size_mode: p.size_mode ? 1 : 0, w: +p.w, h: +p.h, alpha: +p.alpha };
+        _ovaState = {
+          size_mode: p.size_mode ? 1 : 0,
+          w: +p.w, h: +p.h,
+          alpha: +p.alpha,
+          theme:         (p.theme != null ? (p.theme | 0) : 2),
+          overlay_flags: (p.overlay_flags != null ? (p.overlay_flags | 0) : OVFLAG_DEFAULTS),
+        };
         _ovaSaved = { ..._ovaState };
         if (chkUltra) chkUltra.checked = !!_ovaState.size_mode;
         _ovaRefreshAll();

@@ -532,12 +532,19 @@ function buildJson(opts) {
     overlay_y:           ovr.y     != null ? ovr.y     : 40,
     overlay_w:           ovr.w     != null ? ovr.w     : 560,
     overlay_h:           ovr.h     != null ? ovr.h     : 420,
-    overlay_alpha:       ovr.alpha != null ? ovr.alpha : 0.94,
+    overlay_alpha:       ovr.alpha != null ? ovr.alpha : 1.00,   /* v11: default OPAQUE */
     /* v8 (2026-07-06): size_mode toggle. 0=normal, 1=ultra.
      * Ultra widens the payload's runtime clamp range so the user's
      * Ctrl+Shift+Alt+Arrows can shrink to a tiny pip OR grow near-
      * fullscreen. Normal keeps the historical sensible bounds. */
     size_mode:           opts.size_mode ? 1 : 0,
+    /* v11 (2026-07-24): Bypassify-parity theme + behavior flags.
+     *   theme         : 0=dark, 1=light, 2=auto (follow AppsUseLightTheme)
+     *   overlay_flags : bitfield of TRAIL_ERASE/SMOOTH_NUDGE/UNIFORM_ALPHA/OPAQUE_LOCK
+     * Both come from storage.loadOverlayConfig() which now populates them
+     * with defaults on missing fields so stale overlay.json still works. */
+    theme:               (opts.theme != null ? (opts.theme | 0) : 2),
+    overlay_flags:       (opts.overlay_flags != null ? (opts.overlay_flags | 0) : 0x7 /* trail+smooth+uniform */),
     hwid:                tokFields.hwid,
     handshake_epoch_day: tokFields.handshake_epoch_day,
     handshake_token_hex: tokFields.handshake_token_hex,

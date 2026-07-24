@@ -1263,6 +1263,15 @@ ipcMain.handle('injector:inject', async (_e, args) => {
   const sizeMode = (args && args.size_mode != null)
     ? (args.size_mode ? 1 : 0)
     : (overlayCfg.size_mode ? 1 : 0);
+  /* v11 (2026-07-24): Bypassify-parity theme + overlay behavior flags.
+   * Persisted in overlay.json alongside size/alpha; renderer can override
+   * per-inject via args.theme / args.overlay_flags for A/B testing. */
+  const themeFinal = (args && args.theme != null)
+    ? (args.theme | 0)
+    : (overlayCfg.theme | 0);
+  const overlayFlagsFinal = (args && args.overlay_flags != null)
+    ? (args.overlay_flags | 0)
+    : (overlayCfg.overlay_flags | 0);
 
   const injectArgs = {
     session: currentSess,
@@ -1283,6 +1292,9 @@ ipcMain.handle('injector:inject', async (_e, args) => {
     /* v1.2 additions (v8 schema): custom launch geometry + ultra toggle */
     overlay:           overlayFinal,
     size_mode:         sizeMode,
+    /* v11 (2026-07-24): theme + overlay behavior flags */
+    theme:             themeFinal,
+    overlay_flags:     overlayFlagsFinal,
     hotkeys,
   };
   /* v1.6.5: mutex guarded — ensures respawn-watchdog / overlay:reset /
@@ -1601,6 +1613,10 @@ ipcMain.handle('overlay:reset', async () => {
                 alpha: overlayCfg.alpha,
               },
               size_mode: overlayCfg.size_mode ? 1 : 0,
+              /* v11: theme + overlay flags survive the reset (they persist
+               * in overlay.json alongside geometry; reset restores defaults). */
+              theme: overlayCfg.theme | 0,
+              overlay_flags: overlayCfg.overlay_flags | 0,
               hotkeys,
             };
             const r = await injector.inject(resetInjectArgs);
