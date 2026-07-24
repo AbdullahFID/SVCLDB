@@ -4780,103 +4780,28 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
          *   overlay pixels get overwritten by the natural compose
          *   cycle without our help. So skip-1-frame is REDUNDANT AND
          *   flickery — deleted. BP has no skip logic either. */
-        /* v1.7.4.16 (2026-07-24) — OLD-RECT CLEARVIEW on ALL cached
-         * RTVs, with backbuffer-rotation coverage.
+        /* v1.7.4.18 (2026-07-24) — CLEARVIEW REVERTED.
          *
-         * v1.7.4.15 cleared only the CURRENT frame's RTV. DXGI's
-         * swap chain rotates 2-3 backbuffers per screen; each RTV
-         * in g_cache[] maps to a different backbuffer. When we
-         * ClearView on backbuffer 0, backbuffers 1+2 still hold
-         * OUR OLD overlay pixels. As DWM rotates through them,
-         * user sees the old-position pixels intermittently
-         * ("sometimes trails after a bit" — LO 2026-07-24).
+         * v1.7.4.15/16 tried clearing the OLD overlay rect to alpha=0
+         * on all cached RTVs to eliminate trailing. Problem: the layer
+         * texture IS the final displayed image (there's no compositor
+         * blending after we write to it). alpha=0 pixels literally
+         * render as BLACK on screen. DWM doesn't refill the cleared
+         * region with app pixels the way we'd hoped, so:
+         *   - Trailing → replaced with BLACK PIXEL FLASH
+         *   - User: "background flickers like hell as I move, black
+         *     pixels, arguably worse"
          *
-         * Fix: on position/size change, ClearView the OLD RECT on
-         * EVERY cached RTV (up to RTV_CACHE_MAX). Also maintain a
-         * "clears_pending" counter that spreads the clear across
-         * the next several Presents (so newly-created RTVs — which
-         * might appear if DWM allocates a fresh backbuffer — also
-         * get cleaned).
+         * Reverting to no-clear approach. Trailing returns as a known
+         * cosmetic issue until we RE Bypassify's actual technique
+         * (probably a fullscreen ImGui viewport that touches every
+         * pixel per frame, or a technique we haven't identified yet).
          *
-         * ClearView takes an RTV pointer directly (no bind needed)
-         * so we can iterate g_cache and clear each without disturbing
-         * our current bind state. */
-        static volatile LONG s_prev_x = -99999, s_prev_y = -99999,
-                             s_prev_w = 0,      s_prev_h = 0;
-        static volatile LONG s_clear_x = 0, s_clear_y = 0,
-                             s_clear_w = 0, s_clear_h = 0;
-        static volatile LONG s_clears_pending = 0;   /* frames left to keep clearing */
-
-        LONG cur_x = g_last_overlay_x;
-        LONG cur_y = g_last_overlay_y;
-        LONG cur_w = g_last_overlay_w;
-        LONG cur_h = g_last_overlay_h;
-
-        LONG prev_x = InterlockedExchange(&s_prev_x, cur_x);
-        LONG prev_y = InterlockedExchange(&s_prev_y, cur_y);
-        LONG prev_w = InterlockedExchange(&s_prev_w, cur_w);
-        LONG prev_h = InterlockedExchange(&s_prev_h, cur_h);
-
-        if (prev_x != -99999 &&
-            (prev_x != cur_x || prev_y != cur_y ||
-             prev_w != cur_w || prev_h != cur_h) &&
-            prev_w > 0 && prev_h > 0) {
-            /* Position/size changed — record the OLD rect + schedule
-             * clears for the next N frames to cover backbuffer
-             * rotation. RTV_CACHE_MAX = 8 covers even 8-buffer chains
-             * with room to spare. */
-            InterlockedExchange(&s_clear_x, prev_x);
-            InterlockedExchange(&s_clear_y, prev_y);
-            InterlockedExchange(&s_clear_w, prev_w);
-            InterlockedExchange(&s_clear_h, prev_h);
-            InterlockedExchange(&s_clears_pending, RTV_CACHE_MAX + 2);
-        }
-
-        if (s_clears_pending > 0) {
-            ID3D11DeviceContext1 *ctx1 = nullptr;
-            if (SUCCEEDED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext1),
-                                              (void**)&ctx1)) && ctx1) {
-                const FLOAT clear_col[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-                D3D11_RECT rc;
-                rc.left   = s_clear_x;
-                rc.top    = s_clear_y;
-                rc.right  = s_clear_x + s_clear_w;
-                rc.bottom = s_clear_y + s_clear_h;
-                if (rc.left   < 0)         rc.left   = 0;
-                if (rc.top    < 0)         rc.top    = 0;
-                if (rc.right  > (LONG)w)   rc.right  = (LONG)w;
-                if (rc.bottom > (LONG)h)   rc.bottom = (LONG)h;
-                if (rc.right > rc.left && rc.bottom > rc.top) {
-                    /* Clear on the CURRENT rtv (which is the one DWM
-                     * is presenting right now). */
-                    __try {
-                        ctx1->ClearView(rtv, clear_col, &rc, 1);
-                    } __except (EXCEPTION_EXECUTE_HANDLER) { }
-
-                    /* Also clear on every OTHER cached RTV so when
-                     * DWM rotates backbuffers, the old-rect stays
-                     * clean. Each ClearView on a non-bound RTV is
-                     * a lightweight GPU op (no state changes). */
-                    for (int i = 0; i < RTV_CACHE_MAX; i++) {
-                        ID3D11RenderTargetView *other = g_cache[i].rtv;
-                        if (!other || other == rtv) continue;
-                        __try {
-                            ctx1->ClearView(other, clear_col, &rc, 1);
-                        } __except (EXCEPTION_EXECUTE_HANDLER) { }
-                    }
-
-                    static volatile LONG s_cv_diag = 0;
-                    LONG dn = InterlockedIncrement(&s_cv_diag);
-                    if (dn <= 8 || (dn % 200) == 0) {
-                        diag("ClearView all-RTVs old-rect (%ld,%ld)-(%ld,%ld) pending=%ld",
-                             rc.left, rc.top, rc.right, rc.bottom,
-                             (long)s_clears_pending);
-                    }
-                }
-                ctx1->Release();
-            }
-            InterlockedDecrement(&s_clears_pending);
-        }
+         * TODO: try changing ImGui window to fullscreen with fully
+         * transparent bg + content in a sub-region. If ImGui's D3D
+         * backend emits per-frame draw commands covering the entire
+         * viewport, natural overwrite of old-position pixels should
+         * happen without explicit clears. */
 
         (void)g_geom_generation;   /* still bumped by ui_* fns but unused here */
 
