@@ -401,7 +401,7 @@ static volatile LONG  g_burst_frames_per_pump = 30;
  * hooks_uninstall (belt-and-suspenders; Bypassify doesn't revert but
  * we do because a graceful uninstall in the same DWM instance benefits
  * from a clean restore). */
-static BYTE  g_iop_saved_bytes[3] = {0};
+static BYTE  g_iop_saved_bytes[6] = {0};
 static void *g_iop_patch_addr     = NULL;
 static BOOL  g_iop_patched        = FALSE;
 
@@ -1159,25 +1159,69 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
     /* ── 5d. AddDirtyRect passive-logging hooks REMOVED 2026-07-06 v4.2.
      * See the block-comment above `hooks_install`'s definition for context. */
 
-    /* ── 6. IsOverlayPrevented byte-patch (return FALSE = allow overlay) ──
-     * Save original 3 bytes so hooks_uninstall can revert cleanly. */
+    /* ── 6. IsOverlayPrevented byte-patch — CRITICAL FIX v1.7.4.11 ──
+     *
+     * Save original 6 bytes so hooks_uninstall can revert cleanly.
+     *
+     * v1.7.4.11 (2026-07-24) — SEMANTIC INVERSION. Pre-v1.7.4.11 we
+     * patched to `xor eax,eax; ret` = returns FALSE. Comment claimed
+     * "return FALSE = allow overlay". That read the function name
+     * BACKWARD. `IsOverlayPrevented` asks: "is HARDWARE OVERLAY
+     * (Multiplane Overlay) prevented?" Return semantics:
+     *   TRUE  = "yes, hardware overlay is prevented" → DWM MUST use
+     *           software compositor path → every app's pixels flow
+     *           through the shared composited surface → our injected
+     *           pixels (drawn LAST via Present hook) end up on TOP
+     *           of every app in that surface.
+     *   FALSE = "no, hardware overlay is NOT prevented" → DWM is
+     *           free to give DirectComposition apps (Chrome, Cursor,
+     *           terminal, Slack, Discord, Electron in general) their
+     *           OWN hardware overlay plane, composited by the GPU
+     *           bypassing our injected surface entirely → our overlay
+     *           ends up BEHIND those apps.
+     *
+     * LO's screenshot from 2026-07-24 showed BP's overlay literally
+     * above EVERYTHING (Chrome, terminal, Cursor, everything) with
+     * zero flicker. RE of BP's Detour_IsOverlayPrevented (0x180003460)
+     * confirmed they return TRUE while their shutdown_flag is 0. We
+     * were returning the OPPOSITE. This one-bit-flip is why their
+     * overlay stayed above and ours dropped behind. Same reason ours
+     * flickered on mouse move — the RC[Window] capture-detection
+     * false-positives only surface when DirectComposition apps are
+     * getting hardware plane placement (which our FALSE patch was
+     * enabling).
+     *
+     * Patch: `mov eax, 1; ret` = `B8 01 00 00 00 C3` (6 bytes).
+     * Full 32-bit return so ANY caller convention sees TRUE, not
+     * just the low byte. Matches semantics of BP's detour when their
+     * shutdown_flag == 0 (their active state). */
     if (off->isOverlayPrevented) {
         BYTE *iop = (BYTE *)dwmcore + off->isOverlayPrevented;
         DWORD old_prot = 0;
-        if (VirtualProtect(iop, 4, PAGE_EXECUTE_READWRITE, &old_prot)) {
+        if (VirtualProtect(iop, 8, PAGE_EXECUTE_READWRITE, &old_prot)) {
             g_iop_saved_bytes[0] = iop[0];
             g_iop_saved_bytes[1] = iop[1];
             g_iop_saved_bytes[2] = iop[2];
+            g_iop_saved_bytes[3] = iop[3];
+            g_iop_saved_bytes[4] = iop[4];
+            g_iop_saved_bytes[5] = iop[5];
             g_iop_patch_addr     = iop;
-            iop[0] = 0x31;  /* xor eax, eax */
-            iop[1] = 0xC0;
-            iop[2] = 0xC3;  /* ret */
+            iop[0] = 0xB8;  /* mov eax, imm32 */
+            iop[1] = 0x01;  /* imm32 = 1 (TRUE) */
+            iop[2] = 0x00;
+            iop[3] = 0x00;
+            iop[4] = 0x00;
+            iop[5] = 0xC3;  /* ret */
             DWORD tmp = 0;
-            VirtualProtect(iop, 4, old_prot, &tmp);
-            FlushInstructionCache(GetCurrentProcess(), iop, 4);
+            VirtualProtect(iop, 8, old_prot, &tmp);
+            FlushInstructionCache(GetCurrentProcess(), iop, 8);
             g_iop_patched = TRUE;
-            slog_writef("payload.log", "IsOverlayPrevented patched @ %p (saved=%02x %02x %02x)",
-                        iop, g_iop_saved_bytes[0], g_iop_saved_bytes[1], g_iop_saved_bytes[2]);
+            slog_writef("payload.log",
+                        "IsOverlayPrevented patched @ %p — RETURNS TRUE (forces DWM out of "
+                        "hardware overlay plane path so our pixels composite ON TOP of "
+                        "DirectComposition apps). Original 6 bytes: %02x %02x %02x %02x %02x %02x",
+                        iop, g_iop_saved_bytes[0], g_iop_saved_bytes[1], g_iop_saved_bytes[2],
+                        g_iop_saved_bytes[3], g_iop_saved_bytes[4], g_iop_saved_bytes[5]);
         } else {
             slog_writef("payload.log", "IsOverlayPrevented VirtualProtect failed GLE=%lu",
                         GetLastError());
@@ -1314,19 +1358,21 @@ void hooks_uninstall(void) {
     /* Step 4 (belt-and-suspenders): revert the IsOverlayPrevented
      * byte-patch. Bypassify skips this (they rely on DWM restart),
      * but we do it for cleanliness — enables reinstall in the same
-     * DWM instance without stale state. */
+     * DWM instance without stale state.
+     *
+     * v1.7.4.11: patch is now 6 bytes (mov eax,1; ret) instead of 3
+     * (xor eax,eax; ret). Revert restores the original 6 bytes so
+     * dwmcore's IsOverlayPrevented behaves natively again. */
     if (g_iop_patched && g_iop_patch_addr) {
         DWORD old_prot = 0;
-        if (VirtualProtect(g_iop_patch_addr, 4, PAGE_EXECUTE_READWRITE, &old_prot)) {
+        if (VirtualProtect(g_iop_patch_addr, 8, PAGE_EXECUTE_READWRITE, &old_prot)) {
             BYTE *iop = (BYTE *)g_iop_patch_addr;
-            iop[0] = g_iop_saved_bytes[0];
-            iop[1] = g_iop_saved_bytes[1];
-            iop[2] = g_iop_saved_bytes[2];
+            for (int i = 0; i < 6; i++) iop[i] = g_iop_saved_bytes[i];
             DWORD tmp = 0;
-            VirtualProtect(g_iop_patch_addr, 4, old_prot, &tmp);
-            FlushInstructionCache(GetCurrentProcess(), g_iop_patch_addr, 4);
+            VirtualProtect(g_iop_patch_addr, 8, old_prot, &tmp);
+            FlushInstructionCache(GetCurrentProcess(), g_iop_patch_addr, 8);
             g_iop_patched = FALSE;
-            hook_diag("hooks_uninstall: IsOverlayPrevented reverted");
+            hook_diag("hooks_uninstall: IsOverlayPrevented reverted (6 bytes)");
         }
     }
 
