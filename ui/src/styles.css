@@ -1790,12 +1790,21 @@ html, body {
 }
 
 /* v1.7.4.9 (2026-07-24): compact horizontal speed picker + stealth toggle
- * combined into a single settings row above the hotkey list. */
+ * combined into a single settings row above the hotkey list.
+ *
+ * v1.7.4.10 (2026-07-24) FIX: controls-row is a CHILD of .hk-editor (which
+ * uses grid auto-fit). Without grid-column:1/-1 the controls-row got
+ * placed in ONE outer grid column and hotkey rows filled the rest — user
+ * saw SPEED and INVISIBLE HOTKEYS crammed into half the width with a
+ * hotkey row appearing floating on the right. Span the full outer grid. */
+.hk-editor > .hk-controls-row {
+  grid-column: 1 / -1;
+}
 .hk-controls-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 10px;
-  margin-bottom: 12px;
+  margin-bottom: 6px;
 }
 @media (max-width: 780px) {
   .hk-controls-row { grid-template-columns: 1fr; }
@@ -1805,21 +1814,22 @@ html, body {
   background: rgba(15, 23, 42, 0.55);
   border: 1px solid rgba(255,255,255,0.08);
   border-radius: 10px;
-  padding: 10px 12px;
+  padding: 12px 14px;
   margin-bottom: 0;
   min-width: 0;
+  display: flex; flex-direction: column; gap: 10px;
 }
 .hk-speed-head {
-  display: flex; align-items: baseline; justify-content: space-between;
-  gap: 10px; margin-bottom: 6px;
+  display: flex; flex-direction: column; gap: 2px;
+  min-width: 0;
 }
 .hk-speed-title {
   font-size: 12px; font-weight: 700; color: var(--fg);
-  letter-spacing: 0.06em; text-transform: uppercase;
+  letter-spacing: 0.08em; text-transform: uppercase;
 }
 .hk-speed-sub {
-  font-size: 10.5px; color: var(--fg3); line-height: 1.35;
-  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 11px; color: var(--fg3); line-height: 1.4;
+  min-width: 0;
 }
 .hk-speed-buttons {
   display: flex; gap: 4px; padding: 3px;
@@ -1867,12 +1877,13 @@ html, body {
 }
 .hk-stealth-head {
   display: grid; grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center; gap: 12px;
+  align-items: start; gap: 12px;
 }
 .hk-stealth-title {
   font-size: 12px; font-weight: 700; color: var(--fg);
   display: flex; align-items: center; gap: 8px;
-  letter-spacing: 0.06em; text-transform: uppercase;
+  letter-spacing: 0.08em; text-transform: uppercase;
+  white-space: nowrap;
 }
 .hk-stealth-on {
   font-size: 9px; font-weight: 800;
@@ -1883,12 +1894,18 @@ html, body {
   letter-spacing: 0.08em;
 }
 .hk-stealth-sub {
-  font-size: 10.5px; color: var(--fg3);
+  font-size: 11px; color: var(--fg3);
   margin-top: 3px; line-height: 1.4;
-  overflow: hidden; text-overflow: ellipsis;
+  overflow: hidden;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
 }
 .hk-stealth-sub b { color: var(--fg2); }
+/* v1.7.4.10: make the stealth card visually mirror the speed card:
+ * head fills top, toggle floats right of head. Same padding, same
+ * structure — they line up perfectly side-by-side. */
+.hk-stealth-banner .hk-stealth-head > div {
+  min-width: 0; display: flex; flex-direction: column; gap: 2px;
+}
 .hk-toggle-switch {
   position: relative;
   width: 42px; height: 22px;
