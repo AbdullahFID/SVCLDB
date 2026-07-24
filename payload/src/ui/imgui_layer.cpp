@@ -504,7 +504,7 @@ static bool             g_ui_cs_init  = false;
  * whole stealth workflow: triple-tap ` -> ASK fires invisibly -> wait
  * a beat -> triple-tap A -> answer in clipboard -> paste. Zero pixels
  * on screen. */
-static bool             g_visible     = false;
+static bool             g_visible     = true;   /* v11.2.4 (2026-07-24) — LO ask: show overlay immediately on inject (was default HIDDEN — required Ctrl+B toggle). Bypassify parity. */
 static bool             g_imgui_inited= false;
 static ULONGLONG        g_frame_count = 0;
 
