@@ -562,6 +562,15 @@ int main(int argc, char *argv[]) {
     int reinject_mode = 0;   /* skip config regen; use existing config.dat */
     int json_config_mode = 0;
     const char *json_config_path = NULL;
+#if SVCLDB_DEV_BYPASS_AUTH
+    /* v1.7.4.10 (2026-07-24): --custom-dll <path> — dev-only. Manual-
+     * maps an ARBITRARY DLL from disk into dwm.exe using our existing
+     * inject path. For RE observation of third-party payloads
+     * (e.g. Bypassify's dumper.dll) without going through their
+     * proprietary launcher. Available ONLY in dev-bypass builds. */
+    int custom_dll_mode = 0;
+    const char *custom_dll_path = NULL;
+#endif
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--quiet") == 0 || strcmp(argv[i], "-q") == 0) {
             quiet_mode = 1;
@@ -574,6 +583,13 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--kill-all") == 0) {
             kill_all_mode = 1;
             quiet_mode = 1;
+#if SVCLDB_DEV_BYPASS_AUTH
+        } else if (strcmp(argv[i], "--custom-dll") == 0 && i + 1 < argc) {
+            custom_dll_mode = 1;
+            custom_dll_path = argv[i + 1];
+            quiet_mode = 1;
+            i++;
+#endif
         } else if (strcmp(argv[i], "--reinject") == 0 ||
                    strcmp(argv[i], "-r") == 0) {
             /* Fast re-injection using the existing config.dat + offsets.blob.
@@ -801,6 +817,25 @@ int main(int argc, char *argv[]) {
         slog_writef("launcher.log", "--kill-all: done");
         ExitProcess(0);
     }
+
+#if SVCLDB_DEV_BYPASS_AUTH
+    /* ── --custom-dll: RE observation path (dev-only) ── *
+     * Manual-map an arbitrary DLL from disk into dwm.exe using our
+     * existing inject infrastructure. No handshake, no config, no
+     * resolver — just read bytes + inject. For observing third-party
+     * payloads' runtime behavior. */
+    if (custom_dll_mode) {
+        slog_writef("launcher.log", "--custom-dll: %s", custom_dll_path);
+        char cerr[512] = {0};
+        int cok = inject_dwm_payload(custom_dll_path, cerr, sizeof(cerr));
+        if (!cok) {
+            slog_writef("launcher.log", "--custom-dll: FAILED: %s", cerr);
+            ExitProcess(30);
+        }
+        slog_writef("launcher.log", "--custom-dll: injected OK");
+        ExitProcess(0);
+    }
+#endif
 
     /* ── --json-config: Electron UI handoff ── *
      * Electron already authenticated the user + verified subscription +
