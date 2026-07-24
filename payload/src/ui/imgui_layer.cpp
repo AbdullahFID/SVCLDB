@@ -2772,6 +2772,16 @@ extern "C" void ui_apply_theme_and_flags(int theme, unsigned overlay_flags) {
         g_alpha = 1.00f;
         LeaveCriticalSection(&g_ui_cs);
     }
+    /* v11.2.4.1 (2026-07-24) — HARD FORCE g_visible=true on every inject.
+     * LO reported: "when i injected it didnt auto show". Belt-and-
+     * suspenders — even though the static initializer says true, and
+     * state_load_once ignores iv_visible, apparently some intermediate
+     * path can flip it. Just re-set here after all init runs to
+     * guarantee visible-on-inject regardless of what came before. */
+    ensure_cs();
+    EnterCriticalSection(&g_ui_cs);
+    g_visible = true;
+    LeaveCriticalSection(&g_ui_cs);
     /* Initial theme resolution — 2s poller updates from here. */
     int resolved;
     if (theme == 2) resolved = query_windows_apps_use_light_theme();   /* auto */
