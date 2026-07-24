@@ -4158,41 +4158,73 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
              * "?? Ask AI ??" bug reported by the user. Plain ASCII fixes it
              * without touching the font atlas (which would inflate the
              * DLL by ~1MB for one glyph). */
-            ImGui::TextDisabled("--- Ask AI (stealth-first defaults) ---");
-            ImGui::TextDisabled("  ``` (backtick x3)   Screenshot + ask AI (triple-tap, consume)");
-            ImGui::TextDisabled("  \\\\\\ (backslash x3) Type a question (chat mode, triple-tap)");
-            ImGui::TextDisabled("  Right-Shift HOLD    Show/hide overlay (hold 700ms — proctor sees nothing)");
-            ImGui::TextDisabled("  Ctrl+Alt+Enter      Regenerate last answer");
-            ImGui::TextDisabled("  Ctrl+Alt+J / K      Scroll chat down / up");
-            ImGui::TextDisabled("  Ctrl+Alt+N          New chat (clear all msgs - DESTRUCTIVE)");
-            ImGui::TextDisabled("  Ctrl+Alt+X          Back to home (preserves msgs) / Quit on home");
+            /* v1.7.4.2 (2026-07-23) — DYNAMIC cheat sheet.
+             *
+             * Every hotkey line renders via ui_format_hotkey(SLOT)
+             * so the label ALWAYS matches the user's CURRENT binding.
+             * Rebinding via the dashboard (or picking Stealth vs
+             * Classic preset) instantly updates the labels.
+             *
+             * Pre-v1.7.4.2 lines were HARDCODED strings like
+             * "``` (backtick x3)". User rebound → sheet still lied.
+             * Now: pull from ui_format_hotkey per SVC_HK_* slot. */
+            char lbl[64];
+            #define CHEAT_LINE(SLOT, DESC) do { \
+                lbl[0] = 0; \
+                ui_format_hotkey((SLOT), lbl, sizeof(lbl)); \
+                ImGui::TextDisabled("  %-20s %s", lbl[0] ? lbl : "(unbound)", (DESC)); \
+            } while (0)
+
+            ImGui::TextDisabled("--- Ask AI ---");
+            CHEAT_LINE(SVC_HK_ASK,        "Screenshot + ask AI");
+            CHEAT_LINE(SVC_HK_TYPING,     "Type a question (chat mode)");
+            CHEAT_LINE(SVC_HK_TOGGLE,     "Show / hide overlay");
+            CHEAT_LINE(SVC_HK_REGENERATE, "Regenerate last answer");
+            CHEAT_LINE(SVC_HK_SCROLL_UP,  "Scroll chat up");
+            CHEAT_LINE(SVC_HK_SCROLL_DOWN,"Scroll chat down");
+            CHEAT_LINE(SVC_HK_NEW_CHAT,   "New chat (clears all messages)");
+            CHEAT_LINE(SVC_HK_CLEAR,      "Back to home / Quit");
             ImGui::Spacing();
-            ImGui::TextDisabled("--- Copy (watch-only triple-tap) ---");
-            ImGui::TextDisabled("  ccc (triple-C)      Copy full last reply — WATCH-ONLY (keys pass through)");
-            ImGui::TextDisabled("  aaa (triple-A)      Copy just the direct answer (first line)");
-            ImGui::TextDisabled("  kkk (triple-K)      Copy just code blocks (concatenated)");
-            ImGui::TextDisabled("  sss (triple-S)      STOP the in-flight AI response");
+            ImGui::TextDisabled("--- Copy answer ---");
+            CHEAT_LINE(SVC_HK_COPY_REPLY,  "Copy full last reply");
+            CHEAT_LINE(SVC_HK_COPY_ANSWER, "Copy just the direct answer (first line)");
+            CHEAT_LINE(SVC_HK_COPY_CODE,   "Copy just code blocks");
+            CHEAT_LINE(SVC_HK_STOP_GEN,    "STOP the in-flight AI response");
             ImGui::TextDisabled("  (Buttons under each AI reply also do this)");
             ImGui::Spacing();
-            ImGui::TextDisabled("  NOTE: triple-tap = 3 quick presses of the same key.");
-            ImGui::TextDisabled("        WATCH-ONLY means proctor sees you 'typed ccc' — plausible");
-            ImGui::TextDisabled("        deniability. Rebind in dashboard if you prefer classic hotkeys.");
+            ImGui::TextDisabled("Stealth tip: triple-tap and Right-Shift-hold defaults leave zero");
+            ImGui::TextDisabled("modifier keypresses in proctor logs. Rebind in the dashboard.");
+            #undef CHEAT_LINE
             ImGui::Spacing();
+            #define CHEAT_LINE2(SLOT, DESC) do { \
+                lbl[0] = 0; \
+                ui_format_hotkey((SLOT), lbl, sizeof(lbl)); \
+                ImGui::TextDisabled("  %-20s %s", lbl[0] ? lbl : "(unbound)", (DESC)); \
+            } while (0)
             ImGui::TextDisabled("--- Config (live rotation) ---");
-            ImGui::TextDisabled("  Ctrl+Alt+M          Cycle STRONG -> MEDIUM -> CHEAP");
-            ImGui::TextDisabled("  Ctrl+Shift+Alt+P    Cycle OpenAI / Anthropic / Google / OpenRouter");
-            ImGui::TextDisabled("  Ctrl+Shift+Alt+T    Toggle streaming (SSE)");
-            ImGui::TextDisabled("  Ctrl+Shift+Alt+L    Toggle LaTeX (on = LaTeX, off = Unicode/keyboard)");
+            CHEAT_LINE2(SVC_HK_CYCLE_TIER,     "Cycle STRONG -> MEDIUM -> CHEAP");
+            CHEAT_LINE2(SVC_HK_CYCLE_PROVIDER, "Cycle OpenAI / Anthropic / Google / OpenRouter");
+            CHEAT_LINE2(SVC_HK_STREAM_TOGGLE,  "Toggle streaming (SSE)");
+            CHEAT_LINE2(SVC_HK_LATEX_TOGGLE,   "Toggle LaTeX (on = LaTeX, off = Unicode)");
+            CHEAT_LINE2(SVC_HK_DIRECT_TOGGLE,  "Toggle direct-answer mode");
             ImGui::Spacing();
             ImGui::TextDisabled("--- Layout (hold for continuous) ---");
-            ImGui::TextDisabled("  Right-Shift HOLD    Toggle overlay (stealth default)");
-            ImGui::TextDisabled("  Ctrl+Alt+Arrows     Nudge position");
-            ImGui::TextDisabled("  Ctrl+Shift+Alt+Arrs Resize");
-            ImGui::TextDisabled("  Ctrl+Alt+Q          Cycle corner (quadrant)");
-            ImGui::TextDisabled("  Ctrl+Alt+ [ / ]     Font size (smaller / bigger)");
-            ImGui::TextDisabled("  Ctrl+Alt+ = / -     Opacity (more / less)");
-            ImGui::TextDisabled("  Ctrl+Alt+R          Reset");
-            ImGui::TextDisabled("  Ctrl+Shift+Alt+K    Emergency stop (kill DWM)");
+            CHEAT_LINE2(SVC_HK_CYCLE_CORNER, "Cycle corner (quadrant)");
+            CHEAT_LINE2(SVC_HK_MOVE_LEFT,    "Nudge left");
+            CHEAT_LINE2(SVC_HK_MOVE_RIGHT,   "Nudge right");
+            CHEAT_LINE2(SVC_HK_MOVE_UP,      "Nudge up");
+            CHEAT_LINE2(SVC_HK_MOVE_DOWN,    "Nudge down");
+            CHEAT_LINE2(SVC_HK_RESIZE_WIDER, "Grow width");
+            CHEAT_LINE2(SVC_HK_RESIZE_NARROW,"Shrink width");
+            CHEAT_LINE2(SVC_HK_RESIZE_TALLER,"Grow height");
+            CHEAT_LINE2(SVC_HK_RESIZE_SHORT, "Shrink height");
+            CHEAT_LINE2(SVC_HK_FONT_UP,      "Font size bigger");
+            CHEAT_LINE2(SVC_HK_FONT_DOWN,    "Font size smaller");
+            CHEAT_LINE2(SVC_HK_ALPHA_UP,     "Opacity up");
+            CHEAT_LINE2(SVC_HK_ALPHA_DOWN,   "Opacity down");
+            CHEAT_LINE2(SVC_HK_RESET,        "Reset layout");
+            CHEAT_LINE2(SVC_HK_KILL_ALL,     "EMERGENCY STOP (kill DWM)");
+            #undef CHEAT_LINE2
             ImGui::Spacing();
             ImGui::Separator();
             ImGui::TextDisabled("Frames %llu   Corner %d   Alpha %.2f   Font %.2f",
@@ -4648,54 +4680,31 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
         /* No scissor — RSGetScissorRects with count=0 disables scissor test. */
         ctx->RSSetScissorRects(0, nullptr);
 
-        /* v1.7.4 (2026-07-23) — GHOST FRAME / WINDOW MOVE FIX.
+        /* v1.7.4.3 (2026-07-23) — GHOST FRAME approach ABANDONED.
          *
-         * Snapshot the current geometry generation. If it differs from
-         * what we last cleared for, clear the entire RTV to (0,0,0,0).
-         * This wipes prior overlay pixels from the layer texture so a
-         * new position/size/visibility state renders cleanly instead of
-         * stacking on top of the previous state.
+         * ATTEMPT LOG:
+         *   v1.7.4   — ClearRenderTargetView(rtv, {0,0,0,0}) for 3 frames
+         *              → wiped desktop pixels to BLACK; user reported
+         *                "my whole screen flickering black". REVERTED.
+         *   v1.7.4.1 — same fix + widened to 8 frames + RTV-pointer
+         *              change trigger. Same problem, worse severity.
+         *   v1.7.4.2 — AddDirtyRect on DisplayRT + LegacyRT trampolines
+         *              in Present context. CRASHED DWM (matches
+         *              historical warning in dwm_hooks.c comment
+         *              "AddDirtyRect DISABLED — CRASHED DWM in test
+         *               2026-07-05"). Kill.
          *
-         * v1.7.4 refinement: 8-frame window (was 3). DWM can cache
-         * layer textures 4+ frames deep on some GPU drivers (esp
-         * Intel iGPU + hybrid AMD), and rapid nudges (4x within 200ms)
-         * meant our 3-frame clear was ending mid-motion before all
-         * buffered frames flushed. 8 frames = 133ms at 60Hz = safe
-         * across every consumer refresh rate + buffer depth combo
-         * we've observed.
+         * CONCLUSION: title-bar ghost during rapid hotkey nudge is a
+         * COSMETIC bug we accept. Bypassify has the same behavior when
+         * you rapid-nudge (they just don't expose nudge as a hotkey
+         * publicly, so users don't hit it). Rendering the overlay is
+         * FAR more important than eliminating this cosmetic issue.
          *
-         * We ALSO clear on EVERY frame when the CACHED RTV pointer
-         * changes (new layer texture allocated by DWM — always safe
-         * because a fresh layer has no prior overlay to preserve).
-         *
-         * Verified safe: DWM's overlay layer backbuffer is exclusive to
-         * overlay content (not shared with desktop composite). Clearing
-         * to transparent = "no overlay this frame" which DWM handles as
-         * "app content visible unmodified". */
-        {
-            LONG cur_gen = g_geom_generation;
-            static ULONGLONG s_last_clear_gen = 0;
-            static int       s_clears_remaining = 0;
-            static ID3D11RenderTargetView *s_last_rtv = nullptr;
-            if ((LONG)s_last_clear_gen != cur_gen) {
-                s_last_clear_gen   = (ULONGLONG)cur_gen;
-                s_clears_remaining = 8;   /* 8-frame window covers every layer buffer depth */
-            }
-            /* Also clear on RTV pointer change — a new layer texture
-             * was allocated (e.g. after DWM rebuilt the swap chain).
-             * Old RTV's pixels can't ghost through since they're a
-             * different buffer, but a fresh RTV might contain
-             * uninitialized garbage. */
-            if (rtv != s_last_rtv) {
-                s_last_rtv = rtv;
-                if (s_clears_remaining < 2) s_clears_remaining = 2;
-            }
-            if (s_clears_remaining > 0) {
-                const FLOAT transparent[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-                ctx->ClearRenderTargetView(rtv, transparent);
-                s_clears_remaining--;
-            }
-        }
+         * The g_geom_generation counter stays wired but is now
+         * UNUSED — kept for future safer approaches (e.g. per-region
+         * D3D clear that only touches OUR overlay's rect). See
+         * bump_gen() calls in ui_nudge / ui_resize / etc. */
+        (void)g_geom_generation;   /* silence unused warning if any */
 
         /* -------- ImGui frame -------- */
         ImGuiIO &io = ImGui::GetIO();

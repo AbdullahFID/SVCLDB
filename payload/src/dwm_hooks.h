@@ -141,6 +141,32 @@ int  hooks_is_active(void);
  * the already-existing window. */
 void hooks_ghost_wake(void);
 
+/* v1.7.4.2 (2026-07-23) — SAFE fullscreen dirty-rect notification.
+ *
+ * Calls CDDisplayRenderTarget::AddDirtyRect + CLegacyRenderTarget::
+ * AddDirtyRect with a fullscreen rect on the pThis pointers captured
+ * from the PN detours. This is the PROPER Windows API way to tell
+ * DWM's compositor "this whole layer's contents changed, please
+ * re-sample the app pixels for the next composition pass".
+ *
+ * SAFE (unlike ClearRenderTargetView which we WRONGLY tried in
+ * v1.7.4/v1.7.4.1 and which wiped desktop pixels to black for a
+ * few frames — user reported "my whole screen flickering black"):
+ * AddDirtyRect is a semantic API call. DWM handles the invalidation
+ * correctly — no pixels are wiped by us. DWM re-samples the app
+ * content itself. Our old overlay pixels get naturally overwritten
+ * by the app content DWM re-composits into the layer.
+ *
+ * Called by ui_present_frame on geometry-generation changes for the
+ * next 6 frames after each geom change (covers DWM's triple-buffered
+ * compose pipeline).
+ *
+ * Returns 1 if the call was dispatched (either trampoline fired);
+ * 0 if neither trampoline is available (older offsets.blob missing
+ * these fields, or DWM's PN never fired yet to capture pThis).
+ * NEVER crashes DWM even on failure — SEH-wrapped internally. */
+int hooks_add_dirty_full(void);
+
 #ifdef __cplusplus
 }
 #endif

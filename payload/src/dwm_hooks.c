@@ -1773,3 +1773,57 @@ void hooks_ghost_wake(void) {
         RedrawWindow(h, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
     } __except (EXCEPTION_EXECUTE_HANDLER) { }
 }
+
+/* v1.7.4.2 (2026-07-23) — SAFE fullscreen-dirty notifier.
+ *
+ * Fires AddDirtyRect on the DisplayRT + LegacyRT trampolines with a
+ * fullscreen rect. DWM's compositor invalidates that region and
+ * re-samples app pixels for the next composition pass — old overlay
+ * pixels get naturally overwritten by DWM's own re-render.
+ *
+ * SEH-wrapped for defence: an older v1.6 note said "AddDirtyRect
+ * CRASHED DWM in test 2026-07-05" when called from arbitrary threads.
+ * That was in the PN detour context (where pThis might be adjusted).
+ * Here we call from the Present detour context via the CAPTURED PN
+ * pThis pointers — same virtual-base-adjusted object that PN itself
+ * hands us. Empirically safer.
+ *
+ * Rect: fullscreen virtual-screen bounds. DWM's AddDirtyRect impl at
+ * dwmcore!0xbed84 UNIONs the new rect with existing tracked dirty —
+ * passing fullscreen guarantees the whole layer is marked dirty.
+ * Trampolines pre-resolved in hooks_install; if either is NULL we
+ * silently skip that one. */
+int hooks_add_dirty_full(void) {
+    if (!g_active || g_shutdown_flag) return 0;
+    int fired = 0;
+    /* Full virtual screen — every pixel gets marked dirty. */
+    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    float rect[4] = {
+        (float)vx, (float)vy,
+        (float)(vx + vw), (float)(vy + vh)
+    };
+    __try {
+        if (g_add_dirty_display && g_display_rt) {
+            g_add_dirty_display((void *)g_display_rt, rect);
+            fired = 1;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        /* If display trampoline crashes, cache-out so we don't
+         * repeatedly try + risk destabilizing DWM. */
+        g_add_dirty_display = NULL;
+        hook_diag("add_dirty_full: display trampoline crashed — disabled");
+    }
+    __try {
+        if (g_add_dirty_legacy && g_legacy_rt) {
+            g_add_dirty_legacy((void *)g_legacy_rt, rect);
+            fired = 1;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_add_dirty_legacy = NULL;
+        hook_diag("add_dirty_full: legacy trampoline crashed — disabled");
+    }
+    return fired;
+}
