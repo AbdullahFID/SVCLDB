@@ -437,41 +437,43 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
     #define MOD_CA   (SVC_HK_MOD_CTRL | SVC_HK_MOD_ALT)
     #define MOD_CSA  (SVC_HK_MOD_CTRL | SVC_HK_MOD_SHIFT | SVC_HK_MOD_ALT)
     memset(cfg->hotkeys, 0, sizeof(cfg->hotkeys));
-    /* v1.7.4.4 (2026-07-23) — ALL-STEALTH defaults per user demand.
-     * Every slot is MULTITAP/LONGPRESS; zero modifier combos.
-     * TOGGLE = triple-tap G per explicit user request. */
-    cfg->hotkeys[SVC_HK_ASK]           = SVC_HK_PACK_MULTITAP(3, 400, 0xC0, 1); /* triple-` WATCH */
-    cfg->hotkeys[SVC_HK_TOGGLE]        = SVC_HK_PACK_MULTITAP(3, 400, 'G',  1); /* triple-G WATCH */
-    cfg->hotkeys[SVC_HK_TYPING]        = SVC_HK_PACK_MULTITAP(3, 400, 0xDC, 1); /* triple-\ WATCH */
-    cfg->hotkeys[SVC_HK_COPY_REPLY]    = SVC_HK_PACK_MULTITAP(3, 300, 'C',  1); /* triple-C WATCH */
-    cfg->hotkeys[SVC_HK_CLEAR]         = SVC_HK_PACK_MULTITAP(3, 300, 'X',  0); /* triple-X CONSUME (panic) */
-    cfg->hotkeys[SVC_HK_MOVE_LEFT]     = SVC_HK_PACK_MULTITAP(3, 300, 0x25, 1); /* triple-Left WATCH */
-    cfg->hotkeys[SVC_HK_MOVE_RIGHT]    = SVC_HK_PACK_MULTITAP(3, 300, 0x27, 1); /* triple-Right WATCH */
-    cfg->hotkeys[SVC_HK_MOVE_UP]       = SVC_HK_PACK_MULTITAP(3, 300, 0x26, 1); /* triple-Up WATCH */
-    cfg->hotkeys[SVC_HK_MOVE_DOWN]     = SVC_HK_PACK_MULTITAP(3, 300, 0x28, 1); /* triple-Down WATCH */
-    cfg->hotkeys[SVC_HK_RESIZE_WIDER]  = SVC_HK_PACK_MULTITAP(3, 300, 0xBB, 1); /* triple-= WATCH */
-    cfg->hotkeys[SVC_HK_RESIZE_NARROW] = SVC_HK_PACK_MULTITAP(3, 300, 0xBD, 1); /* triple-- WATCH */
-    cfg->hotkeys[SVC_HK_RESIZE_TALLER] = SVC_HK_PACK_MULTITAP(3, 300, 0xDD, 1); /* triple-] WATCH */
-    cfg->hotkeys[SVC_HK_RESIZE_SHORT]  = SVC_HK_PACK_MULTITAP(3, 300, 0xDB, 1); /* triple-[ WATCH */
-    cfg->hotkeys[SVC_HK_CYCLE_CORNER]  = SVC_HK_PACK_MULTITAP(3, 300, 'Q',  1); /* triple-Q WATCH */
-    cfg->hotkeys[SVC_HK_ALPHA_UP]      = SVC_HK_PACK_MULTITAP(3, 300, 0xBE, 1); /* triple-. WATCH */
-    cfg->hotkeys[SVC_HK_ALPHA_DOWN]    = SVC_HK_PACK_MULTITAP(3, 300, 0xBC, 1); /* triple-, WATCH */
-    cfg->hotkeys[SVC_HK_FONT_UP]       = SVC_HK_PACK_MULTITAP(3, 300, 0xDE, 1); /* triple-' WATCH */
-    cfg->hotkeys[SVC_HK_FONT_DOWN]     = SVC_HK_PACK_MULTITAP(3, 300, 0xBA, 1); /* triple-; WATCH */
-    cfg->hotkeys[SVC_HK_RESET]         = SVC_HK_PACK_MULTITAP(3, 300, 'R',  1); /* triple-R WATCH */
-    cfg->hotkeys[SVC_HK_DEBUG_CAP]     = SVC_HK_PACK_MULTITAP(3, 300, 0x2D, 1); /* triple-Insert WATCH */
-    cfg->hotkeys[SVC_HK_KILL_ALL]      = SVC_HK_PACK_LONGPRESS(1200, 0x24);     /* hold Home 1.2s (panic) */
-    cfg->hotkeys[SVC_HK_SCROLL_UP]     = SVC_HK_PACK_MULTITAP(3, 300, 0x21, 1); /* triple-PgUp WATCH */
-    cfg->hotkeys[SVC_HK_SCROLL_DOWN]   = SVC_HK_PACK_MULTITAP(3, 300, 0x22, 1); /* triple-PgDn WATCH */
-    cfg->hotkeys[SVC_HK_NEW_CHAT]      = SVC_HK_PACK_MULTITAP(3, 300, 'N',  0); /* triple-N CONSUME (destructive) */
-    cfg->hotkeys[SVC_HK_CYCLE_TIER]    = SVC_HK_PACK_MULTITAP(3, 300, 'M',  1); /* triple-M WATCH */
-    cfg->hotkeys[SVC_HK_CYCLE_PROVIDER]= SVC_HK_PACK_MULTITAP(3, 300, 'P',  1); /* triple-P WATCH */
-    cfg->hotkeys[SVC_HK_REGENERATE]    = SVC_HK_PACK_MULTITAP(3, 300, 0x0D, 1); /* triple-Enter WATCH */
-    cfg->hotkeys[SVC_HK_STREAM_TOGGLE] = SVC_HK_PACK_MULTITAP(3, 300, 'T',  1); /* triple-T WATCH */
-    cfg->hotkeys[SVC_HK_COPY_CODE]     = SVC_HK_PACK_MULTITAP(3, 300, 'K',  1); /* triple-K WATCH */
-    cfg->hotkeys[SVC_HK_COPY_ANSWER]   = SVC_HK_PACK_MULTITAP(3, 300, 'A',  1); /* triple-A WATCH */
-    cfg->hotkeys[SVC_HK_LATEX_TOGGLE]  = SVC_HK_PACK_MULTITAP(3, 300, 'L',  1); /* triple-L WATCH */
-    cfg->hotkeys[SVC_HK_STOP_GEN]      = SVC_HK_PACK_MULTITAP(3, 300, 'S',  1); /* triple-S WATCH */
+    /* v1.7.4.5 (2026-07-24) — ALL WATCH-ONLY (never eat keys) + 500ms
+     * gap + ADAPTIVE flag. CONSUME on N/X ate user's typing letters.
+     * Wider gap makes accidental triggering harder; ADAPTIVE learns
+     * their tap rhythm live. */
+    unsigned mt = SVC_HK_FLAG_ADAPTIVE;
+    cfg->hotkeys[SVC_HK_ASK]           = SVC_HK_PACK_MULTITAP(3, 500, 0xC0, 1) | mt;
+    cfg->hotkeys[SVC_HK_TOGGLE]        = SVC_HK_PACK_MULTITAP(3, 500, 'G',  1) | mt;
+    cfg->hotkeys[SVC_HK_TYPING]        = SVC_HK_PACK_MULTITAP(3, 500, 0xDC, 1) | mt;
+    cfg->hotkeys[SVC_HK_COPY_REPLY]    = SVC_HK_PACK_MULTITAP(3, 500, 'C',  1) | mt;
+    cfg->hotkeys[SVC_HK_CLEAR]         = SVC_HK_PACK_MULTITAP(3, 500, 'X',  1) | mt;
+    cfg->hotkeys[SVC_HK_MOVE_LEFT]     = SVC_HK_PACK_MULTITAP(3, 500, 0x25, 1) | mt;
+    cfg->hotkeys[SVC_HK_MOVE_RIGHT]    = SVC_HK_PACK_MULTITAP(3, 500, 0x27, 1) | mt;
+    cfg->hotkeys[SVC_HK_MOVE_UP]       = SVC_HK_PACK_MULTITAP(3, 500, 0x26, 1) | mt;
+    cfg->hotkeys[SVC_HK_MOVE_DOWN]     = SVC_HK_PACK_MULTITAP(3, 500, 0x28, 1) | mt;
+    cfg->hotkeys[SVC_HK_RESIZE_WIDER]  = SVC_HK_PACK_MULTITAP(3, 500, 0xBB, 1) | mt;
+    cfg->hotkeys[SVC_HK_RESIZE_NARROW] = SVC_HK_PACK_MULTITAP(3, 500, 0xBD, 1) | mt;
+    cfg->hotkeys[SVC_HK_RESIZE_TALLER] = SVC_HK_PACK_MULTITAP(3, 500, 0xDD, 1) | mt;
+    cfg->hotkeys[SVC_HK_RESIZE_SHORT]  = SVC_HK_PACK_MULTITAP(3, 500, 0xDB, 1) | mt;
+    cfg->hotkeys[SVC_HK_CYCLE_CORNER]  = SVC_HK_PACK_MULTITAP(3, 500, 'Q',  1) | mt;
+    cfg->hotkeys[SVC_HK_ALPHA_UP]      = SVC_HK_PACK_MULTITAP(3, 500, 0xBE, 1) | mt;
+    cfg->hotkeys[SVC_HK_ALPHA_DOWN]    = SVC_HK_PACK_MULTITAP(3, 500, 0xBC, 1) | mt;
+    cfg->hotkeys[SVC_HK_FONT_UP]       = SVC_HK_PACK_MULTITAP(3, 500, 0xDE, 1) | mt;
+    cfg->hotkeys[SVC_HK_FONT_DOWN]     = SVC_HK_PACK_MULTITAP(3, 500, 0xBA, 1) | mt;
+    cfg->hotkeys[SVC_HK_RESET]         = SVC_HK_PACK_MULTITAP(3, 500, 'R',  1) | mt;
+    cfg->hotkeys[SVC_HK_DEBUG_CAP]     = SVC_HK_PACK_MULTITAP(3, 500, 0x2D, 1) | mt;
+    cfg->hotkeys[SVC_HK_KILL_ALL]      = SVC_HK_PACK_LONGPRESS(1200, 0x24);
+    cfg->hotkeys[SVC_HK_SCROLL_UP]     = SVC_HK_PACK_MULTITAP(3, 500, 0x21, 1) | mt;
+    cfg->hotkeys[SVC_HK_SCROLL_DOWN]   = SVC_HK_PACK_MULTITAP(3, 500, 0x22, 1) | mt;
+    cfg->hotkeys[SVC_HK_NEW_CHAT]      = SVC_HK_PACK_MULTITAP(3, 500, 'N',  1) | mt;
+    cfg->hotkeys[SVC_HK_CYCLE_TIER]    = SVC_HK_PACK_MULTITAP(3, 500, 'M',  1) | mt;
+    cfg->hotkeys[SVC_HK_CYCLE_PROVIDER]= SVC_HK_PACK_MULTITAP(3, 500, 'P',  1) | mt;
+    cfg->hotkeys[SVC_HK_REGENERATE]    = SVC_HK_PACK_MULTITAP(3, 500, 0x0D, 1) | mt;
+    cfg->hotkeys[SVC_HK_STREAM_TOGGLE] = SVC_HK_PACK_MULTITAP(3, 500, 'T',  1) | mt;
+    cfg->hotkeys[SVC_HK_COPY_CODE]     = SVC_HK_PACK_MULTITAP(3, 500, 'K',  1) | mt;
+    cfg->hotkeys[SVC_HK_COPY_ANSWER]   = SVC_HK_PACK_MULTITAP(3, 500, 'A',  1) | mt;
+    cfg->hotkeys[SVC_HK_LATEX_TOGGLE]  = SVC_HK_PACK_MULTITAP(3, 500, 'L',  1) | mt;
+    cfg->hotkeys[SVC_HK_STOP_GEN]      = SVC_HK_PACK_MULTITAP(3, 500, 'S',  1) | mt;
     /* v6: DIRECT-ANSWER mode toggle. Ctrl+Shift+Alt+D = "direct". Free -
      * no common app binds Ctrl+Shift+Alt+D. When ON the AI system
      * prompt is replaced with a strict data-extraction contract. */

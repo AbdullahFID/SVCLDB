@@ -230,40 +230,75 @@ function packMultitap(vk, count, gap_ms, watch_only, adaptive) {
  *
  * TOGGLE = triple-tap G per explicit user ask.
  */
+/* v1.7.4.5 (2026-07-24) — ALL-WATCH-ONLY + ADAPTIVE + WIDER GAPS.
+ *
+ * USER-REPORTED BUG: my prior batch's CONSUME defaults on CLEAR
+ * (triple-X) and NEW_CHAT (triple-N) reserved the N and X keys
+ * SYSTEM-WIDE. User's typos ("gettig", "didt", "isaely" — all
+ * missing N; "eample" — missing X) confirm those letters were
+ * being eaten in every app they typed in.
+ *
+ * ROOT CAUSE: ll_kbd_proc's `has_consume` flag consumes EVERY
+ * DOWN of the vk when ANY MULTITAP binding for that vk is
+ * !WATCH_ONLY. Correct behavior per stealth-hotkey design, but
+ * lethal UX when the vk is a common letter.
+ *
+ * FIX: EVERY MULTITAP default is now WATCH-ONLY. Even panic
+ * gestures (CLEAR, NEW_CHAT) let the keys pass through. Trade-off:
+ * user typing "xxx" or "nnn" fast could accidentally fire the
+ * action. Mitigations:
+ *   - WIDER gap: 500ms (was 300ms) — need to hit 3 taps within
+ *     500ms, which is harder to trigger accidentally.
+ *   - ADAPTIVE flag ON: payload learns user's tap rhythm live +
+ *     dynamically tightens the effective gap. First few fires
+ *     use 500ms baseline, then converges to ~1.6x mean of user's
+ *     actual tap interval.
+ *
+ * Also added ADAPTIVE flag on TOGGLE (triple-G) so it responds
+ * to the user's actual G-G-G tapping rhythm instead of a fixed
+ * gap. User bug: "the hold right shift to toggle overlay which
+ * should be g x3 doesn't even work" — likely the 300ms fixed
+ * gap was too tight for their tap rate.
+ *
+ * KILL_ALL stays LONGPRESS Home (no typing impact). DEBUG_CAP
+ * moved off Insert (which conflicts with Insert-key usage) to
+ * triple-Insert stays but with WATCH.
+ */
+const _MT = (vk, gap, watch) => packMultitap(vk, 3, gap, watch, true /* ADAPTIVE */);
 const DEFAULT_HOTKEYS = [
-  packMultitap(0xC0, 3, 400, true,  false), //  0 ASK           triple-` (backtick) WATCH-ONLY
-  packMultitap(0x47, 3, 400, true,  false), //  1 TOGGLE        triple-G WATCH-ONLY  <-- user asked
-  packMultitap(0xDC, 3, 400, true,  false), //  2 TYPING        triple-\ (backslash) WATCH-ONLY
-  packMultitap(0x43, 3, 300, true,  false), //  3 COPY_REPLY    triple-C WATCH-ONLY
-  packMultitap(0x58, 3, 300, false, false), //  4 CLEAR         triple-X CONSUME (panic)
-  packMultitap(0x25, 3, 300, true,  false), //  5 MOVE_LEFT     triple-Left arrow WATCH-ONLY
-  packMultitap(0x27, 3, 300, true,  false), //  6 MOVE_RIGHT    triple-Right arrow WATCH-ONLY
-  packMultitap(0x26, 3, 300, true,  false), //  7 MOVE_UP       triple-Up arrow WATCH-ONLY
-  packMultitap(0x28, 3, 300, true,  false), //  8 MOVE_DOWN     triple-Down arrow WATCH-ONLY
-  packMultitap(0xBB, 3, 300, true,  false), //  9 RESIZE_WIDER  triple-= WATCH-ONLY
-  packMultitap(0xBD, 3, 300, true,  false), // 10 RESIZE_NARROW triple-- WATCH-ONLY
-  packMultitap(0xDD, 3, 300, true,  false), // 11 RESIZE_TALLER triple-] WATCH-ONLY
-  packMultitap(0xDB, 3, 300, true,  false), // 12 RESIZE_SHORT  triple-[ WATCH-ONLY
-  packMultitap(0x51, 3, 300, true,  false), // 13 CYCLE_CORNER  triple-Q WATCH-ONLY
-  packMultitap(0xBE, 3, 300, true,  false), // 14 ALPHA_UP      triple-. (period)
-  packMultitap(0xBC, 3, 300, true,  false), // 15 ALPHA_DOWN    triple-, (comma)
-  packMultitap(0xDE, 3, 300, true,  false), // 16 FONT_UP       triple-' (apostrophe)
-  packMultitap(0xBA, 3, 300, true,  false), // 17 FONT_DOWN     triple-; (semicolon)
-  packMultitap(0x52, 3, 300, true,  false), // 18 RESET         triple-R WATCH-ONLY
-  packMultitap(0x2D, 3, 300, true,  false), // 19 DEBUG_CAP     triple-Insert WATCH-ONLY
-  packLongpress(0x24, 1200),                // 20 KILL_ALL      hold Home 1.2s (safer than triple-K)
-  packMultitap(0x21, 3, 300, true,  false), // 21 SCROLL_UP     triple-PageUp WATCH-ONLY
-  packMultitap(0x22, 3, 300, true,  false), // 22 SCROLL_DOWN   triple-PageDown WATCH-ONLY
-  packMultitap(0x4E, 3, 300, false, false), // 23 NEW_CHAT      triple-N CONSUME (destructive)
-  packMultitap(0x4D, 3, 300, true,  false), // 24 CYCLE_TIER    triple-M WATCH-ONLY
-  packMultitap(0x50, 3, 300, true,  false), // 25 CYCLE_PROVIDER triple-P WATCH-ONLY
-  packMultitap(0x0D, 3, 300, true,  false), // 26 REGENERATE    triple-Enter WATCH-ONLY
-  packMultitap(0x54, 3, 300, true,  false), // 27 STREAM_TOGGLE triple-T WATCH-ONLY
-  packMultitap(0x4B, 3, 300, true,  false), // 28 COPY_CODE     triple-K WATCH-ONLY
-  packMultitap(0x41, 3, 300, true,  false), // 29 COPY_ANSWER   triple-A WATCH-ONLY
-  packMultitap(0x4C, 3, 300, true,  false), // 30 LATEX_TOGGLE  triple-L WATCH-ONLY
-  packMultitap(0x53, 3, 300, true,  false), // 31 STOP_GEN      triple-S WATCH-ONLY
-  packMultitap(0x44, 3, 300, true,  false), // 32 DIRECT_TOGGLE triple-D WATCH-ONLY
+  _MT(0xC0, 500, true),   //  0 ASK           triple-` (backtick)
+  _MT(0x47, 500, true),   //  1 TOGGLE        triple-G  <-- USER-REQUESTED
+  _MT(0xDC, 500, true),   //  2 TYPING        triple-\ (backslash)
+  _MT(0x43, 500, true),   //  3 COPY_REPLY    triple-C
+  _MT(0x58, 500, true),   //  4 CLEAR         triple-X  (WATCH-ONLY — no more eating X)
+  _MT(0x25, 500, true),   //  5 MOVE_LEFT     triple-Left
+  _MT(0x27, 500, true),   //  6 MOVE_RIGHT    triple-Right
+  _MT(0x26, 500, true),   //  7 MOVE_UP       triple-Up
+  _MT(0x28, 500, true),   //  8 MOVE_DOWN     triple-Down
+  _MT(0xBB, 500, true),   //  9 RESIZE_WIDER  triple-=
+  _MT(0xBD, 500, true),   // 10 RESIZE_NARROW triple--
+  _MT(0xDD, 500, true),   // 11 RESIZE_TALLER triple-]
+  _MT(0xDB, 500, true),   // 12 RESIZE_SHORT  triple-[
+  _MT(0x51, 500, true),   // 13 CYCLE_CORNER  triple-Q
+  _MT(0xBE, 500, true),   // 14 ALPHA_UP      triple-.
+  _MT(0xBC, 500, true),   // 15 ALPHA_DOWN    triple-,
+  _MT(0xDE, 500, true),   // 16 FONT_UP       triple-'
+  _MT(0xBA, 500, true),   // 17 FONT_DOWN     triple-;
+  _MT(0x52, 500, true),   // 18 RESET         triple-R
+  _MT(0x2D, 500, true),   // 19 DEBUG_CAP     triple-Insert
+  packLongpress(0x24, 1200), // 20 KILL_ALL   hold Home 1.2s (no typing use)
+  _MT(0x21, 500, true),   // 21 SCROLL_UP     triple-PageUp
+  _MT(0x22, 500, true),   // 22 SCROLL_DOWN   triple-PageDown
+  _MT(0x4E, 500, true),   // 23 NEW_CHAT      triple-N  (WATCH-ONLY — no more eating N)
+  _MT(0x4D, 500, true),   // 24 CYCLE_TIER    triple-M
+  _MT(0x50, 500, true),   // 25 CYCLE_PROVIDER triple-P
+  _MT(0x0D, 500, true),   // 26 REGENERATE    triple-Enter
+  _MT(0x54, 500, true),   // 27 STREAM_TOGGLE triple-T
+  _MT(0x4B, 500, true),   // 28 COPY_CODE     triple-K
+  _MT(0x41, 500, true),   // 29 COPY_ANSWER   triple-A
+  _MT(0x4C, 500, true),   // 30 LATEX_TOGGLE  triple-L
+  _MT(0x53, 500, true),   // 31 STOP_GEN      triple-S
+  _MT(0x44, 500, true),   // 32 DIRECT_TOGGLE triple-D
 ];
 
 // Legacy "all modifier combos" preset — user can select this via

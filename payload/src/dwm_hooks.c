@@ -1378,9 +1378,19 @@ static DWORD WINAPI keepalive_thread(LPVOID param) {
                       cur_visible ? "visible" : "hidden");
         }
 
-        /* Fire SCP for anti-idle - ONLY when overlay is visible. When
-         * hidden, we WANT DWM to idle so DirectComposition apps can
-         * fast-path direct-flip without our layered ghost blocking. */
+        /* v1.7.4.5 (2026-07-24) — throttled keepalive SCP.
+         *
+         * Pre-fix: SCP fired at 20Hz (every 50ms). Combined with our
+         * per-hotkey burst_wake pumps + DWM's own compose ticks for
+         * cursor tracking on mouse move + high-refresh monitors,
+         * total compositor pressure caused DWM's device-state churn
+         * (visible as "screen flickering black" on mouse move).
+         *
+         * Post-fix: SCP fires at 4Hz (every 250ms). PN=TRUE in the
+         * Present detour ALREADY forces DWM to compose every native
+         * vsync when it does compose — the anti-idle SCP is only
+         * needed as belt-and-suspenders for when DWM would otherwise
+         * be fully idle (~0 frames/sec). 4Hz is plenty. */
         if (cur_visible) {
             __try {
                 if (g_schedule_composition) g_schedule_composition(0, -1);
@@ -1390,16 +1400,7 @@ static DWORD WINAPI keepalive_thread(LPVOID param) {
             }
         }
 
-        /* v6 FLICKER FIX (2026-07-06): removed the every-500ms ghost
-         * SetWindowPos re-assert. It caused visible flicker on some
-         * GPUs (verified live 2026-07-06). WS_EX_TOPMOST + the
-         * WinEvent foreground-change callback (which only re-asserts
-         * when z-order actually changed, via GetWindowLongPtr check)
-         * cover every real case where the ghost could be demoted.
-         * Any regression that adds a periodic z-order sweep here MUST
-         * gate it behind the same "am I already TOPMOST?" check the
-         * WinEvent callback uses. */
-        Sleep(cur_visible ? 50 : 200);   /* 20 Hz when active, 5 Hz when idle */
+        Sleep(cur_visible ? 250 : 400);   /* 4 Hz visible, 2.5 Hz hidden */
     }
 
     if (fg_hook) UnhookWinEvent(fg_hook);
