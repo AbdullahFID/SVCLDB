@@ -459,22 +459,35 @@ static const char SVCLDB_DEFAULT_SYSTEM_PROMPT[] =
 
 /* OpenAI tiers.
  *
- * v1.7.4 (2026-07-23) — MODEL LIST FIX per live probe with real user keys.
- * OLD (broken): STRONG=gpt-5.5-pro (404 not found on standard keys),
- *               CHEAP=gpt-5-mini (returns empty content on many prompts).
- * NEW: verified via GET /v1/models + POST /v1/chat/completions:
- *   - gpt-5.6-terra   (STRONG) — accepted, high-quality frontier reasoning
- *   - gpt-5.5         (MEDIUM) — balanced, always accepted
- *   - gpt-5.4-mini    (CHEAP)  — reliable content generation, not-empty
+ * v1.7.4.3 (2026-07-23) — FINAL tier mapping per web + live probe.
  *
- * The prior `gpt-5.5-pro` was gated to a small subset of enterprise
- * accounts + newer model releases obsoleted it; keeping a broken STRONG
- * default was the #1 reported bug ("Strong mode isn't working"). */
+ * OpenAI released the GPT-5.6 family (Sol / Terra / Luna) on 2026-07-09.
+ * Per artificialanalysis.ai + axis-intelligence.com + emergent.sh:
+ *   - Sol   = flagship, MAX reasoning ($5/$30, Coding Agent Index 80,
+ *             Intelligence Index 59 — beats GPT-5.5 across the board)
+ *   - Terra = balanced middle ($2.50/$15, GPT-5.5-class at 1/2 cost)
+ *   - Luna  = fast/cheap ($1/$6, 1/5 Sol cost, drops on long-context)
+ *
+ * Live-verified with user's enterprise key 2026-07-23: all 3 models
+ * accept POST /v1/chat/completions and return non-empty content.
+ * `reasoning_effort` accepts {low, medium, high} on all three; the
+ * `minimal` value was rejected in tests.
+ *
+ * Final mapping per user's ask ("strongest highest reasoning" for
+ * STRONG, "medium reasoning medium model" for MEDIUM, "low reasoning
+ * low model" for CHEAP):
+ *   STRONG -> gpt-5.6-sol   + reasoning_effort=high    (flagship)
+ *   MEDIUM -> gpt-5.6-terra + reasoning_effort=medium  (balanced)
+ *   CHEAP  -> gpt-5.6-luna  + reasoning_effort=low     (efficiency)
+ *
+ * The default reasoning_effort comes from cfg->reasoning_effort which
+ * user sets in the dashboard (default 4=high). The map here reflects
+ * "recommended for tier" not "hardcoded" — user's setting overrides. */
 static const svc_model_tier_t OPENAI_TIERS[SVC_TIER_COUNT] = {
-    { "gpt-5.6-terra", "STRONG (gpt-5.6 Terra)", "Frontier reasoning + vision, 272K ctx (verified live 2026-07-23)", 1, 1, 32768 },
-    { "gpt-5.5",       "MEDIUM (gpt-5.5)",       "Balanced flagship + vision, $5/$30 per 1M tok, 272K ctx",           1, 1, 16384 },
-    { "gpt-5.4-mini",  "CHEAP  (gpt-5.4-mini)",  "Fast + affordable + vision, replaces gpt-5-mini for reliability",   1, 1,  8192 },
-    { NULL,            "CUSTOM",                 "user-specified model",                                                0, 0,  8192 },
+    { "gpt-5.6-sol",   "STRONG (GPT-5.6 Sol)",   "Flagship max-reasoning, $5/$30, Intelligence Index 59, 400K ctx", 1, 1, 32768 },
+    { "gpt-5.6-terra", "MEDIUM (GPT-5.6 Terra)", "Balanced daily driver, $2.50/$15, GPT-5.5-class at 1/2 cost",      1, 1, 16384 },
+    { "gpt-5.6-luna",  "CHEAP  (GPT-5.6 Luna)",  "Fast + cheap, $1/$6, 1/5 Sol cost (short-context only)",           1, 1,  8192 },
+    { NULL,            "CUSTOM",                 "user-specified model",                                              0, 0,  8192 },
 };
 
 /* Anthropic tiers. Per user request: opus-4-8 NOT fable-5 (too expensive).
@@ -1848,12 +1861,15 @@ int ai_is_reasoning_model(const char *model_id) {
     /* OpenAI o-series — o1, o3, o4… */
     if ((model_id[0] == 'o' || model_id[0] == 'O') &&
         (model_id[1] >= '1' && model_id[1] <= '9')) return 1;
-    /* OpenAI reasoning flagships (v1.7.4: added 5.6 family) */
+    /* OpenAI reasoning flagships. v1.7.4.3 (2026-07-23): the WHOLE
+     * 5.6 family (Sol/Terra/Luna) uses the /v1/chat/completions
+     * reasoning-model shape (max_completion_tokens + reasoning_effort);
+     * all three qualify for the extended timeout window since they
+     * can spend >30s on thinking before emitting any token on complex
+     * prompts. Older 5.x-pro slugs kept for legacy config compat. */
+    if (strstr(model_id, "gpt-5.6"))      return 1;    /* Sol / Terra / Luna all */
     if (strstr(model_id, "gpt-5.5-pro")) return 1;
     if (strstr(model_id, "gpt-5-pro"))   return 1;
-    if (strstr(model_id, "gpt-5.6-terra")) return 1;   /* v1.7.4 STRONG default */
-    if (strstr(model_id, "gpt-5.6-sol"))   return 1;
-    if (strstr(model_id, "gpt-5.6-luna"))  return 1;
     if (strstr(model_id, "gpt-5.4-pro"))   return 1;
     if (strstr(model_id, "gpt-5.2-pro"))   return 1;
     /* Anthropic reasoning */
