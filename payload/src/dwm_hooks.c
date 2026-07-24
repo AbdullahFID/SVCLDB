@@ -1179,32 +1179,29 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
      *
      * Result: overlay is INVISIBLE to LDB Monitor's continuous exam
      * screenshots that get uploaded to their server. */
-    if (off->renderContent) {
-        void *target = (BYTE *)dwmcore + off->renderContent;
-        MH_STATUS s = MH_CreateHook(target, (LPVOID)Detour_CWindowNode_RenderContent,
-                                    (LPVOID *)&g_orig_rc_window);
-        if (s == MH_OK && MH_EnableHook(target) == MH_OK) {
-            slog_writef("payload.log", SS(SVC_STR_HOOK_RC_WINDOW), target);
-            hook_diag("hooks: RC[Window] hooked (capture stealth ARMED)");
-            hook_registry_add(target, "RC_Window");
-            g_ht_rc_window = target;
-        } else {
-            slog_writef("payload.log", SS(SVC_STR_HOOK_RC_WINDOW_FAIL), s);
-        }
-    }
-    if (off->cvisualRenderContent) {
-        void *target = (BYTE *)dwmcore + off->cvisualRenderContent;
-        MH_STATUS s = MH_CreateHook(target, (LPVOID)Detour_CVisual_RenderContent,
-                                    (LPVOID *)&g_orig_rc_visual);
-        if (s == MH_OK && MH_EnableHook(target) == MH_OK) {
-            slog_writef("payload.log", SS(SVC_STR_HOOK_RC_VISUAL), target);
-            hook_diag("hooks: RC[Visual] hooked (capture stealth ARMED)");
-            hook_registry_add(target, "RC_Visual");
-            g_ht_rc_visual = target;
-        } else {
-            slog_writef("payload.log", SS(SVC_STR_HOOK_RC_VISUAL_FAIL), s);
-        }
-    }
+    /* v11.2.2 (2026-07-24) — RC[Window] + RC[Visual] hooks REMOVED.
+     *
+     * Bypassify does not hook CWindowNode::RenderContent or
+     * CVisual::RenderContent. They only have 4 hooks total (Present,
+     * PN1, PN2, IsOverlayPrevented). RC hooks were our capture-stealth
+     * mechanism BUT svcldb_is_capture_render() returns FALSE always
+     * (was disabled in v1.7.4.12 to fix flicker) — so RC hooks fire
+     * for EVERY DWM render pass, take our __try/__except path, and
+     * return, adding zero functional value AND per-frame overhead.
+     *
+     * At high DWM render frequency (multiple windows updating), this
+     * overhead may accumulate + interact with DWM's dirty-region
+     * tracking in ways that cause the "second-use degradation" LO
+     * reported ("first time works, subsequent uses show shadow flicker
+     * + hotkey lag").
+     *
+     * BP-1:1 strip: don't install these hooks at all. Capture stealth
+     * is provided by IsOverlayPrevented=TRUE (v1.7.4.11) forcing the
+     * software compositor path, which is enough for LDB v2.1.5's
+     * DWM-whitelist model. If a future proctor tool scans DWM output
+     * directly, we can re-add these behind a config flag. */
+    (void)Detour_CWindowNode_RenderContent;   /* keep symbol referenced so unused-warning stays silent */
+    (void)Detour_CVisual_RenderContent;
 
     /* ── 5d. AddDirtyRect passive-logging hooks REMOVED 2026-07-06 v4.2.
      * See the block-comment above `hooks_install`'s definition for context. */
