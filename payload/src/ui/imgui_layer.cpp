@@ -43,6 +43,7 @@
 
 #include "../../../shared/imgui/imgui.h"
 #include "../../../shared/imgui/backends/imgui_impl_dx11.h"
+#include "../../../shared/imgui/backends/imgui_impl_win32.h"
 
 #include "imgui_layer.h"
 
@@ -506,6 +507,68 @@ static bool             g_ui_cs_init  = false;
  * on screen. */
 static bool             g_visible     = true;   /* v11.2.4 (2026-07-24) — LO ask: show overlay immediately on inject (was default HIDDEN — required Ctrl+B toggle). Bypassify parity. */
 static bool             g_imgui_inited= false;
+
+/* v12 (2026-07-24) — ARCHITECTURAL REFACTOR TO BP PARITY.
+ *
+ * Deep Ghidra decomp of Bypassify (bp-architecture-full-picture.md
+ * memory note) proved BP uses PROGMAN's HWND as a fake parent Win32
+ * window + standard ImGui-Win32 backend. That's why their input works
+ * per-frame + why DWM's dirty-region tracker knows about them + why
+ * they don't ghost-trail. Our custom no-HWND setup was architecturally
+ * different — every surface tweak (trail-erase, hide-grace, RTV swap,
+ * opaque-lock, message pump) was fighting this gap and losing.
+ *
+ * v12 architectural change:
+ *   1. Find Progman's HWND at first render (matches BP exactly).
+ *   2. ImGui_ImplWin32_Init(g_fake_hwnd) alongside ImGui_ImplDX11_Init.
+ *   3. Per-frame: ImGui_ImplWin32_NewFrame() BEFORE ImGui::NewFrame()
+ *      updates io.DisplaySize + cursor + kbd from Win32 API.
+ *   4. Progman-recovery: every frame check IsWindow(g_fake_hwnd); if
+ *      invalid, teardown + refind + reinit (matches BP FUN_180008AC0's
+ *      "[RECOVERY] Progman changed" branch).
+ *   5. Message pump per-frame is now SAFE because ImGui_ImplWin32
+ *      installs its own WndProc handler that routes events cleanly.
+ *
+ * WHY THIS IS RIGHT: DWM's compositor treats Progman as a real window
+ * with a rect it tracks. Rendering into DWM's layer texture at
+ * coordinates INSIDE that rect means DWM's next dirty-tracking pass
+ * knows to re-composite the area from source apps. Old-position
+ * pixels get naturally overwritten. Same reason BP has zero ghost. */
+static HWND             g_fake_hwnd            = NULL;
+static bool             g_win32_backend_inited = false;
+static ULONGLONG        g_last_progman_check   = 0;
+
+/* Progman-recovery: fired every frame from ui_present_frame. If our
+ * fake HWND is null or destroyed, teardown ImGui-Win32 backend, refind
+ * Progman, reinit. Throttled to once per ~500ms so we're not calling
+ * IsWindow every vsync. */
+static bool ensure_fake_hwnd_valid(void) {
+    ULONGLONG now = GetTickCount64();
+    if (g_fake_hwnd && IsWindow(g_fake_hwnd)) {
+        return true;
+    }
+    /* Slow path only when HWND missing or invalid. */
+    HWND newh = FindWindowA("Progman", "Program Manager");
+    if (!newh) {
+        /* Fallback: try WorkerW (behind-desktop worker windows). */
+        newh = FindWindowA("WorkerW", NULL);
+    }
+    if (newh == g_fake_hwnd) {
+        return g_fake_hwnd != NULL;   /* nothing changed */
+    }
+    /* Progman changed (explorer restart, session switch, etc.) —
+     * teardown Win32 backend, swap HWND, re-init on next frame. */
+    if (g_win32_backend_inited) {
+        diag("[RECOVERY] Progman changed %p -> %p; teardown Win32 backend",
+             g_fake_hwnd, newh);
+        ImGui_ImplWin32_Shutdown();
+        g_win32_backend_inited = false;
+    }
+    g_fake_hwnd = newh;
+    g_last_progman_check = now;
+    if (!g_fake_hwnd) return false;
+    return true;
+}
 static ULONGLONG        g_frame_count = 0;
 
 /* ── Chat message ring buffer (v3) ────────────────────────────── *
@@ -5008,6 +5071,21 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
             diag("ImGui READY — overlay should render this frame");
         }
 
+        /* v12 (2026-07-24) — ARCHITECTURAL BP PARITY: ImGui-Win32 backend
+         * bound to Progman HWND. Full rationale in the g_fake_hwnd comment
+         * near the top of this file + bp-architecture-full-picture.md.
+         * Runs every Present frame — cheap validity check via
+         * ensure_fake_hwnd_valid(), then one-time backend init on the
+         * first frame after HWND becomes available. */
+        if (ensure_fake_hwnd_valid() && !g_win32_backend_inited) {
+            if (ImGui_ImplWin32_Init((void *)g_fake_hwnd)) {
+                g_win32_backend_inited = true;
+                diag("ImGui-Win32 backend inited on Progman HWND=%p", g_fake_hwnd);
+            } else {
+                diag("ImGui_ImplWin32_Init FAILED on HWND=%p", g_fake_hwnd);
+            }
+        }
+
         /* Save OM state before we clobber it. */
         OMBackup om = {};
         om_backup(ctx, &om);
@@ -5088,6 +5166,28 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
         io.DisplaySize = ImVec2((float)w, (float)h);
         io.DeltaTime   = 1.0f / 60.0f;
 
+        /* v12: pump message queue THROUGH our fake WndProc (Progman) —
+         * safe now that ImGui-Win32 has installed a handler. Matches BP's
+         * per-frame pump in FUN_18000b290. Bounded at 32 msgs/frame. */
+        if (g_win32_backend_inited) {
+            __try {
+                MSG msg;
+                int n = 0;
+                while (n < 32 && PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+                    TranslateMessage(&msg);
+                    DispatchMessageA(&msg);
+                    n++;
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                /* Silently drop — WndProc exception shouldn't kill DWM. */
+            }
+        }
+        /* v12: Win32 backend NewFrame updates io.DisplaySize (from
+         * GetClientRect on Progman HWND = desktop rect), cursor pos,
+         * modifier keys, focus state — matches BP FUN_180070210 exactly. */
+        if (g_win32_backend_inited) {
+            ImGui_ImplWin32_NewFrame();
+        }
         ImGui_ImplDX11_NewFrame();
         ImGui::NewFrame();
         draw_chat_window(w, h);
@@ -5135,6 +5235,11 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
 }
 
 extern "C" void ui_shutdown() {
+    /* v12: teardown Win32 backend before DX11 backend (reverse init order). */
+    if (g_win32_backend_inited) {
+        ImGui_ImplWin32_Shutdown();
+        g_win32_backend_inited = false;
+    }
     if (g_imgui_inited) {
         ImGui_ImplDX11_Shutdown();
         ImGui::DestroyContext();

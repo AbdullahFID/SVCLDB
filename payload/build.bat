@@ -66,6 +66,7 @@ set CXX_SOURCES=^
  "%IMGUI%\imgui.cpp" "%IMGUI%\imgui_draw.cpp" "%IMGUI%\imgui_tables.cpp" ^
  "%IMGUI%\imgui_widgets.cpp" ^
  "%IMGUI%\backends\imgui_impl_dx11.cpp" ^
+ "%IMGUI%\backends\imgui_impl_win32.cpp" ^
  "%SRC%\ui\imgui_layer.cpp"
 
 REM ── Compile C sources → objs ──
