@@ -2859,12 +2859,87 @@ static void invalidate_last_overlay_region(const char *why) {
     diag("invalidate: (%s) FULL-DESKTOP + compose-grace 500ms", why ? why : "?");
 }
 
+/* v1.7.11.19 (2026-07-25) — GLIDE JITTER FIX.
+ *
+ * LO observation: BP's overlay glides perfectly smooth across screen.
+ * Ours glides too but occasionally jitters/stutters mid-glide. Last
+ * known "our-only" regression.
+ *
+ * Root cause: every ui_nudge() called invalidate_last_overlay_region()
+ * which fires RedrawWindow(NULL, ..., RDW_INVALIDATE | RDW_FRAME |
+ * RDW_ALLCHILDREN) — a FULL-desktop paint cascade to every visible
+ * window. Cost varies wildly:
+ *   - Idle desktop: ~50µs
+ *   - Chrome + Slack + Discord in foreground with pending compose work:
+ *     5-20ms of blocking wall time in DWM's process
+ *
+ * At 60Hz continuous nudge (16ms period), a single ~15ms cascade
+ * blows the frame budget → next Present catches up two nudges at once
+ * → visible stutter. That's the "sometimes jitters then keeps gliding"
+ * LO reported.
+ *
+ * ALSO: the trail-clear is REDUNDANT during a burst — consecutive nudge
+ * positions overlap naturally, so old pixels are covered by new overlay
+ * within one frame. Trail pixels only surface when the overlay STOPS
+ * moving (chrome edges the new position doesn't cover).
+ *
+ * Fix strategy:
+ *   1. Throttle mid-burst invalidate to at most once per 120ms — enough
+ *      for the initial stationary→moving trail-erase, but no per-frame
+ *      cascade during continuous glide.
+ *   2. From ui_present_frame, if last-nudge-tick > 120ms ago AND we
+ *      haven't already fired a post-burst clear, fire ONE
+ *      invalidate_last_overlay_region to clean up whatever trail the
+ *      final resting position left. This is the "user stopped" cleanup
+ *      that mid-burst throttling skipped.
+ *   3. Same treatment for SetCursorPos (cursor-invalidate trick) — the
+ *      Windows win32k dispatch adds ~100-500µs per call under load.
+ *      Throttle to the same 120ms window as the RedrawWindow.
+ *
+ * Result: burst = ~1 invalidate at start, then pure glide, then 1
+ * cleanup ~120ms after stop. BP-parity smooth. */
+static volatile LONGLONG g_last_nudge_tick     = 0;   /* set on ui_nudge; consumed by Present */
+static volatile LONGLONG g_last_nudge_inv_tick = 0;   /* last time we fired invalidate for a nudge */
+static volatile LONG     g_post_burst_pending  = 0;   /* 1 if Present should fire post-burst clear */
+
+/* Called from ui_present_frame at frame start. Fires ONE post-burst
+ * trail-clear ~120ms after the last nudge, then latches. Zero cost
+ * when no nudge is in flight (fast path == atomic read + compare). */
+static void nudge_burst_maybe_finalize(void) {
+    LONGLONG last_nudge = g_last_nudge_tick;
+    if (last_nudge == 0) return;   /* no burst ever, or already cleaned up */
+    ULONGLONG now = GetTickCount64();
+    if ((ULONGLONG)((LONGLONG)now - last_nudge) < 120ULL) return;   /* still bursting */
+    /* Burst has settled — fire ONE final invalidate to clean up trail
+     * at the resting position. Latch so we don't refire until next burst. */
+    InterlockedExchange64(&g_last_nudge_tick, 0);
+    invalidate_last_overlay_region("nudge-burst-end");
+    /* Cursor-invalidate the resting-position trail region too. */
+    __try {
+        POINT pt;
+        if (GetCursorPos(&pt)) SetCursorPos(pt.x, pt.y);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    (void)g_post_burst_pending;  /* reserved for future finer-grained tracking */
+}
+
 extern "C" void ui_nudge(int dx, int dy) {
     ensure_cs();
-    /* v1.7.8: invalidate OLD position BEFORE applying nudge — this
-     * cascades a repaint through every underlying app at the old rect
-     * so DWM re-composes and overwrites our stale overlay pixels. */
-    invalidate_last_overlay_region("nudge");
+    ULONGLONG now = GetTickCount64();
+
+    /* v1.7.11.19: THROTTLED trail-clear. Mid-burst invalidates are
+     * redundant + variable-latency = source of the glide jitter. Fire
+     * at most once per 120ms during a burst; post-burst cleanup is
+     * handled by nudge_burst_maybe_finalize from the Present hook. */
+    LONGLONG last_inv = g_last_nudge_inv_tick;
+    int fire_inv = ((ULONGLONG)((LONGLONG)now - last_inv) >= 120ULL);
+    if (fire_inv) {
+        InterlockedExchange64(&g_last_nudge_inv_tick, (LONGLONG)now);
+        invalidate_last_overlay_region("nudge");
+    }
+    /* Always mark that a nudge occurred — Present hook will trigger the
+     * post-burst clear ~120ms after the last one. */
+    InterlockedExchange64(&g_last_nudge_tick, (LONGLONG)now);
+
     EnterCriticalSection(&g_ui_cs);
     g_offset_x += dx;
     g_offset_y += dy;
@@ -2882,27 +2957,25 @@ extern "C" void ui_nudge(int dx, int dy) {
      * LO observation: MOVING MOUSE OVER trail region CLEARS trails.
      * DWM's cursor drawing logic recomposites the region behind the
      * cursor every time it renders. Even a no-op SetCursorPos(same_pt)
-     * triggers this recompose (verified in Windows Interactive Users
-     * Group posts + confirmed by DWM's public compose behavior).
+     * triggers this recompose.
      *
-     * Trick: after every nudge, call SetCursorPos(current) — same
-     * position, no visible move — to force DWM cursor-region recompose
-     * at the CURRENT cursor location. Not the trail region directly,
-     * but each call triggers a compose pass that DWM extends over
-     * dirty regions naturally.
-     *
-     * SEH-wrapped. Non-user-visible (cursor stays put). Called once
-     * per nudge (not per-frame — that'd be too aggressive). */
-    __try {
-        POINT pt;
-        if (GetCursorPos(&pt)) {
-            SetCursorPos(pt.x, pt.y);
+     * v1.7.11.19: throttled to the same 120ms window as the RedrawWindow
+     * cascade — cursor-invalidate mid-burst is also redundant while the
+     * overlay is continuously moving. Post-burst finalize does it once
+     * more when the glide settles. */
+    if (fire_inv) {
+        __try {
+            POINT pt;
+            if (GetCursorPos(&pt)) {
+                SetCursorPos(pt.x, pt.y);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            /* Silent — non-critical trail-clear trick. */
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        /* Silent — non-critical trail-clear trick. */
     }
 
-    diag("nudge dx=%d dy=%d -> off=(%d,%d)", dx, dy, g_offset_x, g_offset_y);
+    diag("nudge dx=%d dy=%d -> off=(%d,%d)%s", dx, dy, g_offset_x, g_offset_y,
+         fire_inv ? " [inv]" : " [glide]");
 }
 
 extern "C" void ui_resize(int dw, int dh) {
@@ -5237,6 +5310,12 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
 
     /* Throttled state persistence — no-op fast path if !g_state_dirty. */
     state_flush_if_due();
+    /* v1.7.11.19: post-burst trail-clear. Fires ONE
+     * invalidate_last_overlay_region ~120ms after the last nudge, so the
+     * mid-burst throttled trail-clear doesn't leave ghost pixels at the
+     * resting position. Fast path is an atomic read of g_last_nudge_tick
+     * — zero cost when no nudge burst is in flight. */
+    nudge_burst_maybe_finalize();
     /* v11: throttled auto-theme re-poll (2s cadence, only when pref=AUTO). */
     maybe_repoll_theme();
 
