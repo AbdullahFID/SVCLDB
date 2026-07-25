@@ -26,6 +26,9 @@
 #include <stdio.h>
 #include <stdarg.h>
 
+/* v1.7.11.11 — extern for conditional-consume in copy-hotkey path. */
+extern int ui_has_reply(void);
+
 /* ── Constants (avoid pulling in whole winuser structs) ─────────── */
 #define WORKER_CLASS_NAME  L"MSDiagEventSink"
 #define RIDEV_INPUTSINK    0x00000100
@@ -670,6 +673,12 @@ static void attach_to_input_desktop(void) {
     /* Intentionally leak hd — thread lifetime == process lifetime. */
 }
 
+/* Forward decl — g_consumed_vk / g_consumed_vk_slot are defined further
+ * down (~line 883) as file-scope statics maintained by the LL keyboard
+ * hook. poll_thread uses them as the CANONICAL "is-held" source (v1.7.11.7). */
+static volatile LONG g_consumed_vk[256];
+static volatile LONG g_consumed_vk_slot[256];
+
 /* ── Poll thread (reliable delivery path) ──────────────────────── *
  * Polls every 16 ms. For each configured hotkey, tracks "was matched last
  * poll" so we edge-trigger on the down-transition. Also emits a periodic
@@ -750,29 +759,57 @@ static DWORD WINAPI poll_thread(LPVOID param) {
             /* MULTITAP / DISABLED: no poll-thread work (LL hook only). */
             if (kind != SVC_HK_KIND_MODIFIER) continue;
 
-            /* MODIFIER kind — original poll behavior. */
+            /* MODIFIER kind — CANONICAL-STATE poll behavior.
+             *
+             * v1.7.11.7 (2026-07-25) — REAL fix for the chaotic-hotkey
+             * bug that v1.7.11.5 introduced.
+             *
+             * Root cause: GetAsyncKeyState is DOCUMENTED as UNRELIABLE
+             * in DWM's process context (see comments ~line 109 same
+             * file). Continuous-fire based on that returns wrong keys,
+             * stuck states, missed releases. Symptoms LO reported:
+             *   - Ctrl+Right fires slot 5 (LEFT) instead of slot 6
+             *   - overlay keeps sliding after user releases keys
+             *   - dead hotkeys (Ctrl+Alt+X not responding)
+             *
+             * Fix: derive is_key from the LL hook's CANONICAL state.
+             * LL hook maintains g_consumed_vk[vk] (set on KEY_DOWN
+             * consume, cleared on KEY_UP). That's the same event
+             * stream Windows itself dispatches — 100% accurate.
+             *
+             * Behavior:
+             *   - EDGE: LL hook already fires on first KEY_DOWN.
+             *   - HELD-REPEAT: poll thread sees g_consumed_vk[vk]==1
+             *     for our slot, fires at 60Hz (debounce = 16ms) until
+             *     LL clears g_consumed_vk on KEY_UP. Zero Windows-
+             *     keyboard-repeat 500ms delay. Kills the "small
+             *     delay before overlay moves" LO reported.
+             *   - RELEASE: LL clears g_consumed_vk instantly on
+             *     KEY_UP; next poll sees not-held, stops firing.
+             *     No stuck-key state possible. */
             unsigned target_vk  = SVC_HK_VK(g_hk[i]);
             unsigned target_mod = SVC_HK_EXTRA(g_hk[i]);
-            if (target_vk == 0) { prev_down[i] = 0; continue; }
-            int is_key = (GetAsyncKeyState(target_vk) & 0x8000) != 0;
-            if (is_key) any_target_vk_events++;
-            int want_ctrl  = (target_mod & SVC_HK_MOD_CTRL)  != 0;
-            int want_shift = (target_mod & SVC_HK_MOD_SHIFT) != 0;
-            int want_alt   = (target_mod & SVC_HK_MOD_ALT)   != 0;
-            int match = is_key
-                && (want_ctrl  == is_ctrl)
-                && (want_shift == is_shift)
-                && (want_alt   == is_alt);
-            /* Near-match: target vk down but mods wrong. Great for diag. */
-            if (is_key && !match) {
-                any_near_matches++;
+            (void)target_mod;  /* mod validation happens inside LL hook */
+            if (target_vk == 0 || target_vk >= 256) { prev_down[i] = 0; continue; }
+
+            /* Diag: still use GetAsyncKeyState for observability only. */
+            if ((GetAsyncKeyState(target_vk) & 0x8000) != 0) any_target_vk_events++;
+
+            /* CANONICAL: this slot holds this vk iff LL hook granted
+             * ownership via KEY_DOWN + slot-mod-match. Cleared on UP. */
+            int slot_holds = g_consumed_vk[target_vk] &&
+                             (g_consumed_vk_slot[target_vk] == i);
+
+            if (slot_holds) {
+                int is_repeat = g_repeat_allowed[i];
+                if (!prev_down[i] || is_repeat) {
+                    if (fire(i))
+                        rin_diag("POLL fired slot=%d vk=0x%02X %s",
+                                 i, target_vk,
+                                 prev_down[i] ? "(held-repeat)" : "(edge)");
+                }
             }
-            if (match && !prev_down[i]) {
-                if (fire(i))
-                    rin_diag("POLL fired slot=%d vk=0x%02X mod=0x%X",
-                             i, target_vk, target_mod);
-            }
-            prev_down[i] = match;
+            prev_down[i] = slot_holds;
         }
         poll_count++;
         DWORD now = GetTickCount();
@@ -1091,6 +1128,26 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
             for (int i = 0; i < SVC_HK_COUNT; i++) {
                 if (SVC_HK_KIND(g_hk[i]) != SVC_HK_KIND_MODIFIER) continue;
                 if (match_hk_mod(g_hk[i], vk, is_ctrl, is_shift, is_alt)) {
+                    /* v1.7.11.11 (2026-07-25) — CONDITIONAL-CONSUME for copy
+                     * hotkeys. Prior: LL hook consumed Ctrl+C
+                     * unconditionally for SVC_HK_COPY_REPLY slot even when
+                     * no AI reply existed to copy. Result: user's Ctrl+C
+                     * in Chrome/anywhere got eaten + no copy happened →
+                     * "copy is broken" per LO report.
+                     *
+                     * Fix: for the 3 copy slots, if there's no reply to
+                     * copy, DON'T consume this Ctrl+C event — let it fall
+                     * through to the focused app so user's normal copy
+                     * still works. Only intercept when there's actually
+                     * something for us to copy. */
+                    if ((i == SVC_HK_COPY_REPLY ||
+                         i == SVC_HK_COPY_ANSWER ||
+                         i == SVC_HK_COPY_CODE) &&
+                        !ui_has_reply()) {
+                        /* No reply → don't consume, don't fire → user's
+                         * Ctrl+C reaches Chrome/Word/etc as normal. */
+                        continue;
+                    }
                     if (vk < 256) {
                         InterlockedExchange(&g_consumed_vk[vk], 1);
                         InterlockedExchange(&g_consumed_vk_slot[vk], i);

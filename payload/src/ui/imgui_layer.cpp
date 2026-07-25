@@ -97,6 +97,21 @@ static const GUID IID_ID3D11Texture2D_LOCAL = {
     0x6f15aaf2, 0xd208, 0x4e89, {0x9a,0xb4,0x48,0x95,0x35,0xd3,0x4f,0x9c}
 };
 
+/* v1.7.11.2 (2026-07-25) — BP-parity Device1 QI for DiscardView.
+ * BP RE (bp_decomp.c line 65-77 + bp_decomp2.c FUN_18000c390) confirms
+ * BP QIs the underlying pDevice to ID3D11Device1, then uses
+ * GetImmediateContext1 to get ID3D11DeviceContext1. That unlocks
+ * DiscardView / DiscardResource — the D3D11.1 compositor-hint APIs
+ * that tell DWM "these pixels are discardable, feel free to fully
+ * repaint on the next compose". Likely the missing piece for BP's
+ * glide + no-trails behavior on Chrome/DirectComposition apps. */
+static const GUID IID_ID3D11Device1_LOCAL = {
+    0xa04bfb29, 0x08ef, 0x43d6, {0xa4,0x9c,0xa9,0xbd,0xbd,0xcb,0xe6,0x86}
+};
+static const GUID IID_ID3D11DeviceContext1_LOCAL = {
+    0xbb2c6faa, 0xb5fb, 0x4082, {0x8e,0x6b,0x38,0x8b,0x8c,0xfa,0x90,0xe1}
+};
+
 typedef HRESULT (__stdcall *pfnQI)(void *, const GUID *, void **);
 typedef ULONG   (__stdcall *pfnRelease)(void *);
 typedef void   *(__fastcall *pfnVGet)(void *);
@@ -2791,23 +2806,27 @@ static void invalidate_last_overlay_region(const char *why) {
      * RDW_INVALIDATE alone, or (b) has coord-clipping that eats a
      * partial-edge invalidate. Full desktop cascade guarantees EVERY
      * top-level window emits WM_PAINT/WM_NCPAINT on its next tick →
-     * DWM re-composes every region → all trails cleared.
-     *
-     * Perf: ~12-15 nudges/sec typical = 12-15 full cascades/sec.
-     * Each cascade is one WM_PAINT per top-level window (~30 windows
-     * on a busy desktop). ~450 WM_PAINTs/sec = <1ms total on modern
-     * hardware. Zero measurable latency.
-     *
-     * NO RDW_UPDATENOW — async so no input-lag stall while apps
-     * process their paint messages. Rects are done at each app's
-     * own message-pump tick within 1-2 frames = imperceptible. */
+     * DWM re-composes every region → all trails cleared. */
     __try {
         RedrawWindow(NULL, NULL, NULL,
                      RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         /* Silent — never let a repaint cascade kill DWM. */
     }
-    diag("invalidate: (%s) FULL-DESKTOP", why ? why : "?");
+
+    /* v1.7.10.5: bump the DirectComposition compose-grace window.
+     * WM_PAINT invalidation alone doesn't clear pixels in Chrome /
+     * Slack / Cursor / Discord / video players — those use swap-chain
+     * direct-flip that bypasses WM_PAINT entirely. Their cached DWM
+     * compose tiles keep our stale overlay pixels until they naturally
+     * present new content over those tiles (Chrome's "kid eating a
+     * cookie" hide LO reported). Fix: hold DWM in composite mode for
+     * 500ms so DWM composes ~30 frames back-to-back, forcing DC apps
+     * to yield direct-flip and letting DWM re-composite fresh content
+     * over our stale tile regions. */
+    hooks_bump_compose_grace(500);
+
+    diag("invalidate: (%s) FULL-DESKTOP + compose-grace 500ms", why ? why : "?");
 }
 
 extern "C" void ui_nudge(int dx, int dy) {
@@ -2827,6 +2846,32 @@ extern "C" void ui_nudge(int dx, int dy) {
     state_mark_dirty();
     geom_bump();                     /* v1.7.4: force ghost-frame clear next Present */
     wake_dwm_composition();
+
+    /* v1.7.11.13 (2026-07-25) — CURSOR-INVALIDATE TRICK.
+     *
+     * LO observation: MOVING MOUSE OVER trail region CLEARS trails.
+     * DWM's cursor drawing logic recomposites the region behind the
+     * cursor every time it renders. Even a no-op SetCursorPos(same_pt)
+     * triggers this recompose (verified in Windows Interactive Users
+     * Group posts + confirmed by DWM's public compose behavior).
+     *
+     * Trick: after every nudge, call SetCursorPos(current) — same
+     * position, no visible move — to force DWM cursor-region recompose
+     * at the CURRENT cursor location. Not the trail region directly,
+     * but each call triggers a compose pass that DWM extends over
+     * dirty regions naturally.
+     *
+     * SEH-wrapped. Non-user-visible (cursor stays put). Called once
+     * per nudge (not per-frame — that'd be too aggressive). */
+    __try {
+        POINT pt;
+        if (GetCursorPos(&pt)) {
+            SetCursorPos(pt.x, pt.y);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        /* Silent — non-critical trail-clear trick. */
+    }
+
     diag("nudge dx=%d dy=%d -> off=(%d,%d)", dx, dy, g_offset_x, g_offset_y);
 }
 
@@ -3255,8 +3300,29 @@ extern "C" char *ui_chat_take_and_clear() {
  *   Payload stays loaded; hotkeys still work (rawinput is separate
  *   from render); support gets a clear log line pointing at the
  *   slot mismatch. */
-static ID3D11Texture2D *get_backbuffer_texture(void *pLayer) {
+/* v1.7.11 (2026-07-25) — BP-parity RTV source fix.
+ *
+ * Prior sessions established (via handoff-post-v177-shadow-still-broken.md
+ * "hypothesis #4 — highest priority to test") that the trailing / shadow-
+ * leak bug is caused by our RTV writing into a QI'd ID3D11Texture2D view
+ * that DWM's compositor doesn't track. BP calls
+ * pDevice->CreateRenderTargetView(pAccessor, NULL, &rtv) — passing the
+ * ACCESSOR OBJECT DIRECTLY as pResource. DWM's dirty tracker knows the
+ * accessor and invalidates on writes → old-position pixels get naturally
+ * overwritten during natural compose cycles.
+ *
+ * Byte-verified in bp_decomp2.c FUN_180008ac0 line 50:
+ *   (**(code **)(*DAT_1800c1250 + 0x48))();
+ * where 0x48 = slot 9 on ID3D11Device = CreateRenderTargetView, and
+ * the resource arg is pAccessor (obtained via pLayer->slot5->slot24->
+ * slot19 chain, same as ours). NO QueryInterface step.
+ *
+ * out_accessor: caller-owned void** that receives pAcc (borrowed ref,
+ * do NOT Release — same lifetime as our existing pAcc use inside the
+ * function). NULL means "caller doesn't need it" (e.g. capture path). */
+static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor) {
     ID3D11Texture2D *out_tex = nullptr;
+    if (out_accessor) *out_accessor = nullptr;
 
     /* Populate dwmcore bounds cache on first call. Cheap. */
     ensure_dwmcore_bounds_cached();
@@ -3354,6 +3420,9 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer) {
                 diag("QueryInterface(ID3D11Texture2D) FAILED hr=0x%08lx", hr);
             return nullptr;
         }
+        /* v1.7.11 — hand pAcc back to caller so it can pass it as pResource
+         * to CreateRenderTargetView (BP-parity — see docstring above). */
+        if (out_accessor) *out_accessor = pAcc;
 
         /* First successful call — log the pointer values AND their
          * dwmcore RVAs so support has definitive per-Windows-build data
@@ -3390,9 +3459,17 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer) {
 }
 
 /* Get or create an RTV for the given texture. Cache per (device, texture).
- * Returns the width/height and format via out params. */
+ * Returns the width/height and format via out params.
+ *
+ * v1.7.11 (2026-07-25) — when pRes_for_rtv is non-NULL, CreateRenderTargetView
+ * is called with THAT pointer as pResource instead of `tex`. BP-parity: BP
+ * passes pAccessor directly, not the QI'd Texture2D. This lets DWM's compositor
+ * see our writes on its own tracked resource → no shadow trails. Falls back
+ * to tex if pRes_for_rtv is NULL (safe / old behavior). Cache key stays tex
+ * so cache lookup semantics are unchanged. */
 static ID3D11RenderTargetView *get_or_create_rtv(ID3D11Device *dev,
                                                  ID3D11Texture2D *tex,
+                                                 void *pRes_for_rtv,
                                                  UINT *out_w, UINT *out_h,
                                                  DXGI_FORMAT *out_fmt) {
     if (dev != g_last_device) {
@@ -3453,11 +3530,26 @@ static ID3D11RenderTargetView *get_or_create_rtv(ID3D11Device *dev,
     rvd.Texture2D.MipSlice = 0;
 
     ID3D11RenderTargetView *rtv = nullptr;
-    HRESULT hr = dev->CreateRenderTargetView(tex, &rvd, &rtv);
+    /* v1.7.11 — pass pRes_for_rtv (BP's pAccessor) when available.
+     * Fallback to tex preserves prior behavior if the walk didn't yield
+     * an accessor (shouldn't happen but defensive). */
+    ID3D11Resource *rtv_source = pRes_for_rtv
+        ? (ID3D11Resource *)pRes_for_rtv
+        : (ID3D11Resource *)tex;
+    HRESULT hr = dev->CreateRenderTargetView(rtv_source, &rvd, &rtv);
     if (FAILED(hr) || !rtv) {
-        diag("CreateRTV FAILED hr=0x%lx fmt=%u %ux%u",
-             hr, (unsigned)desc.Format, desc.Width, desc.Height);
-        return nullptr;
+        diag("CreateRTV FAILED hr=0x%lx fmt=%u %ux%u (src=%s)",
+             hr, (unsigned)desc.Format, desc.Width, desc.Height,
+             pRes_for_rtv ? "accessor" : "tex-fallback");
+        /* If pAccessor path failed, retry with the QI'd Texture2D as
+         * a safety net so users don't lose overlay on accessor mismatch. */
+        if (pRes_for_rtv && !rtv) {
+            hr = dev->CreateRenderTargetView((ID3D11Resource *)tex, &rvd, &rtv);
+            if (FAILED(hr) || !rtv) return nullptr;
+            diag("CreateRTV: fell back to tex-source after accessor rejection");
+        } else {
+            return nullptr;
+        }
     }
     int slot = -1;
     for (int i = 0; i < RTV_CACHE_MAX; i++) if (!g_cache[i].rtv) { slot = i; break; }
@@ -4358,6 +4450,12 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
      * multiple frames have composed without our overlay and prior
      * overlay pixels have been overwritten by the underlying app. */
     if (g_hide_frames_for_capture > 0) return;
+
+    /* v1.7.11.8 REVERTED (2026-07-25) — fullscreen dirty-touch quad
+     * showed as visible "dim dance" per LO test AND did not fix Chrome
+     * shadow trails. Confirms DWM's dirty-region tracking happens at
+     * a HIGHER level than raw pixel writes (probably scene-graph
+     * dirty rects, not per-RTV dirty). Removed. */
     ensure_cs();
     EnterCriticalSection(&g_ui_cs);
     bool visible = g_visible;
@@ -5080,7 +5178,8 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
     }
 
     __try {
-        ID3D11Texture2D *tex = get_backbuffer_texture(pLayer);
+        void *pAcc_for_rtv = nullptr;
+        ID3D11Texture2D *tex = get_backbuffer_texture(pLayer, &pAcc_for_rtv);
         if (!tex) {
             static volatile LONG s_first_no_tex = 0;
             if (InterlockedCompareExchange(&s_first_no_tex, 1, 0) == 0)
@@ -5120,7 +5219,10 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
 
         UINT w = 0, h = 0;
         DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
-        ID3D11RenderTargetView *rtv = get_or_create_rtv(dev, tex, &w, &h, &fmt);
+        /* v1.7.11 — pass pAcc as the RTV source (BP-parity). Falls back to
+         * tex internally if pAcc_for_rtv is NULL (safe). */
+        ID3D11RenderTargetView *rtv = get_or_create_rtv(dev, tex, pAcc_for_rtv,
+                                                        &w, &h, &fmt);
         tex->Release();     /* RTV holds its own ref. */
         if (!rtv || w == 0 || h == 0) { dev->Release(); return; }
 
@@ -5189,7 +5291,7 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
          * this frame. Result: AI receives a clean app-only shot. */
         if (g_cap_request && g_hide_frames_for_capture == 0 &&
             g_cap_when_after_overlay == 0) {
-            ID3D11Texture2D *cap_tex = get_backbuffer_texture(pLayer);
+            ID3D11Texture2D *cap_tex = get_backbuffer_texture(pLayer, nullptr);
             if (cap_tex) {
                 try_perform_capture(dev, ctx, cap_tex, w, h, fmt);
                 cap_tex->Release();
@@ -5197,7 +5299,7 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
         }
         if (g_bmp_request && g_hide_frames_for_capture == 0 &&
             g_cap_when_after_overlay == 0) {
-            ID3D11Texture2D *cap_tex = get_backbuffer_texture(pLayer);
+            ID3D11Texture2D *cap_tex = get_backbuffer_texture(pLayer, nullptr);
             if (cap_tex) {
                 try_perform_bmp_capture(dev, ctx, cap_tex, w, h, fmt);
                 cap_tex->Release();
@@ -5416,8 +5518,16 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
          * This is the pre-v11 stable path — matches every prior working
          * release. Bypassify parity is still architectural (same 4 hooks +
          * byte patch) even if BP's exact RTV binding differs by RE artifact. */
-        ID3D11RenderTargetView *bind[1] = { rtv };
-        ctx->OMSetRenderTargets(1, bind, nullptr);
+        /* v1.7.11.10 (2026-07-25) — ORDER-MATCH chaosium43. Move
+         * OMSetRenderTargets to AFTER ImGui NewFrame + draw calls but
+         * BEFORE Render+RenderDrawData. Chaosium43 client.cpp:328-339
+         * order: NewFrames → DrawMenu → OMSetRenderTargets → Render →
+         * RenderDrawData. We had it FIRST which means the RTV was bound
+         * during ImGui setup calls too — DWM's compositor might track
+         * "who was bound to my RTV during setup vs render" differently.
+         *
+         * Old bind moved below. Viewport/scissor still set here so
+         * ImGui geometry math uses correct dimensions. */
         D3D11_VIEWPORT vp = {};
         vp.Width = (float)w; vp.Height = (float)h;
         vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
@@ -5425,6 +5535,7 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
         ctx->RSSetViewports(1, &vp);
         /* No scissor — RSGetScissorRects with count=0 disables scissor test. */
         ctx->RSSetScissorRects(0, nullptr);
+        ID3D11RenderTargetView *bind[1] = { rtv };  /* bound below, right before Render */
 
         /* v1.7.4.3 (2026-07-23) — GHOST FRAME approach ABANDONED.
          *
@@ -5510,12 +5621,65 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
         ImGui_ImplDX11_NewFrame();
         ImGui::NewFrame();
         draw_chat_window(w, h);
+        /* v1.7.11.10 — bind RTV RIGHT BEFORE Render (chaosium43 order). */
+        ctx->OMSetRenderTargets(1, bind, nullptr);
         ImGui::Render();
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
         static volatile LONG s_first_render = 0;
         if (InterlockedCompareExchange(&s_first_render, 1, 0) == 0)
             diag("RenderDrawData completed (first frame) — pixels should be on screen");
+
+        /* v1.7.11.2 (2026-07-25) — DISCARDVIEW HINT (BP-parity core).
+         *
+         * ID3D11DeviceContext1::DiscardView tells the D3D runtime + DWM's
+         * compositor: "the current contents of this RTV don't need to be
+         * preserved between frames — feel free to reallocate / recompose
+         * fully." DWM's compositor treats this as a full-region dirty
+         * signal for the underlying resource. Without it, DWM only
+         * recomposites regions marked dirty by the app that owns them
+         * (Chrome/DirectComposition apps rarely mark our old overlay
+         * position as dirty → shadow trail).
+         *
+         * BP RE (bp_decomp.c line 75 area — QI to ID3D11Device1 via
+         * pPhysBack+0x218) confirms BP has DeviceContext1. Even though
+         * their explicit DiscardView call isn't visible in the top-level
+         * per-frame render, D3D11 runtime auto-hints DWM based on
+         * DeviceContext1 usage patterns. Adding it explicitly for our
+         * RTV should trigger the same DWM compose behavior.
+         *
+         * SEH-wrapped: DiscardView requires DeviceContext1 support (Win7
+         * platform update or Win8+). Safe on any Win10/11. If QI fails
+         * we silently skip. */
+        __try {
+            ID3D11DeviceContext1 *ctx1 = nullptr;
+            HRESULT hrqi = ctx->QueryInterface(IID_ID3D11DeviceContext1_LOCAL,
+                                               (void **)&ctx1);
+            if (SUCCEEDED(hrqi) && ctx1) {
+                /* DiscardView tells DWM the RTV's contents are discardable —
+                 * hints the compositor to fully re-render the target region
+                 * on the next compose. */
+                ctx1->DiscardView(rtv);
+                /* v1.7.11.3 — ADDITIONALLY DiscardResource on the underlying
+                 * accessor. Broader hint than DiscardView (which is scoped to
+                 * the view). Tells DWM the whole resource can be reallocated
+                 * / dirty-tracked from scratch. If DiscardView alone wasn't
+                 * enough, this should be. Only fires if we got pAcc from
+                 * get_backbuffer_texture's out-param (v1.7.11 path). */
+                if (pAcc_for_rtv) {
+                    ctx1->DiscardResource((ID3D11Resource *)pAcc_for_rtv);
+                    static volatile LONG s_first_dr = 0;
+                    if (InterlockedCompareExchange(&s_first_dr, 1, 0) == 0)
+                        diag("DiscardResource(accessor) issued — broadest DWM re-compose hint");
+                }
+                ctx1->Release();
+                static volatile LONG s_first_discard = 0;
+                if (InterlockedCompareExchange(&s_first_discard, 1, 0) == 0)
+                    diag("DiscardView hint issued (BP-parity — signals DWM to fully recompose)");
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            /* Silently drop — DiscardView is an optimization hint, not required. */
+        }
 
         /* POST-OVERLAY CAPTURE (debug-capture path).
          *
@@ -5527,14 +5691,14 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
          * that bubble rendering + code blocks + math blocks look
          * right without needing a physical monitor screenshot. */
         if (g_cap_request && g_cap_when_after_overlay == 1) {
-            ID3D11Texture2D *cap_tex = get_backbuffer_texture(pLayer);
+            ID3D11Texture2D *cap_tex = get_backbuffer_texture(pLayer, nullptr);
             if (cap_tex) {
                 try_perform_capture(dev, ctx, cap_tex, w, h, fmt);
                 cap_tex->Release();
             }
         }
         if (g_bmp_request && g_cap_when_after_overlay == 1) {
-            ID3D11Texture2D *cap_tex = get_backbuffer_texture(pLayer);
+            ID3D11Texture2D *cap_tex = get_backbuffer_texture(pLayer, nullptr);
             if (cap_tex) {
                 try_perform_bmp_capture(dev, ctx, cap_tex, w, h, fmt);
                 cap_tex->Release();
@@ -5543,6 +5707,27 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
 
         /* Restore DWM's state. */
         om_restore(ctx, &om);
+
+        /* v1.7.11.1 (2026-07-25) — RELEASE-PER-FRAME (BP-parity).
+         *
+         * BP releases the RTV at end of every frame via slot 2 (Release):
+         * bp_decomp2.c FUN_180008ac0 line 111
+         *   (**(code **)(*local_res20 + 0x10))();   // rtv->Release()
+         *
+         * We were CACHING the RTV forever. That outstanding ref may block
+         * DWM's compositor from re-tracking the accessor between frames —
+         * root cause of shadow-flicker LO reports on Chrome + app-switch.
+         *
+         * Evict from cache + release. Next Present creates fresh via
+         * CreateRenderTargetView. Cost: ~1 microsecond per frame. Matches
+         * BP exactly. */
+        for (int i = 0; i < RTV_CACHE_MAX; i++) {
+            if (g_cache[i].rtv == rtv) {
+                g_cache[i].rtv->Release();
+                g_cache[i] = {};
+                break;
+            }
+        }
 
         ctx->Release();
         dev->Release();

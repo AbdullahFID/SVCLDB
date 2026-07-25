@@ -167,6 +167,19 @@ void hooks_ghost_wake(void);
  * NEVER crashes DWM even on failure — SEH-wrapped internally. */
 int hooks_add_dirty_full(void);
 
+/* v1.7.10.5 — extend the DirectComposition compose-grace window by
+ * `ms` milliseconds. While within the grace window, PN detours force
+ * PN=TRUE + fire SCP even when overlay is hidden, holding DWM in
+ * composite mode long enough to clear stale tiles in DirectComposition
+ * apps (Chrome/Slack/Cursor/Discord/Electron/video players) that would
+ * otherwise leave "chunk-eaten" old-position pixels visible. Called
+ * from ui_toggle_visible / ui_nudge / ui_resize / etc — every path
+ * that changes what pixels should be on-screen. Cheap: atomic
+ * compare-exchange, no thread spawn, no allocation. Only extends
+ * the deadline, never shortens it (multiple rapid changes → grace
+ * covers the whole burst). */
+void hooks_bump_compose_grace(unsigned ms);
+
 #ifdef __cplusplus
 }
 #endif

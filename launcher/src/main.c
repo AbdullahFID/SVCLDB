@@ -454,7 +454,7 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
     cfg->hotkeys[SVC_HK_ASK]           = SVC_HK_PACK(MOD_C,   'U');       /*  0 Ctrl+U   Take Screenshot     */
     cfg->hotkeys[SVC_HK_TOGGLE]        = SVC_HK_PACK(MOD_C,   'B');       /*  1 Ctrl+B   Hide/Show Overlay   */
     cfg->hotkeys[SVC_HK_TYPING]        = SVC_HK_PACK(MOD_C,   'T');       /*  2 Ctrl+T   Text Input Mode     */
-    cfg->hotkeys[SVC_HK_COPY_REPLY]    = SVC_HK_PACK(MOD_C,   'C');       /*  3 Ctrl+C                       */
+    cfg->hotkeys[SVC_HK_COPY_REPLY]    = SVC_HK_PACK(MOD_C,   'C');       /*  3 Ctrl+C   (LO ask 2026-07-25 — user prefers Ctrl+C binding; clipboard-write bug is separate) */
     cfg->hotkeys[SVC_HK_CLEAR]         = SVC_HK_PACK(MOD_C,   'Q');       /*  4 Ctrl+Q   Quit                */
     cfg->hotkeys[SVC_HK_MOVE_LEFT]     = SVC_HK_PACK(MOD_C,   0x25);      /*  5 Ctrl+Left                    */
     cfg->hotkeys[SVC_HK_MOVE_RIGHT]    = SVC_HK_PACK(MOD_C,   0x27);      /*  6 Ctrl+Right                   */

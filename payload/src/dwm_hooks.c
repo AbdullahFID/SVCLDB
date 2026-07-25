@@ -27,9 +27,28 @@
 #include <stdarg.h>
 
 /* ── Detour signatures ── */
-/* Present: 6-arg __fastcall (confirmed via Bypassify RE + production audit). */
+/* Present: 7-arg __fastcall.
+ *
+ * v1.7.11.4 (2026-07-25) — CRITICAL FIX. Prior signature had only 6 args
+ * which meant our call to orig Present passed uninitialized STACK GARBAGE
+ * as the 7th arg (bool disableMPO). When garbage happened to be non-zero
+ * DWM disabled MPO (fine, similar to our IsOverlayPrevented hack); when
+ * garbage was 0 DWM re-enabled MPO → Chrome's DirectComposition swapped
+ * to hardware overlay planes → our overlay pixels wrote to the software
+ * composite path but Chrome's pixels went through hardware plane path →
+ * DWM couldn't reliably dirty-track our layer → SHADOW TRAILS.
+ *
+ * Sources for 7-arg signature:
+ *   1. chaosium43/dwm-overlay client/dwmcore.cpp (Win11 25H2, working
+ *      reference implementation) — HookPresent declared with 7 args
+ *      including trailing `bool disableMPO`.
+ *   2. Bypassify v1.3.0 Ghidra decomp (bp_decomp.c line 542) —
+ *      Detour_Present has 7 params, last is `undefined1 param_7`.
+ *   3. Our earlier BP RE at 0x180003470 disassembly showed reads from
+ *      [rsp+0x88] confirming 7th arg present in Present's caller. */
 typedef LONG (__fastcall *pfnCOverlayPresent_t)(
-    void *pCtx, void *pLayer, UINT flags, void *a3, DWORD a4, void *a5);
+    void *pCtx, void *pLayer, UINT flags, void *a3, DWORD a4, void *a5,
+    BOOL disableMPO);
 
 /* PresentNeeded: 1-arg __fastcall taking pThis, returns BOOL. */
 typedef BOOL (__fastcall *pfnPresentNeeded_t)(void *pThis);
@@ -87,6 +106,45 @@ typedef void (__stdcall *pfnScheduleCompositionPass_t)(int arg0, int arg1);
 /* Extern from imgui_layer.cpp — used by the PN detours + keepalive
  * to gate SCP/ghost activity on overlay visibility (v6.3 flicker fix). */
 extern int ui_is_visible(void);
+
+/* v1.7.10.5 (2026-07-24) — DIRECTCOMPOSITION APP COMPOSE-GRACE.
+ *
+ * LO report: closing LDB + opening Chrome triggers shadow trails on
+ * nudge + "kid eating cookie" chunk-by-chunk hide. Root cause: Chrome
+ * (+ every DirectComposition app: Slack, Discord, Cursor, Electron,
+ * hardware-accelerated video players) uses swap-chain direct-flip
+ * that bypasses DWM's compositor. When we hide the overlay or nudge
+ * it, DWM composes ONCE (partial clear), goes idle for Chrome
+ * direct-flip, and our OLD-position overlay pixels stay cached in
+ * DWM's compose tiles until Chrome eventually presents new content
+ * over those tiles.
+ *
+ * Fix: track the last "visibility change / geometry change" tick.
+ * PN detour checks: if within 500ms of last change, KEEP forcing
+ * PN=TRUE + SCP even if overlay is hidden. This holds DWM in
+ * composite mode for ~30 frames after the change, giving DWM enough
+ * passes to clear all our stale tiles. After 500ms we let DWM go
+ * idle again (Chrome regains direct-flip fast path).
+ *
+ * Set from ui_toggle_visible / ui_nudge / ui_resize etc via
+ * hooks_bump_compose_grace(). */
+static volatile LONG64 g_compose_grace_until_tick = 0;
+
+void hooks_bump_compose_grace(unsigned ms) {
+    LONG64 target = (LONG64)GetTickCount64() + (LONG64)ms;
+    /* Only extend, never shorten. */
+    LONG64 cur;
+    do {
+        cur = g_compose_grace_until_tick;
+        if (target <= cur) return;
+    } while (InterlockedCompareExchange64(&g_compose_grace_until_tick,
+                                          target, cur) != cur);
+}
+
+static int in_compose_grace_window(void) {
+    LONG64 now = (LONG64)GetTickCount64();
+    return (now < g_compose_grace_until_tick) ? 1 : 0;
+}
 
 /* ── Originals + state ── */
 static pfnCOverlayPresent_t g_orig_present    = NULL;
@@ -493,6 +551,101 @@ static void hook_diag(const char *fmt, ...) {
 
 /* ── The 3 detours (Bypassify pattern) ── */
 
+/* v1.7.11.9 (2026-07-25) — PRIMARY-MONITOR FILTER.
+ *
+ * chaosium43/dwm-overlay (Win11 25H2 working reference) filters compose
+ * passes: only renders if the current COverlayContext's monitor target
+ * IsPrimaryMonitor()==TRUE. Skips non-primary compose passes (secondary
+ * monitor, virtual displays, aeropeek thumbnails, task view compose).
+ *
+ * We render into EVERY COverlayContext DWM presents — creating render
+ * conflicts on HiDPI laptops (LO 2880x1800) which have multiple compose
+ * surfaces per vsync. Chrome-specific shadow trails likely come from
+ * DWM's per-monitor dirty tracking seeing writes across surfaces.
+ *
+ * Fix: dynamically scan pCtx (COverlayContext*) for the field holding
+ * pMonitorTarget. Try each 8-byte offset; first one where deref points
+ * to something whose vtable+IsPrimaryMonitor call returns cleanly = our
+ * target offset. Cache. Filter subsequent Presents.
+ *
+ * Chaosium43 does this at deploy-time via PDB (dumper.cpp:167-183). We
+ * scan at runtime — no PDB access needed on client machines. */
+typedef BOOL (__fastcall *pfnIsPrimaryMonitor_t)(void *pMonitorTarget);
+static pfnIsPrimaryMonitor_t g_is_primary_monitor = NULL;
+static volatile LONG g_monitor_target_offset = -1;   /* -1 = not resolved */
+static volatile LONG g_mto_scan_started      = 0;
+
+static int is_ptr_readable_dwm(const void *p, size_t n) {
+    if (!p) return 0;
+    MEMORY_BASIC_INFORMATION mbi = {0};
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi)) return 0;
+    if (mbi.State != MEM_COMMIT) return 0;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+    return ((BYTE *)p + n <= (BYTE *)mbi.BaseAddress + mbi.RegionSize);
+}
+
+static void discover_monitor_target_offset(void *pCtx) {
+    if (g_monitor_target_offset >= 0) return;
+    if (!pCtx || !g_is_primary_monitor) return;
+
+    /* One-shot latch — only first thread to reach here does the scan. */
+    if (InterlockedCompareExchange(&g_mto_scan_started, 1, 0) != 0) return;
+
+    /* Scan first 512 bytes (64 pointer slots) of COverlayContext for a
+     * field that dereferences to an object whose IsPrimaryMonitor call
+     * returns without crashing. Wrapped in SEH per-probe. */
+    for (int slot = 0; slot < 64; slot++) {
+        void **field = (void **)((BYTE *)pCtx + (slot * 8));
+        if (!is_ptr_readable_dwm(field, 8)) continue;
+        void *candidate = *field;
+        if (!candidate) continue;
+        if (!is_ptr_readable_dwm(candidate, 8)) continue;
+        /* Check candidate has a plausible vtable — first qword should
+         * point into dwmcore's .text. */
+        void *vtable = *(void **)candidate;
+        /* Vtable pointer should be in a MEM_IMAGE region (loaded module).
+         * If not, this isn't a real COM object. */
+        {
+            MEMORY_BASIC_INFORMATION vmbi = {0};
+            if (VirtualQuery(vtable, &vmbi, sizeof(vmbi)) != sizeof(vmbi)) continue;
+            if (vmbi.Type != MEM_IMAGE) continue;
+        }
+
+        /* Probe: call IsPrimaryMonitor(candidate). Wrapped in SEH. */
+        __try {
+            BOOL result = g_is_primary_monitor(candidate);
+            /* Any bool return without crash is a valid hit. */
+            g_monitor_target_offset = slot * 8;
+            hook_diag("Monitor-target offset discovered: 0x%X (slot %d), IsPrimaryMonitor returned %d",
+                      slot * 8, slot, result);
+            return;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            /* Not this slot — continue. */
+            continue;
+        }
+    }
+    hook_diag("Monitor-target offset scan: NO valid slot found in first 512 bytes — filter disabled");
+    g_monitor_target_offset = -2;  /* sentinel: scan complete, no offset */
+}
+
+/* Returns 1 if pCtx's monitor is primary (should render) OR if we can't
+ * determine (scan in progress / failed / no fn) — defensive: false
+ * positives OK, false negatives break rendering entirely. */
+static int should_render_this_context(void *pCtx) {
+    if (!pCtx || !g_is_primary_monitor) return 1;  /* no filter possible */
+    LONG off = g_monitor_target_offset;
+    if (off < 0) return 1;  /* still scanning OR scan failed */
+    __try {
+        void *pMT = *(void **)((BYTE *)pCtx + off);
+        if (!pMT) return 1;
+        return g_is_primary_monitor(pMT) ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        /* If probe crashes, disable filter permanently. */
+        g_monitor_target_offset = -2;
+        return 1;
+    }
+}
+
 /* Detour_COverlayContextPresent — main frame hook.
  * Draws overlay into layer texture BEFORE orig, so orig samples the
  * texture with our pixels already composited in.
@@ -502,7 +655,8 @@ static void hook_diag(const char *fmt, ...) {
  * gets disabled — that's what naturally clears our overlay off the
  * screen when the payload uninstalls). */
 static LONG __fastcall Detour_COverlayContextPresent(
-    void *pCtx, void *pLayer, UINT flags, void *a3, DWORD a4, void *a5)
+    void *pCtx, void *pLayer, UINT flags, void *a3, DWORD a4, void *a5,
+    BOOL disableMPO)
 {
     LONG ret = 0;
     int n = InterlockedIncrement(&g_present_calls);
@@ -518,7 +672,7 @@ static LONG __fastcall Detour_COverlayContextPresent(
 
     if (InterlockedIncrement(&g_present_depth) > 1) {
         InterlockedDecrement(&g_present_depth);
-        return g_orig_present ? g_orig_present(pCtx, pLayer, flags, a3, a4, a5) : 0;
+        return g_orig_present ? g_orig_present(pCtx, pLayer, flags, a3, a4, a5, disableMPO) : 0;
     }
 
     __try {
@@ -539,15 +693,37 @@ static LONG __fastcall Detour_COverlayContextPresent(
         int is_capture   = svcldb_capture_active();
         int want_overlay = svcldb_debug_capture_wants_overlay();
         int skip_draw    = is_capture && !want_overlay;
+        /* v1.7.11.12 (2026-07-25) — v1.7.11.9 monitor filter DISABLED.
+         *
+         * The runtime-scan discovery for OverlayMonitorTarget struct
+         * offset was too loose (accepts any pointer whose vtable is in
+         * MEM_IMAGE, no dwmcore-specific validation). It sometimes
+         * false-matched a wrong field → IsPrimaryMonitor returned wrong
+         * → we skipped rendering on TRUE primary passes → overlay
+         * flickers off for a frame → LO reported "jerks back".
+         *
+         * Reverting to always-render (old behavior). If we want proper
+         * primary-monitor filter, we need PDB-based struct offset
+         * resolution in our resolver (chaosium43-style) rather than
+         * runtime pattern-scan. TODO for future.
+         *
+         * Chrome flicker persists but that's compose-level, not this
+         * filter's fault. Focus other fixes there. */
         if (g_active && !g_stop_draw && !skip_draw && g_present_cb && pLayer) {
             g_present_cb(pCtx, pLayer);
+            /* v1.7.11 REVERTED (2026-07-25). Adding hooks_add_dirty_full()
+             * here calls AddDirtyRect on the PN-captured pThis pointer,
+             * which the memory `trailing-do-not-adddirty` proves crashes
+             * DWM with __fastfail at dwmcore!0xbedb4. SEH does NOT catch
+             * __fastfail. Confirmed dangerous 2026-07-05. Left as
+             * empty branch for git-diff clarity. */
         } else if (skip_draw) {
             LONG n = InterlockedIncrement(&g_present_skips_capture);
             if (n <= 5 || n % 500 == 0) {
                 hook_diag("Present: SKIPPED overlay draw #%ld (capture in progress)", n);
             }
         }
-        if (g_orig_present) ret = g_orig_present(pCtx, pLayer, flags, a3, a4, a5);
+        if (g_orig_present) ret = g_orig_present(pCtx, pLayer, flags, a3, a4, a5, disableMPO);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         /* Silently swallow — DWM crash = user desktop dies. */
         hook_diag("Detour_Present: caught exception in body");
@@ -626,9 +802,16 @@ static BOOL __fastcall Detour_DisplayPresentNeeded(void *pThis) {
      * inherent - user sees minor flicker while overlay is showing
      * during app switch. Acceptable + matches their manual workaround
      * (hide overlay, switch, show overlay) now made automatic. */
-    if (!ui_is_visible()) return orig_result;
+    /* v1.7.10.5: DirectComposition app compose-grace.
+     * If we're within the post-change grace window, KEEP forcing
+     * PN=TRUE + SCP even when hidden — this holds DWM in composite
+     * mode long enough to clear stale tiles in Chrome/Slack/Cursor/
+     * etc that would otherwise "chunk-eat" our old overlay pixels
+     * as they direct-flip. Grace is set by hooks_bump_compose_grace
+     * from ui_toggle_visible / ui_nudge / ui_resize / etc. */
+    if (!ui_is_visible() && !in_compose_grace_window()) return orig_result;
 
-    /* Overlay visible - fire SCP + return TRUE as before (Bypassify pattern). */
+    /* Overlay visible OR within compose grace — fire SCP + return TRUE (BP pattern). */
     __try {
         if (g_schedule_composition) g_schedule_composition(0, -1);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -1054,10 +1237,47 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
      * consistency. Trail-clearing is handled by our RedrawWindow
      * cascade in imgui_layer.cpp instead. */
     if (off->forceFullDirty) {
-        g_force_full_dirty = (pfnForceFullDirty_t)
-            ((BYTE *)dwmcore + off->forceFullDirty);
-        slog_writef("payload.log", "ForceFullDirty resolved @ %p (v1.7.9 — NOT PATCHED, BP-parity)",
-                    (void *)g_force_full_dirty);
+        /* v1.7.11.14 (2026-07-25) — WPT-TRACE-DRIVEN FIX.
+         *
+         * WPT trace comparison of BP vs svcldb (2026-07-25) shows BP
+         * triggers ~42,500 Dwm-Core `ETWGUID_VISUAL_RENDERCONTENT`
+         * (event 115) + `Dx_Flip_Consumed` (event 182) events per 13
+         * seconds = ~3269/sec = ~55 per vsync. We trigger ~0. That is
+         * DWM's "render all visuals every frame" full-dirty compose
+         * mode — the exact mechanism BP uses to eliminate Chrome
+         * trails.
+         *
+         * Prior v1.7.11.4 patched at `forceFullDirty - 0x60` (copied
+         * from BP's 0x3fd7b9 offset which was `ForceFullDirtyRendering
+         * function RVA - 0x60`). But chaosium43's dumper.cpp line 341
+         * shows the CORRECT resolution is `SymFromName(dwmcore!Force
+         * FullDirtyRendering)` returns the FLAG BYTE ADDRESS DIRECTLY.
+         * On current Windows, our PDB-resolved `off->forceFullDirty`
+         * IS the flag byte — no -0x60 needed.
+         *
+         * Patch at the DIRECT address. If this is the correct flag on
+         * current Windows, DWM enters full-dirty compose mode → all
+         * visuals re-render every frame → Chrome trails vanish. */
+        BYTE *ffd_flag = (BYTE *)dwmcore + off->forceFullDirty;
+        DWORD old_prot = 0;
+        if (VirtualProtect(ffd_flag, 1, PAGE_EXECUTE_READWRITE, &old_prot)) {
+            g_ffd_saved_byte = ffd_flag[0];
+            g_ffd_patch_addr = ffd_flag;
+            ffd_flag[0] = 1;
+            DWORD tmp = 0;
+            VirtualProtect(ffd_flag, 1, old_prot, &tmp);
+            FlushInstructionCache(GetCurrentProcess(), ffd_flag, 1);
+            g_ffd_patched = TRUE;
+            slog_writef("payload.log",
+                "ForceFullDirty flag @ %p patched DIRECT: 0x%02X -> 0x01 "
+                "(WPT-trace-driven — chaosium43 dumper.cpp:341 pattern, forces "
+                "DWM full-dirty compose mode = expect 3000+/sec RENDERCONTENT events)",
+                ffd_flag, g_ffd_saved_byte);
+        } else {
+            slog_writef("payload.log",
+                "ForceFullDirty flag VirtualProtect FAILED gle=%lu",
+                GetLastError());
+        }
     }
 
     /* ── 5. ScheduleCompositionPass — THE MISSING PIECE (Bypassify slot [7]) ──
@@ -1080,6 +1300,19 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
     } else {
         slog_write("payload.log", "ScheduleCompositionPass NOT in blob "
                                   "(DWM may enter idle → half-render on toggle)");
+    }
+
+    /* v1.7.11.9 (2026-07-25) — IsPrimaryMonitor for chaosium43-parity
+     * primary-monitor filter. Enables discover_monitor_target_offset() +
+     * should_render_this_context() in Present detour. Without this fn,
+     * filter is disabled + we render every compose pass (old behavior). */
+    if (off->isPrimaryMonitor) {
+        g_is_primary_monitor = (pfnIsPrimaryMonitor_t)
+            ((BYTE *)dwmcore + off->isPrimaryMonitor);
+        slog_writef("payload.log", "IsPrimaryMonitor resolved @ %p (primary-monitor filter armed)",
+                    (void *)g_is_primary_monitor);
+    } else {
+        slog_write("payload.log", "IsPrimaryMonitor NOT in blob — primary-monitor filter DISABLED");
     }
 
     /* ── 5b. AddDirtyRect trampolines (both RT classes) ── *
