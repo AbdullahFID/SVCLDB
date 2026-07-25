@@ -22,6 +22,7 @@
 #include "../../shared/common.h"
 #include "../../shared/config_types.h"
 #include "rawinput_hook.h"
+#include "config_read.h"   /* v1.7.11.18: cfg_get() for scroll_step_px */
 
 #include <stdio.h>
 #include <stdarg.h>
@@ -988,10 +989,20 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
          * no longer held. Stops auto-repeat continuous nudge the
          * INSTANT the user lifts Ctrl/Shift/Alt, even if they still
          * hold the arrow/letter key. Belt-and-suspenders on top of the
-         * per-fire mods_match check below. */
+         * per-fire mods_match check below.
+         *
+         * v1.7.11.15 (2026-07-25) — no longer gated on g_consumed_vk[vki].
+         * Prior code SKIPPED vks whose g_consumed_vk had already been
+         * cleared by a UP event, leaving g_consumed_vk_slot[vki] stale
+         * (still pointing at the last fired hotkey). If the user later
+         * pressed the same vk WITHOUT the required modifier while chat
+         * mode was active (which sets g_consumed_vk[vk]=1 for typing),
+         * the poll thread's slot_holds check would fire the stale
+         * hotkey — root cause of "bare H fires TOGGLE, bare S fires
+         * ASK when typing to AI". Sweep now clears stale slot IDs
+         * regardless of live g_consumed_vk state. */
         if (mod_released) {
             for (int vki = 0; vki < 256; vki++) {
-                if (!g_consumed_vk[vki]) continue;
                 LONG slot = g_consumed_vk_slot[vki];
                 if (slot < 0 || slot >= SVC_HK_COUNT) continue;
                 unsigned req = (g_hk[slot] >> 16) & 0xFF;
@@ -1011,6 +1022,18 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
          * the UP too — no orphan UP events for LDB to see. */
         if (is_up && vk < 256 && g_consumed_vk[vk]) {
             InterlockedExchange(&g_consumed_vk[vk], 0);
+            /* v1.7.11.15 (2026-07-25) — also clear the slot association.
+             * Prior code left g_consumed_vk_slot[vk] pointing at the
+             * last-fired hotkey slot even after the key was released.
+             * The next time g_consumed_vk[vk] was set to 1 by some OTHER
+             * path (notably chat-mode typing at ~line 1313), the poll
+             * thread's slot_holds check saw (g_consumed_vk[vk] &&
+             * g_consumed_vk_slot[vk]==stale_slot) and fired the STALE
+             * hotkey. Symptom: user typing H in chat fires TOGGLE (if
+             * they ever pressed their Ctrl+H toggle before). Clearing
+             * the slot on UP breaks the leak — a fresh fire is required
+             * to establish ownership. */
+            InterlockedExchange(&g_consumed_vk_slot[vk], -1);
             /* v10: also reset any LONGPRESS tracking for this vk — user
              * released before the hold threshold, so cancel the pending
              * fire. */
@@ -1124,10 +1147,28 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
              * hits just call the action and fall through (so downstream
              * apps still receive the DOWN). */
 
-            /* Pass 1 — MODIFIER slots (existing behavior). */
+            /* Pass 1 — MODIFIER slots.
+             *
+             * v1.7.11.18 (2026-07-25) — WATCH-ONLY bit now honored for
+             * MODIFIER kind (was MULTITAP-only). LO's ask: "for hotkeys
+             * like ctrl A etc there should be an option to make them
+             * non consumable so you can use them generally too and
+             * accept the risk of doing an action in the ui too."
+             *
+             * When SVC_HK_WATCH is set on a MODIFIER binding: fire the
+             * action AND let the key pass through to the focused app.
+             * Both effects happen. Bound to Ctrl+A → copies AI answer
+             * AND select-all fires in Chrome/Word/etc. User opted in;
+             * they know what they signed up for.
+             *
+             * Default is still consume (WATCH bit clear) — the classic
+             * "no leakage" behavior is preserved unless the user
+             * explicitly toggles a binding to watch-only via the
+             * dashboard. */
             for (int i = 0; i < SVC_HK_COUNT; i++) {
                 if (SVC_HK_KIND(g_hk[i]) != SVC_HK_KIND_MODIFIER) continue;
                 if (match_hk_mod(g_hk[i], vk, is_ctrl, is_shift, is_alt)) {
+                    int is_watch = SVC_HK_WATCH(g_hk[i]);
                     /* v1.7.11.11 (2026-07-25) — CONDITIONAL-CONSUME for copy
                      * hotkeys. Prior: LL hook consumed Ctrl+C
                      * unconditionally for SVC_HK_COPY_REPLY slot even when
@@ -1147,6 +1188,18 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
                         /* No reply → don't consume, don't fire → user's
                          * Ctrl+C reaches Chrome/Word/etc as normal. */
                         continue;
+                    }
+                    if (is_watch) {
+                        /* Watch-only MODIFIER — fire but pass through.
+                         * Do NOT touch g_consumed_vk (the key isn't
+                         * ours, we're just observing). The event
+                         * naturally flows through the LL chain +
+                         * reaches the focused app. */
+                        if (fire(i)) {
+                            rin_diag("LL_HOOK fired slot=%d vk=0x%02X mods=(c%d s%d a%d) [WATCH-ONLY, pass-through]",
+                                     i, vk, is_ctrl, is_shift, is_alt);
+                        }
+                        break;   /* skip remaining MODIFIER slots but let key propagate */
                     }
                     if (vk < 256) {
                         InterlockedExchange(&g_consumed_vk[vk], 1);
@@ -1277,13 +1330,21 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
              * chat mode PgUp/PgDn are eaten a few lines down for the
              * "leak nothing while typing" invariant. */
             if (!is_ctrl && !is_shift && !is_alt && !ui_chat_is_active()) {
+                /* v1.7.11.18: PgUp/PgDn scroll step = 2× hotkey scroll
+                 * (page-jump feels naturally bigger than line-scroll).
+                 * Sources from cfg->scroll_step_px so user's dashboard
+                 * slider controls PgUp/PgDn too. */
+                const svc_config_t *cfg = cfg_get();
+                int step = (cfg && cfg->scroll_step_px >= 20 && cfg->scroll_step_px <= 400)
+                           ? cfg->scroll_step_px : 80;
+                int page_step = step * 2;
                 if (vk == VK_PRIOR /* PageUp */ && ui_is_visible()) {
-                    ui_scroll_reply(-160);
+                    ui_scroll_reply(-page_step);
                     if (vk < 256) InterlockedExchange(&g_consumed_vk[vk], 1);
                     return 1;
                 }
                 if (vk == VK_NEXT /* PageDown */ && ui_is_visible()) {
-                    ui_scroll_reply(+160);
+                    ui_scroll_reply(+page_step);
                     if (vk < 256) InterlockedExchange(&g_consumed_vk[vk], 1);
                     return 1;
                 }
@@ -1400,7 +1461,13 @@ static LRESULT CALLBACK ll_mouse_proc(int code, WPARAM wp, LPARAM lp) {
                 ui_point_in_overlay((int)m->pt.x, (int)m->pt.y)) {
                 if (wp == RIN_WM_MOUSEHWHEEL) return 1;
                 short delta = (short)HIWORD(m->mouseData);
-                int px = -(int)((delta * 90) / 120);
+                /* v1.7.11.18: wheel notch scaled by cfg->scroll_step_px.
+                 * Windows emits 120 wheel-delta per notch, so 1 notch =
+                 * scroll_step_px pixels. Was hardcoded 90px. */
+                const svc_config_t *cfg = cfg_get();
+                int step = (cfg && cfg->scroll_step_px >= 20 && cfg->scroll_step_px <= 400)
+                           ? cfg->scroll_step_px : 80;
+                int px = -(int)((delta * step) / 120);
                 if (px == 0) px = (delta > 0 ? -3 : 3);
                 ui_scroll_reply(px);
                 return 1;

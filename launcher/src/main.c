@@ -338,6 +338,10 @@ static int assemble_config_from_json(const char *json,
     if (json_get_num(json, "theme",         &n)) cfg->theme = (int)n; else cfg->theme = 2;
     /* v11: overlay behavior flags. Default: TRAIL_ERASE + SMOOTH_NUDGE + UNIFORM_ALPHA on. */
     if (json_get_num(json, "overlay_flags", &n)) cfg->overlay_flags = (unsigned)n; else cfg->overlay_flags = SVC_OVFLAG_DEFAULTS;
+    /* v12 (2026-07-25): scroll_step_px — user-configurable pixels per scroll
+     * hotkey / mouse wheel notch. Default 80 mirrors pre-v12 hardcoded value. */
+    if (json_get_num(json, "scroll_step_px", &n)) cfg->scroll_step_px = (int)n; else cfg->scroll_step_px = 80;
+    if (cfg->scroll_step_px < 20 || cfg->scroll_step_px > 400) cfg->scroll_step_px = 80;
 
     /* Hotkeys: CSV of packed uints. Missing / short → zeroed slots.
      *
@@ -494,6 +498,7 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
     cfg->size_mode = 0;   /* v8: normal size clamps by default */
     cfg->theme = 2;                            /* v11: AUTO — follow Windows theme */
     cfg->overlay_flags = SVC_OVFLAG_DEFAULTS;  /* v11: trail-erase + smooth-nudge + uniform-alpha ON */
+    cfg->scroll_step_px = 80;                  /* v12: default scroll granularity */
 
     /* Defaults for the AI-config fields.
      *   tier=MEDIUM — balanced default; user rotates live via Ctrl+Alt+M

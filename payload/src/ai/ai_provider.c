@@ -453,7 +453,7 @@ static const char SVCLDB_DEFAULT_SYSTEM_PROMPT[] =
  *
  * OpenRouter: user picks the model. Default is `openrouter/free`
  * (auto-routes to a free model). Also accepts any specific slug like
- * `meta-llama/llama-4-maverick:free` or `anthropic/claude-opus-4.8`.
+ * `meta-llama/llama-4-maverick:free` or `anthropic/claude-opus-5`.
  * Reference: https://openrouter.ai/docs/guides/routing/routers/free-router
  */
 
@@ -490,10 +490,15 @@ static const svc_model_tier_t OPENAI_TIERS[SVC_TIER_COUNT] = {
     { NULL,            "CUSTOM",                 "user-specified model",                                              0, 0,  8192 },
 };
 
-/* Anthropic tiers. Per user request: opus-4-8 NOT fable-5 (too expensive).
+/* Anthropic tiers. Per user request: opus-5 NOT fable-5 (too expensive).
  * All 3 tiers verified against platform.claude.com/docs/models/overview. */
 static const svc_model_tier_t ANTHROPIC_TIERS[SVC_TIER_COUNT] = {
-    { "claude-opus-4-8",   "STRONG (Opus 4.8)",  "Best coding + reasoning, $5/$25, 1M ctx, adaptive thinking", 1, 1, 12288 },
+    /* v1.7.11.17 (2026-07-25) — Bumped Opus 4.8 → Opus 5 (Anthropic
+     * launched 2026-07-24, same $5/$25 pricing, 1M ctx, adaptive
+     * thinking on by default, knowledge cutoff May 2026). Positioned
+     * by Anthropic as "close to Fable 5 frontier intelligence at half
+     * the price". */
+    { "claude-opus-5",     "STRONG (Opus 5)",    "Frontier reasoning + agentic coding, $5/$25, 1M ctx, adaptive thinking", 1, 1, 12288 },
     { "claude-sonnet-5",   "MEDIUM (Sonnet 5)",  "Balanced workhorse, $3/$15, 1M ctx, adaptive thinking",       1, 1,  8192 },
     { "claude-haiku-4-5",  "CHEAP  (Haiku 4.5)", "Fast + affordable, $1/$5, 200K ctx, extended thinking",       1, 1,  6144 },
     { NULL,                "CUSTOM",             "user-specified model",                                          0, 0,  6144 },

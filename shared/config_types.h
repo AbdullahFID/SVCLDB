@@ -41,7 +41,7 @@ typedef enum {
  * configs cleanly fail via cu_wrap_decrypt's plen != sizeof(svc_config_t)
  * check when a field is added — this magic is defence-in-depth. */
 #define SVC_CONFIG_MAGIC             0x53564C43u  /* 'SVLC' little-endian */
-#define SVC_CONFIG_SCHEMA_VERSION    11u  /* v11 (2026-07-24): + theme (light/dark/auto) + overlay_flags for opacity preset & smooth-nudge & trail-erase */
+#define SVC_CONFIG_SCHEMA_VERSION    12u  /* v12 (2026-07-25): + scroll_step_px (user-configurable pixels per scroll hotkey / mouse wheel notch) */
 
 typedef struct {
     /* ── v4 header: written by Electron UI / launcher --json-config.
@@ -203,6 +203,21 @@ typedef struct {
      * ui_apply_launch_config. */
     int         theme;
     unsigned    overlay_flags;
+
+    /* v12 (2026-07-25) — user-configurable scroll granularity.
+     *
+     * LO's ask: "we should also let users control how much the scroll
+     * scrolls like if they wanna make it more or less a granular control."
+     *
+     * Applied by:
+     *   - SVC_HK_SCROLL_UP/DOWN hotkeys → ui_scroll_reply(±scroll_step_px)
+     *   - PgUp/PgDn fallback in rawinput_hook → ±(scroll_step_px * 2)
+     *   - Mouse wheel notch → scroll_step_px per notch (was fixed 90px)
+     *
+     * Default 80 preserves pre-v12 hotkey feel. Range 20-400 clamped
+     * by the dashboard slider. 0 or out-of-range = fallback to 80 in
+     * ui_apply_launch_config so an unmigrated field never zero-scrolls. */
+    int         scroll_step_px;
 } svc_config_t;
 
 /* v11 overlay_flags bit constants. */

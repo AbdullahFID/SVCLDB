@@ -262,9 +262,9 @@
               <button id="btn-tiers-explain" class="chip" style="margin-left:auto;background:transparent;border-color:transparent;color:var(--cyan-light)">What&apos;s the difference?</button>
             </div>
             <div id="tier-explainer" class="tier-explainer" style="display:none;margin-top:10px">
-              <div class="tier-row"><b>Strong</b> — flagship reasoning models (o3, Opus 4.8, Gemini 3.1 Pro, GPT-5.5 Pro). Best answers on hard exam questions. Slow (30&nbsp;s – 10&nbsp;min per answer for deep reasoning) and expensive (up to $180 per 1M output tokens). Use for the hardest MCQs or when Medium keeps missing.</div>
-              <div class="tier-row"><b>Medium</b> — balanced flagships (GPT-5.5, Sonnet 5, Gemini 3.5 Flash). Sub-10&nbsp;s answers on typical exam questions, still highly accurate. Costs ~10× less than Strong. <b>Recommended default.</b></div>
-              <div class="tier-row"><b>Cheap</b> — small/fast (GPT-5-mini, Haiku 4.5, Gemini 2.5 Flash-Lite). ~2&nbsp;s answers, cheap enough for study drills. Good for factual recall, weaker on multi-step math/logic.</div>
+              <div class="tier-row"><b>Strong</b> — flagship reasoning models (GPT-5.6 Sol, Claude Opus 5, Gemini 3.1 Pro). Best answers on hard exam questions. Slow (30&nbsp;s – 10&nbsp;min per answer for deep reasoning) and expensive (up to $30 per 1M output tokens). Use for the hardest MCQs or when Medium keeps missing.</div>
+              <div class="tier-row"><b>Medium</b> — balanced daily drivers (GPT-5.6 Terra, Claude Sonnet 5, Gemini 3.6 Flash). Sub-10&nbsp;s answers on typical exam questions, still highly accurate. Costs ~5× less than Strong. <b>Recommended default.</b></div>
+              <div class="tier-row"><b>Cheap</b> — fast + affordable (GPT-5.6 Luna, Claude Haiku 4.5, Gemini 3.5 Flash-Lite). ~2&nbsp;s answers, cheap enough for study drills. Good for factual recall, weaker on multi-step math/logic.</div>
               <div class="tier-row" style="color:var(--fg3);font-size:11px;margin-top:8px">Cycle live in-overlay with <kbd>Ctrl+Alt+M</kbd>.</div>
             </div>
           </div>
@@ -516,6 +516,14 @@
                 <label for="rng-ova-alpha">Opacity</label>
                 <input id="rng-ova-alpha" type="range" min="20" max="100" step="1" value="100">
                 <span class="ova-val" id="val-ova-alpha">100%</span>
+              </div>
+              <!-- v12 (2026-07-25) — user-configurable scroll granularity.
+                   Controls the pixels-per-step for Ctrl+Alt+J/K scroll,
+                   PgUp/PgDn scroll (2× value), and mouse wheel per notch. -->
+              <div class="ova-slider-row" title="Pixels the AI reply scrolls per press of the scroll hotkey. Mouse wheel scales with this too. PgUp/PgDn = 2×. Default 80.">
+                <label for="rng-ova-scroll">Scroll step</label>
+                <input id="rng-ova-scroll" type="range" min="20" max="400" step="10" value="80">
+                <span class="ova-val" id="val-ova-scroll">80 px</span>
               </div>
 
               <div class="ova-presets">

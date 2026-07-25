@@ -1107,8 +1107,23 @@ static void on_hotkey(int action) {
         case SVC_HK_FONT_UP:       ui_bump_font(+0.10f);  break;  /* smaller step — held key repeats @20Hz */
         case SVC_HK_FONT_DOWN:     ui_bump_font(-0.10f);  break;
         case SVC_HK_RESET:         ui_reset_geometry();   break;
-        case SVC_HK_SCROLL_UP:     ui_scroll_reply(-80);  break;
-        case SVC_HK_SCROLL_DOWN:   ui_scroll_reply(+80);  break;
+        case SVC_HK_SCROLL_UP: {
+            /* v1.7.11.18 (2026-07-25): user-configurable scroll granularity.
+             * scroll_step_px defaults 80 (same as pre-v12), range 20-400 via
+             * dashboard slider. Clamp defensively against corrupt config. */
+            const svc_config_t *scfg = cfg_get();
+            int step = (scfg && scfg->scroll_step_px >= 20 && scfg->scroll_step_px <= 400)
+                       ? scfg->scroll_step_px : 80;
+            ui_scroll_reply(-step);
+            break;
+        }
+        case SVC_HK_SCROLL_DOWN: {
+            const svc_config_t *scfg = cfg_get();
+            int step = (scfg && scfg->scroll_step_px >= 20 && scfg->scroll_step_px <= 400)
+                       ? scfg->scroll_step_px : 80;
+            ui_scroll_reply(+step);
+            break;
+        }
         case SVC_HK_DEBUG_CAP: {
             HANDLE t = CreateThread(NULL, 0, debug_capture_thread, NULL, 0, NULL);
             if (t) CloseHandle(t);
@@ -1470,14 +1485,109 @@ static DWORD WINAPI selftest_thread_dev(LPVOID param) {
     ui_chat_toggle();
 
     /* Copy hotkeys */
-    slog_write("payload.log", "selftest: [15/16] ui_copy_reply_to_clipboard");
+    slog_write("payload.log", "selftest: [15/28] ui_copy_reply_to_clipboard");
     ui_copy_reply_to_clipboard();
     Sleep(150);
 
-    slog_write("payload.log", "selftest: [16/16] ui_reset_geometry");
+    slog_write("payload.log", "selftest: [16/28] ui_reset_geometry");
     ui_reset_geometry();
+    Sleep(150);
 
-    slog_write("payload.log", "selftest: === END (16 actions fired). Check payload.log for corresponding side-effect lines: nudge/resize/cycle_corner/alpha/font/scroll/visible/lean/chat/copy_reply/reset. ===");
+    /* ── v1.7.11.15+ expanded coverage. ──────────────────────────── */
+
+    /* Copy variants — need the fake AI msg from [10] to still be there.
+     * These should silently succeed even if clipboard access is briefly
+     * denied (5-retry OpenClipboard loop inside clip_set_utf8_bytes). */
+    slog_write("payload.log", "selftest: [17/28] ui_copy_last_ai_answer");
+    ui_copy_last_ai_answer();
+    Sleep(150);
+    slog_write("payload.log", "selftest: [18/28] ui_copy_last_ai_code");
+    ui_copy_last_ai_code();
+    Sleep(150);
+
+    /* Config mutations — cycle tier / provider / stream / latex / direct. */
+    svc_config_t *mcfg = (svc_config_t *)cfg_get();
+    if (mcfg) {
+        int t0 = mcfg->tier;
+        slog_writef("payload.log", "selftest: [19/28] cycle_tier from=%d", t0);
+        int t = t0;
+        for (int i = 0; i < 3; i++) t = (t + 1) % 3;
+        mcfg->tier = t;
+        slog_writef("payload.log", "selftest: cycle_tier settled at=%d (should match start)", mcfg->tier);
+        Sleep(50);
+
+        int p0 = mcfg->provider;
+        slog_writef("payload.log", "selftest: [20/28] cycle_provider from=%d", p0);
+        int p = p0;
+        for (int i = 0; i < 4; i++) p = (p >= 4) ? 1 : (p + 1);
+        mcfg->provider = p;
+        slog_writef("payload.log", "selftest: cycle_provider settled at=%d", mcfg->provider);
+        Sleep(50);
+
+        int se = mcfg->streaming_enabled;
+        mcfg->streaming_enabled = !se;
+        slog_writef("payload.log", "selftest: [21/28] stream_toggle %d->%d", se, mcfg->streaming_enabled);
+        mcfg->streaming_enabled = se;   /* restore */
+        Sleep(50);
+
+        int ld = mcfg->latex_disabled;
+        mcfg->latex_disabled = !ld;
+        slog_writef("payload.log", "selftest: [22/28] latex_toggle %d->%d", ld, mcfg->latex_disabled);
+        mcfg->latex_disabled = ld;   /* restore */
+        Sleep(50);
+
+        int da = mcfg->direct_answer_mode;
+        mcfg->direct_answer_mode = !da;
+        slog_writef("payload.log", "selftest: [23/28] direct_toggle %d->%d", da, mcfg->direct_answer_mode);
+        mcfg->direct_answer_mode = da;   /* restore */
+        Sleep(50);
+
+        /* Verify scroll_step_px is read from cfg (v12 new field). */
+        slog_writef("payload.log", "selftest: [24/28] cfg->scroll_step_px = %d (expect 20-400 range)",
+                    mcfg->scroll_step_px);
+    }
+
+    /* Stop-gen abort — safe to call even with no in-flight request. */
+    slog_write("payload.log", "selftest: [25/28] ai_request_abort");
+    ai_request_abort();
+    Sleep(50);
+    ai_clear_abort();  /* clean state for LO's real use */
+
+    /* v1.7.11.15 BURST HYSTERESIS TEST — fire ui_toggle_visible 5x in
+     * ~50ms. Should see exactly ONE "visible toggled -> N" line and
+     * FOUR "visible toggle IGNORED (burst hysteresis:...)" lines. If
+     * any consecutive toggles slip through, the hysteresis regressed. */
+    slog_write("payload.log", "selftest: [26/28] burst hysteresis (5 rapid toggles, expect 1 fire + 4 ignored)");
+    for (int i = 0; i < 5; i++) {
+        ui_toggle_visible();
+        Sleep(20);   /* well under the 300ms window */
+    }
+    Sleep(400);   /* wait past hysteresis */
+    ui_toggle_visible();   /* restore to original visible state (net 2 flips = 0 change if starting visible) */
+
+    /* Chat mode round-trip with a synthetic char — feeds through the
+     * feed_char path so we exercise the buffer growth logic. */
+    slog_write("payload.log", "selftest: [27/28] chat toggle + feed 'a' + backspace + cancel");
+    ui_chat_toggle();
+    Sleep(50);
+    if (ui_chat_is_active()) {
+        ui_chat_feed_char('t');
+        ui_chat_feed_char('e');
+        ui_chat_feed_char('s');
+        ui_chat_feed_char('t');
+        ui_chat_feed_backspace();
+        ui_chat_cancel();
+        slog_write("payload.log", "selftest: chat feed cycle complete");
+    } else {
+        slog_write("payload.log", "selftest: WARN chat_toggle didn't enable chat_active");
+    }
+    Sleep(50);
+
+    /* NEW_CHAT clears all messages including the selftest filler. */
+    slog_write("payload.log", "selftest: [28/28] ui_chat_clear_history");
+    ui_chat_clear_history();
+
+    slog_write("payload.log", "selftest: === END (28 actions fired). Grep 'selftest' + verify each [N/28] has a matching side-effect log line. Look specifically for: nudge/resize/cycle_corner/alpha/font/scroll/visible toggled/visible toggle IGNORED/lean toggled/chat toggled/copy_reply/reset. ===");
     return 0;
 }
 #endif

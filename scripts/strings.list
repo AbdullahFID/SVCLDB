@@ -60,7 +60,7 @@ MODEL_GEMINI_PRO|gemini-2.5-pro
 MODEL_GEMINI_3_PRO|gemini-3.1-pro-preview
 MODEL_GEMINI_3_FLASH|gemini-3.5-flash
 MODEL_OPENAI_GPT55|gpt-5.5
-MODEL_ANTHROPIC_OPUS|claude-opus-4-8
+MODEL_ANTHROPIC_OPUS|claude-opus-5
 
 # ─── Resolver PDB symbol names (leak dwmcore RE target) ──────────
 PDB_CVISUAL_RC|dwmcore!CVisual::RenderContent

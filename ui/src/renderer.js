@@ -1249,9 +1249,10 @@ function _ovaRenderPreview() {
 
 function _ovaRenderValues() {
   const setText = (id, txt) => { const el = document.getElementById(id); if (el) el.textContent = txt; };
-  setText('val-ova-w',     `${_ovaState.w} px`);
-  setText('val-ova-h',     `${_ovaState.h} px`);
-  setText('val-ova-alpha', `${Math.round(_ovaState.alpha * 100)}%`);
+  setText('val-ova-w',      `${_ovaState.w} px`);
+  setText('val-ova-h',      `${_ovaState.h} px`);
+  setText('val-ova-alpha',  `${Math.round(_ovaState.alpha * 100)}%`);
+  setText('val-ova-scroll', `${_ovaState.scroll_step_px | 0} px`);
 }
 
 function _ovaDirty() {
@@ -1259,8 +1260,9 @@ function _ovaDirty() {
       || _ovaState.w             !== _ovaSaved.w
       || _ovaState.h             !== _ovaSaved.h
       || Math.abs(_ovaState.alpha - _ovaSaved.alpha) > 0.005
-      || _ovaState.theme         !== _ovaSaved.theme
-      || _ovaState.overlay_flags !== _ovaSaved.overlay_flags;
+      || _ovaState.theme          !== _ovaSaved.theme
+      || _ovaState.overlay_flags  !== _ovaSaved.overlay_flags
+      || _ovaState.scroll_step_px !== _ovaSaved.scroll_step_px;
 }
 
 // v11: reflect current theme + flag chips as .is-active based on _ovaState.
@@ -1310,6 +1312,8 @@ function _ovaSyncSliderRanges() {
   if (rH) { rH.min = b.hMin; rH.max = b.hMax; rH.value = _ovaState.h; }
   const rA = document.getElementById('rng-ova-alpha');
   if (rA) rA.value = Math.round(_ovaState.alpha * 100);
+  const rS = document.getElementById('rng-ova-scroll');
+  if (rS) rS.value = _ovaState.scroll_step_px | 0;
 }
 
 function _ovaRefreshAll() {
@@ -1333,6 +1337,8 @@ async function _initOverlayCard() {
          * saved file was written by an older svchelper (missing fields). */
         theme:         (p.theme != null ? (p.theme | 0) : 2),
         overlay_flags: (p.overlay_flags != null ? (p.overlay_flags | 0) : OVFLAG_DEFAULTS),
+        /* v12 (2026-07-25): scroll granularity. Sensible default 80 on missing. */
+        scroll_step_px: (p.scroll_step_px != null ? (+p.scroll_step_px | 0) : 80),
       };
       _ovaSaved = { ..._ovaState };
     }
@@ -1342,6 +1348,7 @@ async function _initOverlayCard() {
   const rngW     = document.getElementById('rng-ova-w');
   const rngH     = document.getElementById('rng-ova-h');
   const rngA     = document.getElementById('rng-ova-alpha');
+  const rngScr   = document.getElementById('rng-ova-scroll');
   const btnSave  = document.getElementById('btn-ova-save');
   const btnReset = document.getElementById('btn-ova-reset');
 
@@ -1375,12 +1382,27 @@ async function _initOverlayCard() {
       _ovaRefreshChipsActive();
     });
   }
+  if (rngScr) {
+    /* v12 (2026-07-25) — scroll granularity live update. Requires
+     * Inject Now to apply (payload reads cfg->scroll_step_px on
+     * config load, no live hot-swap). */
+    rngScr.value = _ovaState.scroll_step_px;
+    rngScr.addEventListener('input', () => {
+      _ovaState.scroll_step_px = +rngScr.value | 0;
+      _ovaRenderValues(); _ovaRenderStatus();
+    });
+  }
 
   document.querySelectorAll('#overlay-appearance-card .ova-preset').forEach((chip) => {
     chip.addEventListener('click', async () => {
       const w = +chip.dataset.w, h = +chip.dataset.h;
       const ultra = chip.dataset.ultra === '1' ? 1 : 0;
-      _ovaState = { size_mode: ultra, w, h, alpha: _ovaState.alpha };
+      _ovaState = {
+        size_mode: ultra, w, h, alpha: _ovaState.alpha,
+        theme: _ovaState.theme, overlay_flags: _ovaState.overlay_flags,
+        /* v12 (2026-07-25): preserve scroll granularity across size presets. */
+        scroll_step_px: _ovaState.scroll_step_px,
+      };
       if (chkUltra) chkUltra.checked = !!ultra;
       _ovaRefreshAll();
       /* v1.7.4 (2026-07-23) — LIVE APPLY.
@@ -1942,8 +1964,15 @@ const MOUSE_VK_SHORT = { 1: 'LMB', 2: 'RMB', 4: 'MMB', 5: 'MX1', 6: 'MX2' };
  * the realistic UX ceiling — LO's ask. */
 const HK_TAP_MAX = 6;
 
-function packHotkey(mod, vk) {
-  return ((mod & 0xFF) << 16) | (vk & 0xFFFF);
+/* v1.7.11.18 (2026-07-25) — packHotkey accepts optional `watch` flag.
+ * When true, sets the WATCH-ONLY bit so the C-side LL hook fires the
+ * action but doesn't consume the key event (lets it pass through to
+ * the focused app). Enables "Ctrl+A as both copy-answer AND select-all"
+ * kind of setups. */
+function packHotkey(mod, vk, watch) {
+  let out = ((mod & 0xFF) << 16) | (vk & 0xFFFF);
+  if (watch) out |= HK_FLAG_WATCH_ONLY;
+  return out >>> 0;
 }
 function packLongpress(vk, hold_ms) {
   const h = Math.max(10, Math.min(2550, Math.floor(hold_ms / 10) * 10));
@@ -2251,13 +2280,23 @@ function _renderHotkeyEditor() {
     let modeChipHtml = '<span></span>';   /* placeholder keeps grid alignment */
     if (packed) {
       const u = unpackHotkey(packed);
-      if (u.kind === HK_KIND_MULTITAP) {
+      /* v1.7.11.18 (2026-07-25) — MODIFIER kind now honors the chip too.
+       * User asked to be able to run Ctrl+A as both "copy answer" AND
+       * regular select-all. When flipped to silent, the LL hook fires
+       * the action but doesn't consume the keystroke — apps still see
+       * their normal Ctrl+A. */
+      if (u.kind === HK_KIND_MULTITAP || u.kind === HK_KIND_MODIFIER) {
         const isWatch = !!u.watch;
         const chipCls = isWatch ? 'hk-mode-chip hk-mode-silent' : 'hk-mode-chip hk-mode-blocked';
         const chipLabel = isWatch ? 'silent' : 'blocks';
+        const isMod = u.kind === HK_KIND_MODIFIER;
         const chipTitle = isWatch
-          ? 'Silent mode — the key still types normally in your exam. Click to switch to BLOCKED (reserves the key).'
-          : 'BLOCKED mode — the key is reserved and won\'t type anywhere. Click to switch to SILENT.';
+          ? (isMod
+              ? 'Silent mode — key still works normally in apps (Ctrl+A still selects-all, plus fires this action). Click to switch to BLOCKED.'
+              : 'Silent mode — the key still types normally in your exam. Click to switch to BLOCKED (reserves the key).')
+          : (isMod
+              ? 'BLOCKED mode — key is intercepted, apps don\'t see it. Click to switch to SILENT (fires action AND lets key through).'
+              : 'BLOCKED mode — the key is reserved and won\'t type anywhere. Click to switch to SILENT.');
         modeChipHtml = `<button class="${chipCls}" title="${escapeHtml(chipTitle)}" data-slot-mode-toggle="${slot}">${chipLabel}</button>`;
       }
     }
@@ -2290,17 +2329,23 @@ function _renderHotkeyEditor() {
       toast(`Reset ${HK_LABELS[slot]} to default.`, 'ok');
     });
   }
-  /* v1.7.4.6: per-row silent/blocked toggle for MULTITAP bindings. */
+  /* v1.7.4.6: per-row silent/blocked toggle. Handles MULTITAP + (as of
+   * v1.7.11.18) MODIFIER kinds. Other kinds don't render the chip. */
   for (const chip of root.querySelectorAll('[data-slot-mode-toggle]')) {
     chip.addEventListener('click', async (e) => {
       e.stopPropagation();
       const slot = parseInt(chip.dataset.slotModeToggle, 10);
       const current = _bindingFor(slot);
       const u = unpackHotkey(current);
-      if (u.kind !== HK_KIND_MULTITAP) return;
-      /* Flip WATCH-ONLY bit + preserve ADAPTIVE. Re-pack. */
+      let newPacked = null;
       const newWatch = !u.watch;
-      const newPacked = packMultitap(u.vk, u.count, u.gap_ms, newWatch, u.adaptive);
+      if (u.kind === HK_KIND_MULTITAP) {
+        newPacked = packMultitap(u.vk, u.count, u.gap_ms, newWatch, u.adaptive);
+      } else if (u.kind === HK_KIND_MODIFIER) {
+        newPacked = packHotkey(u.mod, u.vk, newWatch);
+      } else {
+        return;
+      }
       _hkState.overrides[slot] = newPacked;
       const save = await window.svc.hotkeys.save(_hkState.overrides);
       _renderHotkeyEditor();
@@ -2507,6 +2552,30 @@ function _openHotkeyRecorder(slot) {
         if (e.ctrlKey)  mod |= 1;
         if (e.shiftKey) mod |= 2;
         if (e.altKey)   mod |= 4;
+        /* v1.7.11.15 (2026-07-25) — reject bare-key MODIFIER bindings.
+         *
+         * Without this guard the recorder would happily save mod=0
+         * bindings (e.g. bare "H"), which then match EVERY press of
+         * that key in the LL hook — turning normal typing of that
+         * letter into a hotkey trigger. Nasty when it's a common
+         * letter (H, S, T, etc.) because the user then can't type
+         * that letter in the AI chat OR any other app without firing
+         * the shortcut.
+         *
+         * If the user genuinely wants a bare-key trigger they should
+         * use the "Tap a key fast" tab (MULTITAP, 3 taps within a
+         * gap) or the "Hold a key" tab (LONGPRESS) — both of which
+         * are stealth-safe because normal typing doesn't produce the
+         * pattern. */
+        if (mod === 0) {
+          candidate = null;
+          _updateRisk();
+          const curEl = document.getElementById('hk-capture-current');
+          if (curEl) {
+            curEl.innerHTML = '<span style="color:#ef4444;">Hold <b>Ctrl</b>, <b>Shift</b>, or <b>Alt</b> and press the key.</span> Bare-key shortcuts would fire on every keystroke in your apps — try the <b>Tap a key fast</b> or <b>Hold a key</b> tabs instead.';
+          }
+          return;
+        }
         candidate = packHotkey(mod, vk);
         document.getElementById('hk-capture-current').textContent = formatHotkey(candidate);
         _updateRisk();
@@ -2847,9 +2916,9 @@ function _obSteps() {
       body: `
         <p>On the dashboard\'s <b>API keys</b> card, paste keys for one or more providers:</p>
         <ul>
-          <li><b>OpenAI</b> — GPT-5, o-series reasoning models</li>
-          <li><b>Anthropic</b> — Claude Opus, Sonnet, Haiku</li>
-          <li><b>Google</b> — Gemini 3.x, 2.5 flash</li>
+          <li><b>OpenAI</b> — GPT-5.6 family (Sol / Terra / Luna)</li>
+          <li><b>Anthropic</b> — Claude Opus 5, Sonnet 5, Haiku 4.5</li>
+          <li><b>Google</b> — Gemini 3.1 Pro, 3.6 Flash, 3.5 Flash-Lite</li>
           <li><b>OpenRouter</b> — has free models if you\'re trying it out</li>
         </ul>
         <p>Configure multiple providers so if one rate-limits, we transparently fall back to the next.</p>
@@ -3006,7 +3075,7 @@ function _obSteps() {
           <kbd>Ctrl+Alt+S</kbd>
           <span class="desc">Stop the current AI response (partial reply preserved)</span>
         </div>
-        <p>Strong-tier reasoning models (o3, Opus 4.8, GPT-5.5 Pro) can spend 30 s – 10 min thinking. Ctrl+Alt+S aborts cleanly and appends "(stopped by user)" to whatever streamed so far.</p>
+        <p>Strong-tier reasoning models (GPT-5.6 Sol, Claude Opus 5, Gemini 3.1 Pro) can spend 30 s – 10 min thinking. Ctrl+Alt+S aborts cleanly and appends "(stopped by user)" to whatever streamed so far.</p>
         <p>Regen the last question with a fresh AI call:</p>
         <div class="ob-kbdrow">
           <kbd>Ctrl+Alt+Enter</kbd>

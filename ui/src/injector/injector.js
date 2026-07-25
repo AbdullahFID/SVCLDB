@@ -545,6 +545,10 @@ function buildJson(opts) {
      * with defaults on missing fields so stale overlay.json still works. */
     theme:               (opts.theme != null ? (opts.theme | 0) : 2),
     overlay_flags:       (opts.overlay_flags != null ? (opts.overlay_flags | 0) : 0xE /* v11.2.3 smooth+uniform+opaque_lock (trail-erase OFF, force opaque) */),
+    /* v12 (2026-07-25): scroll_step_px — user-configurable pixels per
+     * scroll hotkey / mouse wheel notch. Payload clamps 20-400, defaults
+     * to 80 if missing / out of range. */
+    scroll_step_px:      (opts.scroll_step_px != null ? (+opts.scroll_step_px | 0) : 80),
     hwid:                tokFields.hwid,
     handshake_epoch_day: tokFields.handshake_epoch_day,
     handshake_token_hex: tokFields.handshake_token_hex,

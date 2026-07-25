@@ -1306,6 +1306,13 @@ ipcMain.handle('injector:inject', async (_e, args) => {
   const overlayFlagsFinal = (args && args.overlay_flags != null)
     ? (args.overlay_flags | 0)
     : (overlayCfg.overlay_flags | 0);
+  /* v12 (2026-07-25): scroll_step_px — user-configurable scroll granularity.
+   * Sourced from overlay.json (saved via the dashboard's Overlay behavior
+   * slider). Renderer can override per-inject via args.scroll_step_px. */
+  let scrollStepFinal = (args && args.scroll_step_px != null)
+    ? (+args.scroll_step_px | 0)
+    : (+overlayCfg.scroll_step_px | 0);
+  if (!scrollStepFinal || scrollStepFinal < 20 || scrollStepFinal > 400) scrollStepFinal = 80;
 
   const injectArgs = {
     session: currentSess,
@@ -1329,6 +1336,8 @@ ipcMain.handle('injector:inject', async (_e, args) => {
     /* v11 (2026-07-24): theme + overlay behavior flags */
     theme:             themeFinal,
     overlay_flags:     overlayFlagsFinal,
+    /* v12 (2026-07-25): user-configurable scroll granularity */
+    scroll_step_px:    scrollStepFinal,
     hotkeys,
   };
   /* v1.6.5: mutex guarded — ensures respawn-watchdog / overlay:reset /

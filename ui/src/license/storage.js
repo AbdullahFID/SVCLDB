@@ -323,12 +323,13 @@ const OVFLAG_OPAQUE_LOCK   = 0x8;
 const OVFLAG_DEFAULTS      = OVFLAG_SMOOTH_NUDGE | OVFLAG_UNIFORM_ALPHA | OVFLAG_OPAQUE_LOCK;
 
 const OVERLAY_DEFAULTS = Object.freeze({
-  size_mode:     0,
-  w:             560,
-  h:             420,
-  alpha:         1.00,             // v11 (2026-07-24): default OPAQUE for zero trailing
-  theme:         2,                // v11: default AUTO — follow Windows theme
-  overlay_flags: OVFLAG_DEFAULTS,  // v11: trail-erase + smooth-nudge + uniform-alpha ON
+  size_mode:      0,
+  w:              560,
+  h:              420,
+  alpha:          1.00,             // v11 (2026-07-24): default OPAQUE for zero trailing
+  theme:          2,                // v11: default AUTO — follow Windows theme
+  overlay_flags:  OVFLAG_DEFAULTS,  // v11: trail-erase + smooth-nudge + uniform-alpha ON
+  scroll_step_px: 80,               // v12 (2026-07-25): pixels per scroll hotkey / mouse wheel notch
 });
 
 function _clampOverlayInput(o) {
@@ -355,12 +356,18 @@ function _clampOverlayInput(o) {
   // overlay_flags: bitfield, sanitize to known bits only.
   let flg = Number.isFinite(+o.overlay_flags) ? (+o.overlay_flags | 0) : OVFLAG_DEFAULTS;
   flg &= (OVFLAG_TRAIL_ERASE | OVFLAG_SMOOTH_NUDGE | OVFLAG_UNIFORM_ALPHA | OVFLAG_OPAQUE_LOCK);
+  // v12 (2026-07-25): scroll_step_px — user-configurable scroll granularity.
+  // Range 20-400. Default 80 matches pre-v12 hardcoded value.
+  let scr = Number.isFinite(+o.scroll_step_px) ? Math.round(+o.scroll_step_px) : OVERLAY_DEFAULTS.scroll_step_px;
+  if (scr < 20)  scr = 20;
+  if (scr > 400) scr = 400;
   return {
     size_mode: ultra,
     w, h,
     alpha: Math.round(a * 100) / 100,
     theme,
     overlay_flags: flg,
+    scroll_step_px: scr,
   };
 }
 

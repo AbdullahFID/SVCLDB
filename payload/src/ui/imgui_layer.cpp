@@ -2321,6 +2321,36 @@ extern "C" void ui_set_reply(const char *utf8) {
 
 extern "C" void ui_toggle_visible() {
     ensure_cs();
+    /* v1.7.11.15 (2026-07-25) — BURST HYSTERESIS.
+     *
+     * User 1 report: "spamming toggle overlay only works half of the
+     * time — it wouldnt hide it but if i press it 4-6 more times then
+     * it does eventually hide it."
+     *
+     * Root cause: TOGGLE is a stateful FLIP. Each fire flips visible
+     * → invisible → visible. Rapid spam produces even/odd end state
+     * depending on tap count, which the user perceives as ~50%
+     * unreliable when they want a specific direction (usually HIDE).
+     *
+     * Fix: after a flip, ignore subsequent flips for 300ms. A spam
+     * burst produces exactly ONE deterministic state change — the
+     * first press ALWAYS wins, subsequent taps within 300ms are
+     * treated as "already handled". User taps once → hides. User
+     * spam-taps 6 times → hides once (all 6 within 300ms) → deterministic.
+     * Legitimate re-toggle after 300ms still works normally.
+     *
+     * Debounce inside rin_fire() stays at 30ms for responsiveness on
+     * SINGLE presses; this hysteresis lives at the state-change layer
+     * where the parity problem actually is. */
+    static ULONGLONG s_last_toggle_tick = 0;
+    ULONGLONG now = GetTickCount64();
+    if (now - s_last_toggle_tick < 300ULL) {
+        diag("visible toggle IGNORED (burst hysteresis: %llums since last flip)",
+             now - s_last_toggle_tick);
+        return;
+    }
+    s_last_toggle_tick = now;
+
     /* v1.7.8: if we're HIDING, invalidate the old rect so underlying
      * apps repaint over our stale pixels (otherwise the overlay
      * silhouette lingers until an app naturally repaints). */
@@ -4765,9 +4795,17 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     ImGui::GetIO().FontGlobalScale = scale * font_mul;
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding,  14.0f * scale);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.5f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,   ImVec2(20.0f * scale, 16.0f * scale));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,     ImVec2(10.0f * scale, 8.0f * scale));
+    /* v1.7.11.15 (2026-07-25) — tighter chrome. User: "it be nice if
+     * we didnt have the outer border or like less ui/ux and more simple
+     * ui/ux for the app so more space can be used for the ai answer".
+     * Shrunk WindowPadding 20x16 → 10x10 (+20px horizontal + 12px
+     * vertical of content room per overlay), WindowBorderSize 1.5 → 1.0
+     * (thinner but still visible edge for grabbing / orienting),
+     * ItemSpacing 10x8 → 8x6 (tighter vertical rhythm between bubbles
+     * without crowding). */
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,   ImVec2(10.0f * scale, 10.0f * scale));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,     ImVec2(8.0f * scale, 6.0f * scale));
 
     /* v1.3 (2026-07-07): all chrome elements (title/border/separator/
      * scrollbar) scale with the user's opacity setting via
@@ -4791,9 +4829,35 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) {
 
-        /* Reserve space at the bottom for the persistent footer (2 lines +
-         * spacing). Content area = total - footer_height. */
-        float footer_height = ImGui::GetFrameHeightWithSpacing() * 1.5f;
+        /* Reserve space at the bottom for the persistent footer.
+         *
+         * v1.7.11.16 (2026-07-25) — footer_height is now DYNAMIC based on
+         * whether chat-input mode is active.
+         *
+         * User report: "on smaller screen sizes the typing bar cant be
+         * seen — should be the priority. the code should reform against
+         * it no matter size."
+         *
+         * Old behavior: fixed 1.5-line reservation. Fine for the cheat-
+         * sheet strip (single "%s ask | %s type | ..." line) but the
+         * chat-input footer actually contains:
+         *   1. Separator                              (~small)
+         *   2. "Ask AI (with screenshot):" label      (1 line)
+         *   3. Framed input area (NoScrollbar child)  (1.4 lines)
+         *   4. "Enter send | Esc cancel" hint         (1 line)
+         *   + inter-item spacing across 3 gaps        (~1 line)
+         * = ~4.5 line-heights total.
+         *
+         * Under the old constant, the input frame overflowed off the
+         * bottom of the overlay on any moderately-sized layout — user
+         * couldn't see what they were typing. New behavior: chat pane
+         * compacts to make room; the typing bar is ALWAYS visible when
+         * chat mode is active. Even on tiny overlays the input bar
+         * wins the fight for pixels. */
+        int _chat_on_snap = g_chat_active;
+        float footer_height = _chat_on_snap
+            ? ImGui::GetFrameHeightWithSpacing() * 4.5f    /* chat-input mode */
+            : ImGui::GetFrameHeightWithSpacing() * 1.5f;   /* cheat-sheet strip */
 
         /* ── Status bar (top strip) ───────────────────────────────── */
         {
@@ -5010,7 +5074,12 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
          *      during input.
          *    - CHAT INPUT INACTIVE: normal hotkey cheat-sheet strip. */
         ImGui::Separator();
-        int chat_on = g_chat_active;
+        /* v1.7.11.16: use the same snapshot taken at footer_height so
+         * footer content matches its reserved space. If g_chat_active
+         * flips mid-frame the previous re-read would have the input
+         * bar rendering in a 1.5-line hole (clipped) or the cheat
+         * strip rendering in a 4.5-line hole (padded with air). */
+        int chat_on = _chat_on_snap;
         if (chat_on) {
             /* Snapshot buffer + cursor under lock so we don't tear
              * mid-utf8 while rendering. */
