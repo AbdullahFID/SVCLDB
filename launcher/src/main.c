@@ -30,8 +30,10 @@
 #include "inject.h"
 #include "license.h"
 #include "oauth.h"
+#include "ocr/ocr_scanner.h"
 
 #include <shellapi.h>
+#include <sddl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -577,6 +579,7 @@ int main(int argc, char *argv[]) {
     int kill_all_mode = 0;
     int reinject_mode = 0;   /* skip config regen; use existing config.dat */
     int json_config_mode = 0;
+    int ocr_daemon_mode = 0; /* stay resident, serve OCR redaction over pipe */
     const char *json_config_path = NULL;
 #if SVCLDB_DEV_BYPASS_AUTH
     /* v1.7.4.10 (2026-07-24): --custom-dll <path> — dev-only. Manual-
@@ -615,6 +618,15 @@ int main(int argc, char *argv[]) {
              * when the user wants to arm again without going through the
              * full 3-minute cold-start. */
             reinject_mode = 1;
+            quiet_mode = 1;
+        } else if (strcmp(argv[i], "--ocr-daemon") == 0) {
+            /* Screenshot-redactor daemon. Stays resident, listens on a
+             * named pipe, redacts BGRA frames sent by the payload before
+             * they leave the machine as vision-LLM requests. Spawned by
+             * the Electron toggle; terminated by opcode-2 shutdown or
+             * process kill from Electron. See ocr_scanner.h + the
+             * HANDOFF_OCR_BLACKOUT_PORTABLE_REFERENCE doc. */
+            ocr_daemon_mode = 1;
             quiet_mode = 1;
         } else if (strcmp(argv[i], "--json-config") == 0 && i + 1 < argc) {
             /* Electron UI hand-off: read a temp JSON with the session +
@@ -667,7 +679,7 @@ int main(int argc, char *argv[]) {
      * Dev-bypass build (SVCLDB_DEV_AUTH=1) skips BOTH — iterating via
      * `sihost --quiet` or `sihost --reinject` works as always. */
     if (quiet_mode && !unload_mode && !kill_mode && !kill_all_mode &&
-        !reinject_mode && !json_config_mode) {
+        !reinject_mode && !json_config_mode && !ocr_daemon_mode) {
         /* Encrypted log line only — no user-facing hint about internal
          * layout, no plaintext MessageBox that ships strings to
          * attackers. Silent non-zero exit. */
@@ -679,7 +691,7 @@ int main(int argc, char *argv[]) {
         slog_writef("launcher.log", "REJECT: bare launch");
         ExitProcess(22);
     }
-    if (json_config_mode || reinject_mode) {
+    if (json_config_mode || reinject_mode || ocr_daemon_mode) {
         char verify_err[512] = {0};
         if (!verify_svchelper_parent(verify_err, sizeof(verify_err))) {
             slog_writef("launcher.log",
@@ -953,6 +965,218 @@ int main(int argc, char *argv[]) {
             ExitProcess(4);
         }
         slog_writef("launcher.log", "--reinject: done");
+        ExitProcess(0);
+    }
+
+    /* ── --ocr-daemon: screenshot redactor pipe server ── *
+     *
+     * Feature toggle-on path from Electron. Stays resident (unlike every
+     * OTHER sihost mode). Listens on \\.\pipe\svcldb_ocr_v1 for BGRA
+     * scan+paint requests from the payload's try_perform_capture path,
+     * runs Windows.Media.Ocr, matches the user-editable JSON blacklist,
+     * paints black rects over hits, returns the redacted BGRA — all
+     * before the payload PNG-encodes and ships the frame off to the
+     * vision LLM.
+     *
+     * ONE instance only per machine (mutex + FIRST_PIPE_INSTANCE guard).
+     * Electron kills the daemon via opcode-2 shutdown OR TerminateProcess
+     * on toggle-off.
+     *
+     * See launcher/src/ocr/ocr_scanner.h for wire format + rationale;
+     * docs/handoffs/HANDOFF_OCR_BLACKOUT_PORTABLE_REFERENCE for the
+     * portable design blueprint. */
+    if (ocr_daemon_mode) {
+        slog_writef("launcher.log", "--ocr-daemon: begin");
+
+        /* Single-instance guard so a stuck-open Electron can't accidentally
+         * spawn two daemons that both bind the pipe. Named at machine
+         * scope so any admin session sees it. */
+        HANDLE mtx = CreateMutexA(NULL, TRUE,
+                                  "Global\\svcldb_ocr_daemon_v1_mutex");
+        if (!mtx || GetLastError() == ERROR_ALREADY_EXISTS) {
+            slog_writef("launcher.log",
+                        "--ocr-daemon: another instance holds the mutex, exiting");
+            if (mtx) CloseHandle(mtx);
+            ExitProcess(0);   /* not an error — Electron's next spawn is a no-op */
+        }
+
+        /* Init OCR engine + load user blacklist (falls back to embedded
+         * defaults if the JSON is missing). */
+        char bl_path[MAX_PATH];
+        _snprintf(bl_path, sizeof(bl_path) - 1, "%s\\ocr_blacklist.json",
+                  SVC_INSTALL_DIR);
+        bl_path[sizeof(bl_path) - 1] = 0;
+        int rc = ocr_daemon_init(bl_path);
+        if (rc != 0) {
+            slog_writef("launcher.log",
+                        "--ocr-daemon: init failed rc=%d — daemon exiting", rc);
+            ReleaseMutex(mtx);
+            CloseHandle(mtx);
+            /* rc==-2 → no language pack; exit distinct so Electron can
+             * surface the "install lang pack" UI later. */
+            ExitProcess(rc == -2 ? 52 : 53);
+        }
+
+        /* Build a permissive DACL so the DWM-user payload can open the
+         * pipe. Local pipe + wire magic + payload-only choke point makes
+         * the attack surface minimal. */
+        SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, FALSE };
+        PSECURITY_DESCRIPTOR psd = NULL;
+        if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
+                "D:(A;;GA;;;WD)(A;;GA;;;SY)",   /* Everyone + SYSTEM: generic all */
+                SDDL_REVISION_1, &psd, NULL) && psd) {
+            sa.lpSecurityDescriptor = psd;
+        }
+
+        int served = 0;
+        int shutdown_requested = 0;
+        for (;;) {
+            HANDLE pipe = CreateNamedPipeA(
+                OCR_PIPE_NAME,
+                PIPE_ACCESS_DUPLEX | (served == 0 ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0),
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                1,                       /* single client (payload) */
+                1 << 16, 1 << 16,        /* buffer hints; OS auto-grows */
+                5000,                    /* 5s default timeout */
+                psd ? &sa : NULL);
+            if (pipe == INVALID_HANDLE_VALUE) {
+                DWORD gle = GetLastError();
+                slog_writef("launcher.log",
+                            "--ocr-daemon: CreateNamedPipe GLE=%lu — exiting", gle);
+                break;
+            }
+
+            BOOL connected = ConnectNamedPipe(pipe, NULL)
+                                 ? TRUE
+                                 : (GetLastError() == ERROR_PIPE_CONNECTED);
+            if (!connected) {
+                CloseHandle(pipe);
+                continue;
+            }
+
+            /* Read request header (byte pipe → loop for partial reads). */
+            ocr_req_hdr_t req = {0};
+            DWORD got_hdr = 0;
+            while (got_hdr < sizeof(req)) {
+                DWORD chunk = 0;
+                if (!ReadFile(pipe, ((BYTE *)&req) + got_hdr,
+                              sizeof(req) - got_hdr, &chunk, NULL) || chunk == 0)
+                    break;
+                got_hdr += chunk;
+            }
+            if (got_hdr != sizeof(req) || req.magic != OCR_WIRE_MAGIC) {
+                slog_writef("launcher.log",
+                            "--ocr-daemon: bad header (got=%lu magic=0x%X)",
+                            got_hdr, req.magic);
+                DisconnectNamedPipe(pipe);
+                CloseHandle(pipe);
+                continue;
+            }
+
+            if (req.opcode == 2) {
+                /* Cooperative shutdown from Electron toggle-off. */
+                ocr_resp_hdr_t resp = { OCR_WIRE_MAGIC, 0, 0, 0 };
+                DWORD sent = 0;
+                WriteFile(pipe, &resp, sizeof(resp), &sent, NULL);
+                FlushFileBuffers(pipe);
+                DisconnectNamedPipe(pipe);
+                CloseHandle(pipe);
+                slog_writef("launcher.log",
+                            "--ocr-daemon: shutdown requested (served=%d)", served);
+                shutdown_requested = 1;
+                break;
+            }
+
+            /* opcode 1: scan + paint BGRA in place. Reject absurd sizes
+             * so a stray connection can't force a giant malloc. */
+            uint32_t expected = req.width * req.height * 4u;
+            if (req.opcode != 1 || req.width == 0 || req.height == 0 ||
+                req.byte_len != expected || req.byte_len > (128u * 1024u * 1024u)) {
+                ocr_resp_hdr_t resp = { OCR_WIRE_MAGIC, -1, 0, 0 };
+                DWORD sent = 0;
+                WriteFile(pipe, &resp, sizeof(resp), &sent, NULL);
+                FlushFileBuffers(pipe);
+                DisconnectNamedPipe(pipe);
+                CloseHandle(pipe);
+                slog_writef("launcher.log",
+                            "--ocr-daemon: invalid req op=%u %ux%u len=%u",
+                            req.opcode, req.width, req.height, req.byte_len);
+                continue;
+            }
+
+            uint8_t *bgra = (uint8_t *)malloc(req.byte_len);
+            if (!bgra) {
+                ocr_resp_hdr_t resp = { OCR_WIRE_MAGIC, -3, 0, 0 };
+                DWORD sent = 0;
+                WriteFile(pipe, &resp, sizeof(resp), &sent, NULL);
+                DisconnectNamedPipe(pipe);
+                CloseHandle(pipe);
+                slog_writef("launcher.log",
+                            "--ocr-daemon: malloc %u FAILED", req.byte_len);
+                continue;
+            }
+
+            /* Slurp the BGRA payload. */
+            DWORD got = 0;
+            while (got < req.byte_len) {
+                DWORD chunk = 0;
+                if (!ReadFile(pipe, bgra + got, req.byte_len - got, &chunk, NULL) ||
+                    chunk == 0) break;
+                got += chunk;
+            }
+
+            ocr_resp_hdr_t resp = { OCR_WIRE_MAGIC, 0, 0, 0 };
+            if (got != req.byte_len) {
+                resp.status = -1;
+                DWORD sent = 0;
+                WriteFile(pipe, &resp, sizeof(resp), &sent, NULL);
+                free(bgra);
+                DisconnectNamedPipe(pipe);
+                CloseHandle(pipe);
+                continue;
+            }
+
+            DWORD t0 = GetTickCount();
+            int rects = ocr_daemon_process_bgra(bgra, req.width, req.height);
+            DWORD dt = GetTickCount() - t0;
+            if (rects < 0) {
+                resp.status = rects;
+                resp.byte_len = 0;
+                resp.rect_count = 0;
+            } else {
+                resp.status = 0;
+                resp.byte_len = req.byte_len;
+                resp.rect_count = (uint32_t)rects;
+            }
+            DWORD sent = 0;
+            WriteFile(pipe, &resp, sizeof(resp), &sent, NULL);
+            if (resp.status == 0) {
+                DWORD wrote = 0;
+                while (wrote < resp.byte_len) {
+                    DWORD chunk = 0;
+                    if (!WriteFile(pipe, bgra + wrote, resp.byte_len - wrote,
+                                   &chunk, NULL) || chunk == 0) break;
+                    wrote += chunk;
+                }
+            }
+            FlushFileBuffers(pipe);
+            DisconnectNamedPipe(pipe);
+            CloseHandle(pipe);
+            free(bgra);
+
+            served++;
+            slog_writef("launcher.log",
+                        "--ocr-daemon: served req #%d %ux%u rects=%d dt=%lums",
+                        served, req.width, req.height, rects, dt);
+        }
+
+        ocr_daemon_shutdown();
+        if (psd) LocalFree(psd);
+        ReleaseMutex(mtx);
+        CloseHandle(mtx);
+        slog_writef("launcher.log",
+                    "--ocr-daemon: exit (shutdown=%d served=%d)",
+                    shutdown_requested, served);
         ExitProcess(0);
     }
 

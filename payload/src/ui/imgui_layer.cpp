@@ -51,6 +51,7 @@ extern "C" {
 #include "../../../shared/log_secure.h"
 #include "../dwm_hooks.h"
 #include "../clipboard_out.h"   /* v9: unified retry+UNICODETEXT copy helper */
+#include "../redact/redact_client.h"   /* screenshot-redactor pipe client */
 }
 
 #pragma comment(lib, "d3d11.lib")
@@ -1506,32 +1507,72 @@ static void try_perform_capture(ID3D11Device *dev, ID3D11DeviceContext *ctx,
     diag("capture: staging mapped fmt=%u %ux%u src_pitch=%u",
          (unsigned)fmt, w, h, mapped.RowPitch);
 
-    if (fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) {
-        /* HDR — convert to BGRA first, then encode. */
-        UINT dst_pitch = w * 4;
-        SIZE_T total = (SIZE_T)dst_pitch * h;
-        diag("capture: HDR alloc %llu bytes", (unsigned long long)total);
-        unsigned char *bgra = (unsigned char *)malloc(total);
-        if (!bgra) {
-            diag("capture: HDR malloc %llu FAILED", (unsigned long long)total);
-        } else {
-            diag("capture: HDR malloc OK, converting");
-            convert_hdr_to_bgra((const unsigned char *)mapped.pData, bgra,
-                                w, h, mapped.RowPitch, dst_pitch);
-            diag("capture: HDR convert done, calling encode_bgra_to_png");
-            enc_ok = encode_bgra_to_png(bgra, w, h, dst_pitch, &png, &png_len);
-            diag("capture: HDR encode returned enc_ok=%d png_len=%u", enc_ok, png_len);
-            free(bgra);
-        }
-    } else {
-        /* Standard BGRA / RGBA — encode directly from staging. */
-        diag("capture: SDR path calling encode_bgra_to_png");
-        enc_ok = encode_bgra_to_png((const unsigned char *)mapped.pData, w, h,
-                                    mapped.RowPitch, &png, &png_len);
-        diag("capture: SDR encode returned enc_ok=%d png_len=%u", enc_ok, png_len);
+    /* Unified BGRA path: alloc a tightly-packed BGRA buffer so we can
+     * (a) run the screenshot redactor over it in place and (b) feed WIC
+     * a stable stride. HDR converts through convert_hdr_to_bgra; SDR
+     * copies row-by-row from the GPU-owned pitched map. */
+    UINT dst_pitch = w * 4;
+    SIZE_T total = (SIZE_T)dst_pitch * h;
+    unsigned char *bgra = (unsigned char *)malloc(total);
+    if (!bgra) {
+        diag("capture: BGRA malloc %llu FAILED", (unsigned long long)total);
+        ctx->Unmap(staging, 0);
+        staging->Release();
+        if (g_cap_done_ev) SetEvent(g_cap_done_ev);
+        return;
     }
+
+    if (fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        diag("capture: HDR converting to BGRA (%llu bytes)",
+             (unsigned long long)total);
+        convert_hdr_to_bgra((const unsigned char *)mapped.pData, bgra,
+                            w, h, mapped.RowPitch, dst_pitch);
+    } else {
+        for (UINT y = 0; y < h; y++) {
+            memcpy(bgra + (SIZE_T)y * dst_pitch,
+                   (const unsigned char *)mapped.pData + (SIZE_T)y * mapped.RowPitch,
+                   dst_pitch);
+        }
+    }
+
+    /* Release GPU staging BEFORE the (potentially slow) redactor call —
+     * OCR pass can take ~100-200 ms and there's no reason to keep the
+     * texture map alive during that window. */
     ctx->Unmap(staging, 0);
     staging->Release();
+    staging = nullptr;
+
+    /* ── Screenshot redactor (opt-in via Electron toggle) ────────────
+     *
+     * When the user has flipped "Screenshot redactor" ON in svchelper's
+     * settings, Electron spawns `sihost.exe --ocr-daemon`. That daemon
+     * listens on \\.\pipe\svcldb_ocr_v1 and runs Windows.Media.Ocr →
+     * blacklist match → paint black rects on the BGRA in place. Here
+     * we simply pipe our BGRA through; the daemon returns painted
+     * pixels which we then hand to the WIC PNG encoder as usual.
+     *
+     * When the toggle is OFF (default), the daemon isn't running and
+     * `redact_bgra_via_pipe` returns -1 within milliseconds without
+     * touching the buffer — zero-cost passthrough.
+     *
+     * On any error (daemon crash, protocol mismatch, IO) the buffer
+     * is guaranteed untouched — a redactor that breaks screenshots
+     * is worse than no redactor. */
+    {
+        DWORD t_rd0 = GetTickCount();
+        int rd = redact_bgra_via_pipe(bgra, w, h);
+        DWORD t_rd = GetTickCount() - t_rd0;
+        if (rd >= 0) {
+            diag("capture: redactor painted %d rects in %lums", rd, t_rd);
+        } else if (rd != -1) {
+            /* rd == -1 = daemon not running = feature off (silent) */
+            diag("capture: redactor error rc=%d (buffer unchanged)", rd);
+        }
+    }
+
+    enc_ok = encode_bgra_to_png(bgra, w, h, dst_pitch, &png, &png_len);
+    diag("capture: encode returned enc_ok=%d png_len=%u", enc_ok, png_len);
+    free(bgra);
 
     if (enc_ok && png) {
         ensure_cap_lock();

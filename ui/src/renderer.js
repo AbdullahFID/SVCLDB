@@ -3320,3 +3320,192 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Load hotkeys once the dashboard is likely to be shown.
   try { await _loadHotkeys(); } catch {}
 });
+
+/* ══════════════════════════════════════════════════════════════════
+ * v1.7.12 (2026-08-01) — Screenshot redactor card + modal wiring.
+ *
+ * Self-contained IIFE — depends only on window.svc.ocr (exposed via
+ * preload.js) and DOM elements added to index.html for the redactor
+ * card + modal. Registers its own DOMContentLoaded handler so it
+ * survives being appended anywhere in renderer.js.
+ * ══════════════════════════════════════════════════════════════════ */
+(function initOcrRedactor() {
+  const run = () => {
+    const chk       = document.getElementById('chk-ocr-enabled');
+    const badge     = document.getElementById('ocr-status-badge');
+    const editBtn   = document.getElementById('btn-ocr-edit');
+    const modal     = document.getElementById('ocr-modal');
+    const backdrop  = document.getElementById('ocr-modal-backdrop');
+    const closeBtn  = document.getElementById('btn-ocr-close');
+    const wordsTa   = document.getElementById('ocr-modal-words');
+    const phrasesTa = document.getElementById('ocr-modal-phrases');
+    const wordsCnt  = document.getElementById('ocr-modal-words-count');
+    const phrasesCnt= document.getElementById('ocr-modal-phrases-count');
+    const saveBtn   = document.getElementById('btn-ocr-save');
+    const resetBtn  = document.getElementById('btn-ocr-reset');
+    const status    = document.getElementById('ocr-modal-status');
+
+    if (!chk || !badge || !editBtn || !modal || !window.svc || !window.svc.ocr) {
+      /* Redactor UI not present or preload missing — nothing to wire. */
+      return;
+    }
+
+    /* ── State helpers ────────────────────────────────── */
+    const setBadge = (state) => {
+      badge.classList.remove('on', 'error');
+      if (state === 'on')    { badge.textContent = 'on';       badge.classList.add('on'); }
+      else if (state === 'starting') { badge.textContent = 'starting…'; }
+      else if (state === 'stopping') { badge.textContent = 'stopping…'; }
+      else if (state === 'error')    { badge.textContent = 'error';    badge.classList.add('error'); }
+      else                    { badge.textContent = 'off'; }
+    };
+
+    const linesFromTa = (ta) => {
+      return (ta.value || '')
+        .split('\n')
+        .map(s => s.trim())
+        .filter(s => s && !s.startsWith('#'));
+    };
+    const linesToTa = (arr) => (arr || []).join('\n');
+
+    const updateCounts = () => {
+      wordsCnt.textContent   = '(' + linesFromTa(wordsTa).length + ')';
+      phrasesCnt.textContent = '(' + linesFromTa(phrasesTa).length + ')';
+    };
+
+    let dirty = false;
+    const markDirty = () => {
+      dirty = true;
+      status.textContent = 'Unsaved changes.';
+      status.className = 'ocr-modal-status dirty';
+      updateCounts();
+    };
+    const markSaved = (n) => {
+      dirty = false;
+      status.textContent = `Saved ${n.wordCount} words + ${n.phraseCount} phrases.`;
+      status.className = 'ocr-modal-status saved';
+    };
+    const markError = (msg) => {
+      status.textContent = msg;
+      status.className = 'ocr-modal-status error';
+    };
+
+    /* ── Initial state fetch ───────────────────────────── */
+    const refreshState = async () => {
+      try {
+        const s = await window.svc.ocr.getState();
+        chk.checked = !!s.enabled;
+        setBadge(s.enabled && s.daemonRunning ? 'on'
+                : s.enabled ? 'error'
+                : 'off');
+      } catch (e) {
+        console.log('[ocr] getState failed:', e && e.message);
+      }
+    };
+    refreshState();
+
+    /* ── Toggle handler ────────────────────────────────── */
+    chk.addEventListener('change', async () => {
+      const want = chk.checked;
+      setBadge(want ? 'starting' : 'stopping');
+      chk.disabled = true;
+      try {
+        const r = await window.svc.ocr.setEnabled(want);
+        if (!r || !r.ok) {
+          setBadge('error');
+          chk.checked = !want;
+        } else {
+          setBadge(r.daemonRunning ? 'on' : (want ? 'error' : 'off'));
+        }
+      } catch (e) {
+        setBadge('error');
+        chk.checked = !want;
+        console.log('[ocr] setEnabled failed:', e && e.message);
+      } finally {
+        chk.disabled = false;
+      }
+    });
+
+    /* ── Modal open / close ────────────────────────────── */
+    const openModal = async () => {
+      status.textContent = 'Loading…';
+      status.className = 'ocr-modal-status';
+      dirty = false;
+      try {
+        const bl = await window.svc.ocr.getBlacklist();
+        wordsTa.value   = linesToTa(bl.words);
+        phrasesTa.value = linesToTa(bl.phrases);
+        updateCounts();
+        status.textContent = bl.usingDefaults
+          ? 'Loaded (using built-in defaults).'
+          : 'Loaded from disk.';
+      } catch (e) {
+        markError('Load failed: ' + (e && e.message || 'unknown'));
+      }
+      modal.hidden = false;
+      modal.setAttribute('aria-hidden', 'false');
+      setTimeout(() => wordsTa.focus(), 30);
+    };
+    const closeModal = () => {
+      if (dirty) {
+        if (!confirm('Discard unsaved changes to the redactor blacklist?')) return;
+      }
+      modal.hidden = true;
+      modal.setAttribute('aria-hidden', 'true');
+    };
+
+    editBtn.addEventListener('click', openModal);
+    closeBtn.addEventListener('click', closeModal);
+    backdrop.addEventListener('click', closeModal);
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !modal.hidden) closeModal();
+    });
+
+    /* ── Textarea change tracking ──────────────────────── */
+    wordsTa.addEventListener('input', markDirty);
+    phrasesTa.addEventListener('input', markDirty);
+
+    /* ── Save ──────────────────────────────────────────── */
+    saveBtn.addEventListener('click', async () => {
+      saveBtn.disabled = true;
+      const payload = {
+        words:   linesFromTa(wordsTa),
+        phrases: linesFromTa(phrasesTa),
+      };
+      try {
+        const r = await window.svc.ocr.saveBlacklist(payload);
+        if (r && r.ok) {
+          markSaved(r);
+        } else {
+          markError('Save failed: ' + (r && r.err || 'unknown'));
+        }
+      } catch (e) {
+        markError('Save threw: ' + (e && e.message || 'unknown'));
+      } finally {
+        saveBtn.disabled = false;
+      }
+    });
+
+    /* ── Reset (repopulates textareas from defaults; user still saves) ── */
+    resetBtn.addEventListener('click', async () => {
+      if (!confirm('Replace both lists with the built-in defaults? '
+                 + 'You will still need to press Save to persist.')) return;
+      try {
+        const d = await window.svc.ocr.getDefaults();
+        wordsTa.value   = linesToTa(d.words);
+        phrasesTa.value = linesToTa(d.phrases);
+        markDirty();
+        status.textContent = 'Defaults loaded — press Save to persist.';
+        status.className = 'ocr-modal-status dirty';
+      } catch (e) {
+        markError('Defaults load failed: ' + (e && e.message || 'unknown'));
+      }
+    });
+  };
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', run, { once: true });
+  } else {
+    run();
+  }
+})();

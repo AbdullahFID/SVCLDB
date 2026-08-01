@@ -20,7 +20,7 @@
     <div class="brand">
       <div class="logo">C</div>
       <span class="name">CloakGPT</span>
-      <span class="ver" id="titlebar-ver">v1.7</span>
+      <span class="ver" id="titlebar-ver">v1.8</span>
     </div>
     <div class="actions">
       <button id="tb-min" title="Minimize" aria-label="Minimize">
@@ -74,7 +74,7 @@
             Browser didn't open? <a id="copy-auth-url">Copy sign-in URL</a>
           </div>
           <div class="device-id" id="login-device"></div>
-          <div class="app-version" id="login-app-ver">CloakGPT v1.7.10</div>
+          <div class="app-version" id="login-app-ver">CloakGPT v1.8.0</div>
         </div>
       </div>
     </section>
@@ -590,6 +590,77 @@
           <div class="ova-actions">
             <span class="ova-actions-hint" id="ova-status">No unsaved changes.</span>
             <button id="btn-ova-save" class="btn btn-primary" disabled>Save (applies on next Inject)</button>
+          </div>
+        </div>
+
+        <!-- v1.7.12 (2026-08-01) — Screenshot redactor
+             On-device Windows.Media.Ocr pass that scans every outbound
+             screenshot for user-blacklisted words (proctoring product
+             names, "proctored", "monitored", etc.) and paints black
+             rects over matched regions BEFORE the image is base64-
+             encoded and sent to the vision LLM. Runs entirely locally
+             through the OS-provided OCR — no models to ship, no
+             external service, no additional network egress.
+
+             Trade-off: helper process (sihost.exe --ocr-daemon) stays
+             resident when enabled → a slight stealth cost. Default OFF;
+             users flip it ON only for proctored-exam sessions. -->
+        <div class="hotkey-card" id="ocr-redactor-card">
+          <h3>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="3" x2="21" y2="21"/><line x1="21" y1="3" x2="3" y2="21"/></svg>
+            Screenshot redactor
+            <span class="hk-header-actions">
+              <span id="ocr-status-badge" class="chip" style="opacity:.7">off</span>
+            </span>
+          </h3>
+          <div class="hk-hint">
+            On-device OCR finds words you blacklist (e.g. <b>Respondus</b>, <b>proctored</b>, <b>Turnitin</b>) inside every screenshot and paints them <b>solid black</b> before the image leaves your machine. Nothing is uploaded; everything runs through Windows' built-in <code>Windows.Media.Ocr</code>.
+            <br><br>
+            <b>Stealth trade-off:</b> when this is ON, our helper process <code>sihost.exe</code> stays resident to service OCR requests. Leave it <b>off</b> unless you actually need redaction (proctored exam etc.).
+          </div>
+
+          <div class="ans-toggle-row" style="margin-top:10px">
+            <label class="ans-toggle">
+              <input type="checkbox" id="chk-ocr-enabled">
+              <span class="ans-toggle-slider"></span>
+            </label>
+            <div class="ans-toggle-text">
+              <div class="ans-toggle-title">Enable screenshot redactor</div>
+              <div class="ans-toggle-sub">Applies to every screenshot taken via the overlay (<kbd>Ctrl+U</kbd>). Toggle off any time to restore full stealth.</div>
+            </div>
+            <button id="btn-ocr-edit" class="btn btn-secondary btn-mini" style="margin-left:auto">Edit blacklist</button>
+          </div>
+        </div>
+
+        <!-- Redactor modal — hidden by default; renderer.js populates
+             from svc.ocr.getBlacklist() on open, persists on save. -->
+        <div id="ocr-modal" class="ocr-modal" hidden aria-hidden="true">
+          <div class="ocr-modal-backdrop" id="ocr-modal-backdrop"></div>
+          <div class="ocr-modal-panel" role="dialog" aria-labelledby="ocr-modal-title">
+            <div class="ocr-modal-header">
+              <h3 id="ocr-modal-title">Edit redactor blacklist</h3>
+              <button class="ocr-modal-close" id="btn-ocr-close" aria-label="Close">&times;</button>
+            </div>
+            <div class="ocr-modal-body">
+              <p class="ocr-modal-hint">
+                <b>Words</b> — matched exact-token per OCR word. <b>Phrases</b> — matched as substrings against the joined text of each OCR line, so multi-word banners work. One entry per line. Lines starting with <code>#</code> are ignored (use them as section headers).
+              </p>
+              <div class="ocr-modal-cols">
+                <div class="ocr-modal-col">
+                  <label for="ocr-modal-words">Words <span class="ocr-modal-count" id="ocr-modal-words-count">(0)</span></label>
+                  <textarea id="ocr-modal-words" spellcheck="false" placeholder="respondus&#10;proctored&#10;midterm"></textarea>
+                </div>
+                <div class="ocr-modal-col">
+                  <label for="ocr-modal-phrases">Phrases <span class="ocr-modal-count" id="ocr-modal-phrases-count">(0)</span></label>
+                  <textarea id="ocr-modal-phrases" spellcheck="false" placeholder="screen recording&#10;proctored exam&#10;academic integrity"></textarea>
+                </div>
+              </div>
+            </div>
+            <div class="ocr-modal-footer">
+              <span id="ocr-modal-status" class="ocr-modal-status">Loaded.</span>
+              <button id="btn-ocr-reset" class="btn btn-secondary">Reset to defaults</button>
+              <button id="btn-ocr-save" class="btn btn-primary">Save</button>
+            </div>
           </div>
         </div>
 

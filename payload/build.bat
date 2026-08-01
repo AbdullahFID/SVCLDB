@@ -60,6 +60,7 @@ set C_SOURCES=^
  "%SRC%\ldb_detect.c" "%SRC%\rawinput_hook.c" ^
  "%SRC%\dwm_hooks.c" "%SRC%\sub_check.c" ^
  "%SRC%\ai\ai_provider.c" ^
+ "%SRC%\redact\redact_client.c" ^
  "%SRC%\dllmain.c"
 
 set CXX_SOURCES=^

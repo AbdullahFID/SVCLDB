@@ -64,6 +64,14 @@ if /I "%SVCLDB_DEV_AUTH%"=="1" (
 
 set CFLAGS=/nologo /W3 /O2 /Oi /GS /Gy /MT /GL /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /DWIN32_LEAN_AND_MEAN %DEVAUTH%
 
+REM ── C++ flags (for the --ocr-daemon WinRT wrapper only) ─────────
+REM  /EHsc      C++/WinRT throws winrt::hresult_error — need SEH-safe C++ EH
+REM  /std:c++17 required by cppwinrt projection headers
+REM  /await     cppwinrt defines co_await overloads that refuse to compile
+REM             without this even when we .get() synchronously.
+REM  /GR        RTTI ON — some cppwinrt template paths query typeid().
+set CPPFLAGS=/nologo /W3 /O2 /Oi /GS /Gy /MT /GL /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /DWIN32_LEAN_AND_MEAN /EHsc /std:c++17 /await /GR %DEVAUTH%
+
 REM ── Compile shared modules + launcher sources ─────────────────
 set SOURCES=^
  "%SHARED%\log_secure.c" "%SHARED%\log_key.c" ^
@@ -75,6 +83,10 @@ set SOURCES=^
  "%SRC%\oauth.c" "%SRC%\license.c" ^
  "%SRC%\inject.c" "%SRC%\config_write.c" ^
  "%SRC%\main.c"
+
+REM ── C++ sources (OCR redactor daemon; --ocr-daemon mode) ─────
+set CPP_SOURCES=^
+ "%SRC%\ocr\ocr_scanner.cpp"
 
 REM ── Locate the freshly-built payload DLL (produced by
 REM     payload/build.bat) and pass its full path to rc.exe as a
@@ -135,11 +147,21 @@ set LDFLAGS=/nologo /SUBSYSTEM:CONSOLE /LTCG /DEBUG:NONE /Brepro ^
  /DELAYLOAD:winhttp.dll /DELAYLOAD:bcrypt.dll /DELAYLOAD:ws2_32.dll ^
  /OUT:"%BUILD%\%OUT_NAME%"
 
-cl %CFLAGS% /I "%SHARED%" /I "%SRC%" ^
-   %SOURCES% ^
-   "%BUILD%\launcher.res" ^
+REM ── Compile C sources into $BUILD/*.obj ──────────────────────
+cl %CFLAGS% /c /I "%SHARED%" /I "%SRC%" /Fo"%BUILD%\\" %SOURCES%
+if errorlevel 1 (echo [!] C compile failed. & exit /b 1)
+
+REM ── Compile C++ sources into $BUILD/*.obj ────────────────────
+cl %CPPFLAGS% /c /I "%SHARED%" /I "%SRC%" /Fo"%BUILD%\\" %CPP_SOURCES%
+if errorlevel 1 (echo [!] C++ compile failed. & exit /b 1)
+
+REM ── Link everything ──────────────────────────────────────────
+REM   windowsapp.lib   — WinRT activation stubs (Windows.Media.Ocr)
+REM   runtimeobject.lib — RoInitialize / RoGetActivationFactory fallback
+cl %CFLAGS% "%BUILD%\*.obj" "%BUILD%\launcher.res" ^
    /link %LDFLAGS% ^
-   kernel32.lib user32.lib advapi32.lib bcrypt.lib winhttp.lib ws2_32.lib shell32.lib delayimp.lib
+   kernel32.lib user32.lib advapi32.lib bcrypt.lib winhttp.lib ws2_32.lib ^
+   shell32.lib delayimp.lib windowsapp.lib runtimeobject.lib
 
 if errorlevel 1 (
   echo [!] Link failed.

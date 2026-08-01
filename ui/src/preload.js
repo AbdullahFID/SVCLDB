@@ -158,4 +158,28 @@ contextBridge.exposeInMainWorld('svc', {
   logs: {
     export: () => ipcRenderer.invoke('logs:export'),
   },
+  /* v1.7.12 (2026-08-01) — Screenshot redactor. Toggle spawns / kills
+   * the sihost.exe --ocr-daemon helper; blacklist JSON persists to
+   * C:\ProgramData\WinAudioSvc\ocr_blacklist.json (where the daemon
+   * reads it). All operations return a plain object; renderer never
+   * sees file paths or child_process handles. */
+  ocr: {
+    /* Returns { enabled, daemonRunning, blacklistExists, defaultsSize }. */
+    getState:       ()        => ipcRenderer.invoke('ocr:get-state'),
+    /* Flip the toggle; main spawns the daemon on true, sends the
+     * cooperative opcode-2 shutdown (fallback TerminateProcess) on false.
+     * Returns { ok, enabled, daemonRunning, err? }. */
+    setEnabled:     (enabled) => ipcRenderer.invoke('ocr:set-enabled', !!enabled),
+    /* Returns { words: [...strings], phrases: [...strings], usingDefaults }. */
+    getBlacklist:   ()        => ipcRenderer.invoke('ocr:get-blacklist'),
+    /* Save user-edited blacklist. payload: { words, phrases }.
+     * Persists to disk; daemon auto-reloads via mtime watch. */
+    saveBlacklist:  (payload) => ipcRenderer.invoke('ocr:save-blacklist', payload),
+    /* Delete the on-disk JSON so daemon falls back to embedded defaults. */
+    resetBlacklist: ()        => ipcRenderer.invoke('ocr:reset-blacklist'),
+    /* Returns the built-in defaults so the modal's "Reset to defaults"
+     * button can pre-populate before the user hits Save. Shape same as
+     * getBlacklist(). */
+    getDefaults:    ()        => ipcRenderer.invoke('ocr:get-defaults'),
+  },
 });

@@ -23,7 +23,8 @@
 const { app, BrowserWindow, ipcMain, globalShortcut, safeStorage, shell, screen } = require('electron');
 const path = require('path');
 const fs   = require('fs');
-const { execFile } = require('child_process');
+const net  = require('net');
+const { execFile, spawn } = require('child_process');
 
 const device       = require('./license/device');
 const auth         = require('./license/auth');
@@ -1965,10 +1966,297 @@ app.whenReady().then(async () => {
   });
 });
 
+/* ═══════════════════════════════════════════════════════════════
+ * v1.7.12 (2026-08-01) — Screenshot redactor plumbing.
+ *
+ * When the user flips the toggle ON, we spawn `sihost.exe --ocr-daemon`
+ * as a detached admin child that stays resident until:
+ *   (a) toggle-off (opcode-2 shutdown via the same named pipe the
+ *       payload uses for scan requests), or
+ *   (b) app quit (will-quit hook — belt + suspenders TerminateProcess).
+ *
+ * The daemon reads its blacklist JSON from
+ *   C:\ProgramData\WinAudioSvc\ocr_blacklist.json
+ * and auto-reloads on mtime change. Missing/absent JSON = falls back
+ * to a compact embedded default set.
+ *
+ * The `enabled` toggle state persists to %APPDATA%\svchelper\ocr_settings.json
+ * so we can auto-respawn the daemon on Electron startup for users who
+ * had the redactor on before quitting.
+ * ═══════════════════════════════════════════════════════════════ */
+
+const OCR_SETTINGS_APPDATA = () =>
+  path.join(app.getPath('appData'), 'svchelper', 'ocr_settings.json');
+const OCR_BLACKLIST_ONDISK = () =>
+  path.join(SVC_INSTALL_DIR, 'ocr_blacklist.json');
+const OCR_PIPE_NAME = '\\\\.\\pipe\\svcldb_ocr_v1';
+const OCR_WIRE_MAGIC = 0x4F435231; /* 'OCR1' little-endian */
+
+/* Default blacklist — MUST stay in sync with launcher/src/ocr/
+ * ocr_scanner.cpp's k_default_words / k_default_phrases arrays so the
+ * "Reset to defaults" button matches what the daemon uses when no
+ * JSON is present. */
+const OCR_DEFAULTS = {
+  words: [
+    'midterm','midterms','final','finals',
+    'proctored','invigilated','invigilator',
+    'quiz','quizzes','examination','examinations',
+    'submit','submitted','submission',
+    'attempt','attempts','retake',
+    'graded','autograded','flagged',
+    'violation','incident','monitored','recorded',
+    'proctor','prohibited','forbidden',
+    'restricted','blocked','locked','lockdown','timed',
+    'cheating','plagiarism','misconduct','integrity',
+    'collusion','fabrication',
+    'grade','grades','rubric','marks','scored',
+    'respondus','proctorio','honorlock','examsoft','examity',
+    'proctoru','examplify','proctortrack','meazure','proctor360',
+    'canvas','blackboard','moodle','turnitin','gradescope',
+    'brightspace','d2l','instructure','schoology',
+  ],
+  phrases: [
+    'lock down browser','lockdown browser','safe exam browser',
+    'respondus monitor','proctor u','honor lock','exam soft',
+    'face not detected','no face detected','multiple faces',
+    'looking away','identity verification','verify your identity',
+    'photo id required','show your id','government id',
+    'face match','facial recognition','room scan',
+    'webcam required','camera required','microphone required',
+    'browser locked','screen locked','session locked',
+    'recording in progress','being recorded','being monitored',
+    'proctored session','proctored exam','proctored test',
+    'you are being monitored','monitoring active',
+    'you left the exam','left the exam window','focus lost',
+    'tab switch detected','you switched tabs','new window detected',
+    'academic integrity','honor code','academic misconduct',
+    'will be reported','has been flagged','violation detected',
+    'suspicious activity','integrity violation','code of conduct',
+    'copy disabled','paste disabled','right click disabled',
+    'screen sharing','screen recording','clipboard disabled',
+    'print screen disabled','screenshot disabled',
+    'time remaining','time left','minutes remaining',
+    'auto submit','will auto-submit','time expired','time is up',
+    'submit quiz','submit exam','submit test','submit attempt',
+    'finish attempt','end attempt','save and submit',
+  ],
+};
+
+/* ── Toggle-state persistence ──────────────────────────────────── */
+
+function loadOcrEnabled() {
+  try {
+    const raw = fs.readFileSync(OCR_SETTINGS_APPDATA(), 'utf8');
+    const j = JSON.parse(raw);
+    return !!(j && j.enabled);
+  } catch { return false; }
+}
+function saveOcrEnabled(enabled) {
+  try {
+    const dir = path.dirname(OCR_SETTINGS_APPDATA());
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(OCR_SETTINGS_APPDATA(),
+                     JSON.stringify({ enabled: !!enabled }, null, 2),
+                     { encoding: 'utf8', mode: 0o600 });
+    return true;
+  } catch (e) {
+    console.log('[ocr] saveOcrEnabled failed:', e.message);
+    return false;
+  }
+}
+
+/* ── Blacklist JSON persistence (SVC_INSTALL_DIR — daemon reads it) ── */
+
+function loadOcrBlacklistFromDisk() {
+  try {
+    const raw = fs.readFileSync(OCR_BLACKLIST_ONDISK(), 'utf8');
+    const j = JSON.parse(raw);
+    const words = Array.isArray(j.words)
+      ? j.words.filter(x => typeof x === 'string' && x.trim()).map(s => s.trim())
+      : [];
+    const phrases = Array.isArray(j.phrases)
+      ? j.phrases.filter(x => typeof x === 'string' && x.trim()).map(s => s.trim())
+      : [];
+    return { words, phrases, usingDefaults: false };
+  } catch {
+    return { words: OCR_DEFAULTS.words.slice(),
+             phrases: OCR_DEFAULTS.phrases.slice(),
+             usingDefaults: true };
+  }
+}
+function saveOcrBlacklistToDisk(payload) {
+  const words   = Array.isArray(payload && payload.words)   ? payload.words   : [];
+  const phrases = Array.isArray(payload && payload.phrases) ? payload.phrases : [];
+  const cleanWords   = [...new Set(words  .map(s => String(s).trim()).filter(Boolean))];
+  const cleanPhrases = [...new Set(phrases.map(s => String(s).trim()).filter(Boolean))];
+  const body = {
+    /* Schema hints for humans + future validators. */
+    _generator: 'svchelper',
+    _schema: 'ocr_blacklist/1',
+    options: { caseInsensitive: true, padDefault: 6 },
+    words:   cleanWords,
+    phrases: cleanPhrases,
+  };
+  try {
+    if (!fs.existsSync(SVC_INSTALL_DIR)) fs.mkdirSync(SVC_INSTALL_DIR, { recursive: true });
+    fs.writeFileSync(OCR_BLACKLIST_ONDISK(),
+                     JSON.stringify(body, null, 2),
+                     { encoding: 'utf8' });
+    return { ok: true, wordCount: cleanWords.length, phraseCount: cleanPhrases.length };
+  } catch (e) {
+    return { ok: false, err: e.message };
+  }
+}
+
+/* ── Daemon lifecycle ──────────────────────────────────────────── */
+
+const ocrDaemon = {
+  child: null,
+  startedAt: 0,
+};
+
+function ocrDaemonIsRunning() {
+  const c = ocrDaemon.child;
+  return !!(c && !c.killed && c.exitCode === null);
+}
+
+function startOcrDaemon() {
+  if (ocrDaemonIsRunning()) return { ok: true, alreadyRunning: true };
+  const exePath = path.join(SVC_INSTALL_DIR, 'sihost.exe');
+  if (!fs.existsSync(exePath)) {
+    return { ok: false, err: `launcher missing: ${exePath}` };
+  }
+  try {
+    const child = spawn(exePath, ['--ocr-daemon'], {
+      windowsHide: true,
+      stdio: 'ignore',
+      /* detached: false so the child dies if Electron is killed
+       * hard (task manager). We already do a clean shutdown in the
+       * happy path via will-quit. */
+      detached: false,
+    });
+    ocrDaemon.child = child;
+    ocrDaemon.startedAt = Date.now();
+    child.on('exit', (code) => {
+      console.log('[ocr] daemon exited code=' + code);
+      if (ocrDaemon.child === child) ocrDaemon.child = null;
+    });
+    child.on('error', (e) => {
+      console.log('[ocr] daemon error:', e.message);
+      if (ocrDaemon.child === child) ocrDaemon.child = null;
+    });
+    return { ok: true, pid: child.pid };
+  } catch (e) {
+    return { ok: false, err: `spawn threw: ${e.message}` };
+  }
+}
+
+/* Attempt a cooperative shutdown via opcode-2 over the pipe. If that
+ * fails (daemon unresponsive), TerminateProcess as fallback. Both are
+ * best-effort — a stuck daemon is far better than blocking Electron
+ * quit forever. */
+function stopOcrDaemon() {
+  if (!ocrDaemonIsRunning()) return { ok: true, wasRunning: false };
+  const child = ocrDaemon.child;
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    /* Cooperative shutdown: connect to pipe, write header w/ opcode=2. */
+    try {
+      const client = net.createConnection(OCR_PIPE_NAME, () => {
+        /* Wire format matches launcher/src/ocr/ocr_scanner.h: 20-byte
+         * request header (magic u32, opcode u32, w u32, h u32, byte_len u32). */
+        const hdr = Buffer.alloc(20);
+        hdr.writeUInt32LE(OCR_WIRE_MAGIC, 0);   /* magic */
+        hdr.writeUInt32LE(2,              4);   /* opcode: shutdown */
+        hdr.writeUInt32LE(0,              8);
+        hdr.writeUInt32LE(0,              12);
+        hdr.writeUInt32LE(0,              16);
+        client.write(hdr, () => { try { client.end(); } catch {} });
+      });
+      client.setTimeout(1500, () => { try { client.destroy(); } catch {} });
+      client.on('error', () => { /* pipe unreachable — fall through */ });
+    } catch { /* fall through */ }
+    /* Wait up to 2s for graceful exit. */
+    const gracefulTmr = setTimeout(() => {
+      if (ocrDaemonIsRunning()) {
+        try { child.kill(); } catch {}
+      }
+      /* Second window for the SIGKILL to land. */
+      const killTmr = setTimeout(() => finish({ ok: true, forced: true }), 500);
+      child.once('exit', () => { clearTimeout(killTmr); finish({ ok: true, forced: true }); });
+    }, 2000);
+    child.once('exit', () => { clearTimeout(gracefulTmr); finish({ ok: true, forced: false }); });
+  });
+}
+
+/* ── IPC handlers ──────────────────────────────────────────────── */
+
+ipcMain.handle('ocr:get-state', async () => {
+  return {
+    enabled:          loadOcrEnabled(),
+    daemonRunning:    ocrDaemonIsRunning(),
+    blacklistExists:  fs.existsSync(OCR_BLACKLIST_ONDISK()),
+    defaultsSize:     { words: OCR_DEFAULTS.words.length,
+                        phrases: OCR_DEFAULTS.phrases.length },
+  };
+});
+
+ipcMain.handle('ocr:set-enabled', async (_e, enabled) => {
+  enabled = !!enabled;
+  saveOcrEnabled(enabled);
+  if (enabled) {
+    const r = startOcrDaemon();
+    return { ok: !!r.ok, enabled: true,
+             daemonRunning: ocrDaemonIsRunning(), err: r.err };
+  } else {
+    await stopOcrDaemon();
+    return { ok: true, enabled: false, daemonRunning: false };
+  }
+});
+
+ipcMain.handle('ocr:get-blacklist',  async () => loadOcrBlacklistFromDisk());
+ipcMain.handle('ocr:save-blacklist', async (_e, payload) => {
+  return saveOcrBlacklistToDisk(payload);
+});
+ipcMain.handle('ocr:reset-blacklist', async () => {
+  try { fs.unlinkSync(OCR_BLACKLIST_ONDISK()); } catch {}
+  return { ok: true };
+});
+ipcMain.handle('ocr:get-defaults', async () => ({
+  words:   OCR_DEFAULTS.words.slice(),
+  phrases: OCR_DEFAULTS.phrases.slice(),
+  usingDefaults: true,
+}));
+
+/* Auto-respawn on startup: if the user had the redactor on before
+ * quitting Electron, bring the daemon back up in the background so the
+ * next screenshot is redacted without them having to re-toggle. Best
+ * effort — a spawn failure just leaves the toggle showing OFF until
+ * the user retries. */
+app.whenReady().then(() => {
+  if (loadOcrEnabled()) {
+    const r = startOcrDaemon();
+    console.log('[ocr] auto-respawn on startup:',
+                r.ok ? `pid=${r.pid}` : `err=${r.err}`);
+  }
+});
+
 app.on('will-quit', () => {
   try { revalidation.stop(); } catch {}
   try { respawnWatchdog.disarm('app_quit'); } catch {}
   try { globalShortcut.unregisterAll(); } catch {}
+  /* Best-effort daemon shutdown — the awaitable pattern doesn't fit
+   * will-quit (it's sync), so we fire-and-forget the graceful path and
+   * hard-kill after 100ms. Electron gives us ~10s before force-quit. */
+  if (ocrDaemonIsRunning()) {
+    stopOcrDaemon().catch(() => {});
+    try { setTimeout(() => { try { ocrDaemon.child && ocrDaemon.child.kill(); } catch {} }, 100); } catch {}
+  }
 });
 
 app.on('window-all-closed', () => {
