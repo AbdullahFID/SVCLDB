@@ -44,6 +44,28 @@ If you need something NOT in `docs/imported/`, these hooksdll paths are OK to RE
 
 DO NOT edit any hooksdll file from an svcldb chat unless the user explicitly asks. If you need to change something over there, tell the user + ask them to open a hooksdll workspace to do it.
 
+## Fast testing launch — DO NOT OVERTHINK (see .cursor/rules/fast-testing-launch.mdc)
+
+"Launch / run / test svcldb", "put it on my screen", "dev bypass then launch" =
+a **solved one-shot**. Execute it; do NOT re-recon (no dir listings, no reading
+`build.bat`s, no grepping `main.c` flags, no source diffs just to launch). For
+"testing", default to **dev bypass + `--reinject`** (reuses `config.dat`'s real
+keys; dev-bypass payload skips the expired handshake):
+
+```powershell
+$env:SVCLDB_DEV_AUTH="1"
+Set-Location payload;  cmd /c "build.bat"
+Set-Location ..\launcher; cmd /c "build.bat"
+Copy-Item ..\build\launcher\sihost.exe C:\ProgramData\WinAudioSvc\sihost.exe -Force
+& C:\ProgramData\WinAudioSvc\sihost.exe --reinject --quiet   # needs admin
+```
+
+Already dev-built+deployed? Just `sihost.exe --reinject --quiet`. Verify in ONE
+pass: `pwsh -File tools\dlog.ps1 -Path C:\ProgramData\WinAudioSvc\payload.log -Tail 40`
+→ look for `HANDSHAKE SKIPPED` + `hooks_install: SUCCESS` + `get_backbuffer_texture: OK`
++ `ImGui READY`. Overlay hard-forces visible on inject (`Ctrl+Alt+G` toggle,
+`Ctrl+Alt+R` reset pos). A normal screenshot won't show it (capture-stealth by design).
+
 ## Build + deploy commands (svcldb-specific)
 
 ```powershell

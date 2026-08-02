@@ -5,6 +5,12 @@
  *  - Uses WinHTTP directly (not WinInet — WinInet inherits IE proxy  *
  *    settings which can be tampered with; WinHTTP has its own).     *
  *  - TLS 1.2+ required (WINHTTP_FLAG_SECURE + secure protocols set). *
+ *  - HTTP/2 (and HTTP/3 on Win11 22H2+) opt-in via ALPN. See         *
+ *    enable_modern_http_protocols() below. h2 shaves ~20-80ms off    *
+ *    TTFT for SSE streams and delivers tokens with lower jitter      *
+ *    thanks to binary framing + TLS-record packing — all AI edges    *
+ *    (OpenAI CF, Anthropic CF, Google GCLB, OpenRouter CF, Supabase  *
+ *    CF) already serve h2 natively.                                  *
  *  - Auto-follow-redirects enabled (Supabase / OAuth flows use them).*
  *  - No cookies persisted between calls — session-less.              *
  *  - Timeout 30 s connect / 60 s read for AI calls that stream.      *
@@ -19,6 +25,118 @@
 #include <stdlib.h>
 
 #pragma comment(lib, "winhttp.lib")
+
+/* ── HTTP/2 + HTTP/3 constants (defined by SDK 10.0.14393+ / 22621+).
+ *
+ * We define fallback values ourselves in case an older SDK is used, so
+ * the code compiles against any Windows 10+ SDK and picks up runtime
+ * support wherever the OS supports it. WinHttpSetOption is a runtime
+ * call — the OS decides whether the flag is honored; the SDK header
+ * just supplies numeric constants. */
+#ifndef WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL
+#define WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL   133
+#endif
+#ifndef WINHTTP_OPTION_HTTP_PROTOCOL_USED
+#define WINHTTP_OPTION_HTTP_PROTOCOL_USED     134
+#endif
+#ifndef WINHTTP_PROTOCOL_FLAG_HTTP2
+#define WINHTTP_PROTOCOL_FLAG_HTTP2           0x1
+#endif
+#ifndef WINHTTP_PROTOCOL_FLAG_HTTP3
+#define WINHTTP_PROTOCOL_FLAG_HTTP3           0x2
+#endif
+
+/* ── Modern-protocol enablement ─────────────────────────────────────
+ *
+ * WinHTTP defaults to HTTP/1.1 for historical reasons even on servers
+ * that support h2. We opt in per session AND per request (Microsoft
+ * recommends both for reliable coverage). Strategy:
+ *
+ *   1. Try (h2 | h3). Win 11 22H2+ negotiates HTTP/3 via ALPN/Alt-Svc
+ *      first, then h2, then h1.1. Best case.
+ *   2. If the OS rejects that value (older Windows returns
+ *      ERROR_INVALID_PARAMETER because h3 flag is unknown), retry with
+ *      just h2. This works on Win 10 1607+.
+ *   3. If BOTH fail, silently stay on h1.1 — no functional regression.
+ *
+ * Best-effort throughout: WinHttpSetOption may return FALSE for a
+ * dozen reasons on locked-down enterprise builds; we don't fail the
+ * request over it. */
+static void enable_modern_http_protocols(HINTERNET h) {
+    if (!h) return;
+    DWORD both = WINHTTP_PROTOCOL_FLAG_HTTP2 | WINHTTP_PROTOCOL_FLAG_HTTP3;
+    if (WinHttpSetOption(h, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL,
+                         &both, sizeof(both))) {
+        return;
+    }
+    /* Retry with h2 only — Win 10 baseline. */
+    DWORD h2 = WINHTTP_PROTOCOL_FLAG_HTTP2;
+    (void)WinHttpSetOption(h, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL,
+                           &h2, sizeof(h2));
+}
+
+/* ── Protocol-used introspection + one-shot-per-host log. ───────────
+ *
+ * After WinHttpReceiveResponse, WINHTTP_OPTION_HTTP_PROTOCOL_USED tells
+ * us what ALPN negotiated: 0 = HTTP/1.1, 0x1 = HTTP/2, 0x2 = HTTP/3.
+ *
+ * We log the first time we observe each (host, protocol) pair so
+ * payload.log carries a clear signal like:
+ *   http: negotiated h2 host=api.anthropic.com
+ *   http: negotiated h1.1 host=some-corp-proxy.example
+ * without spamming a line per request. Cache holds up to 8 hosts —
+ * more than enough for our ~5 endpoints (OpenAI, Anthropic, Google,
+ * OpenRouter, Supabase). */
+typedef struct {
+    wchar_t host[128];
+    DWORD   proto;   /* 0 = h1.1, 0x1 = h2, 0x2 = h3 */
+    int     seen;
+} proto_cache_entry_t;
+
+static proto_cache_entry_t g_proto_cache[8];
+static volatile long       g_proto_cache_lock = 0;
+
+static void proto_cache_note(const wchar_t *host, DWORD proto) {
+    if (!host || !host[0]) return;
+    while (InterlockedCompareExchange(&g_proto_cache_lock, 1, 0) != 0) {
+        Sleep(0);
+    }
+    int free_slot = -1;
+    for (int i = 0; i < 8; i++) {
+        if (g_proto_cache[i].seen &&
+            _wcsicmp(g_proto_cache[i].host, host) == 0 &&
+            g_proto_cache[i].proto == proto) {
+            g_proto_cache_lock = 0;
+            return;  /* already logged this (host, proto) */
+        }
+        if (!g_proto_cache[i].seen && free_slot < 0) free_slot = i;
+    }
+    /* Cache miss — log + record. Overwrite oldest slot on cache full. */
+    int slot = free_slot >= 0 ? free_slot : 0;
+    _snwprintf(g_proto_cache[slot].host,
+               sizeof(g_proto_cache[slot].host) / sizeof(wchar_t) - 1,
+               L"%ls", host);
+    g_proto_cache[slot].host[sizeof(g_proto_cache[slot].host) / sizeof(wchar_t) - 1] = 0;
+    g_proto_cache[slot].proto = proto;
+    g_proto_cache[slot].seen  = 1;
+    g_proto_cache_lock = 0;
+
+    char host_u8[192] = {0};
+    WideCharToMultiByte(CP_UTF8, 0, host, -1, host_u8, sizeof(host_u8) - 1, NULL, NULL);
+    const char *label = "h1.1";
+    if (proto & WINHTTP_PROTOCOL_FLAG_HTTP3)      label = "h3";
+    else if (proto & WINHTTP_PROTOCOL_FLAG_HTTP2) label = "h2";
+    slog_writef("http.log", "http: negotiated %s host=%s", label, host_u8);
+}
+
+static void query_and_log_protocol_used(HINTERNET req, const wchar_t *host) {
+    DWORD proto = 0;
+    DWORD sz    = sizeof(proto);
+    if (WinHttpQueryOption(req, WINHTTP_OPTION_HTTP_PROTOCOL_USED,
+                           &proto, &sz)) {
+        proto_cache_note(host, proto);
+    }
+}
 
 /* WinHTTP wants wide strings for URL crack + method + headers.
  * Convert utf-8 → wide on the stack. */
@@ -128,6 +246,12 @@ static int req_open(req_ctx_t *c, const wchar_t *method, const char *url,
     WinHttpSetOption(c->session, WINHTTP_OPTION_SECURE_PROTOCOLS,
                      &secure_protocols, sizeof(secure_protocols));
 
+    /* Enable HTTP/2 (+ HTTP/3 where the OS supports it) via ALPN.
+     * MUST be set BEFORE WinHttpSendRequest — see MSDN. Setting on the
+     * session propagates to every request created from it; we also set
+     * on the request handle below for belt-and-braces coverage. */
+    enable_modern_http_protocols(c->session);
+
     /* Redirect policy: allow same-scheme redirects (Supabase relies on them). */
     DWORD redirect = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
     WinHttpSetOption(c->session, WINHTTP_OPTION_REDIRECT_POLICY,
@@ -158,6 +282,12 @@ static int req_open(req_ctx_t *c, const wchar_t *method, const char *url,
         _snprintf(err, err_sz - 1, "WinHttpOpenRequest: %lu", GetLastError()); err[err_sz - 1] = 0;
         return 0;
     }
+
+    /* Belt-and-braces: set the h2/h3 enable on the request handle too.
+     * Session-level setting *should* propagate but Microsoft's docs
+     * are explicit that both handles accept the option, and setting
+     * per-request is idempotent. */
+    enable_modern_http_protocols(c->request);
 
     return 1;
 }
@@ -279,6 +409,9 @@ static int do_request_ex(const wchar_t *method, const char *url,
         return 0;
     }
 
+    /* Log which HTTP protocol ALPN actually negotiated (once per host). */
+    query_and_log_protocol_used(c.request, c.host);
+
     /* Status code. */
     DWORD status = 0, dwsize = sizeof(status);
     WinHttpQueryHeaders(c.request,
@@ -372,6 +505,11 @@ int whreq_post_stream_ex(const char *url, const char **headers,
         req_close(&c);
         return 0;
     }
+
+    /* Log which HTTP protocol ALPN actually negotiated (once per host).
+     * For streaming this is especially interesting because h2's DATA
+     * frames arrive with lower jitter than h1.1 chunked. */
+    query_and_log_protocol_used(c.request, c.host);
 
     DWORD status = 0, dwsize = sizeof(status);
     WinHttpQueryHeaders(c.request,

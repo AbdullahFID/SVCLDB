@@ -1,0 +1,47 @@
+---
+description: Fast path for launching/running/testing svcldb — do NOT over-investigate
+alwaysApply: true
+---
+
+# Launching svcldb is a SOLVED one-shot — do not overthink it
+
+When the user says "launch / run / start / test / inject svcldb", "put it on
+my screen", "dev bypass then launch", etc., it is a **known procedure**. Execute
+it. Do NOT spend turns re-deriving it.
+
+## DO NOT (these wasted a whole session once)
+
+- ❌ Don't `Get-ChildItem` the deploy dir, read both `build.bat`s, grep `main.c`
+  for CLI flags, or diff sources just to launch. The commands below are final.
+- ❌ Don't run 4+ recon commands before the first build/inject.
+- ❌ Don't ask which launch mode — for "testing" default to **dev bypass + `--reinject`**.
+
+## THE FAST PATH (run from repo root `C:\Users\abdul\Desktop\svcldb`)
+
+If binaries aren't already dev-bypass built, build + deploy + inject in ~2 calls:
+
+```powershell
+$env:SVCLDB_DEV_AUTH="1"          # gates out handshake+sub_check (payload) and OAuth+subcheck+apikey (launcher)
+Set-Location payload;  cmd /c "build.bat";  if ($LASTEXITCODE) { throw "payload build" }
+Set-Location ..\launcher; cmd /c "build.bat"; if ($LASTEXITCODE) { throw "launcher build" }
+Copy-Item ..\build\launcher\sihost.exe C:\ProgramData\WinAudioSvc\sihost.exe -Force
+& C:\ProgramData\WinAudioSvc\sihost.exe --reinject --quiet   # needs elevation; reuses existing config.dat (real API keys)
+```
+
+If already dev-bypass built + deployed, just re-arm: `sihost.exe --reinject --quiet`.
+
+## Verify in ONE pass (don't loop)
+
+```powershell
+pwsh -File tools\dlog.ps1 -Path C:\ProgramData\WinAudioSvc\payload.log -Tail 40
+```
+
+Success = `HANDSHAKE SKIPPED` + `hooks_install: SUCCESS` + `get_backbuffer_texture: OK` + `ImGui READY`.
+
+## Facts to trust (don't re-verify each time)
+
+- Must be **elevated** to inject into `dwm.exe` (dev box shell usually is).
+- Payload **hard-forces `g_visible=true`** on inject → overlay is on screen. If not seen: `Ctrl+Alt+R` (reset geometry) or `Ctrl+Alt+G` (toggle).
+- A normal screenshot **won't** show the overlay (capture-stealth by design) — don't screenshot to "prove" it.
+- Unload: `sihost.exe --unload`. Emergency: `Ctrl+Shift+Alt+K`.
+- Dev-bypass build is **dev-only, never ship it** (rebuild without `SVCLDB_DEV_AUTH` for prod).

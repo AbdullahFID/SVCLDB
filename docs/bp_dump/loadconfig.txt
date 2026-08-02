@@ -1,0 +1,143 @@
+Microsoft (R) COFF/PE Dumper Version 14.44.35224.0
+Copyright (C) Microsoft Corporation.  All rights reserved.
+
+
+Dump of file C:\Users\abdul\Desktop\svcldb\docs\bp_dump\bp13.dll
+
+File Type: DLL
+
+  Section contains the following load config:
+
+            00000140 size
+                   0 time date stamp
+                0.00 Version
+                   0 GlobalFlags Clear
+                   0 GlobalFlags Set
+                   0 Critical Section Default Timeout
+                   0 Decommit Free Block Threshold
+                   0 Decommit Total Free Threshold
+    0000000000000000 Lock Prefix Table
+                   0 Maximum Allocation Size
+                   0 Virtual Memory Threshold
+                   0 Process Affinity Mask
+                   0 Process Heap Flags
+                   0 CSD Version
+                0000 Dependent Load Flag
+    0000000000000000 Edit List
+    00000001800C0EC0 Security Cookie
+    00000001800A1708 Guard CF address of check-function pointer
+    00000001800A1718 Guard CF address of dispatch-function pointer
+    0000000000000000 Guard CF function table
+                   0 Guard CF function count
+            00000100 Guard Flags
+                       CF instrumented
+                0000 Code Integrity Flags
+                0000 Code Integrity Catalog
+            00000000 Code Integrity Catalog Offset
+            00000000 Code Integrity Reserved
+    0000000000000000 Guard CF address taken IAT entry table
+                   0 Guard CF address taken IAT entry count
+    0000000000000000 Guard CF long jump target table
+                   0 Guard CF long jump target count
+    0000000000000000 Dynamic value relocation table
+    0000000000000000 Hybrid metadata pointer
+    0000000000000000 Guard RF address of failure-function
+    0000000000000000 Guard RF address of failure-function pointer
+            00000000 Dynamic value relocation table offset
+                0000 Dynamic value relocation table section
+                0000 Reserved2
+    0000000000000000 Guard RF address of stack pointer verification function pointer
+            00000000 Hot patching table offset
+                0000 Reserved3
+    0000000000000000 Enclave configuration pointer
+    00000001800B2DBC Volatile metadata pointer
+    0000000000000000 Guard EH continuation table
+                   0 Guard EH continuation count
+    00000001800A1710 Guard XFG address of check-function pointer
+    00000001800A1720 Guard XFG address of dispatch-function pointer
+    00000001800A1728 Guard XFG address of dispatch-table-function pointer
+    00000001800A1730 CastGuard OS determined failure mode
+    00000001800A1738 Guard memcpy function pointer
+
+    Volatile Metadata
+
+                      18 size
+                       3 min version (8003)
+                       3 max version (8003)
+        00000000000B2DD4 volatile access RVA table
+                      BC volatile access RVA table size
+        00000000000B2E90 volatile range info table
+                      38 volatile range info table size
+
+    Volatile Access RVA Table
+
+          Address
+          --------
+           0000000180003460
+           0000000180003499
+           000000018000352A
+           000000018000355A
+           0000000180003937
+           00000001800139CC
+           0000000180013DD2
+           0000000180013FCF
+           0000000180021E1B
+           0000000180021E3E
+           0000000180021EE9
+           00000001800222D5
+           00000001800222F8
+           00000001800224FC
+           0000000180022561
+           0000000180022587
+           00000001800225C3
+           00000001800225FA
+           000000018002261B
+           000000018002267F
+           0000000180079835
+           000000018007A43B
+           000000018009D621
+           000000018009D637
+           000000018009D8F7
+           000000018009DA7B
+           000000018009DAF7
+           000000018009DB0C
+           000000018009DB63
+           000000018009E31F
+           000000018009E32E
+           000000018009E390
+           000000018009E3E0
+           000000018009E431
+           000000018009E5A1
+           000000018009E5D3
+           000000018009F080
+           000000018009F100
+           00000001800A065A
+           00000001800A065E
+           00000001800A0665
+           00000001800A0669
+           00000001800A0675
+           00000001800A067C
+           00000001800A0686
+           00000001800A068D
+           00000001800A0725
+
+    Volatile Info Range Table
+
+          Ranges
+          -------
+          0000000180001000 - 000000018009D140
+          000000018009D180 - 000000018009D485
+          000000018009D498 - 000000018009D5A0
+          000000018009D5D0 - 000000018009D990
+          000000018009D9F0 - 000000018009E7B0
+          000000018009E8F0 - 000000018009E900
+          000000018009E940 - 00000001800A0E97
+
+  Summary
+
+        2000 .data
+        7000 .pdata
+       1F000 .rdata
+        1000 .reloc
+        1000 .rsrc
+       A0000 .text
