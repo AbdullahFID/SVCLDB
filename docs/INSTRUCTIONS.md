@@ -32,8 +32,11 @@ zip, ask them for this doc too.
 
 - **Windows 10** (version 20H2 or newer) or **Windows 11** (any version)
 - **64-bit CPU** with AVX2 support (any laptop from 2015 or later)
-- **Local admin** on the machine (right-click → Run as Administrator works
-  if UAC prompts are on — the installer handles this automatically)
+- **Local admin** on the machine — the installer self-elevates via UAC, so
+  right-click → Run with PowerShell is enough. If your account isn't a
+  local admin, the UAC prompt will ask for an admin's credentials; type
+  YOUR admin creds, not a different account (see "Shortcut missing" in
+  Troubleshooting for why).
 - **~400 MB free disk space**
 - **Internet on first launch** (Google OAuth + subscription check + one-time
   Windows symbol download — subsequent launches can work offline for up
@@ -115,13 +118,22 @@ Defender settings, you're hitting Tamper Protection. Turn it off:
    Documents, wherever. Just remember where.
 2. Open the unzipped folder.
 3. **Right-click `install-cloakgpt.ps1`** → **Run with PowerShell**.
-4. If prompted about execution policy, type **Y** and press Enter.
-5. The installer will:
+4. **Accept the UAC prompt** — the script auto-elevates itself. A new
+   elevated PowerShell window will open; the original one will close.
+5. If prompted about execution policy inside the elevated window, type
+   **Y** and press Enter.
+6. The installer will:
    - Kill any running CloakGPT (if you're upgrading from a previous version)
    - Clean up any old C binaries (config + your login are preserved)
    - Create a **`Launch CloakGPT`** shortcut on your Desktop with the
-     Run-as-Administrator flag pre-set
-6. Press Enter to close the installer window.
+     Run-as-Administrator flag pre-set. If your Desktop can't be written
+     to (AV blocking, corporate policy, redirected share offline), the
+     installer falls back to the **All-Users Desktop**
+     (`C:\Users\Public\Desktop`) so the shortcut is still visible.
+   - Print either **`INSTALL COMPLETE`** (green) if the shortcut landed,
+     or **`INSTALL PARTIAL - SHORTCUT MISSING`** (yellow) with a clear
+     "launch manually here" path if it didn't.
+7. Press Enter to close the installer window.
 
 ### The manual way
 
@@ -217,6 +229,35 @@ on the Dashboard.
 ---
 
 ## 7. Troubleshooting
+
+### "Installer said INSTALL COMPLETE but there's no shortcut on my Desktop"
+
+**This should not happen with the v2 installer** (2026-08-06 and later).
+The installer now writes to your Desktop AND falls back to the All-Users
+Desktop, and reports `INSTALL PARTIAL - SHORTCUT MISSING` (yellow banner)
+when it truly fails. If you see a green `INSTALL COMPLETE` there IS a
+shortcut somewhere — check these locations in order:
+
+1. **Your own Desktop** (obvious): `C:\Users\<you>\Desktop\Launch CloakGPT.lnk`
+   - If it's in OneDrive-synced Desktop instead, look in
+     `C:\Users\<you>\OneDrive\Desktop\Launch CloakGPT.lnk`
+2. **All-Users Desktop** (fallback for Defender/AV-blocked cases):
+   `C:\Users\Public\Desktop\Launch CloakGPT.lnk` — this shows up on
+   every user's Desktop via Windows merging, might be hidden by the
+   "Show hidden files" toggle in Explorer.
+3. **Someone else's Desktop** (over-the-shoulder UAC): if you elevated
+   with a different admin account (e.g. typed `Administrator`'s
+   credentials when your own account isn't admin), the shortcut landed
+   on THAT account's Desktop. Look in `C:\Users\Administrator\Desktop\`
+   with elevation. The v2 installer detects this and ALSO writes to
+   Public Desktop, so you should see it there too.
+
+If you see **`INSTALL PARTIAL - SHORTCUT MISSING`** (yellow banner),
+scroll up in the installer window to see the exact `[WARN]` line — it
+tells you WHY (AV quarantine, WSH disabled, denied write, etc.). Launch
+manually from the path printed in the banner (right-click →
+Run as administrator), and re-run the installer after fixing the
+underlying cause to get the shortcut.
 
 ### "UAC accepts, but no window appears"
 - Windows Defender likely quarantined `svchelper.exe`. Go back to

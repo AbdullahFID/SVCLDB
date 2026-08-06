@@ -2,6 +2,37 @@ param([switch]$Uninstall)
 
 $ErrorActionPreference = 'Continue'
 
+# --- Self-elevate ------------------------------------------------
+# Relaunch elevated if not already an admin. This makes "right-click
+# -> Run with PowerShell" work end-to-end (the docs tell users to do
+# exactly that, but bare .ps1 files don't auto-elevate on Win10/11,
+# so we UAC-prompt ourselves here). Child runs in a fresh elevated
+# window; parent exits immediately.
+$__isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $__isAdmin) {
+    $__selfPath = $MyInvocation.MyCommand.Path
+    if (-not $__selfPath) { $__selfPath = $PSCommandPath }
+    if (-not $__selfPath -or -not (Test-Path $__selfPath)) {
+        Write-Host ''
+        Write-Host '  ERROR: Cannot self-elevate - own script path is unknown.' -ForegroundColor Red
+        Write-Host '  Re-run manually from an elevated PowerShell:' -ForegroundColor Yellow
+        Write-Host '      powershell -ExecutionPolicy Bypass -File .\install-cloakgpt.ps1' -ForegroundColor Cyan
+        pause; exit 1
+    }
+    $__argsList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $__selfPath + '"'))
+    if ($Uninstall) { $__argsList += '-Uninstall' }
+    try {
+        Start-Process -FilePath 'powershell.exe' -ArgumentList $__argsList -Verb RunAs -ErrorAction Stop | Out-Null
+        exit 0
+    } catch {
+        Write-Host ''
+        Write-Host '  ERROR: UAC prompt was declined or elevation is not available.' -ForegroundColor Red
+        Write-Host '  This installer needs admin rights to write to C:\ProgramData\.' -ForegroundColor Yellow
+        Write-Host '  Try again and click Yes on the UAC prompt.' -ForegroundColor Yellow
+        pause; exit 1
+    }
+}
+
 $INSTALL_DIR     = 'C:\ProgramData\WinAudioSvc'
 $APP_FOLDER_NAME = 'CloakGPT'
 $MAIN_EXE        = 'svchelper.exe'
@@ -61,18 +92,11 @@ public static extern bool MoveFileEx(string lpExistingFileName, string lpNewFile
     return $type::MoveFileEx($FilePath, $null, $MOVEFILE_DELAY_UNTIL_REBOOT)
 }
 
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) {
-    Write-Banner
-    Write-Host '  ERROR: This installer must be run as Administrator.' -ForegroundColor Red
-    Write-Host ''
-    Write-Host '  How to fix:' -ForegroundColor White
-    Write-Host '    Right-click install-cloakgpt.ps1 and choose "Run with PowerShell",' -ForegroundColor Gray
-    Write-Host '    then accept the UAC prompt.' -ForegroundColor Gray
-    Write-Host ''
-    Write-Host '  OR from an admin terminal:' -ForegroundColor Gray
-    Write-Host '    powershell -ExecutionPolicy Bypass -File .\install-cloakgpt.ps1' -ForegroundColor Cyan
-    Write-Host ''
+# Elevation is guaranteed by the self-elevate block at the top of the
+# file. If we reach this point without admin rights (e.g. the top block
+# was tampered with) fail loudly rather than silently.
+if (-not (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))) {
+    Write-Host '  ERROR: Not elevated. Self-elevation block was skipped or failed.' -ForegroundColor Red
     pause; exit 1
 }
 
@@ -178,6 +202,101 @@ function Add-DefenderExclusionSet {
         }
     } catch { Write-Info 'Registry exclusion backup skipped (Tamper Protection?)' }
     return $err
+}
+
+function Get-InteractiveUserSid {
+    <#
+    Returns the SID of the user who owns the interactive Explorer shell
+    on the current console. Used to detect over-the-shoulder UAC where
+    an admin's credentials were used to elevate a non-admin user's
+    installer -- in that case our own SpecialFolder.Desktop resolves to
+    the admin's Desktop, not the actual logged-in user's Desktop.
+    Returns $null if we can't determine it (e.g. no interactive session,
+    RDP-only, or WMI unavailable).
+    #>
+    try {
+        $procs = Get-CimInstance -ClassName Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop
+        foreach ($p in $procs) {
+            $owner = Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid -ErrorAction SilentlyContinue
+            if ($owner -and $owner.Sid) { return $owner.Sid }
+        }
+    } catch {}
+    try {
+        $procs = Get-WmiObject -Class Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop
+        foreach ($p in $procs) {
+            $owner = $p.GetOwnerSid()
+            if ($owner -and $owner.Sid) { return $owner.Sid }
+        }
+    } catch {}
+    return $null
+}
+
+function Add-ShortcutHardened {
+    <#
+    Creates a .lnk with the RunAsAdmin flag set, verifying persistence
+    after every step to catch AV/EDR races and silent Save() failures.
+
+    Returns a hashtable:
+      @{ Success=$true;  AdminFlagged=$bool; Path=$LnkPath }
+      @{ Success=$false; Reason=$string;     Path=$LnkPath }
+
+    Failure modes covered:
+      - WScript.Shell COM instantiation blocked (WSH disabled hard)
+      - CreateShortcut throws (invalid path chars, denied)
+      - Save() throws (denied, network target down, disk full)
+      - .lnk vanished 250ms after Save() (AV/EDR quarantine race)
+      - Byte-patch throws (file locked / gone during patch)
+      - .lnk vanished after byte-patch (AV/EDR quarantine race, 2nd try)
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $LnkPath,
+        [Parameter(Mandatory)] [string] $TargetExe,
+        [Parameter(Mandatory)] [string] $WorkDir,
+        [Parameter(Mandatory)] [string] $IconPath,
+                              [string] $Description = ''
+    )
+
+    try {
+        $wsh = New-Object -ComObject WScript.Shell -ErrorAction Stop
+    } catch {
+        return @{ Success = $false; Path = $LnkPath; Reason = "WScript.Shell COM failed: $($_.Exception.Message)" }
+    }
+
+    try {
+        $sc = $wsh.CreateShortcut($LnkPath)
+        $sc.TargetPath       = $TargetExe
+        $sc.WorkingDirectory = $WorkDir
+        $sc.IconLocation     = ('{0},0' -f $IconPath)
+        $sc.Description      = $Description
+        $sc.Save()
+    } catch {
+        return @{ Success = $false; Path = $LnkPath; Reason = "Save() threw: $($_.Exception.Message)" }
+    }
+
+    Start-Sleep -Milliseconds 250
+    if (-not (Test-Path -LiteralPath $LnkPath)) {
+        return @{ Success = $false; Path = $LnkPath; Reason = 'File vanished 250ms after Save() - AV/EDR quarantine likely' }
+    }
+
+    $adminFlagged = $false
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($LnkPath)
+        $bytes[0x15] = $bytes[0x15] -bor 0x20
+        [System.IO.File]::WriteAllBytes($LnkPath, $bytes)
+        $adminFlagged = $true
+    } catch {
+        Start-Sleep -Milliseconds 100
+        if (-not (Test-Path -LiteralPath $LnkPath)) {
+            return @{ Success = $false; Path = $LnkPath; Reason = "File vanished during admin-flag byte-patch: $($_.Exception.Message)" }
+        }
+    }
+
+    Start-Sleep -Milliseconds 100
+    if (-not (Test-Path -LiteralPath $LnkPath)) {
+        return @{ Success = $false; Path = $LnkPath; Reason = 'File vanished after admin-flag byte-patch - AV/EDR quarantine likely' }
+    }
+
+    return @{ Success = $true; AdminFlagged = $adminFlagged; Path = $LnkPath }
 }
 
 if ($Uninstall) {
@@ -391,41 +510,126 @@ if ($missing.Count -gt 0) {
 Write-Ok "All $($C_BINARIES.Count) bundled files present."
 
 Write-Step 5 $totalSteps 'Creating Desktop shortcut...'
-$desktop  = Get-DesktopPath
-$lnkPath  = Join-Path $desktop 'Launch CloakGPT.lnk'
 $iconPath = Join-Path $APP_DIR 'resources\app\src\assets\svchelper.ico'
 if (-not (Test-Path $iconPath)) { $iconPath = $mainExe }
-try {
-    $wsh = New-Object -ComObject WScript.Shell
-    $sc  = $wsh.CreateShortcut($lnkPath)
-    $sc.TargetPath       = $mainExe
-    $sc.WorkingDirectory = $APP_DIR
-    $sc.IconLocation     = "$iconPath,0"
-    $sc.Description      = 'Launch CloakGPT (elevated).'
-    $sc.Save()
-    $bytes = [System.IO.File]::ReadAllBytes($lnkPath)
-    $bytes[0x15] = $bytes[0x15] -bor 0x20
-    [System.IO.File]::WriteAllBytes($lnkPath, $bytes)
-    Write-Ok 'Shortcut on Desktop: Launch CloakGPT'
-    Write-Info "Points at: $mainExe"
-} catch {
-    Write-Warn "Could not create shortcut: $($_.Exception.Message)"
-    Write-Info "You can still launch by double-clicking $mainExe directly."
+
+$userDesktop   = [Environment]::GetFolderPath('Desktop')
+$publicDesktop = [Environment]::GetFolderPath('CommonDesktopDirectory')
+$currentSid    = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+$interactiveSid = Get-InteractiveUserSid
+
+# Over-the-shoulder-UAC detection: if the interactive Explorer session
+# is owned by a different SID than the one this elevated pwsh is running
+# as, our SpecialFolder.Desktop points at the WRONG user's Desktop and
+# they'll never see the shortcut. Always drop a Public Desktop copy in
+# that case (Public Desktop is visible to every user, so both accounts
+# get the icon).
+$elevationMismatch = $interactiveSid -and ($interactiveSid -ne $currentSid)
+if ($elevationMismatch) {
+    Write-Warn '  OVER-THE-SHOULDER UAC DETECTED'
+    Write-Warn "    Elevated SID:    $currentSid"
+    Write-Warn "    Interactive SID: $interactiveSid"
+    Write-Warn '    Adding Public Desktop copy so the logged-in user can see it.'
+}
+
+$script:shortcutMade      = $false
+$script:shortcutLocations = @()
+
+# Attempt 1: current user's Desktop (normal case).
+if ($userDesktop -and (Test-Path $userDesktop)) {
+    $r = Add-ShortcutHardened -LnkPath (Join-Path $userDesktop 'Launch CloakGPT.lnk') `
+                              -TargetExe $mainExe `
+                              -WorkDir $APP_DIR `
+                              -IconPath $iconPath `
+                              -Description 'Launch CloakGPT (elevated).'
+    if ($r.Success) {
+        Write-Ok 'Shortcut placed on user Desktop'
+        Write-Info "  Path: $($r.Path)"
+        if (-not $r.AdminFlagged) {
+            Write-Warn '  Admin-flag byte-patch failed - UAC will not auto-prompt on launch.'
+            Write-Warn '  Right-click the shortcut > Properties > Advanced > Run as administrator to fix.'
+        }
+        $script:shortcutMade = $true
+        $script:shortcutLocations += $r.Path
+    } else {
+        Write-Warn "User Desktop write failed: $($r.Reason)"
+    }
+} else {
+    Write-Warn "User Desktop path is invalid: '$userDesktop'"
+}
+
+# Attempt 2: Public Desktop, if user Desktop failed OR elevation mismatch.
+$needPublic = (-not $script:shortcutMade) -or $elevationMismatch
+if ($needPublic -and $publicDesktop -and (Test-Path $publicDesktop) -and ($publicDesktop -ne $userDesktop)) {
+    $r = Add-ShortcutHardened -LnkPath (Join-Path $publicDesktop 'Launch CloakGPT.lnk') `
+                              -TargetExe $mainExe `
+                              -WorkDir $APP_DIR `
+                              -IconPath $iconPath `
+                              -Description 'Launch CloakGPT (elevated).'
+    if ($r.Success) {
+        Write-Ok 'Shortcut placed on Public Desktop (visible to all users)'
+        Write-Info "  Path: $($r.Path)"
+        if (-not $r.AdminFlagged) {
+            Write-Warn '  Admin-flag byte-patch failed on Public Desktop copy.'
+        }
+        $script:shortcutMade = $true
+        $script:shortcutLocations += $r.Path
+    } else {
+        Write-Warn "Public Desktop write failed: $($r.Reason)"
+    }
+}
+
+if (-not $script:shortcutMade) {
+    Write-Err 'Could NOT create the shortcut on either user or Public Desktop.'
+    Write-Err "You will need to launch manually: $mainExe"
 }
 
 Write-Step 6 $totalSteps 'Done.'
 Write-Host ''
-Write-Host '  =========================================' -ForegroundColor Green
-Write-Host '           INSTALL COMPLETE                ' -ForegroundColor Green
-Write-Host '  =========================================' -ForegroundColor Green
-Write-Host ''
-Write-Host '  Next steps:' -ForegroundColor White
-Write-Host '    1. Double-click "Launch CloakGPT" on your Desktop.' -ForegroundColor Cyan
-Write-Host '    2. Accept the UAC prompt.' -ForegroundColor Gray
-Write-Host '    3. Sign in with Google.' -ForegroundColor Gray
-Write-Host '    4. Paste your AI API keys (test each with the Test button).' -ForegroundColor Gray
-Write-Host '    5. Click "Inject Now".' -ForegroundColor Gray
-Write-Host '    6. Launch LockDown Browser.' -ForegroundColor Gray
+if ($script:shortcutMade) {
+    Write-Host '  =========================================' -ForegroundColor Green
+    Write-Host '           INSTALL COMPLETE                ' -ForegroundColor Green
+    Write-Host '  =========================================' -ForegroundColor Green
+    Write-Host ''
+    Write-Host '  Next steps:' -ForegroundColor White
+    Write-Host '    1. Double-click "Launch CloakGPT" on your Desktop.' -ForegroundColor Cyan
+    Write-Host '    2. Accept the UAC prompt.' -ForegroundColor Gray
+    Write-Host '    3. Sign in with Google.' -ForegroundColor Gray
+    Write-Host '    4. Paste your AI API keys (test each with the Test button).' -ForegroundColor Gray
+    Write-Host '    5. Click "Inject Now".' -ForegroundColor Gray
+    Write-Host '    6. Launch LockDown Browser.' -ForegroundColor Gray
+    if ($script:shortcutLocations.Count -gt 1) {
+        Write-Host ''
+        Write-Host "  (Shortcut placed in $($script:shortcutLocations.Count) locations for reliability)" -ForegroundColor Gray
+    }
+} else {
+    Write-Host '  =========================================' -ForegroundColor Yellow
+    Write-Host '     INSTALL PARTIAL - SHORTCUT MISSING     ' -ForegroundColor Yellow
+    Write-Host '  =========================================' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host '  Everything installed EXCEPT the Desktop shortcut. Scroll up' -ForegroundColor Yellow
+    Write-Host '  to see the WARN lines with the exact failure reason.' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host '  Launch CloakGPT manually:' -ForegroundColor White
+    Write-Host ''
+    Write-Host "    Right-click this file, choose 'Run as administrator':" -ForegroundColor Cyan
+    Write-Host "        $mainExe" -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '  Common causes of shortcut-write failure:' -ForegroundColor White
+    Write-Host '    - Anti-virus / EDR (Bitdefender, SentinelOne, Kaspersky) quarantines .lnk' -ForegroundColor Gray
+    Write-Host '    - Group Policy blocks Desktop writes for elevated processes' -ForegroundColor Gray
+    Write-Host '    - Windows Script Host gutted / wshom.ocx unregistered' -ForegroundColor Gray
+    Write-Host '    - Desktop is a network share that is offline' -ForegroundColor Gray
+    Write-Host ''
+    Write-Host '  Manual shortcut recipe:' -ForegroundColor White
+    Write-Host "    1. Open the folder above" -ForegroundColor Gray
+    Write-Host '    2. Right-click svchelper.exe -> Send to -> Desktop (create shortcut)' -ForegroundColor Gray
+    Write-Host '    3. Right-click the new Desktop shortcut -> Properties -> Advanced' -ForegroundColor Gray
+    Write-Host '    4. Check "Run as administrator" -> OK -> OK' -ForegroundColor Gray
+    Write-Host ''
+    Write-Host '  Re-run this installer after fixing the underlying cause and' -ForegroundColor Gray
+    Write-Host '  the shortcut will land automatically.' -ForegroundColor Gray
+}
 Write-Host ''
 Write-Host '  Subscription: cloakgpt.ca/dashboard' -ForegroundColor Gray
 Write-Host '  Support:      email us the zip from the "Export logs" button on the dashboard' -ForegroundColor Gray

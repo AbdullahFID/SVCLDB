@@ -28,11 +28,27 @@ powershell -File ui\tools\build-distribution.ps1
 The users' recipe is even simpler:
 1. Download `CloakGPTWindowsMaxStealth.zip`.
 2. Extract it (Windows Explorer, right-click → Extract All).
-3. Right-click `install-cloakgpt.ps1` → Run with PowerShell. This
-   creates the `Launch CloakGPT` shortcut on their Desktop with the
-   admin flag pre-set and (on upgrades) cleans up any stale binaries.
+3. Right-click `install-cloakgpt.ps1` → Run with PowerShell → accept
+   the UAC prompt (the script self-elevates via `Start-Process -Verb
+   RunAs`; the original non-elevated window closes immediately). The
+   elevated child creates the `Launch CloakGPT` shortcut on their
+   Desktop with the admin flag pre-set. If the user's Desktop can't
+   be written to (AV/EDR blocking, corporate GPO, redirected share
+   offline, KFM in a weird state), the installer falls back to
+   `C:\Users\Public\Desktop\Launch CloakGPT.lnk` so the shortcut is
+   visible on every user's Desktop. On upgrades it also uninjects the
+   running payload and cleans stale C binaries.
 4. Double-click **Launch CloakGPT** → UAC → sign in → paste keys →
    Inject → launch LockDown Browser.
+
+**Failure signaling** (v2 installer, 2026-08-06+): if the shortcut
+truly could not be placed anywhere (both user Desktop AND Public
+Desktop writes failed), the installer prints a big yellow
+`INSTALL PARTIAL - SHORTCUT MISSING` banner with the exact
+`svchelper.exe` path for manual launch and a categorized list of
+common causes (AV, GPO, WSH gutted, Desktop = offline share). It does
+NOT print the misleading green `INSTALL COMPLETE` banner in that
+case — the final banner is honest about the actual outcome.
 
 ---
 
