@@ -1727,6 +1727,9 @@ static volatile LONG g_resize_grip_px = 30;
 /* v14d: overlay corner-anchor margin (px), published each frame so
  * ui_resize_begin can convert to a top-left anchor without moving. */
 static volatile LONG g_overlay_margin_px = 32;
+/* v16: chrome-collapse (focus mode). 1 = hide header + footer so only the
+ * chat shows; a chevron toggles it. Render-thread only. */
+static volatile LONG g_chrome_collapsed = 0;
 
 /* Exported to rawinput_hook.c so the LL mouse hook (WH_MOUSE_LL) can
  * decide whether to consume a WM_MOUSEWHEEL and route it to
@@ -4730,7 +4733,8 @@ struct ui_theme_t {
 /* Icon identifiers. */
 enum {
     IC_NONE = -1, IC_GEAR = 0, IC_MOON, IC_SUN, IC_BOLT, IC_CHAT, IC_SEND,
-    IC_PLUS, IC_STOP, IC_REFRESH, IC_SPARK, IC_SLIDERS, IC_LAYOUT, IC_TEXT
+    IC_PLUS, IC_STOP, IC_REFRESH, IC_SPARK, IC_SLIDERS, IC_LAYOUT, IC_TEXT,
+    IC_CHEVRON_UP, IC_CHEVRON_DOWN
 };
 
 /* 8 unit directions (avoids pulling in <math.h> for cos/sin). */
@@ -4756,6 +4760,8 @@ static const char *icon_glyph(int kind) {
     case IC_SLIDERS: return "\xEE\x8A\x9A";  /* E29A sliders-horizontal  */
     case IC_LAYOUT:  return "\xEE\x87\x81";  /* E1C1 layout-dashboard    */
     case IC_TEXT:    return "\xEE\x86\x98";  /* E198 type                */
+    case IC_CHEVRON_UP:   return "\xEE\x81\xB0";  /* E070 chevron-up      */
+    case IC_CHEVRON_DOWN: return "\xEE\x81\xAD";  /* E06D chevron-down    */
     default:         return 0;
     }
 }
@@ -4997,7 +5003,7 @@ static void draw_topbar(const ui_theme_t &T, float scale, float alpha_cur,
     /* Right cluster: opacity slider + theme + settings. */
     float ib = rowh;
     float sw = 120.0f * scale;
-    float cluster = sw + 8.0f * scale + ib + 4.0f * scale + ib;
+    float cluster = sw + 8.0f * scale + ib + 4.0f * scale + ib + 4.0f * scale + ib;
     float rx = ImGui::GetContentRegionMax().x - cluster;
     ImGui::SameLine();
     if (rx > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(rx);
@@ -5015,6 +5021,9 @@ static void draw_topbar(const ui_theme_t &T, float scale, float alpha_cur,
     ImGui::SameLine(0, 4.0f * scale);
     if (icon_button("##tb_gear", IC_GEAR, ib, T, scale, g_home_view_forced != 0))
         (g_home_view_forced ? ui_view_show_chat() : ui_view_show_home());
+    ImGui::SameLine(0, 4.0f * scale);
+    if (icon_button("##tb_chev", IC_CHEVRON_UP, ib, T, scale))
+        InterlockedExchange(&g_chrome_collapsed, 1);   /* focus mode: hide chrome */
 
     ImGui::Dummy(ImVec2(0, 5.0f * scale));
 
@@ -5296,7 +5305,12 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     /* have_msgs = messages exist AND we're not on home-forced view.
      * If user hit Ctrl+Alt+X (back), messages stay in memory but the
      * chat view is hidden and cheat-sheet home is shown instead. */
-    int have_msgs = (msg_n > 0) && (g_home_view_forced == 0);
+    /* v16: focus mode — when chrome is collapsed we always show the chat
+     * body (ignore home-forced) so ONLY the chat is visible. */
+    int collapsed = (int)InterlockedCompareExchange(&g_chrome_collapsed, 0, 0);
+    int home_forced_eff = collapsed ? 0
+                        : (int)InterlockedCompareExchange(&g_home_view_forced, 0, 0);
+    int have_msgs = (msg_n > 0) && (home_forced_eff == 0);
     size_t sl = have_msgs ? 1 : 0;
 
     /* DPI-derived base scale. Baseline 1080p → scale=1.0; 4K → scale ~2.0. */
@@ -5658,10 +5672,19 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
         int _chat_on_snap = g_chat_active;
         float footer_height = _chat_on_snap
             ? ImGui::GetFrameHeightWithSpacing() * 4.5f    /* chat-input mode */
-            : ImGui::GetFrameHeightWithSpacing() * 1.5f;   /* cheat-sheet strip */
+            : (collapsed ? 0.0f                            /* focus mode: no footer */
+                         : ImGui::GetFrameHeightWithSpacing() * 1.5f); /* hint strip */
 
-        /* ── v14b TOP BAR: gradient header + tabs (custom-drawn) ───── */
-        draw_topbar(T, scale, alpha, stat_provider, stat_tier, stat_streaming);
+        /* ── TOP BAR — hidden in focus mode (chevron collapse) ─────── */
+        if (!collapsed) {
+            draw_topbar(T, scale, alpha, stat_provider, stat_tier, stat_streaming);
+        } else {
+            /* Focus mode: just a small chevron top-right to restore chrome. */
+            float _cib = ImGui::GetFrameHeight();
+            ImGui::SetCursorPosX(ImGui::GetContentRegionMax().x - _cib);
+            if (icon_button("##chev_expand", IC_CHEVRON_DOWN, _cib, T, scale))
+                InterlockedExchange(&g_chrome_collapsed, 0);
+        }
 
         if (!have_msgs) {
             /* v14 (2026-08-11): HOME hub (master control) when home is
@@ -5671,7 +5694,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
             for (int i = 0; i < msg_n; i++) if (msgs[i].text) free(msgs[i].text);
 
             ImGui::BeginChild("body", ImVec2(0, -footer_height), false, 0);
-            if (g_home_view_forced) {
+            if (home_forced_eff) {
                 draw_home_hub(T, scale, alpha, font_mul,
                               stat_provider, stat_tier, stat_model, stat_streaming);
             } else {
@@ -5761,7 +5784,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
          *      matching hotkeys, so ANY app receives no keystrokes
          *      during input.
          *    - CHAT INPUT INACTIVE: normal hotkey cheat-sheet strip. */
-        ImGui::Separator();
+        if (_chat_on_snap || !collapsed) ImGui::Separator();
         /* v1.7.11.16: use the same snapshot taken at footer_height so
          * footer content matches its reserved space. If g_chat_active
          * flips mid-frame the previous re-read would have the input
@@ -5833,7 +5856,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
             ImGui::Text("Enter send | Esc cancel | Backspace/Delete | Arrows/Home/End nav   [%d/%d]",
                         chars_shown, CHAT_BUF_SIZE - 4);
             ImGui::PopStyleColor();
-        } else {
+        } else if (!collapsed) {
             ImGui::PushStyleColor(ImGuiCol_Text, col_text_dim);
             if (sl == 0) {
                 /* Home view (either empty history OR user hit back).
@@ -6253,6 +6276,7 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
              * silently fall back to the vector-drawn icons. */
             {
                 static const ImWchar RANGES_ICONS[] = {
+                    0xE06D, 0xE070,  /* chevron-down, chevron-up */
                     0xE116, 0xE116,  /* message-circle      */
                     0xE11E, 0xE11E,  /* moon                */
                     0xE13D, 0xE13D,  /* plus                */
