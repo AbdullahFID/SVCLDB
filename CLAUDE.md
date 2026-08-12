@@ -11,6 +11,27 @@ and `.cursor/rules/fast-testing-launch.mdc`.
 
 Recent operational handoffs (append to top as new ones land):
 
+- `docs/HANDOFF_2026-08-12_NSIS_ONE_CLICK_INSTALLER.md` — one-click NSIS
+  Setup.exe now ships as primary distribution artifact; zip retained as
+  manual-install fallback. Setup.exe wraps the same obfuscated+bytecoded+
+  fuse-flipped+asar-extracted `win-unpacked/` via a second-pass electron-
+  builder invocation (Step 7 in `ui/build-protected.js`). Custom install/
+  uninstall macros in `ui/build/installer.nsh` handle Defender exclusions,
+  cooperative payload unload on upgrade, ProgramData binary mirror, and
+  silent-upgrade-preserves-user-data via `${IfNot} ${Silent}` gate.
+  **CRITICAL sihost.exe naming-collision fix documented inside** — killing
+  `sihost.exe` by image name takes down Windows' Shell Infrastructure Host
+  (`C:\Windows\system32\sihost.exe`) and briefly respawns Explorer;
+  installer.nsh path-filters via PowerShell to only touch OUR sihost.exe
+  under `C:\ProgramData\WinAudioSvc\` or `C:\Program Files\svchelper\`.
+  Read before touching any NSIS surface.
+- `docs/HANDOFF_2026-08-12_FRONTEND_ONE_LINER_INSTALL.md` — brief for the
+  lumiofrontend Claude (macOS side) covering: new `/api/download` variant
+  serving Setup.exe, new `/api/install` endpoint returning a PowerShell
+  one-liner bootstrap, dashboard setup-guide simplification (15 accordion
+  sections → 3 for Max Stealth), removal of the raw 20-line PS uninstall
+  one-liner (users uninstall via Windows Apps & Features instead). Contains
+  the exact PowerShell script template + copy-paste TypeScript route stubs.
 - `docs/HANDOFF_2026-08-11_OVERLAY_MOUSE_INTERACTIVITY.md` — the overlay
   is now mouse-interactive (drag the window by empty background; ImGui
   slider/buttons/dropdown are clickable). Debunks the "DWM overlay can't

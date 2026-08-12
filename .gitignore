@@ -1,5 +1,11 @@
 # Build outputs
 build/
+# ...but track the NSIS custom-installer macros (checked-in source, not a build output).
+# electron-builder resolves `nsis.include` in package.json against ui/build/, so this
+# path is required at build time for the Setup.exe production; keeping it out of git
+# would break `pnpm build` on a fresh clone. See docs/HANDOFF_2026-08-12_NSIS_ONE_CLICK_INSTALLER.md.
+!ui/build/
+!ui/build/installer.nsh
 *.obj
 *.pdb
 *.ilk

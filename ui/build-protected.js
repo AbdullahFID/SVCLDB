@@ -502,7 +502,7 @@ const UNPACKED     = path.join(DIST_RES, 'app.asar.unpacked');
 const APP_DIR      = path.join(DIST_RES, 'app');
 
 if (fs.existsSync(ASAR_PATH)) {
-  console.log('[6/6] Extracting asar → app/ (Electron 34 integrity workaround) ...');
+  console.log('[6/7] Extracting asar → app/ (Electron 34 integrity workaround) ...');
   try {
     const asar = require('@electron/asar');
     if (fs.existsSync(APP_DIR)) fs.rmSync(APP_DIR, { recursive: true });
@@ -517,12 +517,60 @@ if (fs.existsSync(ASAR_PATH)) {
     console.error('  ⚠ asar extraction failed:', e.message);
   }
 } else {
-  console.log('[6/6] No app.asar to extract (already unpacked).');
+  console.log('[6/7] No app.asar to extract (already unpacked).');
+}
+
+// ─── Step 7: Second-pass electron-builder → NSIS Setup.exe ─────
+//
+// The `dir` target above produced dist/win-unpacked/, and Step 6
+// finalized it (asar → resources/app/, fuses flipped, obfuscated JS +
+// bytecode already in place). We now feed that FINAL layout back into
+// electron-builder with --prepackaged so it just wraps it as an NSIS
+// installer without re-packing. Output: dist/CloakGPTWindowsMaxStealth-
+// Setup.exe (~90-100 MB, LZMA-compressed).
+//
+// This second pass reads the same package.json build.nsis block that
+// declares oneClick + perMachine + custom installer.nsh macros for
+// Defender exclusions + ProgramData binary mirror + upgrade cleanup.
+//
+// Why not add nsis to the FIRST target array? Because electron-builder
+// packages nsis BEFORE afterPack finishes running our fuses + build-
+// protected Step 6 asar extraction — so the Setup.exe would ship the
+// pre-extraction layout, which conflicts with the Electron 34 asar
+// integrity workaround we rely on. The two-pass approach guarantees
+// Setup.exe wraps the exact same bits we test-launch out of the
+// dir target.
+console.log('[7/7] Packaging Setup.exe (second-pass electron-builder → nsis) ...');
+try {
+  const bin = process.env.SVC_UI_PKGMGR
+    || (fs.existsSync(path.join(ROOT, 'pnpm-lock.yaml')) ? 'pnpm exec' : 'npx');
+  /* CLI `--win nsis` overrides package.json's `build.win.target` array,
+   * asking electron-builder to build ONLY the nsis target this pass. The
+   * `--prepackaged` flag skips the pack step and reuses the win-unpacked
+   * dir we already produced in Steps 1-6 (obfuscated + bytecoded + fuse-
+   * flipped + asar-extracted). Cleaner than passing a JSON --config
+   * override, which was fighting shell quoting on Windows PowerShell + cmd. */
+  execSync(`${bin} electron-builder --win nsis --prepackaged "${path.join(DIST, 'win-unpacked')}"`, {
+    stdio: 'inherit',
+    cwd: ROOT,
+    env: { ...process.env },
+    shell: true,
+  });
+  const setupPath = path.join(DIST, 'CloakGPTWindowsMaxStealth-Setup.exe');
+  if (fs.existsSync(setupPath)) {
+    const sizeMb = (fs.statSync(setupPath).size / 1024 / 1024).toFixed(1);
+    console.log(`  ✓ ${path.basename(setupPath)} (${sizeMb} MB)`);
+  } else {
+    console.warn('  ⚠ Setup.exe not found at expected path — electron-builder may have used a different artifactName template');
+  }
+} catch (e) {
+  console.warn(`  ⚠ NSIS pass failed: ${e.message}`);
+  console.warn('    dist/win-unpacked/ is still valid — build-distribution.ps1 will fall back to the zip flow.');
 }
 
 console.log('');
 console.log('═══════════════════════════════════════════════════');
 console.log('  ✓ PROTECTED BUILD COMPLETE');
-console.log('  Output: dist/win-unpacked/');
+console.log('  Output: dist/win-unpacked/ + dist/CloakGPTWindowsMaxStealth-Setup.exe');
 console.log('═══════════════════════════════════════════════════');
 console.log('');

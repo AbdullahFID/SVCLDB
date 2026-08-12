@@ -87,32 +87,45 @@ Copy-Item C:\Users\<you>\Desktop\svcldb\build\launcher\sihost.exe `
 
 ## Distribution + packaging pipeline (ship to end users)
 
-This is what you run whenever the user says "update the zip", "package for distribution", "rebuild the installer", or similar. Full doc: `docs/DISTRIBUTION.md`. Recipe:
+This is what you run whenever the user says "update the zip", "package for distribution", "rebuild the installer", or similar. Full doc: `docs/DISTRIBUTION.md`. As of 2026-08-12 the primary shippable is a one-click NSIS Setup.exe; the zip is retained as a manual-install fallback. Recipe:
 
 ```powershell
 # 1. Build C stack (payload → resolver → launcher) — only if C source changed.
 #    Skips cleanly if binaries under build\ are already current.
+#    build_all.bat's Step 4 also invokes ui\build.bat which runs pnpm build,
+#    which now chains through Steps 1-7 of ui\build-protected.js. Step 7 is
+#    a second-pass electron-builder invocation that produces the NSIS
+#    Setup.exe via `--win nsis --prepackaged dist/win-unpacked`. So one
+#    `build_all.bat` produces the Setup.exe alongside the Electron dir/ output.
 cd C:\Users\<you>\Desktop\svcldb
 .\build_all.bat
 
-# 2. Rebuild the Electron UI (obfuscation + bytenode + electron-builder +
-#    fuse-flip + asar-extract). Emits dist\win-unpacked\svchelper.exe.
+# 2. (Only-UI changes: skip step 1 and just run pnpm build.)
 cd C:\Users\<you>\Desktop\svcldb\ui
-pnpm build           # ~15–25 s; requires pnpm (NOT npm)
+pnpm build           # ~15–25 s Electron build + ~10 s NSIS second pass = ~35 s
 
-# 3. Package for distribution — drops THREE artifacts on the CURRENT
+# 3. Package for distribution — drops FOUR artifacts on the CURRENT
 #    USER'S REAL Desktop (OneDrive Known-Folder-Move safe via
 #    [Environment]::GetFolderPath):
-#      CloakGPTWindowsMaxStealth.zip     ~120 MB   -> the shippable
-#      CloakGPT Setup Instructions.md    ~13 KB    -> user-facing guide
-#      Launch CloakGPT.lnk               1.8 KB    -> admin-flagged shortcut
+#      CloakGPTWindowsMaxStealth-Setup.exe   ~79 MB   -> primary one-click installer
+#      CloakGPTWindowsMaxStealth.zip         ~123 MB  -> manual-install fallback
+#      CloakGPT Setup Instructions.md        ~13 KB   -> user-facing guide
+#      Launch CloakGPT.lnk                   1.8 KB   -> admin-flagged shortcut
+#                                                       (zip-flow only — NSIS
+#                                                       Setup.exe writes its own)
 cd C:\Users\<you>\Desktop\svcldb
 powershell -NoProfile -ExecutionPolicy Bypass -File ui\tools\build-distribution.ps1
 ```
 
 Key pipeline invariants (from `docs/DISTRIBUTION.md` + `CLAUDE.md` v4.5 entry — DO NOT REGRESS):
 
-- **`ui\tools\build-distribution.ps1`** is the ONE canonical packager. Never hand-zip `dist\win-unpacked\` — you'll skip the shortcut + instructions + `install-cloakgpt.ps1` bundling and users will complain the shortcut is missing.
+- **`ui\tools\build-distribution.ps1`** is the ONE canonical packager. Never hand-zip `dist\win-unpacked\` — you'll skip the shortcut + instructions + `install-cloakgpt.ps1` bundling AND you'll skip the fresh Setup.exe copy, and users will complain the shortcut is missing / the download is stale.
+- **NSIS one-click Setup.exe pipeline** (added 2026-08-12 — see `docs/HANDOFF_2026-08-12_NSIS_ONE_CLICK_INSTALLER.md`):
+  - `ui\build\installer.nsh` — custom NSIS macros (customInit / customInstall / customUnInstall). Force-tracked via `!ui/build/installer.nsh` in `.gitignore`. Handles: cooperative unload of running payload, path-filtered process kill (sihost.exe COLLIDES with Windows' Shell Infrastructure Host at `C:\Windows\system32\sihost.exe` — MUST filter by executable path or you nuke Explorer's shell coordinator), Defender exclusion add/remove, ProgramData binary mirror on install, silent-upgrade-preserves-user-data via `${IfNot} ${Silent}` gate on the wipe step.
+  - `ui\package.json` — has an `nsis` block with `oneClick: true, perMachine: true, artifactName: 'CloakGPTWindowsMaxStealth-Setup.exe', include: 'build/installer.nsh'`. `win.target` array stays as `dir` only; the NSIS second pass overrides via CLI `--win nsis --prepackaged`.
+  - `ui\build-protected.js` Step 7 — second-pass `electron-builder --win nsis --prepackaged dist/win-unpacked` that wraps the ALREADY-obfuscated + bytecoded + fuse-flipped + asar-extracted `win-unpacked/` layout as an NSIS installer. Adding `nsis` to the FIRST target array is FORBIDDEN — electron-builder would pack nsis BEFORE afterPack finishes running our fuses + build-protected Step 6 asar extraction, shipping a pre-processed installer that boots into asar integrity errors.
+  - Setup.exe outputs to `ui\dist\CloakGPTWindowsMaxStealth-Setup.exe` (~79 MB LZMA vs ~123 MB zip). Installs to `C:\Program Files\svchelper\`, registers in Add/Remove Programs as `CloakGPT (Max Stealth)`, auto-launches via `runAfterFinish: true`, uses NSIS's native shortcut API (no more `.lnk` byte-patching — the admin flag is a first-class NSIS shortcut attribute).
+- **`ui\tools\install-cloakgpt.ps1`** is bundled INSIDE the zip at its root. Legacy manual-install path — still shipped because it works on MDM boxes that block Setup.exe elevation AND provides a debug channel that reveals the unpacked layout. It's the end-user's one-click upgrade path: kills stale svchelper, removes old C bins from `C:\ProgramData\WinAudioSvc\` (preserves config.dat + session + api_keys + logs), creates the admin-flagged Desktop shortcut. Users run it with right-click → Run with PowerShell. As of 2026-08-06 (v2) the script:
 - **`ui\tools\install-cloakgpt.ps1`** is bundled INSIDE the zip at its root. It's the end-user's one-click upgrade path: kills stale svchelper, removes old C bins from `C:\ProgramData\WinAudioSvc\` (preserves config.dat + session + api_keys + logs), creates the admin-flagged Desktop shortcut. Users run it with right-click → Run with PowerShell. As of 2026-08-06 (v2) the script:
   - **Self-elevates via `Start-Process -Verb RunAs`** at the top — right-click → Run with PowerShell now auto-UAC-prompts and re-executes elevated. The old "must be Administrator" hard-fail path is gone.
   - **Writes shortcut to user Desktop AND falls back to `[Environment]::GetFolderPath('CommonDesktopDirectory')`** (= `C:\Users\Public\Desktop`, visible on every user's merged Desktop view) if user Desktop write fails.
@@ -129,12 +142,13 @@ Key pipeline invariants (from `docs/DISTRIBUTION.md` + `CLAUDE.md` v4.5 entry �
 
 **Verify success by:**
 ```powershell
-Get-Item C:\Users\<you>\Desktop\CloakGPTWindowsMaxStealth.zip, `
+Get-Item C:\Users\<you>\Desktop\CloakGPTWindowsMaxStealth-Setup.exe, `
+         C:\Users\<you>\Desktop\CloakGPTWindowsMaxStealth.zip, `
          "C:\Users\<you>\Desktop\Launch CloakGPT.lnk", `
          "C:\Users\<you>\Desktop\CloakGPT Setup Instructions.md" |
     Format-List Name, Length, LastWriteTime
 ```
-All three should have LastWriteTime within the last minute. Zip size should be ~115–130 MB (varies with Electron version + bundled locale packs; sub-90 MB = suspicious, likely missing resources/).
+All four should have LastWriteTime within the last minute. Sanity ranges: Setup.exe ~75–85 MB, zip ~115–130 MB (varies with Electron version + bundled locale packs; Setup.exe sub-60 MB OR zip sub-90 MB = suspicious, likely missing resources/).
 
 ## Encrypted log decryption
 

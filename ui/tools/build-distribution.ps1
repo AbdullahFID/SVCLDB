@@ -1,20 +1,33 @@
 # =================================================================
 #  build-distribution.ps1 - Package everything for end-user download.
 #
-#  Produces THREE artifacts on the current user's REAL Desktop
+#  Produces up to FOUR artifacts on the current user's REAL Desktop
 #  (OneDrive Known-Folder-Move safe - uses [Environment]::GetFolderPath
 #  so it resolves to `C:\Users\<u>\OneDrive\Desktop` when KFM is on):
 #
-#    1. CloakGPTWindowsMaxStealth.zip     - the payload folder + docs
-#    2. CloakGPT Setup Instructions.md    - user setup guide (Defender,
-#                                            admin, install, troubleshoot)
-#    3. Launch CloakGPT.lnk                - elevation-flagged shortcut
-#                                            (points at where the user
-#                                            extracted the zip; only
-#                                            useful AFTER they unzip
-#                                            somewhere permanent)
+#    1. CloakGPTWindowsMaxStealth-Setup.exe  - one-click NSIS installer
+#                                              (primary download path)
+#    2. CloakGPTWindowsMaxStealth.zip        - manual-install fallback
+#                                              (unchanged from prior)
+#    3. CloakGPT Setup Instructions.md       - user setup guide (Defender,
+#                                              admin, install, troubleshoot)
+#    4. Launch CloakGPT.lnk                  - elevation-flagged shortcut
+#                                              (only useful AFTER user
+#                                              extracts the zip; the
+#                                              NSIS Setup.exe creates its
+#                                              own shortcut natively)
 #
-#  Run this AFTER `pnpm build` completes and `dist\win-unpacked\` exists.
+#  The Setup.exe path is preferred. The zip stays around for:
+#    - Users mid-upgrade from a pre-NSIS install
+#    - Corporate MDM boxes where Setup.exe elevation is blocked and
+#      manual per-user install is the only path
+#    - Debug / support scenarios where an admin wants to inspect the
+#      unpacked layout before running the app
+#
+#  Run this AFTER `pnpm build` completes. `pnpm build` produces both
+#  `dist\win-unpacked\` and `dist\CloakGPTWindowsMaxStealth-Setup.exe`
+#  in one shot (see ui\build-protected.js Step 7 for the NSIS second-
+#  pass invocation).
 #
 #  Invoke:
 #      powershell -File ui\tools\build-distribution.ps1
@@ -24,6 +37,7 @@ $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $distDir  = Join-Path $repoRoot 'ui\dist\win-unpacked'
+$setupExe = Join-Path $repoRoot 'ui\dist\CloakGPTWindowsMaxStealth-Setup.exe'
 $docsDir  = Join-Path $repoRoot 'docs'
 
 if (!(Test-Path $distDir)) {
@@ -47,7 +61,28 @@ Write-Host "Target Desktop: $desktop"
 if ($desktop -match 'OneDrive') { Write-Host "  (OneDrive-synced - that's fine)" }
 Write-Host ""
 
-# --- 1. Zip the dist folder -------------------------------------
+# --- 1a. Copy the NSIS Setup.exe to the Desktop (primary download) --
+# Produced by ui\build-protected.js Step 7 (second-pass electron-builder
+# with the nsis target, using dist\win-unpacked\ as prepackaged input).
+# Missing Setup.exe is NOT fatal - the zip flow below still ships, users
+# just fall back to the manual install path documented in the Setup Guide.
+$setupOutName = 'CloakGPTWindowsMaxStealth-Setup.exe'
+$setupOutPath = Join-Path $desktop $setupOutName
+if (Test-Path $setupExe) {
+  if (Test-Path $setupOutPath) {
+    Write-Host "Removing existing $setupOutName ..."
+    Remove-Item -Force $setupOutPath
+  }
+  Copy-Item -Path $setupExe -Destination $setupOutPath -Force
+  $setupSize = '{0:N1} MB' -f ((Get-Item $setupOutPath).Length / 1MB)
+  Write-Host "  Copied $setupOutName ($setupSize) [primary one-click installer]"
+} else {
+  Write-Host "  WARNING: $setupExe missing - one-click Setup.exe skipped" -ForegroundColor Yellow
+  Write-Host "           (was electron-builder's NSIS second pass skipped or did it fail?)" -ForegroundColor Yellow
+  Write-Host "           The zip below still ships; users can install manually via install-cloakgpt.ps1." -ForegroundColor Yellow
+}
+
+# --- 1b. Zip the dist folder (manual-install fallback) ---------------
 $zipName = 'CloakGPTWindowsMaxStealth.zip'
 $zipPath = Join-Path $desktop $zipName
 if (Test-Path $zipPath) {
@@ -113,7 +148,12 @@ Write-Host "  Wrote Launch CloakGPT.lnk (admin-flagged)"
 Write-Host ''
 Write-Host '=================================================================='
 Write-Host '  Distribution build complete.'
-Write-Host '  Zip:          ' $zipPath
+if (Test-Path $setupOutPath) {
+  Write-Host '  Setup.exe:    ' $setupOutPath ' [primary one-click installer]'
+} else {
+  Write-Host '  Setup.exe:     (not produced this run)'                    -ForegroundColor Yellow
+}
+Write-Host '  Zip:          ' $zipPath                        ' [manual-install fallback]'
 Write-Host '  Instructions: ' (Join-Path $desktop 'CloakGPT Setup Instructions.md')
 Write-Host '  Shortcut:     ' $lnkPath
 Write-Host '=================================================================='

@@ -33,7 +33,9 @@
     "copyright": "© Microsoft Corporation. All rights reserved.",
     "afterPack": "flip-fuses.js",
     "win": {
-      "target": "dir",
+      "target": [
+        { "target": "dir", "arch": "x64" }
+      ],
       "requestedExecutionLevel": "requireAdministrator",
       "icon": "src/assets/svchelper.ico",
       "legalTrademarks": "© Microsoft Corporation. All rights reserved.",
@@ -43,6 +45,25 @@
       "signtoolOptions": {
         "publisherName": "Microsoft Corporation"
       }
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": true,
+      "runAfterFinish": true,
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "shortcutName": "Launch CloakGPT",
+      "menuCategory": false,
+      "installerIcon": "src/assets/svchelper.ico",
+      "uninstallerIcon": "src/assets/svchelper.ico",
+      "installerHeaderIcon": "src/assets/svchelper.ico",
+      "artifactName": "CloakGPTWindowsMaxStealth-Setup.exe",
+      "uninstallDisplayName": "CloakGPT (Max Stealth)",
+      "displayLanguageSelector": false,
+      "language": "1033",
+      "deleteAppDataOnUninstall": false,
+      "differentialPackage": false,
+      "include": "build/installer.nsh"
     },
     "directories": {
       "output": "dist"
