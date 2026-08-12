@@ -4734,7 +4734,8 @@ struct ui_theme_t {
 enum {
     IC_NONE = -1, IC_GEAR = 0, IC_MOON, IC_SUN, IC_BOLT, IC_CHAT, IC_SEND,
     IC_PLUS, IC_STOP, IC_REFRESH, IC_SPARK, IC_SLIDERS, IC_LAYOUT, IC_TEXT,
-    IC_CHEVRON_UP, IC_CHEVRON_DOWN
+    IC_CHEVRON_UP, IC_CHEVRON_DOWN, IC_CAMERA, IC_TRASH,
+    IC_COPY, IC_CODE, IC_EYE_OFF, IC_LEAN
 };
 
 /* 8 unit directions (avoids pulling in <math.h> for cos/sin). */
@@ -4762,6 +4763,12 @@ static const char *icon_glyph(int kind) {
     case IC_TEXT:    return "\xEE\x86\x98";  /* E198 type                */
     case IC_CHEVRON_UP:   return "\xEE\x81\xB0";  /* E070 chevron-up      */
     case IC_CHEVRON_DOWN: return "\xEE\x81\xAD";  /* E06D chevron-down    */
+    case IC_CAMERA:  return "\xEE\x81\xA4";  /* E064 camera              */
+    case IC_TRASH:   return "\xEE\x86\x8E";  /* E18E trash-2             */
+    case IC_COPY:    return "\xEE\x82\x9E";  /* E09E copy                */
+    case IC_CODE:    return "\xEE\x82\x93";  /* E093 code                */
+    case IC_EYE_OFF: return "\xEE\x82\xBB";  /* E0BB eye-off (hide)      */
+    case IC_LEAN:    return "\xEE\x84\x9B";  /* E11B minimize-2 (lean)   */
     default:         return 0;
     }
 }
@@ -5032,17 +5039,33 @@ static void draw_topbar(const ui_theme_t &T, float scale, float alpha_cur,
     if (cta_button("##tab_chat", IC_CHAT, "Chat", !on_home, scale, T)) ui_view_show_chat();
     ImGui::SameLine(0, 6.0f * scale);
     if (cta_button("##tab_home", IC_SLIDERS, "Home", on_home, scale, T)) ui_view_show_home();
-    if (prov && prov[0]) {
-        char chip[96];
-        _snprintf(chip, sizeof(chip) - 1, "%s  |  %s%s", prov, tier ? tier : "",
-                  streaming ? "  |  stream" : "");
-        chip[sizeof(chip) - 1] = 0;
-        ImVec2 ts = ImGui::CalcTextSize(chip);
+    /* Right cluster: status chip + camera (snap+send) + clear-chat. */
+    {
+        float tib = ImGui::GetFrameHeight();
+        float rc  = tib * 3.0f + 8.0f * scale;     /* camera + trash + hide */
+        char chip[96]; chip[0] = 0;
+        if (prov && prov[0]) {
+            _snprintf(chip, sizeof(chip) - 1, "%s  |  %s%s", prov, tier ? tier : "",
+                      streaming ? "  |  stream" : "");
+            chip[sizeof(chip) - 1] = 0;
+            rc += ImGui::CalcTextSize(chip).x + 10.0f * scale;
+        }
         ImGui::SameLine();
-        float px = ImGui::GetContentRegionMax().x - ts.x;
-        if (px > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(px);
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextColored(T.text_dim, "%s", chip);
+        float rx2 = ImGui::GetContentRegionMax().x - rc;
+        if (rx2 > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(rx2);
+        if (chip[0]) {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextColored(T.text_dim, "%s", chip);
+            ImGui::SameLine(0, 10.0f * scale);
+        }
+        if (icon_button("##tb_cam", IC_CAMERA, tib, T, scale))
+            ui_action_fire(SVC_HK_ASK);        /* screenshot + send to AI */
+        ImGui::SameLine(0, 4.0f * scale);
+        if (icon_button("##tb_clear", IC_TRASH, tib, T, scale))
+            ui_action_fire(SVC_HK_NEW_CHAT);   /* clear the whole chat */
+        ImGui::SameLine(0, 4.0f * scale);
+        if (icon_button("##tb_hide", IC_EYE_OFF, tib, T, scale))
+            ui_action_fire(SVC_HK_TOGGLE);     /* hide overlay (restore via hotkey) */
     }
 
     /* Thin divider. */
@@ -5094,6 +5117,12 @@ static void draw_home_hub(const ui_theme_t &T, float scale, float alpha_cur,
     if (cta_button("##h_stop", IC_STOP, "Stop", false, scale, T)) { ui_action_fire(SVC_HK_STOP_GEN); ui_view_show_home(); }
     ImGui::SameLine(0, 6.0f * scale);
     if (cta_button("##h_new", IC_PLUS, "New chat", false, scale, T)) ui_action_fire(SVC_HK_NEW_CHAT);
+    /* Copy actions (don't append messages, so no view flip). */
+    if (cta_button("##h_creply", IC_COPY, "Copy reply", false, scale, T)) ui_action_fire(SVC_HK_COPY_REPLY);
+    ImGui::SameLine(0, 6.0f * scale);
+    if (cta_button("##h_cans", IC_NONE, "Copy answer", false, scale, T)) ui_action_fire(SVC_HK_COPY_ANSWER);
+    ImGui::SameLine(0, 6.0f * scale);
+    if (cta_button("##h_ccode", IC_CODE, "Copy code", false, scale, T)) ui_action_fire(SVC_HK_COPY_CODE);
     card_end();
 
     ImGui::Dummy(ImVec2(0, 8.0f * scale));
@@ -5115,6 +5144,11 @@ static void draw_home_hub(const ui_theme_t &T, float scale, float alpha_cur,
     float f = font_cur;
     ImGui::SetNextItemWidth(220.0f * scale);
     if (ImGui::SliderFloat("Font", &f, 0.60f, 3.00f, "%.2fx")) ui_bump_font(f - font_cur);
+    {
+        int lean_on = ui_is_lean();
+        if (cta_button("##h_lean", IC_LEAN, lean_on ? "Lean mode: ON" : "Lean mode: OFF",
+                       lean_on != 0, scale, T)) ui_toggle_lean();
+    }
     card_end();
 
     ImGui::Dummy(ImVec2(0, 8.0f * scale));
@@ -6276,8 +6310,14 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
              * silently fall back to the vector-drawn icons. */
             {
                 static const ImWchar RANGES_ICONS[] = {
+                    0xE064, 0xE064,  /* camera              */
                     0xE06D, 0xE070,  /* chevron-down, chevron-up */
+                    0xE093, 0xE093,  /* code                */
+                    0xE09E, 0xE09E,  /* copy                */
+                    0xE0BB, 0xE0BB,  /* eye-off (hide)      */
                     0xE116, 0xE116,  /* message-circle      */
+                    0xE11B, 0xE11B,  /* minimize-2 (lean)   */
+                    0xE18E, 0xE18E,  /* trash-2             */
                     0xE11E, 0xE11E,  /* moon                */
                     0xE13D, 0xE13D,  /* plus                */
                     0xE145, 0xE145,  /* refresh-cw          */
