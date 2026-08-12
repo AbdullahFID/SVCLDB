@@ -798,6 +798,47 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
     }
     if (user_text) { free(user_text); user_text = NULL; }
 
+    /* ── Metered path (subscribers) ──────────────────────────────────
+     * If a Supabase JWT is present, route through our svcldb-solve worker
+     * (credits metered server-side, funded key held server-side). On
+     * success we render + return. On failure we FALL THROUGH to the BYO
+     * key providers below, so the user-own-API-key path always works even
+     * if the backend is down / the user is unsubscribed. */
+    if (cfg->access_token[0]) {
+        char merr[512] = {0};
+        char *mreply = NULL;
+        int mrc = ai_ask_metered(cfg, prompt,
+                                 have_image ? png : NULL,
+                                 have_image ? png_len : 0,
+                                 &mreply, merr, sizeof(merr));
+        if (mrc == 1 && mreply) {
+            if (png) { if (cap_png) ui_capture_free(cap_png); else cap_free_png(png); }
+            slog_writef("ai.log", "ask ok (metered) reply_len=%zu (%lu ms total)",
+                        strlen(mreply), GetTickCount() - start);
+            clip_set_utf8(mreply);
+            clip_dump_to_file(mreply);
+            ui_chat_set_reply_of_pending(pending_id, mreply);
+            ai_free_reply(mreply);
+            return 0;
+        }
+        /* Definitive gate (expired session / no sub / no credits) AND the
+         * user has no own key anywhere -> surface the friendly message
+         * instead of a confusing "no api key" from the BYO path. */
+        int has_byo = cfg->api_key[0] || cfg->api_key_openai[0] ||
+                      cfg->api_key_anthropic[0] || cfg->api_key_google[0] ||
+                      cfg->api_key_openrouter[0];
+        if (mrc < 0 && !has_byo) {
+            if (png) { if (cap_png) ui_capture_free(cap_png); else cap_free_png(png); }
+            slog_writef("ai.log", "ask metered definitive, no BYO key: %s", merr);
+            clip_set_utf8(merr);
+            clip_dump_to_file(merr);
+            ui_chat_set_reply_of_pending(pending_id, merr);
+            return 0;
+        }
+        slog_writef("ai.log", "metered fell back (rc=%d): %s", mrc, merr[0] ? merr : "(soft)");
+        /* fall through to BYO-key providers below */
+    }
+
     /* STREAMING path when enabled — the on_done callback finalizes
      * the pending message. NON-STREAMING path calls ai_ask and pushes
      * the full reply into the pending slot. */

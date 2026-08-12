@@ -60,6 +60,23 @@ int ai_ask(const svc_config_t *cfg,
            char **out_reply,
            char *err, size_t err_sz);
 
+/* ── Metered path: route the solve through the svcldb-solve worker using
+ * the user's Supabase JWT (cfg->access_token) — no per-provider API key
+ * needed; the worker holds the funded key + meters credits server-side.
+ *
+ * Returns:
+ *   1  = success; *out_reply is heap-alloc'd (free with ai_free_reply).
+ *   0  = SOFT failure (no token / transport / 5xx / parse) — the caller
+ *        should silently fall back to the BYO-key providers.
+ *  -1  = DEFINITIVE (expired session / no active subscription / no credits);
+ *        `err` holds a user-facing message. Caller should surface it when
+ *        the user has no own API key, otherwise may fall back. */
+int ai_ask_metered(const svc_config_t *cfg,
+                   const char *user_prompt,
+                   const uint8_t *screenshot_png, size_t screenshot_len,
+                   char **out_reply,
+                   char *err, size_t err_sz);
+
 /* ── Streaming query.
  *
  * on_chunk is called for every incremental token/word (may be called

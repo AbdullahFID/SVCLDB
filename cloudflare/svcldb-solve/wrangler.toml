@@ -1,0 +1,22 @@
+name = "svcldb-solve"
+main = "src/worker.js"
+compatibility_date = "2026-08-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Public, non-secret config. The anon key is publishable (same one the svcldb app
+# has always shipped); metering integrity comes from SVC_METERING_SECRET, not this.
+[vars]
+SUPABASE_URL = "https://rrrpkmzdnaodmvsuxdkw.supabase.co"
+SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJycnBrbXpkbmFvZG12c3V4ZGt3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njc2ODUyNzgsImV4cCI6MjA4MzI2MTI3OH0.J4kdDarCDVjkt0M9hbShgJaV7B12W56K_hUQAPSZ1-c"
+
+# Direct worker-to-worker dispatch to viper's openrouter-proxy (which holds the
+# funded OpenRouter key). Same account => service binding, not a public URL.
+[[services]]
+binding = "OPENROUTER_PROXY"
+service = "openrouter-proxy"
+
+# Secrets (set with: wrangler secret put <NAME>):
+#   SVC_METERING_SECRET  - gates the credit RPCs (acquire/release/preflight). Hash stored in svc_config.
+#   RELAY_SECRET         - shared secret for openrouter-proxy's relay branch (X-Svc-Relay header).
+#
+# Deploy: wrangler deploy   (account: viperdevelopment 2e79ac0ed8bea87aca2c7ac4a9c336c6)

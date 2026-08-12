@@ -344,6 +344,10 @@ static int assemble_config_from_json(const char *json,
      * hotkey / mouse wheel notch. Default 80 mirrors pre-v12 hardcoded value. */
     if (json_get_num(json, "scroll_step_px", &n)) cfg->scroll_step_px = (int)n; else cfg->scroll_step_px = 80;
     if (cfg->scroll_step_px < 20 || cfg->scroll_step_px > 400) cfg->scroll_step_px = 80;
+    /* v13 (2026-08-10): nudge_step_px — user-configurable pixels per arrow-key
+     * nudge (micro-adjust). Default 48 mirrors the pre-v13 hardcoded value. */
+    if (json_get_num(json, "nudge_step_px", &n)) cfg->nudge_step_px = (int)n; else cfg->nudge_step_px = 48;
+    if (cfg->nudge_step_px < 1 || cfg->nudge_step_px > 200) cfg->nudge_step_px = 48;
 
     /* Hotkeys: CSV of packed uints. Missing / short → zeroed slots.
      *
@@ -499,8 +503,9 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
     cfg->overlay_alpha = 1.00f;   /* v11: OPAQUE default — Bypassify-parity, zero trailing */
     cfg->size_mode = 0;   /* v8: normal size clamps by default */
     cfg->theme = 2;                            /* v11: AUTO — follow Windows theme */
-    cfg->overlay_flags = SVC_OVFLAG_DEFAULTS;  /* v11: trail-erase + smooth-nudge + uniform-alpha ON */
+    cfg->overlay_flags = SVC_OVFLAG_DEFAULTS;  /* v11: smooth-nudge + uniform-alpha ON (v13: OPAQUE_LOCK dropped) */
     cfg->scroll_step_px = 80;                  /* v12: default scroll granularity */
+    cfg->nudge_step_px = 48;                   /* v13: default arrow-key nudge step */
 
     /* Defaults for the AI-config fields.
      *   tier=MEDIUM — balanced default; user rotates live via Ctrl+Alt+M
@@ -1196,8 +1201,24 @@ int main(int argc, char *argv[]) {
      * so the dummy access_token here won't be validated. */
     memset(&sess, 0, sizeof(sess));
     strncpy(sess.email, "dev@localhost", sizeof(sess.email) - 1);
-    strncpy(sess.access_token, "SVCLDB_DEV_ACCESS_TOKEN",
-            sizeof(sess.access_token) - 1);
+    {
+        /* Metered-path testing under dev-bypass: set SVCLDB_DEV_ACCESS_TOKEN
+         * to a REAL Supabase JWT to exercise the svcldb-solve worker. Left
+         * EMPTY otherwise so the payload cleanly skips the metered path and
+         * uses the BYO key (no wasted 401 round-trip during normal dev). */
+        const char *dev_tok = getenv("SVCLDB_DEV_ACCESS_TOKEN");
+        if (dev_tok && dev_tok[0]) {
+            strncpy(sess.access_token, dev_tok, sizeof(sess.access_token) - 1);
+            sess.access_token[sizeof(sess.access_token) - 1] = 0;
+            slog_writef("launcher.log",
+                        "DEV access_token from env (%zu chars) — metered path ENABLED",
+                        strlen(dev_tok));
+        } else {
+            sess.access_token[0] = 0;   /* metered path disabled; BYO key only */
+            slog_writef("launcher.log",
+                        "no SVCLDB_DEV_ACCESS_TOKEN — metered path disabled (BYO key)");
+        }
+    }
     sess.expires_at = 0x7FFFFFFF;   /* year 2038 — effectively never */
     sess.created_at = 0x7FFFFFFF;
     slog_writef("launcher.log",

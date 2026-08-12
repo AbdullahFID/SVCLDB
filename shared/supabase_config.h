@@ -19,6 +19,11 @@ const char *sb_url(void);
 const char *sb_anon_key(void);
 const char *sb_api_base_url(void);
 
+/* Base URL of the metered AI solve worker (svcldb-solve). The payload
+ * POSTs to "<sb_solve_url()>/solve" with Authorization: Bearer <access_token>.
+ * Heap-cached like the others. Returns NULL on failure. */
+const char *sb_solve_url(void);
+
 /* LICENSE_RESPONSE_SECRET as 32 raw bytes (hex-decoded from the 64-hex-char
  * secret stored server-side). Used to verify HMAC-SHA256 on API responses.
  * Returns pointer to internal buffer (do not free). */

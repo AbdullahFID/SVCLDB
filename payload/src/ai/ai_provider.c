@@ -28,6 +28,7 @@
 #include "../../../shared/log_secure.h"
 #include "../../../shared/winhttp_util.h"
 #include "../../../shared/str_enc.h"
+#include "../../../shared/supabase_config.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1488,6 +1489,128 @@ int ai_ask(const svc_config_t *cfg, const char *user_prompt,
     slog_writef("ai.log", "ai_ask ok reply_len=%zu", strlen(*out_reply));
     whreq_free_result(&r);
     return 1;
+}
+
+/* ── Metered path: POST to the svcldb-solve worker with the Supabase JWT ── */
+int ai_ask_metered(const svc_config_t *cfg, const char *user_prompt,
+                   const uint8_t *screenshot_png, size_t screenshot_len,
+                   char **out_reply, char *err, size_t err_sz) {
+    if (out_reply) *out_reply = NULL;
+    if (!cfg || !out_reply || !err || err_sz == 0) return 0;
+    err[0] = 0;
+    if (cfg->access_token[0] == 0) return 0;          /* no JWT -> BYO fallback */
+
+    const char *base = sb_solve_url();
+    if (!base || !base[0]) return 0;
+
+    char url[512];
+    _snprintf(url, sizeof(url) - 1, "%s/solve", base);
+    url[sizeof(url) - 1] = 0;
+
+    /* Screenshot -> data URL for the worker. */
+    char *data_url = NULL;
+    if (screenshot_png && screenshot_len > 0) {
+        char *b64 = png_to_b64(screenshot_png, screenshot_len);
+        if (b64) {
+            size_t need = strlen(b64) + 32;
+            data_url = (char *)malloc(need);
+            if (data_url) {
+                _snprintf(data_url, need - 1, "data:image/png;base64,%s", b64);
+                data_url[need - 1] = 0;
+            }
+            free(b64);
+        }
+    }
+
+    /* Body: {"question":"...","explain":bool[,"images":["data:..."]]} */
+    json_builder_t jb;
+    if (!jb_init(&jb, 8192 + (data_url ? strlen(data_url) : 0))) {
+        if (data_url) free(data_url);
+        return 0;
+    }
+    jb_obj_begin(&jb);
+      jb_key(&jb, "question"); jb_str(&jb, user_prompt ? user_prompt : "");
+      jb_key(&jb, "explain");  jb_bool(&jb, cfg->direct_answer_mode ? 0 : 1);
+      if (data_url) {
+        jb_key(&jb, "images"); jb_arr_begin(&jb);
+          jb_str(&jb, data_url);
+        jb_arr_end(&jb);
+      }
+    jb_obj_end(&jb);
+    if (data_url) { free(data_url); data_url = NULL; }
+    if (jb.err) { jb_free(&jb); return 0; }
+
+    char auth_hdr[4200];
+    _snprintf(auth_hdr, sizeof(auth_hdr) - 1, "Authorization: Bearer %s", cfg->access_token);
+    auth_hdr[sizeof(auth_hdr) - 1] = 0;
+    const char *hdrs[] = { "Content-Type: application/json", auth_hdr, NULL };
+
+    slog_writef("ai.log", "ai_ask_metered POST /solve img=%d", screenshot_png ? 1 : 0);
+
+    whreq_result_t r = {0};
+    int ok = whreq_post_ex(url, hdrs, jb.buf, jb.len, AI_TIMEOUT_BALANCED_MS, &r);
+    jb_free(&jb);
+    if (!ok) {
+        slog_writef("ai.log", "ai_ask_metered transport fail: %s", r.err);
+        whreq_free_result(&r);
+        return 0;                                     /* soft -> BYO fallback */
+    }
+
+    if (r.status == 200 && r.body) {
+        char *answer = (char *)malloc(131072);
+        if (!answer) { whreq_free_result(&r); return 0; }
+        if (json_get_str(r.body, "answer", answer, 131072) && answer[0]) {
+            char *combined = answer;
+            if (!cfg->direct_answer_mode) {
+                char *expl = (char *)malloc(131072);
+                if (expl) {
+                    if (json_get_str(r.body, "explanation", expl, 131072) && expl[0]) {
+                        size_t need = strlen(answer) + strlen(expl) + 4;
+                        char *c = (char *)malloc(need);
+                        if (c) {
+                            _snprintf(c, need - 1, "%s\n\n%s", answer, expl);
+                            c[need - 1] = 0;
+                            free(answer);
+                            combined = c;
+                        }
+                    }
+                    free(expl);
+                }
+            }
+            *out_reply = combined;
+            double remaining = -1.0; json_get_num(r.body, "creditsRemaining", &remaining);
+            slog_writef("ai.log", "ai_ask_metered ok reply_len=%zu credits=%.4f",
+                        strlen(combined), remaining);
+            whreq_free_result(&r);
+            return 1;
+        }
+        free(answer);
+        slog_writef("ai.log", "ai_ask_metered 200 but no answer field: %.200s", r.body);
+        whreq_free_result(&r);
+        return 0;                                     /* parse -> BYO fallback */
+    }
+
+    /* Non-200 — map the definitive gates to friendly, actionable messages. */
+    char errcode[128] = {0};
+    if (r.body) json_get_str(r.body, "error", errcode, sizeof(errcode));
+    int rc = 0;
+    if (r.status == 401) {
+        _snprintf(err, err_sz - 1,
+                  "Your session expired. Re-launch CloakGPT to refresh it, or set your own API key.");
+        rc = -1;
+    } else if (r.status == 403 && strcmp(errcode, "no_credits") == 0) {
+        _snprintf(err, err_sz - 1,
+                  "Out of AI credits. They replenish at the start of your next period - buy more, or set your own API key.");
+        rc = -1;
+    } else if (r.status == 403 && strcmp(errcode, "subscription_required") == 0) {
+        _snprintf(err, err_sz - 1,
+                  "No active subscription. Subscribe to use built-in AI, or set your own API key.");
+        rc = -1;
+    }
+    err[err_sz - 1] = 0;
+    slog_writef("ai.log", "ai_ask_metered http=%u error=%s rc=%d", r.status, errcode, rc);
+    whreq_free_result(&r);
+    return rc;                                        /* -1 definitive, 0 soft */
 }
 
 /* ── Streaming: SSE chunk parser ──────────────────────────────── */

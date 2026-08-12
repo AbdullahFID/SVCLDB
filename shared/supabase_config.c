@@ -20,12 +20,15 @@
 /* ── Ciphertext (base64, XOR'd with SHA256("svcldb-config-wrap-v1")) ── */
 static const char C_URL[]           = "lQIajrMjL55196kpvsGyu7bi0SjmwD3MGS73cMb1b2OcFA+NpTdj3g==";
 static const char C_API[]           = "lQIajrMjL55w7LU9utu78bbsyi/j0T7NTynzag==";
+/* svcldb-solve worker base (https://svcldb-solve.c-viperdevelopment.workers.dev) */
+static const char C_SOLVE[]         = "lQIajrMjL55087g1sc7lrLfvyCml1WPPCDr5dYzjbHaRGR6TpXd0n3DqqTKw3rvxvObI";
 static const char C_ANON_KEY[]      = "mA8klqJeY9hI7JEQgNaB7pbq9z/C2ByMAgnVMaHtakurNSTH7nx5+3fm6BS846GVoufmDuPvI/8bEM9Om890WZEsB7f2UG77fua1G6fOkK+z4dMK/ewJiFMpr1Hc3F1nzj8Hial6bYh034gQ4+Wlma3hjHji+g3zERPEVoHJcFbOOASd8lZE5H7LoT6m5aWJ7OD9Bb37JPhVB+ZO2stOWs45Js7uUzTaY8G6K5bonrWz944Bst4s6gkt1ma+sVgizyFbyItGaORWxIsKj53lvA==";
 static const char C_RESP_SECRET[]   = "nEQIx/QrOYI2tr5q5pj+uu6323no1XbYBSz/Zo6weCvIEgjL9i00g2a3vjuxm/Du6bKMdLOAL4sHKKs00b58Iw==";
 
 static char *g_url         = NULL;
 static char *g_anon        = NULL;
 static char *g_api_base    = NULL;
+static char *g_solve       = NULL;
 static unsigned char *g_secret = NULL;   /* 32 raw bytes */
 static CRITICAL_SECTION g_cs;
 static volatile LONG    g_cs_init = 0;
@@ -129,6 +132,14 @@ const char *sb_api_base_url(void) {
     return g_api_base;
 }
 
+const char *sb_solve_url(void) {
+    ensure_cs();
+    EnterCriticalSection(&g_cs);
+    if (!g_solve) g_solve = decrypt_str(C_SOLVE);
+    LeaveCriticalSection(&g_cs);
+    return g_solve;
+}
+
 const unsigned char *sb_response_secret(void) {
     ensure_cs();
     EnterCriticalSection(&g_cs);
@@ -143,6 +154,7 @@ void sb_cleanup(void) {
     if (g_url)      { svc_secure_zero(g_url,      strlen(g_url));      free(g_url);      g_url = NULL; }
     if (g_anon)     { svc_secure_zero(g_anon,     strlen(g_anon));     free(g_anon);     g_anon = NULL; }
     if (g_api_base) { svc_secure_zero(g_api_base, strlen(g_api_base)); free(g_api_base); g_api_base = NULL; }
+    if (g_solve)    { svc_secure_zero(g_solve,    strlen(g_solve));    free(g_solve);    g_solve = NULL; }
     if (g_secret)   { svc_secure_zero(g_secret,   32);                 free(g_secret);   g_secret = NULL; }
     LeaveCriticalSection(&g_cs);
 }
