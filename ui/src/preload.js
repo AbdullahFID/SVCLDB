@@ -158,6 +158,11 @@ contextBridge.exposeInMainWorld('svc', {
   logs: {
     export: () => ipcRenderer.invoke('logs:export'),
   },
+  /* v (2026-08-12): AI credit balance for the dashboard. load() returns
+   * { credits, total_usage, refreshed_at, pending_calls } or null. */
+  credits: {
+    load: () => ipcRenderer.invoke('credits:load'),
+  },
   /* v1.7.12 (2026-08-01) — Screenshot redactor. Toggle spawns / kills
    * the sihost.exe --ocr-daemon helper; blacklist JSON persists to
    * C:\ProgramData\WinAudioSvc\ocr_blacklist.json (where the daemon

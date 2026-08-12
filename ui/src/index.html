@@ -245,6 +245,11 @@
               <div class="b-label">Session</div>
               <div class="b-val" id="d-badge-session">…</div>
             </div>
+            <div class="badge">
+              <div class="b-dot on"></div>
+              <div class="b-label">AI credits</div>
+              <div class="b-val"><span id="d-badge-credits">…</span> <a id="btn-buy-credits" style="cursor:pointer;color:var(--cyan-light);font-size:11px;margin-left:6px">Buy more</a></div>
+            </div>
           </div>
         </div>
 
@@ -512,9 +517,12 @@
                 <input id="rng-ova-h" type="range" min="140" max="1200" step="10" value="420">
                 <span class="ova-val" id="val-ova-h">420 px</span>
               </div>
-              <div class="ova-slider-row">
+              <!-- v13 (2026-08-10) — opacity floor lowered 20% -> 5% so the
+                   overlay can go near-invisible (whole overlay fades: bg +
+                   chrome + text). -->
+              <div class="ova-slider-row" title="Overlay opacity. Fades the WHOLE overlay uniformly (background, chrome, and text). 5% = near invisible ghost, 100% = solid.">
                 <label for="rng-ova-alpha">Opacity</label>
-                <input id="rng-ova-alpha" type="range" min="20" max="100" step="1" value="100">
+                <input id="rng-ova-alpha" type="range" min="5" max="100" step="1" value="100">
                 <span class="ova-val" id="val-ova-alpha">100%</span>
               </div>
               <!-- v12 (2026-07-25) — user-configurable scroll granularity.
@@ -524,6 +532,14 @@
                 <label for="rng-ova-scroll">Scroll step</label>
                 <input id="rng-ova-scroll" type="range" min="20" max="400" step="10" value="80">
                 <span class="ova-val" id="val-ova-scroll">80 px</span>
+              </div>
+              <!-- v13 (2026-08-10) — user-configurable arrow-key nudge step.
+                   Controls how far the overlay moves per Ctrl+Arrow press.
+                   Small = fine micro-adjustment; large = fast hops. -->
+              <div class="ova-slider-row" title="Pixels the overlay moves per arrow-key nudge (Ctrl+Arrow). Small = precise micro-adjustment; large = fast hops. Held keys auto-repeat. Default 48.">
+                <label for="rng-ova-nudge">Nudge step</label>
+                <input id="rng-ova-nudge" type="range" min="1" max="200" step="1" value="48">
+                <span class="ova-val" id="val-ova-nudge">48 px</span>
               </div>
 
               <div class="ova-presets">
@@ -545,7 +561,9 @@
                 <button class="chip ova-alpha-preset" data-alpha="0.85">Frosted (85%)</button>
                 <button class="chip ova-alpha-preset" data-alpha="0.60">Translucent (60%)</button>
                 <button class="chip ova-alpha-preset" data-alpha="0.35"
-                        title="Barely visible over apps — may leave a slight ghost tail during nudge; trade-off for see-through UX.">See-through (35%)</button>
+                        title="Barely visible over apps — whole overlay (incl. text) fades to 35%.">See-through (35%)</button>
+                <button class="chip ova-alpha-preset" data-alpha="0.10"
+                        title="v13: near-invisible ghost — the entire overlay incl. text fades to 10%. Use hotkeys to bring it back / reset.">Ghost (10%)</button>
               </div>
 
               <!-- v11: theme selector — dark / light / auto -->
@@ -567,9 +585,11 @@
                 <button class="chip ova-flag-toggle" data-flag="2"
                         title="Small 8-pixel nudge steps at 60Hz repeat rate = butter-smooth slide (matches Bypassify). Off = 20-pixel steps at 20Hz (jaggy).">Smooth nudge</button>
                 <button class="chip ova-flag-toggle" data-flag="4"
-                        title="Opacity slider affects the WHOLE overlay uniformly (bubbles, code, math, borders) instead of just the outer background.">Uniform alpha</button>
-                <button class="chip ova-flag-toggle" data-flag="8"
-                        title="Force alpha = 100% regardless of the slider. Guarantees zero trailing but overrides your opacity preference.">Opaque lock</button>
+                        title="Opacity slider affects the WHOLE overlay uniformly (bubbles, code, math, borders, text) instead of just the outer background.">Uniform alpha</button>
+                <!-- v13 (2026-08-10): "Opaque lock" chip removed. It forced
+                     100% opacity and made transparency not stick; the payload
+                     now ignores that flag entirely (opacity slider is the
+                     single source of truth). -->
               </div>
             </div>
 

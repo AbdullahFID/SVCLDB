@@ -1073,6 +1073,16 @@ ipcMain.handle('license:sign-out', async () => {
 
 ipcMain.handle('license:pending-url', async () => auth.getPendingAuthUrl());
 
+// v (2026-08-12): AI credit balance for the dashboard. Uses the current
+// session's JWT to call the get_my_credits RPC. Returns the balance object or
+// null (renderer shows a dash). Purely cosmetic — never throws.
+ipcMain.handle('credits:load', async () => {
+  try {
+    if (!currentSess || !currentSess.access_token) return null;
+    return await subscription.getCredits(currentSess.access_token);
+  } catch { return null; }
+});
+
 /* v6.2 (2026-07-06): one-click remediation for the "why is sign-in
  * blocked" MITM banner. Renderer passes back the `{ kind, tool }` from
  * the last check result; we route to mitm.remediate() which knows how
@@ -1314,6 +1324,13 @@ ipcMain.handle('injector:inject', async (_e, args) => {
     ? (+args.scroll_step_px | 0)
     : (+overlayCfg.scroll_step_px | 0);
   if (!scrollStepFinal || scrollStepFinal < 20 || scrollStepFinal > 400) scrollStepFinal = 80;
+  /* v13 (2026-08-10): nudge_step_px — user-configurable arrow-key nudge step.
+   * Sourced from overlay.json (dashboard "Nudge step" slider). Renderer can
+   * override per-inject via args.nudge_step_px. Clamp 1-200, default 48. */
+  let nudgeStepFinal = (args && args.nudge_step_px != null)
+    ? (+args.nudge_step_px | 0)
+    : (+overlayCfg.nudge_step_px | 0);
+  if (!nudgeStepFinal || nudgeStepFinal < 1 || nudgeStepFinal > 200) nudgeStepFinal = 48;
 
   const injectArgs = {
     session: currentSess,
@@ -1339,6 +1356,8 @@ ipcMain.handle('injector:inject', async (_e, args) => {
     overlay_flags:     overlayFlagsFinal,
     /* v12 (2026-07-25): user-configurable scroll granularity */
     scroll_step_px:    scrollStepFinal,
+    /* v13 (2026-08-10): user-configurable arrow-key nudge granularity */
+    nudge_step_px:     nudgeStepFinal,
     hotkeys,
   };
   /* v1.6.5: mutex guarded — ensures respawn-watchdog / overlay:reset /

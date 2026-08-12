@@ -798,6 +798,7 @@ function _renderDashboard() {
     pill.textContent = 'INACTIVE';
     pill.classList.add('inactive');
   }
+  refreshCredits();
   document.getElementById('d-badge-session').textContent =
     s.expires_at ? _formatExpiry(s.expires_at) : '—';
 
@@ -833,6 +834,33 @@ function _formatExpiry(ts) {
     return `${days}d`;
   } catch { return '—'; }
 }
+
+// v (2026-08-12): AI credit balance in the dashboard. Calls get_my_credits
+// (authenticated RPC) via main. Shows a dollar balance; "Buy more" opens the
+// cloakgpt.ca web dashboard (Next.js billing) for one-time top-ups. Cosmetic —
+// failures just show a dash, never block anything.
+function refreshCredits() {
+  const el = document.getElementById('d-badge-credits');
+  if (!el) return;
+  const sub = state.subscription || {};
+  if (!sub.active) { el.textContent = '—'; return; }
+  el.textContent = '…';
+  window.svc.credits.load().then((c) => {
+    if (c && typeof c.credits === 'number') {
+      el.textContent = '$' + c.credits.toFixed(2);
+      const used = (c.total_usage || 0).toFixed(2);
+      el.title = `Used $${used} of AI so far` +
+        (c.refreshed_at ? ` · last topped up ${new Date(c.refreshed_at).toLocaleDateString()}` : '');
+    } else {
+      el.textContent = '—';
+    }
+  }).catch(() => { el.textContent = '—'; });
+}
+
+document.getElementById('btn-buy-credits')?.addEventListener('click', (e) => {
+  e.preventDefault();
+  window.svc.shell.openExternal('https://cloakgpt.ca/dashboard');
+});
 
 document.getElementById('btn-signout').addEventListener('click', async () => {
   if (!confirm('Sign out? The payload will be unloaded from DWM.')) return;
@@ -1214,10 +1242,12 @@ const OVFLAG_TRAIL_ERASE   = 0x1;
 const OVFLAG_SMOOTH_NUDGE  = 0x2;
 const OVFLAG_UNIFORM_ALPHA = 0x4;
 const OVFLAG_OPAQUE_LOCK   = 0x8;
-/* v11.2.3 — TRAIL_ERASE off, OPAQUE_LOCK on. */
-const OVFLAG_DEFAULTS      = OVFLAG_SMOOTH_NUDGE | OVFLAG_UNIFORM_ALPHA | OVFLAG_OPAQUE_LOCK;
+/* v13 (2026-08-10) — OPAQUE_LOCK dropped (deprecated; payload ignores it).
+ * Opacity slider is the single source of truth so transparency actually
+ * sticks + can go near-invisible. TRAIL_ERASE stays off. */
+const OVFLAG_DEFAULTS      = OVFLAG_SMOOTH_NUDGE | OVFLAG_UNIFORM_ALPHA;
 
-let _ovaState  = { size_mode: 0, w: 560, h: 420, alpha: 1.00, theme: 2, overlay_flags: OVFLAG_DEFAULTS };
+let _ovaState  = { size_mode: 0, w: 560, h: 420, alpha: 1.00, theme: 2, overlay_flags: OVFLAG_DEFAULTS, scroll_step_px: 80, nudge_step_px: 48 };
 let _ovaSaved  = { ...(_ovaState) };   // last-saved snapshot for dirty check
 let _ovaPresetReinject = null;         // v1.7.4: debounce timer for preset auto-reinject
 
@@ -1253,6 +1283,7 @@ function _ovaRenderValues() {
   setText('val-ova-h',      `${_ovaState.h} px`);
   setText('val-ova-alpha',  `${Math.round(_ovaState.alpha * 100)}%`);
   setText('val-ova-scroll', `${_ovaState.scroll_step_px | 0} px`);
+  setText('val-ova-nudge',  `${_ovaState.nudge_step_px | 0} px`);
 }
 
 function _ovaDirty() {
@@ -1262,7 +1293,8 @@ function _ovaDirty() {
       || Math.abs(_ovaState.alpha - _ovaSaved.alpha) > 0.005
       || _ovaState.theme          !== _ovaSaved.theme
       || _ovaState.overlay_flags  !== _ovaSaved.overlay_flags
-      || _ovaState.scroll_step_px !== _ovaSaved.scroll_step_px;
+      || _ovaState.scroll_step_px !== _ovaSaved.scroll_step_px
+      || _ovaState.nudge_step_px  !== _ovaSaved.nudge_step_px;
 }
 
 // v11: reflect current theme + flag chips as .is-active based on _ovaState.
@@ -1300,7 +1332,8 @@ function _ovaClampToBounds() {
   if (_ovaState.w > b.wMax) _ovaState.w = b.wMax;
   if (_ovaState.h < b.hMin) _ovaState.h = b.hMin;
   if (_ovaState.h > b.hMax) _ovaState.h = b.hMax;
-  if (_ovaState.alpha < 0.20) _ovaState.alpha = 0.20;
+  // v13 (2026-08-10): floor 0.20 -> 0.05 so the opacity slider reaches near-invisible.
+  if (_ovaState.alpha < 0.05) _ovaState.alpha = 0.05;
   if (_ovaState.alpha > 1.00) _ovaState.alpha = 1.00;
 }
 
@@ -1314,6 +1347,8 @@ function _ovaSyncSliderRanges() {
   if (rA) rA.value = Math.round(_ovaState.alpha * 100);
   const rS = document.getElementById('rng-ova-scroll');
   if (rS) rS.value = _ovaState.scroll_step_px | 0;
+  const rN = document.getElementById('rng-ova-nudge');
+  if (rN) rN.value = _ovaState.nudge_step_px | 0;
 }
 
 function _ovaRefreshAll() {
@@ -1339,6 +1374,8 @@ async function _initOverlayCard() {
         overlay_flags: (p.overlay_flags != null ? (p.overlay_flags | 0) : OVFLAG_DEFAULTS),
         /* v12 (2026-07-25): scroll granularity. Sensible default 80 on missing. */
         scroll_step_px: (p.scroll_step_px != null ? (+p.scroll_step_px | 0) : 80),
+        /* v13 (2026-08-10): arrow-key nudge step. Sensible default 48 on missing. */
+        nudge_step_px: (p.nudge_step_px != null ? (+p.nudge_step_px | 0) : 48),
       };
       _ovaSaved = { ..._ovaState };
     }
@@ -1349,6 +1386,7 @@ async function _initOverlayCard() {
   const rngH     = document.getElementById('rng-ova-h');
   const rngA     = document.getElementById('rng-ova-alpha');
   const rngScr   = document.getElementById('rng-ova-scroll');
+  const rngNud   = document.getElementById('rng-ova-nudge');
   const btnSave  = document.getElementById('btn-ova-save');
   const btnReset = document.getElementById('btn-ova-reset');
 
@@ -1392,6 +1430,16 @@ async function _initOverlayCard() {
       _ovaRenderValues(); _ovaRenderStatus();
     });
   }
+  if (rngNud) {
+    /* v13 (2026-08-10) — arrow-key nudge granularity. Small = micro-adjust,
+     * large = fast hops. Requires Inject Now to apply (payload reads
+     * cfg->nudge_step_px on config load, no live hot-swap). */
+    rngNud.value = _ovaState.nudge_step_px;
+    rngNud.addEventListener('input', () => {
+      _ovaState.nudge_step_px = +rngNud.value | 0;
+      _ovaRenderValues(); _ovaRenderStatus();
+    });
+  }
 
   document.querySelectorAll('#overlay-appearance-card .ova-preset').forEach((chip) => {
     chip.addEventListener('click', async () => {
@@ -1402,6 +1450,8 @@ async function _initOverlayCard() {
         theme: _ovaState.theme, overlay_flags: _ovaState.overlay_flags,
         /* v12 (2026-07-25): preserve scroll granularity across size presets. */
         scroll_step_px: _ovaState.scroll_step_px,
+        /* v13 (2026-08-10): preserve nudge granularity across size presets. */
+        nudge_step_px: _ovaState.nudge_step_px,
       };
       if (chkUltra) chkUltra.checked = !!ultra;
       _ovaRefreshAll();
@@ -1500,11 +1550,10 @@ async function _initOverlayCard() {
   document.querySelectorAll('#overlay-appearance-card .ova-flag-toggle').forEach((chip) => {
     chip.addEventListener('click', () => {
       const bit = +chip.dataset.flag;
-      /* Toggle the bit. OPAQUE_LOCK auto-sets alpha to 1.0 on activate. */
+      /* v13 (2026-08-10): plain bit toggle. The old OPAQUE_LOCK auto-alpha
+       * special-case is gone (that chip was removed; the flag is deprecated
+       * and the payload ignores it). Opacity is slider-driven only. */
       _ovaState.overlay_flags ^= bit;
-      if (bit === OVFLAG_OPAQUE_LOCK && (_ovaState.overlay_flags & OVFLAG_OPAQUE_LOCK)) {
-        _ovaState.alpha = 1.00;
-      }
       _ovaRefreshAll();
       const label = chip.textContent.trim();
       const onOff = (_ovaState.overlay_flags & bit) ? 'ON' : 'OFF';
@@ -1546,7 +1595,8 @@ async function _initOverlayCard() {
         '  \u2022 Launch size (defaults to 560\u00d7420)\n' +
         '  \u2022 Alpha / opacity (defaults to 100% \u2014 opaque)\n' +
         '  \u2022 Theme (defaults to Auto \u2014 follows Windows)\n' +
-        '  \u2022 Behavior flags (trail-erase + smooth-nudge + uniform-alpha ON)\n' +
+        '  \u2022 Behavior flags (smooth-nudge + uniform-alpha ON)\n' +
+        '  \u2022 Scroll + nudge step (defaults 80 / 48 px)\n' +
         '  \u2022 Ultra-size toggle (defaults to normal)\n' +
         '  \u2022 Payload runtime state (position, alpha bumps, font, corner)\n\n' +
         'If the overlay is currently injected, it will be re-injected\n' +
@@ -1563,6 +1613,10 @@ async function _initOverlayCard() {
           alpha: +p.alpha,
           theme:         (p.theme != null ? (p.theme | 0) : 2),
           overlay_flags: (p.overlay_flags != null ? (p.overlay_flags | 0) : OVFLAG_DEFAULTS),
+          /* v12/v13 — carry step granularities through reset so they don't
+           * become undefined (would render "NaN px" + break dirty-check). */
+          scroll_step_px: (p.scroll_step_px != null ? (+p.scroll_step_px | 0) : 80),
+          nudge_step_px:  (p.nudge_step_px  != null ? (+p.nudge_step_px  | 0) : 48),
         };
         _ovaSaved = { ..._ovaState };
         if (chkUltra) chkUltra.checked = !!_ovaState.size_mode;

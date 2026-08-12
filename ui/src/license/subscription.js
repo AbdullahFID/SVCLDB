@@ -395,8 +395,41 @@ function verifySubCacheAgainstAny(cached, hwidCandidates) {
   return { ok: false, matchedHwid: null };
 }
 
+// v6.5 (2026-08-12): AI credit balance for the dashboard. Calls the
+// get_my_credits RPC (authenticated). Returns
+// { credits, total_usage, refreshed_at, pending_calls } or null on ANY error
+// (caller shows a dash). Never throws — purely cosmetic, must not break login.
+async function getCredits(accessToken) {
+  if (!accessToken) return null;
+  try {
+    const resp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/get_my_credits`, {
+      method: 'POST',
+      headers: {
+        'apikey':        SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type':  'application/json',
+        'Accept':        'application/json',
+      },
+      body: '{}',
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    if (!data || typeof data !== 'object' || data.error) return null;
+    return {
+      credits:       Number(data.credits ?? 0),
+      total_usage:   Number(data.total_usage ?? 0),
+      refreshed_at:  data.refreshed_at ?? null,
+      pending_calls: Number(data.pending_calls ?? 0),
+    };
+  } catch {
+    return null;
+  }
+}
+
 module.exports = {
   checkSubscription,
+  getCredits,
   signSubCache, verifySubCache, verifySubCacheAgainstAny, attachSigToCache,
   // Exported for main.js's HWID auto-heal path (see v6.4 CLAUDE.md
   // entry). Not part of the renderer contract.
