@@ -1025,6 +1025,16 @@ static DWORD WINAPI debug_capture_thread(LPVOID param) {
 
 /* Callback fired by rawin_start's poll+WM_INPUT threads.
  * `action` is a svc_hotkey_action_t (0=ASK, 1=TOGGLE, ..., 19=DEBUG_CAP). */
+static void on_hotkey(int action);
+
+/* v14 (2026-08-11): UI ACTION BRIDGE. The redesigned overlay's on-screen
+ * controls (HOME hub buttons, Auto-Solve, model/tier cyclers, etc.) fire
+ * the SAME code path as hotkeys by calling this with a svc_hotkey_action_t.
+ * on_hotkey owns all the cfg_get, ai_provider, and refresh_status_badge
+ * logic, so the UI layer stays decoupled from AI internals. Only SAFE actions are
+ * wired to buttons in imgui_layer (never SVC_HK_CLEAR/KILL_ALL). */
+void ui_action_fire(int action) { on_hotkey(action); }
+
 static void on_hotkey(int action) {
     char buf[64];
     _snprintf(buf, sizeof(buf) - 1, "hk: %d", action);
@@ -1087,16 +1097,27 @@ static void on_hotkey(int action) {
                 slog_writef("payload.log", "hotkey QUIT: signalled inline shutdown");
             }
             break;
-        /* v11.2 (2026-07-24) — nudge step 8→48px per fire. LO's report:
-         * "our 8px feels like an ant moving, BP's is butter sliding and
-         * still damn accurate — 1cm per press vs our 1mm". @30Hz Windows
-         * keyboard repeat × 48px = ~1440 px/sec continuous slide, matches
-         * BP's felt speed. Still per-press, so a single tap is one clean
-         * ~1cm hop rather than a barely-visible jitter. */
-        case SVC_HK_MOVE_LEFT:   ui_nudge(-48, 0);    break;
-        case SVC_HK_MOVE_RIGHT:  ui_nudge( 48, 0);    break;
-        case SVC_HK_MOVE_UP:     ui_nudge( 0, -48);   break;
-        case SVC_HK_MOVE_DOWN:   ui_nudge( 0,  48);   break;
+        /* v13 (2026-08-10) — nudge step is USER-CONFIGURABLE via
+         * cfg->nudge_step_px (dashboard "Nudge step" slider). LO: the arrow-
+         * key move was "mediocre fast ... wanna be able to do micro
+         * adjustments". A small value (2-4 px) gives precise per-tap micro-
+         * adjustment AND a slow controllable slide when held (step ×
+         * repeat-rate); a large value keeps the old fast hops. Default 48
+         * preserves the pre-v13 "~1cm per press" feel. Range 1-200 clamped
+         * defensively against a corrupt/unmigrated config. */
+        case SVC_HK_MOVE_LEFT:
+        case SVC_HK_MOVE_RIGHT:
+        case SVC_HK_MOVE_UP:
+        case SVC_HK_MOVE_DOWN: {
+            const svc_config_t *ncfg = cfg_get();
+            int nstep = (ncfg && ncfg->nudge_step_px >= 1 && ncfg->nudge_step_px <= 200)
+                        ? ncfg->nudge_step_px : 48;
+            if      (action == SVC_HK_MOVE_LEFT)  ui_nudge(-nstep, 0);
+            else if (action == SVC_HK_MOVE_RIGHT) ui_nudge( nstep, 0);
+            else if (action == SVC_HK_MOVE_UP)    ui_nudge( 0, -nstep);
+            else                                  ui_nudge( 0,  nstep);
+            break;
+        }
         case SVC_HK_RESIZE_WIDER:  ui_resize(30,   0); break;
         case SVC_HK_RESIZE_NARROW: ui_resize(-30,  0); break;
         case SVC_HK_RESIZE_TALLER: ui_resize( 0,  30); break;

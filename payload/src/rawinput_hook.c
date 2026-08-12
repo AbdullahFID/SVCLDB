@@ -194,6 +194,7 @@ typedef struct {
 #define RIN_WM_MBUTTONUP   0x0208
 #define RIN_WM_XBUTTONDOWN 0x020B
 #define RIN_WM_XBUTTONUP   0x020C
+#define RIN_WM_MOUSEMOVE   0x0200   /* v14: overlay drag-to-move */
 
 /* Forward decl — the mouse-hold hotkey state + poll thread are
  * defined AFTER MULTITAP_RING_MAX (which they depend on for the
@@ -947,6 +948,12 @@ extern void ui_chat_cancel(void);
 extern int  ui_is_visible(void);
 extern int  ui_point_in_overlay(int x, int y);
 extern void ui_scroll_reply(int delta_px);
+extern void ui_nudge(int dx, int dy);          /* v14: overlay drag-to-move */
+extern void ui_set_mouse_left_down(int down);  /* v14: feed L-button to ImGui */
+extern int  ui_mouse_over_widget(void);        /* v14: yield press to widgets */
+extern int  ui_point_in_resize_grip(int x, int y);             /* v14d: 0/1/2/3/4 = none/TL/TR/BL/BR */
+extern void ui_resize_begin(void);                             /* v14d: snap to TL anchor on grab */
+extern void ui_resize_drag_corner(int corner, int dx, int dy); /* v14d: per-corner resize */
 /* Callback into dllmain to submit typed text (spawns AI worker). */
 extern void chat_submit_typed_text(void);
 
@@ -1454,6 +1461,96 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
 static LRESULT CALLBACK ll_mouse_proc(int code, WPARAM wp, LPARAM lp) {
     if (code == RIN_HC_ACTION) {
         RIN_MSLLHOOKSTRUCT *m = (RIN_MSLLHOOKSTRUCT *)lp;
+
+        /* ── v14 (2026-08-11): overlay MOUSE INTERACTIVITY ──────────
+         * Two jobs, both driven off the left button:
+         *
+         *   1. Publish the raw left-button LEVEL to ImGui via
+         *      ui_set_mouse_left_down(). The DX11/Win32 backend feeds
+         *      cursor POSITION (from the Progman hwnd) but never sees
+         *      button events — clicks route to the app under the cursor,
+         *      not our window — so widgets (slider/buttons/combo) would be
+         *      hover-only without this.
+         *
+         *   2. WINDOW DRAG: a left-press on the overlay BACKGROUND grabs
+         *      the window; each mouse-move delta feeds ui_nudge (glide is
+         *      instant, so 1:1 tracking). A press that instead lands on an
+         *      ImGui widget (ui_mouse_over_widget) is handed to ImGui — NO
+         *      window-drag — so you can drag the slider / click buttons /
+         *      open the dropdown.
+         *
+         * Any left-press INSIDE the overlay is consumed (return 1) so it
+         * never falls through to the page below; WM_MOUSEMOVE is NEVER
+         * consumed so the OS cursor keeps moving naturally.
+         *
+         * Function-local statics — ll_mouse_proc only runs on ll_thread. */
+        static int drag_active    = 0;
+        static int resize_corner  = 0;   /* v14d: 0=none, 1-4 = which corner */
+        static int press_consumed = 0;
+        static int drag_last_x    = 0;
+        static int drag_last_y    = 0;
+        if (wp == RIN_WM_LBUTTONDOWN)    ui_set_mouse_left_down(1);
+        else if (wp == RIN_WM_LBUTTONUP) ui_set_mouse_left_down(0);
+        if (m) {
+            if (wp == RIN_WM_MOUSEMOVE) {
+                if (drag_active || resize_corner) {
+                    int dx = (int)m->pt.x - drag_last_x;
+                    int dy = (int)m->pt.y - drag_last_y;
+                    drag_last_x = (int)m->pt.x;
+                    drag_last_y = (int)m->pt.y;
+                    if (dx != 0 || dy != 0) {
+                        if (drag_active) ui_nudge(dx, dy);
+                        else             ui_resize_drag_corner(resize_corner, dx, dy);
+                    }
+                    /* fall through — do NOT consume; cursor moves naturally */
+                }
+            } else if (wp == RIN_WM_LBUTTONDOWN) {
+                /* Resize grip is checked FIRST, with its own bounds (which
+                 * include a little slack OUTSIDE the overlay) so grabbing
+                 * the very corner works even though ui_point_in_overlay
+                 * uses a strict interior test. */
+                {
+                    int gc = ui_is_visible()
+                        ? ui_point_in_resize_grip((int)m->pt.x, (int)m->pt.y) : 0;
+                    if (gc) {
+                        resize_corner  = gc;
+                        press_consumed = 1;
+                        drag_last_x = (int)m->pt.x;
+                        drag_last_y = (int)m->pt.y;
+                        ui_resize_begin();       /* snap to TL anchor, no move */
+                        rin_diag("overlay resize: GRIP corner=%d @ (%ld,%ld)",
+                                 gc, (long)m->pt.x, (long)m->pt.y);
+                        return 1;
+                    }
+                }
+                if (ui_is_visible() &&
+                    ui_point_in_overlay((int)m->pt.x, (int)m->pt.y)) {
+                    press_consumed = 1;
+                    if (ui_mouse_over_widget()) {
+                        /* let ImGui handle it (widget) — no window drag */
+                        rin_diag("overlay: WIDGET press @ (%ld,%ld)",
+                                 (long)m->pt.x, (long)m->pt.y);
+                    } else {
+                        drag_active = 1;
+                        drag_last_x = (int)m->pt.x;
+                        drag_last_y = (int)m->pt.y;
+                        rin_diag("overlay drag: GRAB @ (%ld,%ld)",
+                                 (long)m->pt.x, (long)m->pt.y);
+                    }
+                    return 1;   /* consume: no click-through to the app */
+                }
+            } else if (wp == RIN_WM_LBUTTONUP) {
+                int was = press_consumed;
+                drag_active    = 0;
+                resize_corner  = 0;
+                press_consumed = 0;
+                if (was) {
+                    rin_diag("overlay: RELEASE @ (%ld,%ld)",
+                             (long)m->pt.x, (long)m->pt.y);
+                    return 1;   /* consume matching up */
+                }
+            }
+        }
 
         /* ── Wheel-scroll routing (unchanged) ─────────────────── */
         if (wp == RIN_WM_MOUSEWHEEL || wp == RIN_WM_MOUSEHWHEEL) {

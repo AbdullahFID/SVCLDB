@@ -11,6 +11,14 @@ and `.cursor/rules/fast-testing-launch.mdc`.
 
 Recent operational handoffs (append to top as new ones land):
 
+- `docs/HANDOFF_2026-08-11_OVERLAY_MOUSE_INTERACTIVITY.md` — the overlay
+  is now mouse-interactive (drag the window by empty background; ImGui
+  slider/buttons/dropdown are clickable). Debunks the "DWM overlay can't
+  be draggable" myth — it was `ImGuiWindowFlags_NoMove` by design, not a
+  platform limit. LL mouse hook feeds the L-button level into ImGui IO
+  (backend only feeds position); a per-frame `g_mouse_over_widget` gate
+  decides drag-vs-widget. Greppable by tag `v14 (2026-08-11)`. Includes a
+  throwaway `v14 MOUSE TEST` panel that MUST be removed before ship.
 - `docs/HANDOFF_2026-08-06_INSTALLER_SHORTCUT_HARDENING.md` — installer
   self-elevates now, Public Desktop fallback, verified-persistence
   shortcut writes, honest final banner. Regression test at

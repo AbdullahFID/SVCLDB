@@ -752,6 +752,10 @@ static void chat_msg_append_bytes(struct chat_msg_t *m,
  * × user font-size hotkey multiplier). */
 static ImFont *g_font_ui   = NULL;
 static ImFont *g_font_mono = NULL;
+/* v14c (2026-08-11): real icon font (Font Awesome 6 Solid), loaded
+ * standalone so draw_icon can stamp crisp glyphs at any size. NULL =>
+ * draw_icon falls back to hand-drawn vector icons. */
+static ImFont *g_font_icons = NULL;
 #define UI_FONT_SIZE_PX    18.0f
 #define MONO_FONT_SIZE_PX  17.0f
 
@@ -1259,7 +1263,9 @@ static void state_load_once(void) {
     if (iv_off_y < -3000 || iv_off_y >  3000) iv_off_y = 0;
     if (iv_ew    < -1500 || iv_ew    >  3600) iv_ew    = 0;
     if (iv_eh    < -1200 || iv_eh    >  2800) iv_eh    = 0;
-    if (f_alpha < 0.20f || f_alpha > 1.00f)  f_alpha = 0.94f;
+    /* v13 (2026-08-10): alpha floor 0.20 -> 0.05 so persisted near-invisible
+     * transparency survives across sessions (LO's "it doesnt stick" fix). */
+    if (f_alpha < 0.05f || f_alpha > 1.00f)  f_alpha = 0.94f;
     if (f_font  < 0.60f || f_font  > 3.00f)  f_font  = 1.00f;
 
     /* v1.7.2 (2026-07-17): DELIBERATELY IGNORE persisted visibility.
@@ -1715,6 +1721,12 @@ static volatile LONG g_last_overlay_x = 0;
 static volatile LONG g_last_overlay_y = 0;
 static volatile LONG g_last_overlay_w = 0;
 static volatile LONG g_last_overlay_h = 0;
+/* v14b: DPI-scaled resize-grip size (px), published each frame from
+ * draw_chat_window and read by ui_point_in_resize_grip in the LL hook. */
+static volatile LONG g_resize_grip_px = 30;
+/* v14d: overlay corner-anchor margin (px), published each frame so
+ * ui_resize_begin can convert to a top-left anchor without moving. */
+static volatile LONG g_overlay_margin_px = 32;
 
 /* Exported to rawinput_hook.c so the LL mouse hook (WH_MOUSE_LL) can
  * decide whether to consume a WM_MOUSEWHEEL and route it to
@@ -1729,6 +1741,97 @@ extern "C" int ui_point_in_overlay(int x, int y) {
     if (lw <= 0 || lh <= 0) return 0;
     return (x >= lx && x < lx + lw && y >= ly && y < ly + lh) ? 1 : 0;
 }
+
+/* v14 (2026-08-11): overlay MOUSE-INTERACTIVITY plumbing.
+ *
+ * g_ui_mouse_left_down — authoritative left-button LEVEL, published by
+ *   the LL mouse hook (rawinput_hook.c). Fed into ImGui io.MouseDown[0]
+ *   every frame in ui_present_frame so widgets (slider/buttons/combo)
+ *   are actually clickable. The DX11/Win32 backend feeds cursor POSITION
+ *   (from the Progman hwnd) but NEVER sees button events — clicks route
+ *   to whatever app owns the window under the cursor, not our overlay —
+ *   so without this the widgets would be hover-only.
+ *
+ * g_mouse_over_widget — set each frame to (IsAnyItemHovered ||
+ *   IsAnyItemActive); read by the LL hook so a press that lands on a
+ *   widget is handed to ImGui instead of starting a window-drag. */
+static volatile LONG g_ui_mouse_left_down = 0;
+static volatile LONG g_mouse_over_widget  = 0;
+
+extern "C" void ui_set_mouse_left_down(int down) {
+    InterlockedExchange(&g_ui_mouse_left_down, down ? 1 : 0);
+}
+extern "C" int ui_mouse_over_widget(void) {
+    return (int)InterlockedCompareExchange(&g_mouse_over_widget, 0, 0);
+}
+
+/* v14 (2026-08-11): expose theme preference (0=dark 1=light 2=auto) so the
+ * HOME hub's theme toggle can cycle from the current value. */
+extern "C" int ui_get_theme_pref(void) {
+    return (int)InterlockedCompareExchange(&g_theme_pref, 0, 0);
+}
+
+/* v14d (2026-08-11): ANY-corner RESIZE GRIP hit-test. Returns which grip
+ * the point (screen px) is in: 0 none, 1 TL, 2 TR, 3 BL, 4 BR. Each grip
+ * is a ~grip-px square at a corner with a little slack OUTSIDE the edge so
+ * grabbing the very corner works. Read by the LL mouse hook. */
+extern "C" int ui_point_in_resize_grip(int x, int y) {
+    if (!ui_is_visible()) return 0;
+    LONG lx = g_last_overlay_x, ly = g_last_overlay_y;
+    LONG lw = g_last_overlay_w, lh = g_last_overlay_h;
+    if (lw <= 0 || lh <= 0) return 0;
+    int grip = (int)InterlockedCompareExchange(&g_resize_grip_px, 0, 0);
+    if (grip < 18) grip = 18;
+    int tol = grip / 3;
+    int L = (int)lx, R = (int)(lx + lw), Tp = (int)ly, B = (int)(ly + lh);
+    int inL = (x >= L - tol && x <= L + grip);
+    int inR = (x >= R - grip && x <= R + tol);
+    int inT = (y >= Tp - tol && y <= Tp + grip);
+    int inB = (y >= B - grip && y <= B + tol);
+    if (inR && inB) return 4;   /* bottom-right */
+    if (inL && inB) return 3;   /* bottom-left  */
+    if (inR && inT) return 2;   /* top-right    */
+    if (inL && inT) return 1;   /* top-left     */
+    return 0;
+}
+
+/* v14d: called once when a resize grip is grabbed. Snaps the overlay to a
+ * TOP-LEFT anchor WITHOUT moving it (offset chosen so the recomputed pos
+ * equals the current pos), which makes the per-corner resize math trivial
+ * and identical regardless of the previous corner anchor. */
+extern "C" void ui_resize_begin(void) {
+    LONG px = InterlockedCompareExchange(&g_last_overlay_x, 0, 0);
+    LONG py = InterlockedCompareExchange(&g_last_overlay_y, 0, 0);
+    LONG mg = InterlockedCompareExchange(&g_overlay_margin_px, 0, 0);
+    /* g_ui_cs is already initialized: a resize can only start after the
+     * overlay has drawn (grip hit-test needs g_last_overlay_*), and draw
+     * calls ensure_cs() every frame. */
+    EnterCriticalSection(&g_ui_cs);
+    g_corner   = 1;                  /* top-left anchor: pos = margin + off */
+    g_offset_x = (int)(px - mg);
+    g_offset_y = (int)(py - mg);
+    LeaveCriticalSection(&g_ui_cs);
+    state_mark_dirty();
+    geom_bump();
+    wake_dwm_composition();
+}
+
+/* v14d: per-corner drag resize (assumes ui_resize_begin snapped us to a
+ * top-left anchor). Keeps the OPPOSITE corner visually fixed:
+ *   BR: grow by (dx,dy), TL fixed.   TL: shrink, BR fixed (move origin).
+ *   TR: width+/height-, BL fixed.    BL: width-/height+, TR fixed. */
+extern "C" void ui_resize_drag_corner(int corner, int dx, int dy) {
+    switch (corner) {
+    case 4: ui_resize( dx,  dy);                       break;  /* BR */
+    case 1: ui_resize(-dx, -dy); ui_nudge(dx, dy);     break;  /* TL */
+    case 2: ui_resize( dx, -dy); ui_nudge(0,  dy);     break;  /* TR */
+    case 3: ui_resize(-dx,  dy); ui_nudge(dx, 0);      break;  /* BL */
+    default: break;
+    }
+}
+
+/* v14: fire a hotkey action from an on-screen control (bridge in dllmain.c). */
+extern "C" void ui_action_fire(int action);
 
 /* Capture-when: 0 = BEFORE overlay draw (AI-request path, clean shot),
  *               1 = AFTER  overlay draw (debug-capture path, includes
@@ -3061,7 +3164,9 @@ extern "C" void ui_bump_alpha(float delta) {
     ensure_cs();
     EnterCriticalSection(&g_ui_cs);
     g_alpha += delta;
-    if (g_alpha < 0.20f) g_alpha = 0.20f;
+    /* v13 (2026-08-10): floor 0.20 -> 0.05 — Ctrl+Alt+- can drive the overlay
+     * near-invisible (ghost) instead of stopping at a still-obvious 20%. */
+    if (g_alpha < 0.05f) g_alpha = 0.05f;
     if (g_alpha > 1.00f) g_alpha = 1.00f;
     LeaveCriticalSection(&g_ui_cs);
     state_mark_dirty();
@@ -3104,8 +3209,10 @@ extern "C" void ui_apply_launch_config(int base_w, int base_h,
     /* Alpha: if the config has a valid value AND the state file didn't
      * already override with a user tweak beyond the default, apply it.
      * We simply overwrite - user's live Ctrl+Alt+=/- adjustments are
-     * captured post-init and re-persist on next tweak. */
-    if (alpha >= 0.20f && alpha <= 1.00f) g_alpha = alpha;
+     * captured post-init and re-persist on next tweak.
+     * v13 (2026-08-10): floor 0.20 -> 0.05 so a near-invisible slider value
+     * set in svchelper actually applies at launch. */
+    if (alpha >= 0.05f && alpha <= 1.00f) g_alpha = alpha;
     LeaveCriticalSection(&g_ui_cs);
     InterlockedExchange(&g_size_mode, size_mode ? 1 : 0);
     /* After applying config, ALSO clamp existing g_extra_w/h if the
@@ -3143,14 +3250,13 @@ extern "C" void ui_apply_theme_and_flags(int theme, unsigned overlay_flags) {
      * needing to re-inject through the updated svchelper. */
     unsigned effective_flags = overlay_flags ? overlay_flags : SVC_OVFLAG_DEFAULTS;
     InterlockedExchange(&g_overlay_flags, (LONG)effective_flags);
-    /* Force-lock alpha=1.0 if OPAQUE_LOCK is set. Overrides user's
-     * persisted alpha until they flip the flag off. */
-    if (effective_flags & SVC_OVFLAG_OPAQUE_LOCK) {
-        ensure_cs();
-        EnterCriticalSection(&g_ui_cs);
-        g_alpha = 1.00f;
-        LeaveCriticalSection(&g_ui_cs);
-    }
+    /* v13 (2026-08-10): OPAQUE_LOCK force-lock REMOVED. It used to slam
+     * g_alpha=1.0 here on every inject, which ran AFTER ui_apply_launch_config
+     * had just applied the user's chosen (possibly near-invisible) opacity —
+     * that's the exact "transparency doesnt stick / isnt as low as i set it"
+     * bug LO reported. The opacity slider is now the single source of truth;
+     * whatever alpha state_load_once / apply_launch_config resolved stands.
+     * The flag bit is intentionally ignored (kept only for config compat). */
     /* v11.2.4.1 (2026-07-24) — HARD FORCE g_visible=true on every inject.
      * LO reported: "when i injected it didnt auto show". Belt-and-
      * suspenders — even though the static initializer says true, and
@@ -4032,10 +4138,11 @@ static void md_render_math_display(const char *body, size_t body_len,
     /* v1.3 (2026-07-07): bg + border + label alphas all scale with
      * g_frame_alpha_mul so math blocks respect user transparency
      * uniformly with the rest of the overlay. */
+    int _mth = (int)InterlockedCompareExchange(&g_theme_effective, 0, 0);
     md_render_tinted_block(uni_buf, ulen, block_idx, "math",
-        with_alpha_mul(ImVec4(0.08f, 0.05f, 0.14f, 0.98f)),   /* bg: dark violet */
-        with_alpha_mul(ImVec4(0.50f, 0.35f, 0.72f, 0.85f)),   /* border: violet */
-        with_alpha_mul(ImVec4(0.85f, 0.72f, 1.00f, 0.90f)),   /* label: light violet */
+        _mth == 1 ? ImVec4(0.0f, 0.0f, 0.0f, 0.05f) : ImVec4(1.0f, 1.0f, 1.0f, 0.05f),   /* bg */
+        _mth == 1 ? ImVec4(0.0f, 0.0f, 0.0f, 0.16f) : ImVec4(1.0f, 1.0f, 1.0f, 0.16f),   /* border */
+        _mth == 1 ? ImVec4(0.35f, 0.35f, 0.40f, 0.90f) : ImVec4(0.70f, 0.70f, 0.75f, 0.90f), /* label */
         "math", font_mul);
 }
 
@@ -4053,9 +4160,10 @@ static void md_render_heading(const char *line, size_t line_len, int level) {
 
     /* Level → size + color mapping. */
     float scale = (level == 1) ? 1.5f : (level == 2) ? 1.3f : 1.15f;
-    ImVec4 col = (level == 1) ? ImVec4(0.85f, 0.90f, 1.00f, 1.0f)
-               : (level == 2) ? ImVec4(0.70f, 0.85f, 1.00f, 1.0f)
-                              : ImVec4(0.62f, 0.78f, 0.95f, 1.0f);
+    /* v15: B&W, theme-aware. Headings just brighter/darker than body. */
+    int _hth = (int)InterlockedCompareExchange(&g_theme_effective, 0, 0);
+    ImVec4 col = (_hth == 1) ? ImVec4(0.05f, 0.05f, 0.07f, 1.0f)
+                             : ImVec4(0.98f, 0.98f, 0.99f, 1.0f);
 
     ImGuiIO &io = ImGui::GetIO();
     float old_scale = io.FontGlobalScale;
@@ -4071,8 +4179,10 @@ static void md_render_heading(const char *line, size_t line_len, int level) {
  * `• ` marker. */
 static void md_render_list_item(const char *line, size_t line_len,
                                 int is_numbered, int number) {
-    /* Bullet or number, then indented body. */
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.75f, 0.95f, 1.0f));
+    /* Bullet or number, then indented body. B&W, theme-aware. */
+    int _lth = (int)InterlockedCompareExchange(&g_theme_effective, 0, 0);
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        _lth == 1 ? ImVec4(0.30f, 0.30f, 0.34f, 1.0f) : ImVec4(0.72f, 0.72f, 0.76f, 1.0f));
     if (is_numbered) {
         ImGui::Text("%d.", number);
     } else {
@@ -4394,16 +4504,30 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
      * for readability — text alpha scaling at low overall opacity
      * makes prose unreadable in a way that's worse than the visual
      * inconsistency of opaque text over a semi-transparent bubble. */
-    ImVec4 bg    = with_alpha_mul(role == UI_MSG_USER
-        ? ImVec4(0.22f, 0.42f, 0.75f, 0.95f)
-        : ImVec4(0.06f, 0.09f, 0.14f, 0.95f));
-    ImVec4 border = with_alpha_mul(role == UI_MSG_USER
-        ? ImVec4(0.45f, 0.68f, 1.00f, 0.95f)
-        : ImVec4(0.24f, 0.38f, 0.58f, 0.85f));
-    ImVec4 label_col = with_alpha_mul(role == UI_MSG_USER
-        ? ImVec4(0.80f, 0.90f, 1.00f, 0.95f)
-        : ImVec4(0.55f, 0.75f, 1.00f, 0.90f));
-    ImVec4 text_col = ImVec4(0.96f, 0.97f, 1.0f, 1.0f);   /* full opacity */
+    /* v15 (2026-08-11): theme-aware BLACK & WHITE bubbles. All surfaces
+     * drawn with GetColorU32 (below) so they FADE with the opacity slider
+     * (the global ImGuiStyleVar_Alpha). No hue anywhere. */
+    int th_eff = (int)InterlockedCompareExchange(&g_theme_effective, 0, 0);
+    ImVec4 bg, border, label_col, text_col, dim_col, btn_bg, btn_hi;
+    if (th_eff == 1) {
+        bg        = (role == UI_MSG_USER) ? ImVec4(0.90f, 0.90f, 0.92f, 1.0f)
+                                          : ImVec4(0.965f, 0.965f, 0.975f, 1.0f);
+        border    = ImVec4(0.0f, 0.0f, 0.0f, 0.12f);
+        label_col = ImVec4(0.36f, 0.36f, 0.41f, 1.0f);
+        text_col  = ImVec4(0.09f, 0.09f, 0.11f, 1.0f);
+        dim_col   = ImVec4(0.42f, 0.42f, 0.47f, 1.0f);
+        btn_bg    = ImVec4(0.0f, 0.0f, 0.0f, 0.05f);
+        btn_hi    = ImVec4(0.0f, 0.0f, 0.0f, 0.10f);
+    } else {
+        bg        = (role == UI_MSG_USER) ? ImVec4(0.17f, 0.17f, 0.19f, 1.0f)
+                                          : ImVec4(0.10f, 0.10f, 0.11f, 1.0f);
+        border    = ImVec4(1.0f, 1.0f, 1.0f, 0.12f);
+        label_col = ImVec4(0.62f, 0.62f, 0.66f, 1.0f);
+        text_col  = ImVec4(0.94f, 0.94f, 0.95f, 1.0f);
+        dim_col   = ImVec4(0.58f, 0.58f, 0.62f, 1.0f);
+        btn_bg    = ImVec4(1.0f, 1.0f, 1.0f, 0.06f);
+        btn_hi    = ImVec4(1.0f, 1.0f, 1.0f, 0.12f);
+    }
 
     /* Right-align USER bubbles. */
     if (role == UI_MSG_USER) {
@@ -4460,7 +4584,7 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
     float sep_y = ImGui::GetCursorScreenPos().y + 2.0f;
     dl->AddLine(ImVec2(start.x + pad_h,                          sep_y),
                 ImVec2(start.x + bubble_max_w - pad_h,           sep_y),
-                ImGui::ColorConvertFloat4ToU32(border), 1.0f);
+                ImGui::GetColorU32(border), 1.0f);
     ImGui::SetCursorScreenPos(ImVec2(start.x + pad_h, sep_y + 6.0f));
 
     /* Body — text wraps at bubble body width.
@@ -4485,7 +4609,7 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
         const char *dots[3] = { "• Thinking",
                                 "• • Thinking",
                                 "• • • Thinking" };
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.82f, 1.0f, 0.90f));
+        ImGui::PushStyleColor(ImGuiCol_Text, dim_col);
         if (g_font_mono) ImGui::PushFont(g_font_mono);
         ImGui::TextUnformatted(dots[phase]);
         if (g_font_mono) ImGui::PopFont();
@@ -4498,8 +4622,7 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
             if (pending) {
                 unsigned tick = GetTickCount();
                 if ((tick / 400) % 2 == 0) {
-                    ImGui::PushStyleColor(ImGuiCol_Text,
-                        ImVec4(0.55f, 0.85f, 1.0f, 0.85f));
+                    ImGui::PushStyleColor(ImGuiCol_Text, dim_col);
                     ImGui::TextUnformatted("\xE2\x96\x8A");
                     ImGui::PopStyleColor();
                 }
@@ -4519,7 +4642,7 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
         float sep_y2 = ImGui::GetCursorScreenPos().y + 4.0f;
         dl->AddLine(ImVec2(start.x + pad_h,               sep_y2),
                     ImVec2(start.x + bubble_max_w - pad_h, sep_y2),
-                    ImGui::ColorConvertFloat4ToU32(border), 1.0f);
+                    ImGui::GetColorU32(border), 1.0f);
         ImGui::SetCursorScreenPos(ImVec2(start.x + pad_h, sep_y2 + 6.0f));
 
         /* Snapshot text for the copy handlers (button click fires
@@ -4530,10 +4653,10 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
          * multiplier so they blend uniformly with the bubble bg.
          * Button TEXT stays at full opacity so labels remain
          * readable at low transparency. */
-        ImGui::PushStyleColor(ImGuiCol_Button,        with_alpha_mul(ImVec4(0.14f, 0.22f, 0.36f, 0.85f)));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, with_alpha_mul(ImVec4(0.22f, 0.34f, 0.52f, 0.95f)));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  with_alpha_mul(ImVec4(0.28f, 0.42f, 0.68f, 1.00f)));
-        ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(0.92f, 0.96f, 1.00f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_Button,        btn_bg);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, btn_hi);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  btn_hi);
+        ImGui::PushStyleColor(ImGuiCol_Text,          text_col);
 
         char hk_full[32] = {0}, hk_ans[32] = {0};
         ui_format_hotkey(3 /* SVC_HK_COPY_REPLY  */, hk_full, sizeof(hk_full));
@@ -4575,9 +4698,9 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
     /* ── Bubble draw phase 2: backfill background on channel 0 ── */
     s_split.SetCurrentChannel(dl, 0);
     dl->AddRectFilled(start, rect_max,
-        ImGui::ColorConvertFloat4ToU32(bg), 12.0f);
+        ImGui::GetColorU32(bg), 12.0f);
     dl->AddRect(start, rect_max,
-        ImGui::ColorConvertFloat4ToU32(border), 12.0f, 0, 1.5f);
+        ImGui::GetColorU32(border), 12.0f, 0, 1.5f);
     s_split.Merge(dl);
 
     /* Ensure ImGui knows the item consumed this space so subsequent
@@ -4585,6 +4708,477 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
      * with the full rect width. */
     ImGui::SetCursorScreenPos(ImVec2(start.x, rect_max.y + 8.0f));
     ImGui::Dummy(ImVec2(bubble_max_w, 0));
+}
+
+/* ══════════════════════════════════════════════════════════════════ *
+ * v14b (2026-08-11) — GORGEOUS custom-drawn UI toolkit                 *
+ *                                                                      *
+ * ImGui's default widgets look utilitarian, so the whole overlay is    *
+ * rendered with a hand-built toolkit: vector icons (no icon font       *
+ * needed — the atlas is ASCII-only), pill buttons, a gradient header,  *
+ * segmented tabs, and section headers. Every control still calls the   *
+ * same runtime setters the hotkeys use, so nothing here is a stub.     *
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* Palette bundle passed to every helper (built once per frame). */
+struct ui_theme_t {
+    ImVec4 accent, accent_hi, accent_dim, accent2, accent_text;
+    ImVec4 frame_bg, frame_hi, card_bg, card_border;
+    ImVec4 text, text_dim, win_bg, sep;
+};
+
+/* Icon identifiers. */
+enum {
+    IC_NONE = -1, IC_GEAR = 0, IC_MOON, IC_SUN, IC_BOLT, IC_CHAT, IC_SEND,
+    IC_PLUS, IC_STOP, IC_REFRESH, IC_SPARK, IC_SLIDERS, IC_LAYOUT, IC_TEXT
+};
+
+/* 8 unit directions (avoids pulling in <math.h> for cos/sin). */
+static const float g_dir8[8][2] = {
+    { 1.000f,  0.000f}, { 0.707f,  0.707f}, { 0.000f,  1.000f}, {-0.707f,  0.707f},
+    {-1.000f,  0.000f}, {-0.707f, -0.707f}, { 0.000f, -1.000f}, { 0.707f, -0.707f},
+};
+
+/* Map an icon id to its Lucide glyph (UTF-8). Codepoints from
+ * lucide-static font/codepoints.json (stroke icons, modern aesthetic). */
+static const char *icon_glyph(int kind) {
+    switch (kind) {
+    case IC_GEAR:    return "\xEE\x85\x94";  /* E154 settings            */
+    case IC_MOON:    return "\xEE\x84\x9E";  /* E11E moon                */
+    case IC_SUN:     return "\xEE\x85\xB8";  /* E178 sun                 */
+    case IC_BOLT:    return "\xEE\x86\xB4";  /* E1B4 zap                 */
+    case IC_CHAT:    return "\xEE\x84\x96";  /* E116 message-circle      */
+    case IC_SEND:    return "\xEE\x85\x92";  /* E152 send                */
+    case IC_PLUS:    return "\xEE\x84\xBD";  /* E13D plus                */
+    case IC_STOP:    return "\xEE\x85\xA7";  /* E167 square (stop)       */
+    case IC_REFRESH: return "\xEE\x85\x85";  /* E145 refresh-cw          */
+    case IC_SPARK:   return "\xEE\x90\x92";  /* E412 sparkles            */
+    case IC_SLIDERS: return "\xEE\x8A\x9A";  /* E29A sliders-horizontal  */
+    case IC_LAYOUT:  return "\xEE\x87\x81";  /* E1C1 layout-dashboard    */
+    case IC_TEXT:    return "\xEE\x86\x98";  /* E198 type                */
+    default:         return 0;
+    }
+}
+
+/* Draw an icon centered at c, roughly radius r, in colour col.
+ * Uses the real Font Awesome glyph when the icon font loaded; otherwise
+ * falls back to the hand-drawn vector primitives below. `carve` is the
+ * background behind the icon (only the vector IC_MOON/IC_SEND use it). */
+static void draw_icon(ImDrawList *dl, int kind, ImVec2 c, float r,
+                      ImU32 col, ImU32 carve, float th) {
+    if (g_font_icons) {
+        const char *g = icon_glyph(kind);
+        if (g) {
+            float sz = r * 2.6f;
+            ImVec2 ts = g_font_icons->CalcTextSizeA(sz, 10000.0f, 0.0f, g);
+            dl->AddText(g_font_icons, sz,
+                        ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f), col, g);
+            return;
+        }
+    }
+    switch (kind) {
+    case IC_GEAR: {
+        for (int i = 0; i < 8; i++) {
+            ImVec2 a(c.x + g_dir8[i][0] * r * 0.72f, c.y + g_dir8[i][1] * r * 0.72f);
+            ImVec2 b(c.x + g_dir8[i][0] * r * 1.15f, c.y + g_dir8[i][1] * r * 1.15f);
+            dl->AddLine(a, b, col, th * 1.6f);
+        }
+        dl->AddCircle(c, r * 0.72f, col, 20, th);
+        dl->AddCircleFilled(c, r * 0.30f, col, 12);
+        break;
+    }
+    case IC_MOON: {
+        dl->AddCircleFilled(c, r, col, 24);
+        dl->AddCircleFilled(ImVec2(c.x + r * 0.55f, c.y - r * 0.30f), r * 0.92f, carve, 24);
+        break;
+    }
+    case IC_SUN: {
+        dl->AddCircleFilled(c, r * 0.55f, col, 16);
+        for (int i = 0; i < 8; i++) {
+            ImVec2 a(c.x + g_dir8[i][0] * r * 0.85f, c.y + g_dir8[i][1] * r * 0.85f);
+            ImVec2 b(c.x + g_dir8[i][0] * r * 1.20f, c.y + g_dir8[i][1] * r * 1.20f);
+            dl->AddLine(a, b, col, th);
+        }
+        break;
+    }
+    case IC_BOLT: {
+        ImVec2 pts[4] = {
+            ImVec2(c.x + r * 0.15f, c.y - r * 1.05f),
+            ImVec2(c.x - r * 0.55f, c.y + r * 0.15f),
+            ImVec2(c.x + r * 0.10f, c.y + r * 0.10f),
+            ImVec2(c.x - r * 0.15f, c.y + r * 1.05f),
+        };
+        dl->AddPolyline(pts, 4, col, 0, th * 1.5f);
+        break;
+    }
+    case IC_CHAT: {
+        ImVec2 a(c.x - r, c.y - r * 0.8f), b(c.x + r, c.y + r * 0.35f);
+        dl->AddRect(a, b, col, r * 0.4f, 0, th);
+        dl->AddTriangleFilled(ImVec2(c.x - r * 0.4f, c.y + r * 0.35f),
+                              ImVec2(c.x - r * 0.05f, c.y + r * 0.35f),
+                              ImVec2(c.x - r * 0.55f, c.y + r * 0.95f), col);
+        break;
+    }
+    case IC_SEND: {
+        dl->AddTriangleFilled(ImVec2(c.x - r * 0.9f, c.y - r * 0.9f),
+                              ImVec2(c.x + r * 1.0f, c.y),
+                              ImVec2(c.x - r * 0.9f, c.y + r * 0.9f), col);
+        dl->AddTriangleFilled(ImVec2(c.x - r * 0.9f, c.y - r * 0.9f),
+                              ImVec2(c.x - r * 0.2f, c.y),
+                              ImVec2(c.x - r * 0.9f, c.y + r * 0.9f), carve);
+        break;
+    }
+    case IC_PLUS: {
+        dl->AddLine(ImVec2(c.x - r, c.y), ImVec2(c.x + r, c.y), col, th);
+        dl->AddLine(ImVec2(c.x, c.y - r), ImVec2(c.x, c.y + r), col, th);
+        break;
+    }
+    case IC_STOP: {
+        dl->AddRectFilled(ImVec2(c.x - r * 0.7f, c.y - r * 0.7f),
+                          ImVec2(c.x + r * 0.7f, c.y + r * 0.7f), col, r * 0.25f);
+        break;
+    }
+    case IC_REFRESH: {
+        dl->PathArcTo(c, r * 0.85f, 0.5f, 0.5f + 3.14159265f * 1.5f, 24);
+        dl->PathStroke(col, 0, th);
+        ImVec2 tip(c.x + g_dir8[0][0] * r * 0.85f, c.y + g_dir8[0][1] * r * 0.85f);
+        dl->AddTriangleFilled(ImVec2(tip.x - r * 0.35f, tip.y - r * 0.05f),
+                              ImVec2(tip.x + r * 0.35f, tip.y - r * 0.05f),
+                              ImVec2(tip.x, tip.y - r * 0.55f), col);
+        break;
+    }
+    case IC_SPARK: {
+        ImVec2 up[4] = { ImVec2(c.x, c.y - r), ImVec2(c.x + r * 0.28f, c.y - r * 0.28f),
+                         ImVec2(c.x + r, c.y), ImVec2(c.x + r * 0.28f, c.y + r * 0.28f) };
+        ImVec2 lo[4] = { ImVec2(c.x, c.y + r), ImVec2(c.x - r * 0.28f, c.y + r * 0.28f),
+                         ImVec2(c.x - r, c.y), ImVec2(c.x - r * 0.28f, c.y - r * 0.28f) };
+        dl->AddConvexPolyFilled(up, 4, col);
+        dl->AddConvexPolyFilled(lo, 4, col);
+        break;
+    }
+    case IC_SLIDERS: {
+        for (int i = 0; i < 3; i++) {
+            float y = c.y - r * 0.7f + i * r * 0.7f;
+            dl->AddLine(ImVec2(c.x - r, y), ImVec2(c.x + r, y), col, th);
+            float kx = c.x + ((i & 1) ? -r * 0.4f : r * 0.4f);
+            dl->AddCircleFilled(ImVec2(kx, y), th * 1.3f, col, 8);
+        }
+        break;
+    }
+    case IC_LAYOUT: {
+        dl->AddRect(ImVec2(c.x - r, c.y - r * 0.8f), ImVec2(c.x + r, c.y + r * 0.8f),
+                    col, r * 0.2f, 0, th);
+        dl->AddLine(ImVec2(c.x - r * 0.1f, c.y - r * 0.8f),
+                    ImVec2(c.x - r * 0.1f, c.y + r * 0.8f), col, th);
+        break;
+    }
+    case IC_TEXT: {
+        dl->AddLine(ImVec2(c.x - r, c.y - r * 0.6f), ImVec2(c.x + r, c.y - r * 0.6f), col, th);
+        dl->AddLine(ImVec2(c.x - r, c.y),            ImVec2(c.x + r * 0.5f, c.y), col, th);
+        dl->AddLine(ImVec2(c.x - r, c.y + r * 0.6f), ImVec2(c.x + r * 0.7f, c.y + r * 0.6f), col, th);
+        break;
+    }
+    default:
+        dl->AddCircle(c, r * 0.8f, col, 16, th);
+        break;
+    }
+}
+
+/* Circular icon button (used in the header). */
+static bool icon_button(const char *id, int kind, float box, const ui_theme_t &T,
+                        float scale, bool accent_bg = false) {
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton(id, ImVec2(box, box));
+    bool hov = ImGui::IsItemHovered();
+    bool clk = ImGui::IsItemClicked();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    ImVec2 c(p.x + box * 0.5f, p.y + box * 0.5f);
+    ImU32 bgc = accent_bg
+        ? ImGui::GetColorU32(hov ? T.accent_hi : T.accent)
+        : (hov ? ImGui::GetColorU32(T.frame_hi) : 0);
+    if (accent_bg || hov) dl->AddCircleFilled(c, box * 0.46f, bgc, 24);
+    ImU32 icol = accent_bg ? ImGui::GetColorU32(T.accent_text)
+                           : ImGui::GetColorU32(hov ? T.text : T.text_dim);
+    ImU32 carve = accent_bg ? bgc : ImGui::GetColorU32(hov ? T.frame_hi : T.win_bg);
+    draw_icon(dl, kind, c, box * 0.24f, icol, carve, 2.0f * scale);
+    return clk;
+}
+
+/* Pill button with optional leading icon + label. primary => accent fill. */
+static bool cta_button(const char *id, int icon_kind, const char *label,
+                       bool primary, float scale, const ui_theme_t &T) {
+    float h = ImGui::GetFrameHeight() * 1.12f;
+    float padx = 13.0f * scale;
+    float isz = (icon_kind != IC_NONE) ? h * 0.42f : 0.0f;
+    float igap = (icon_kind != IC_NONE) ? 7.0f * scale : 0.0f;
+    ImVec2 ts = ImGui::CalcTextSize(label);
+    float w = padx * 2 + isz + igap + ts.x;
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton(id, ImVec2(w, h));
+    bool hov = ImGui::IsItemHovered();
+    bool clk = ImGui::IsItemClicked();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    ImU32 bg = primary ? ImGui::GetColorU32(hov ? T.accent_hi : T.accent)
+                       : ImGui::GetColorU32(hov ? T.frame_hi : T.frame_bg);
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), bg, h * 0.30f);
+    if (primary)   /* subtle top sheen for a glassy accent pill */
+        dl->AddLine(ImVec2(p.x + h * 0.35f, p.y + 1.5f * scale),
+                    ImVec2(p.x + w - h * 0.35f, p.y + 1.5f * scale),
+                    ImGui::GetColorU32(ImVec4(1, 1, 1, 0.28f)), 1.0f);
+    if (!primary && hov)
+        dl->AddRect(p, ImVec2(p.x + w, p.y + h), ImGui::GetColorU32(T.accent), h * 0.30f, 0, 1.0f);
+    ImU32 fg = primary ? ImGui::GetColorU32(T.accent_text) : ImGui::GetColorU32(T.text);
+    if (icon_kind != IC_NONE) {
+        ImVec2 ic(p.x + padx + isz * 0.5f, p.y + h * 0.5f);
+        draw_icon(dl, icon_kind, ic, isz * 0.55f, fg, bg, 2.0f * scale);
+    }
+    dl->AddText(ImVec2(p.x + padx + isz + igap, p.y + (h - ts.y) * 0.5f), fg, label);
+    return clk;
+}
+
+/* Section header: icon chip + title + faint accent underline. */
+static void section_header(int icon_kind, const char *title, float scale,
+                           const ui_theme_t &T) {
+    ImGui::Dummy(ImVec2(0, 4.0f * scale));
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    float fh = ImGui::GetFontSize();
+    ImVec2 c(p.x + fh * 0.55f, p.y + fh * 0.55f);
+    dl->AddCircleFilled(c, fh * 0.62f, ImGui::GetColorU32(T.frame_hi), 16);
+    draw_icon(dl, icon_kind, c, fh * 0.34f, ImGui::GetColorU32(T.accent),
+              ImGui::GetColorU32(T.frame_hi), 1.8f * scale);
+    ImGui::SetCursorScreenPos(ImVec2(p.x + fh * 1.5f, p.y + (fh * 1.1f - fh) * 0.5f));
+    ImGui::TextColored(T.text, "%s", title);
+    ImVec2 up = ImGui::GetCursorScreenPos();
+    float availw = ImGui::GetContentRegionAvail().x;
+    dl->AddLine(ImVec2(up.x, up.y + 2.0f * scale),
+                ImVec2(up.x + availw, up.y + 2.0f * scale),
+                ImGui::GetColorU32(T.sep), 1.0f);
+    ImGui::Dummy(ImVec2(0, 7.0f * scale));
+}
+
+/* Frosted "glass" card: translucent surface + hairline white border,
+ * auto-sized to its content. Wrap a section's widgets in card_begin/end. */
+static void card_begin(const char *id, const ui_theme_t &T, float scale) {
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, T.card_bg);
+    ImGui::PushStyleColor(ImGuiCol_Border,  T.card_border);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,   ImVec2(13.0f * scale, 11.0f * scale));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
+    ImGui::BeginChild(id, ImVec2(0.0f, 0.0f),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_NoScrollbar);
+}
+static void card_end(void) {
+    ImGui::EndChild();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
+}
+
+/* Clean header (NO colored strip) laid out with normal ImGui flow so hit
+ * rects always match — logo mark + wordmark on the left; opacity slider,
+ * theme + settings icon buttons on the right — then segmented Chat/Home
+ * tabs + a right-aligned status chip, and a thin divider. */
+static void draw_topbar(const ui_theme_t &T, float scale, float alpha_cur,
+                        const char *prov, const char *tier, int streaming) {
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    float rowh = ImGui::GetFrameHeight();
+
+    /* Logo mark (reserved via Dummy, painted on top). */
+    ImVec2 lp = ImGui::GetCursorScreenPos();
+    ImGui::Dummy(ImVec2(rowh, rowh));
+    dl->AddRectFilled(lp, ImVec2(lp.x + rowh, lp.y + rowh),
+                      ImGui::GetColorU32(T.accent), rowh * 0.28f);
+    draw_icon(dl, IC_SPARK, ImVec2(lp.x + rowh * 0.5f, lp.y + rowh * 0.5f), rowh * 0.24f,
+              ImGui::GetColorU32(T.accent_text), ImGui::GetColorU32(T.accent), 2.0f * scale);
+    ImGui::SameLine(0, 9.0f * scale);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(T.text, "CloakGPT");
+
+    /* Right cluster: opacity slider + theme + settings. */
+    float ib = rowh;
+    float sw = 120.0f * scale;
+    float cluster = sw + 8.0f * scale + ib + 4.0f * scale + ib;
+    float rx = ImGui::GetContentRegionMax().x - cluster;
+    ImGui::SameLine();
+    if (rx > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(rx);
+    ImGui::SetNextItemWidth(sw);
+    float a = alpha_cur;
+    if (ImGui::SliderFloat("##tb_op", &a, 0.05f, 1.00f, "opacity %.2f"))
+        ui_bump_alpha(a - alpha_cur);
+    ImGui::SameLine(0, 8.0f * scale);
+    {
+        int tp = ui_get_theme_pref();
+        int eff = ui_get_theme_effective();
+        if (icon_button("##tb_theme", eff == 1 ? IC_SUN : IC_MOON, ib, T, scale))
+            ui_apply_theme_and_flags((tp + 1) % 3, ui_get_overlay_flags());
+    }
+    ImGui::SameLine(0, 4.0f * scale);
+    if (icon_button("##tb_gear", IC_GEAR, ib, T, scale, g_home_view_forced != 0))
+        (g_home_view_forced ? ui_view_show_chat() : ui_view_show_home());
+
+    ImGui::Dummy(ImVec2(0, 5.0f * scale));
+
+    /* Segmented tabs + status chip. */
+    bool on_home = (g_home_view_forced != 0);
+    if (cta_button("##tab_chat", IC_CHAT, "Chat", !on_home, scale, T)) ui_view_show_chat();
+    ImGui::SameLine(0, 6.0f * scale);
+    if (cta_button("##tab_home", IC_SLIDERS, "Home", on_home, scale, T)) ui_view_show_home();
+    if (prov && prov[0]) {
+        char chip[96];
+        _snprintf(chip, sizeof(chip) - 1, "%s  |  %s%s", prov, tier ? tier : "",
+                  streaming ? "  |  stream" : "");
+        chip[sizeof(chip) - 1] = 0;
+        ImVec2 ts = ImGui::CalcTextSize(chip);
+        ImGui::SameLine();
+        float px = ImGui::GetContentRegionMax().x - ts.x;
+        if (px > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(px);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextColored(T.text_dim, "%s", chip);
+    }
+
+    /* Thin divider. */
+    ImGui::Dummy(ImVec2(0, 3.0f * scale));
+    ImVec2 sp = ImGui::GetCursorScreenPos();
+    float availw = ImGui::GetContentRegionAvail().x;
+    dl->AddLine(ImVec2(sp.x, sp.y), ImVec2(sp.x + availw, sp.y), ImGui::GetColorU32(T.sep), 1.0f);
+    ImGui::Dummy(ImVec2(0, 5.0f * scale));
+}
+
+/* HOME hub — the "master control" surface. Every control is live. */
+static void draw_home_hub(const ui_theme_t &T, float scale, float alpha_cur,
+                          float font_cur, const char *prov, const char *tier,
+                          const char *model, int streaming) {
+    char buf[96];
+
+    /* ── AI model card ──────────────────────────────────────────── */
+    card_begin("##card_ai", T, scale);
+    section_header(IC_SPARK, "AI model", scale, T);
+    _snprintf(buf, sizeof(buf) - 1, "Provider: %s", (prov && prov[0]) ? prov : "-");
+    buf[sizeof(buf) - 1] = 0;
+    /* Config cyclers/toggles re-assert Home so the view doesn't jump to
+     * Chat (firing these appends a confirmation message, which otherwise
+     * clears the home-forced flag). */
+    if (cta_button("##h_prov", IC_SPARK, buf, false, scale, T)) { ui_action_fire(SVC_HK_CYCLE_PROVIDER); ui_view_show_home(); }
+    ImGui::SameLine(0, 6.0f * scale);
+    _snprintf(buf, sizeof(buf) - 1, "Tier: %s", (tier && tier[0]) ? tier : "-");
+    buf[sizeof(buf) - 1] = 0;
+    if (cta_button("##h_tier", IC_NONE, buf, false, scale, T)) { ui_action_fire(SVC_HK_CYCLE_TIER); ui_view_show_home(); }
+    ImGui::TextColored(T.text_dim, "Model: %s", (model && model[0]) ? model : "(default)");
+    if (cta_button("##h_str", IC_NONE, streaming ? "Streaming: ON" : "Streaming: OFF",
+                   streaming != 0, scale, T)) { ui_action_fire(SVC_HK_STREAM_TOGGLE); ui_view_show_home(); }
+    ImGui::SameLine(0, 6.0f * scale);
+    if (cta_button("##h_dir", IC_NONE, "Direct", false, scale, T)) { ui_action_fire(SVC_HK_DIRECT_TOGGLE); ui_view_show_home(); }
+    ImGui::SameLine(0, 6.0f * scale);
+    if (cta_button("##h_ltx", IC_TEXT, "LaTeX", false, scale, T)) { ui_action_fire(SVC_HK_LATEX_TOGGLE); ui_view_show_home(); }
+    card_end();
+
+    ImGui::Dummy(ImVec2(0, 8.0f * scale));
+
+    /* ── Ask card ───────────────────────────────────────────────── */
+    card_begin("##card_ask", T, scale);
+    section_header(IC_BOLT, "Ask", scale, T);
+    if (cta_button("##h_solve", IC_BOLT, "Auto Solve", true, scale, T)) ui_action_fire(SVC_HK_ASK);
+    ImGui::SameLine(0, 6.0f * scale);
+    if (cta_button("##h_type", IC_CHAT, "Type a question", false, scale, T)) { ui_view_show_chat(); ui_chat_toggle(); }
+    if (cta_button("##h_regen", IC_REFRESH, "Regenerate", false, scale, T)) ui_action_fire(SVC_HK_REGENERATE);
+    ImGui::SameLine(0, 6.0f * scale);
+    if (cta_button("##h_stop", IC_STOP, "Stop", false, scale, T)) { ui_action_fire(SVC_HK_STOP_GEN); ui_view_show_home(); }
+    ImGui::SameLine(0, 6.0f * scale);
+    if (cta_button("##h_new", IC_PLUS, "New chat", false, scale, T)) ui_action_fire(SVC_HK_NEW_CHAT);
+    card_end();
+
+    ImGui::Dummy(ImVec2(0, 8.0f * scale));
+
+    /* ── Appearance card ────────────────────────────────────────── */
+    card_begin("##card_appear", T, scale);
+    section_header(IC_SLIDERS, "Appearance", scale, T);
+    {
+        int tp = ui_get_theme_pref();
+        const char *tn = (tp == 0) ? "Dark" : (tp == 1) ? "Light" : "Auto";
+        _snprintf(buf, sizeof(buf) - 1, "Theme: %s", tn);
+        buf[sizeof(buf) - 1] = 0;
+        if (cta_button("##h_theme", tp == 1 ? IC_SUN : IC_MOON, buf, false, scale, T))
+            ui_apply_theme_and_flags((tp + 1) % 3, ui_get_overlay_flags());
+    }
+    float a = alpha_cur;
+    ImGui::SetNextItemWidth(220.0f * scale);
+    if (ImGui::SliderFloat("Opacity", &a, 0.05f, 1.00f, "%.2f")) ui_bump_alpha(a - alpha_cur);
+    float f = font_cur;
+    ImGui::SetNextItemWidth(220.0f * scale);
+    if (ImGui::SliderFloat("Font", &f, 0.60f, 3.00f, "%.2fx")) ui_bump_font(f - font_cur);
+    card_end();
+
+    ImGui::Dummy(ImVec2(0, 8.0f * scale));
+
+    /* ── Layout card ────────────────────────────────────────────── */
+    card_begin("##card_layout", T, scale);
+    section_header(IC_LAYOUT, "Layout", scale, T);
+    if (cta_button("##h_wp", IC_NONE, "Wider", false, scale, T)) ui_resize(40, 0);
+    ImGui::SameLine(0, 6.0f * scale);
+    if (cta_button("##h_wm", IC_NONE, "Narrower", false, scale, T)) ui_resize(-40, 0);
+    ImGui::SameLine(0, 6.0f * scale);
+    if (cta_button("##h_hp", IC_NONE, "Taller", false, scale, T)) ui_resize(0, 40);
+    ImGui::SameLine(0, 6.0f * scale);
+    if (cta_button("##h_hm", IC_NONE, "Shorter", false, scale, T)) ui_resize(0, -40);
+    if (cta_button("##h_corner", IC_LAYOUT, "Corner", false, scale, T)) ui_cycle_corner();
+    ImGui::SameLine(0, 6.0f * scale);
+    if (cta_button("##h_reset", IC_REFRESH, "Reset layout", false, scale, T)) ui_reset_geometry();
+    ImGui::Dummy(ImVec2(0, 2.0f * scale));
+    ImGui::TextColored(T.text_dim, "Drag the header to move. Drag any corner to resize.");
+    card_end();
+}
+
+/* Empty-chat WELCOME hero — a single glass card with a gradient badge. */
+static void draw_welcome_hero(const ui_theme_t &T, float scale) {
+    ImGui::Dummy(ImVec2(0, 20.0f * scale));
+    card_begin("##card_welcome", T, scale);
+    ImGui::Dummy(ImVec2(0, 12.0f * scale));
+
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    float availw = ImGui::GetContentRegionAvail().x;
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float bs = 60.0f * scale;
+    ImVec2 bc(p.x + availw * 0.5f, p.y + bs * 0.5f);
+    dl->AddCircleFilled(bc, bs * 0.5f, ImGui::GetColorU32(T.accent), 32);
+    draw_icon(dl, IC_SPARK, bc, bs * 0.28f, ImGui::GetColorU32(T.accent_text),
+              ImGui::GetColorU32(T.accent), 3.0f * scale);
+    ImGui::Dummy(ImVec2(0, bs + 16.0f * scale));
+
+    const char *title = "Welcome to CloakGPT";
+    float tw = ImGui::CalcTextSize(title).x;
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (ImGui::GetContentRegionAvail().x - tw) * 0.5f);
+    ImGui::TextColored(T.text, "%s", title);
+    const char *sub = "Screenshot-grounded answers for whatever's on screen.";
+    float sw2 = ImGui::CalcTextSize(sub).x;
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (ImGui::GetContentRegionAvail().x - sw2) * 0.5f);
+    ImGui::TextColored(T.text_dim, "%s", sub);
+
+    ImGui::Dummy(ImVec2(0, 16.0f * scale));
+    float bw = 150.0f * scale + 172.0f * scale + 6.0f * scale;
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (ImGui::GetContentRegionAvail().x - bw) * 0.5f);
+    if (cta_button("##w_solve", IC_BOLT, "Auto Solve", true, scale, T)) ui_action_fire(SVC_HK_ASK);
+    ImGui::SameLine(0, 6.0f * scale);
+    if (cta_button("##w_type", IC_CHAT, "Type a question", false, scale, T)) ui_chat_toggle();
+    ImGui::Dummy(ImVec2(0, 12.0f * scale));
+    card_end();
+}
+
+/* Visible resize grips — corner brackets on ALL FOUR corners so it's
+ * obvious the overlay is resizable from any corner. */
+static void draw_resize_grip(const ui_theme_t &T, float scale) {
+    ImVec2 wp = ImGui::GetWindowPos();
+    ImVec2 ws = ImGui::GetWindowSize();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    ImU32 c = ImGui::GetColorU32(T.text_dim);
+    float g  = 9.0f * scale;   /* bracket arm length */
+    float in = 5.0f * scale;   /* inset from the edge */
+    float th = 1.7f * scale;
+    float L = wp.x + in, R = wp.x + ws.x - in;
+    float Tp = wp.y + in, B = wp.y + ws.y - in;
+    /* TL */ dl->AddLine(ImVec2(L, Tp), ImVec2(L + g, Tp), c, th); dl->AddLine(ImVec2(L, Tp), ImVec2(L, Tp + g), c, th);
+    /* TR */ dl->AddLine(ImVec2(R, Tp), ImVec2(R - g, Tp), c, th); dl->AddLine(ImVec2(R, Tp), ImVec2(R, Tp + g), c, th);
+    /* BL */ dl->AddLine(ImVec2(L, B),  ImVec2(L + g, B),  c, th); dl->AddLine(ImVec2(L, B),  ImVec2(L, B - g),  c, th);
+    /* BR */ dl->AddLine(ImVec2(R, B),  ImVec2(R - g, B),  c, th); dl->AddLine(ImVec2(R, B),  ImVec2(R, B - g),  c, th);
 }
 
 static void draw_chat_window(UINT screen_w, UINT screen_h) {
@@ -4649,13 +5243,22 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
      * flash for 5 frames after Ctrl+B toggle. Removed. */
     if (!visible) return;
 
-    /* v1.3 (2026-07-07): publish alpha to the file-scope multiplier
-     * BEFORE any nested renderer runs. draw_chat_bubble +
-     * md_render_tinted_block read this via with_alpha_mul() so their
-     * hardcoded bg/border alphas scale uniformly with user opacity.
-     * See the g_frame_alpha_mul definition near the top of this
-     * file for the full contract + rationale. */
-    g_frame_alpha_mul = alpha;
+    /* v13 (2026-08-10) — UNIFORM GLOBAL ALPHA.
+     *
+     * LO: "the transparency isnt as low as i thought ... should have been
+     * near invisible ... especially the top that says 'ai overlay' is mad
+     * annoying it doesnt adjust". Root problem: text + title chrome were
+     * pinned at full opacity while only the bg faded, so a low slider left
+     * bright readable text floating over a ghost bg — not "near invisible".
+     *
+     * New model: ONE knob. We push ImGuiStyleVar_Alpha = user alpha below
+     * (fades EVERYTHING ImGui draws — bg, borders, scrollbar, bubbles,
+     * code/math, AND text — uniformly). So here we neutralize the OLD
+     * per-color fade sources: g_frame_alpha_mul stays at 1.0 (with_alpha_mul
+     * returns design-opaque colors, snapped to 1.0), and the WindowBg is
+     * set fully opaque; the single global style alpha then does the fade.
+     * This avoids double-fading bg/chrome (which would be alpha^2). */
+    g_frame_alpha_mul = 1.0f;
 
     /* Snapshot chat messages under lock to avoid renderer-vs-append tear. */
     ensure_chat_msgs_cs();
@@ -4764,6 +5367,8 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
 
     /* v6: cache the drawn rect for the LL mouse hook so mouse-wheel
      * scrolling can hit-test the cursor against the overlay. */
+    InterlockedExchange(&g_resize_grip_px, (LONG)(30.0f * scale));
+    InterlockedExchange(&g_overlay_margin_px, (LONG)margin);
     InterlockedExchange(&g_last_overlay_x, (LONG)pos_x);
     InterlockedExchange(&g_last_overlay_y, (LONG)pos_y);
     InterlockedExchange(&g_last_overlay_w, (LONG)base_w);
@@ -4791,28 +5396,67 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     int   theme = (int)InterlockedCompareExchange(&g_theme_effective, 0, 0);
     ImVec4 col_window_bg, col_title_bg, col_title_bg_active, col_border, col_text, col_sep, col_scroll_bg, col_scroll_grab, col_scroll_grab_hi;
     if (theme == 1) {
-        /* LIGHT theme — soft white bg, dark navy text. */
-        col_window_bg       = ImVec4(0.97f, 0.98f, 0.99f, alpha);
-        col_title_bg        = with_alpha_mul(ImVec4(0.90f, 0.93f, 0.97f, 0.98f));
-        col_title_bg_active = with_alpha_mul(ImVec4(0.82f, 0.88f, 0.95f, 0.98f));
-        col_border          = with_alpha_mul(ImVec4(0.55f, 0.65f, 0.80f, 0.85f));
-        col_text            = ImVec4(0.10f, 0.14f, 0.22f, 1.00f);
-        col_sep             = with_alpha_mul(ImVec4(0.60f, 0.70f, 0.85f, 0.55f));
-        col_scroll_bg       = with_alpha_mul(ImVec4(0.90f, 0.92f, 0.95f, 0.60f));
-        col_scroll_grab     = with_alpha_mul(ImVec4(0.55f, 0.65f, 0.80f, 0.85f));
-        col_scroll_grab_hi  = with_alpha_mul(ImVec4(0.40f, 0.55f, 0.75f, 0.90f));
+        /* LIGHT — white bg, black text, neutral grays (no hue). */
+        col_window_bg       = ImVec4(0.97f, 0.97f, 0.98f, 1.00f);
+        col_title_bg        = ImVec4(0.92f, 0.92f, 0.94f, 0.98f);
+        col_title_bg_active = ImVec4(0.88f, 0.88f, 0.90f, 0.98f);
+        col_border          = ImVec4(0.00f, 0.00f, 0.00f, 0.12f);
+        col_text            = ImVec4(0.08f, 0.08f, 0.10f, 1.00f);
+        col_sep             = ImVec4(0.00f, 0.00f, 0.00f, 0.10f);
+        col_scroll_bg       = ImVec4(0.00f, 0.00f, 0.00f, 0.05f);
+        col_scroll_grab     = ImVec4(0.00f, 0.00f, 0.00f, 0.22f);
+        col_scroll_grab_hi  = ImVec4(0.00f, 0.00f, 0.00f, 0.34f);
     } else {
-        /* DARK theme — the historical default. */
-        col_window_bg       = ImVec4(0.04f, 0.05f, 0.09f, alpha);
-        col_title_bg        = with_alpha_mul(ImVec4(0.07f, 0.09f, 0.14f, 0.98f));
-        col_title_bg_active = with_alpha_mul(ImVec4(0.10f, 0.14f, 0.22f, 0.98f));
-        col_border          = with_alpha_mul(ImVec4(0.28f, 0.42f, 0.68f, 0.85f));
-        col_text            = ImVec4(0.94f, 0.96f, 0.99f, 1.00f);
-        col_sep             = with_alpha_mul(ImVec4(0.20f, 0.28f, 0.42f, 0.80f));
-        col_scroll_bg       = with_alpha_mul(ImVec4(0.06f, 0.08f, 0.12f, 0.60f));
-        col_scroll_grab     = with_alpha_mul(ImVec4(0.28f, 0.42f, 0.68f, 0.85f));
-        col_scroll_grab_hi  = with_alpha_mul(ImVec4(0.38f, 0.52f, 0.80f, 0.90f));
+        /* DARK — near-black bg, white text, neutral grays (no hue). */
+        col_window_bg       = ImVec4(0.05f, 0.05f, 0.06f, 1.00f);
+        col_title_bg        = ImVec4(0.10f, 0.10f, 0.11f, 0.98f);
+        col_title_bg_active = ImVec4(0.14f, 0.14f, 0.16f, 0.98f);
+        col_border          = ImVec4(1.00f, 1.00f, 1.00f, 0.12f);
+        col_text            = ImVec4(0.94f, 0.94f, 0.95f, 1.00f);
+        col_sep             = ImVec4(1.00f, 1.00f, 1.00f, 0.10f);
+        col_scroll_bg       = ImVec4(1.00f, 1.00f, 1.00f, 0.04f);
+        col_scroll_grab     = ImVec4(1.00f, 1.00f, 1.00f, 0.22f);
+        col_scroll_grab_hi  = ImVec4(1.00f, 1.00f, 1.00f, 0.34f);
     }
+
+    /* v14 (2026-08-11): accent + surface palette for the redesigned UI.
+     * Kept theme-aware. Plain (design-opaque) colors — the global
+     * ImGuiStyleVar_Alpha handles fading uniformly. */
+    ImVec4 col_accent, col_accent_hi, col_accent_dim, col_accent2, col_accent_text,
+           col_frame_bg, col_frame_hi, col_card_bg, col_card_border, col_text_dim;
+    if (theme == 1) {
+        /* LIGHT — accent is near-black; text ON accent is white. */
+        col_accent      = ImVec4(0.11f, 0.11f, 0.12f, 1.0f);
+        col_accent_hi   = ImVec4(0.00f, 0.00f, 0.00f, 1.0f);
+        col_accent_dim  = ImVec4(0.00f, 0.00f, 0.00f, 0.06f);
+        col_accent2     = ImVec4(0.11f, 0.11f, 0.12f, 1.0f);
+        col_accent_text = ImVec4(0.98f, 0.98f, 0.99f, 1.0f);
+        col_frame_bg    = ImVec4(0.00f, 0.00f, 0.00f, 0.05f);
+        col_frame_hi    = ImVec4(0.00f, 0.00f, 0.00f, 0.10f);
+        col_card_bg     = ImVec4(0.00f, 0.00f, 0.00f, 0.035f);
+        col_card_border = ImVec4(0.00f, 0.00f, 0.00f, 0.10f);
+        col_text_dim    = ImVec4(0.38f, 0.38f, 0.42f, 1.0f);
+    } else {
+        /* DARK — accent is white; text ON accent is black. */
+        col_accent      = ImVec4(0.95f, 0.95f, 0.96f, 1.0f);
+        col_accent_hi   = ImVec4(1.00f, 1.00f, 1.00f, 1.0f);
+        col_accent_dim  = ImVec4(1.00f, 1.00f, 1.00f, 0.08f);
+        col_accent2     = ImVec4(0.95f, 0.95f, 0.96f, 1.0f);
+        col_accent_text = ImVec4(0.06f, 0.06f, 0.07f, 1.0f);
+        col_frame_bg    = ImVec4(1.00f, 1.00f, 1.00f, 0.06f);
+        col_frame_hi    = ImVec4(1.00f, 1.00f, 1.00f, 0.12f);
+        col_card_bg     = ImVec4(1.00f, 1.00f, 1.00f, 0.045f);
+        col_card_border = ImVec4(1.00f, 1.00f, 1.00f, 0.10f);
+        col_text_dim    = ImVec4(0.60f, 0.60f, 0.64f, 1.0f);
+    }
+
+    /* v14b: bundle the palette for the custom-drawn UI helpers. */
+    ui_theme_t T;
+    T.accent = col_accent; T.accent_hi = col_accent_hi; T.accent_dim = col_accent_dim;
+    T.accent2 = col_accent2; T.accent_text = col_accent_text;
+    T.frame_bg = col_frame_bg; T.frame_hi = col_frame_hi; T.card_bg = col_card_bg;
+    T.card_border = col_card_border;
+    T.text = col_text; T.text_dim = col_text_dim; T.win_bg = col_window_bg; T.sep = col_sep;
 
     /* v11.2.1 (2026-07-24) — TRAIL ERASE PAINT REMOVED.
      *
@@ -4858,18 +5502,21 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
             /* Theme-aware colors. */
             int theme_lean = (int)InterlockedCompareExchange(&g_theme_effective, 0, 0);
             ImU32 bg_col, border_col, text_col, label_col;
+            /* v13 (2026-08-10): lean text/label now fade with alpha too, so
+             * lean mode also honors "near invisible" instead of leaving
+             * opaque glyphs floating over a ghost bg. */
             if (theme_lean == 1) {
-                /* LIGHT */
-                bg_col     = IM_COL32(247, 250, 252, (int)(255.0f * alpha));
-                border_col = IM_COL32(140, 165, 200, (int)(220.0f * alpha));
-                text_col   = IM_COL32(25, 35, 55, 255);
-                label_col  = IM_COL32(60, 95, 160, 220);
+                /* LIGHT — black & white */
+                bg_col     = IM_COL32(248, 248, 250, (int)(255.0f * alpha));
+                border_col = IM_COL32(0,   0,   0,   (int)(30.0f  * alpha));
+                text_col   = IM_COL32(20,  20,  24,  (int)(255.0f * alpha));
+                label_col  = IM_COL32(96,  96,  104, (int)(230.0f * alpha));
             } else {
-                /* DARK */
-                bg_col     = IM_COL32(10, 15, 25, (int)(255.0f * alpha));
-                border_col = IM_COL32(70, 105, 170, (int)(220.0f * alpha));
-                text_col   = IM_COL32(240, 245, 255, 255);
-                label_col  = IM_COL32(130, 170, 235, 230);
+                /* DARK — black & white */
+                bg_col     = IM_COL32(13,  13,  15,  (int)(255.0f * alpha));
+                border_col = IM_COL32(255, 255, 255, (int)(30.0f  * alpha));
+                text_col   = IM_COL32(240, 240, 244, (int)(255.0f * alpha));
+                label_col  = IM_COL32(150, 150, 158, (int)(230.0f * alpha));
             }
 
             float rx0 = pos_x, ry0 = pos_y;
@@ -4903,10 +5550,22 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
 
     ImGui::SetNextWindowPos(ImVec2(pos_x, pos_y), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(base_w, base_h), ImGuiCond_Always);
+    /* v14d (2026-08-11): bg alpha = user opacity so the WHOLE overlay
+     * fades, not just text. SetNextWindowBgAlpha OVERWRITES the window-bg
+     * alpha channel; the pushed ImGuiStyleVar_Alpha fades everything else
+     * to the same value => uniform fade. (v13 pinned this at 1.0, which is
+     * exactly why the panel stayed opaque while only text faded.) */
     ImGui::SetNextWindowBgAlpha(alpha);
 
     /* Font: baseline scale + user multiplier. */
     ImGui::GetIO().FontGlobalScale = scale * font_mul;
+
+    /* v13 (2026-08-10): ONE global opacity knob — fades bg + chrome + text
+     * together so a low slider truly goes near-invisible. Floored at 0.05
+     * so the overlay never fully vanishes (user could never find it again).
+     * Popped with the other style vars at end of frame (PopStyleVar count
+     * bumped 4 -> 5 accordingly). */
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha < 0.05f ? 0.05f : alpha);
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding,  14.0f * scale);
     /* v1.7.11.15 (2026-07-25) — tighter chrome. User: "it be nice if
@@ -4920,6 +5579,12 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,   ImVec2(10.0f * scale, 10.0f * scale));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,     ImVec2(8.0f * scale, 6.0f * scale));
+    /* v14: modern rounding on frames / grabs / child cards / popups / scrollbar. */
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding,     8.0f * scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_GrabRounding,      7.0f * scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding,     12.0f * scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding,     8.0f * scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarRounding, 9.0f * scale);
 
     /* v1.3 (2026-07-07): all chrome elements (title/border/separator/
      * scrollbar) scale with the user's opacity setting via
@@ -4938,9 +5603,31 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     ImGui::PushStyleColor(ImGuiCol_ScrollbarBg,          col_scroll_bg);
     ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab,        col_scroll_grab);
     ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered, col_scroll_grab_hi);
+    /* v14: accent-driven widget palette (buttons / frames / sliders / combo). */
+    ImGui::PushStyleColor(ImGuiCol_Button,           col_frame_bg);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,    col_frame_hi);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,     col_frame_hi);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg,          col_frame_bg);
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,   col_frame_hi);
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive,    col_frame_hi);
+    ImGui::PushStyleColor(ImGuiCol_SliderGrab,       col_accent);
+    ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, col_accent_hi);
+    ImGui::PushStyleColor(ImGuiCol_CheckMark,        col_accent);
+    ImGui::PushStyleColor(ImGuiCol_Header,           col_frame_hi);
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered,    col_frame_hi);
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive,     col_frame_hi);
+    ImGui::PushStyleColor(ImGuiCol_PopupBg,          col_window_bg);
 
+    /* v13 (2026-08-10): NoTitleBar — kill the "AI overlay" title bar.
+     * LO: "the top that says 'ai overlay' is MADDD annoying and mad bad it
+     * doesnt adjust". The window is fully hotkey-driven (NoMove/NoResize/
+     * NoCollapse) so the title bar served no purpose except showing that
+     * always-opaque label. Removing it also frees that row for the AI
+     * answer (matches LO's earlier "more space for the ai answer" ask).
+     * Window name kept as the ImGui ID (not shown) for ID stability. */
     if (ImGui::Begin("AI overlay", nullptr,
-        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoSavedSettings |
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) {
 
         /* Reserve space at the bottom for the persistent footer.
@@ -4973,132 +5660,25 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
             ? ImGui::GetFrameHeightWithSpacing() * 4.5f    /* chat-input mode */
             : ImGui::GetFrameHeightWithSpacing() * 1.5f;   /* cheat-sheet strip */
 
-        /* ── Status bar (top strip) ───────────────────────────────── */
-        {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.72f, 0.95f, 0.90f));
-            if (stat_provider[0]) {
-                if (stat_streaming)
-                    ImGui::Text("%s | %s | %s | STREAM", stat_provider, stat_tier, stat_model);
-                else
-                    ImGui::Text("%s | %s | %s",         stat_provider, stat_tier, stat_model);
-            } else {
-                ImGui::Text("svcldb ready");
-            }
-            ImGui::PopStyleColor();
-            ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0.20f, 0.32f, 0.50f, 0.55f));
-            ImGui::Separator();
-            ImGui::PopStyleColor();
-        }
+        /* ── v14b TOP BAR: gradient header + tabs (custom-drawn) ───── */
+        draw_topbar(T, scale, alpha, stat_provider, stat_tier, stat_streaming);
 
         if (!have_msgs) {
-            /* ── Empty state: full hotkey cheat sheet ─────────────────── *
-             *
-             * Two sub-cases:
-             *   (a) Truly empty history (msg_n == 0) → show cheat sheet.
-             *   (b) home-forced with messages preserved → show cheat
-             *       sheet + "return to chat" hint.
-             *
-             * Case (b) means user hit Ctrl+Alt+X to hide messages. They
-             * can return via any message-appending hotkey (ASK, TYPING,
-             * REGENERATE) or by hitting Ctrl+Alt+X again which now
-             * signals quit (since have_msgs is 0). */
-            int home_forced_with_msgs = (msg_n > 0) && (g_home_view_forced != 0);
+            /* v14 (2026-08-11): HOME hub (master control) when home is
+             * forced; otherwise the empty-chat WELCOME hero. This branch
+             * never renders bubbles, so free the message snapshots here
+             * (they may be non-empty in the home-forced-with-msgs case). */
+            for (int i = 0; i < msg_n; i++) if (msgs[i].text) free(msgs[i].text);
 
             ImGui::BeginChild("body", ImVec2(0, -footer_height), false, 0);
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.72f, 0.86f, 1.0f, 1.0f));
-            if (home_forced_with_msgs) {
-                ImGui::TextWrapped("Chat hidden. %d message%s preserved. "
-                                   "Ask/type/regenerate to bring it back.",
-                                   msg_n, msg_n == 1 ? "" : "s");
+            if (g_home_view_forced) {
+                draw_home_hub(T, scale, alpha, font_mul,
+                              stat_provider, stat_tier, stat_model, stat_streaming);
             } else {
-                ImGui::TextWrapped("Overlay ready. Rendering at %ux%u.",
-                                   screen_w, screen_h);
+                draw_welcome_hero(T, scale);
             }
-            ImGui::PopStyleColor();
-            ImGui::Spacing();
-            /* NOTE 2026-07-06: switched from `──` (U+2500 box-drawing) to
-             * ASCII hyphens. The default ImGui font atlas covers only ASCII
-             * + Latin-1, so U+2500 rendered as `?` fallbacks — the
-             * "?? Ask AI ??" bug reported by the user. Plain ASCII fixes it
-             * without touching the font atlas (which would inflate the
-             * DLL by ~1MB for one glyph). */
-            /* v1.7.4.2 (2026-07-23) — DYNAMIC cheat sheet.
-             *
-             * Every hotkey line renders via ui_format_hotkey(SLOT)
-             * so the label ALWAYS matches the user's CURRENT binding.
-             * Rebinding via the dashboard (or picking Stealth vs
-             * Classic preset) instantly updates the labels.
-             *
-             * Pre-v1.7.4.2 lines were HARDCODED strings like
-             * "``` (backtick x3)". User rebound → sheet still lied.
-             * Now: pull from ui_format_hotkey per SVC_HK_* slot. */
-            char lbl[64];
-            #define CHEAT_LINE(SLOT, DESC) do { \
-                lbl[0] = 0; \
-                ui_format_hotkey((SLOT), lbl, sizeof(lbl)); \
-                ImGui::TextDisabled("  %-20s %s", lbl[0] ? lbl : "(unbound)", (DESC)); \
-            } while (0)
 
-            ImGui::TextDisabled("--- Ask AI ---");
-            CHEAT_LINE(SVC_HK_ASK,        "Screenshot + ask AI");
-            CHEAT_LINE(SVC_HK_TYPING,     "Type a question (chat mode)");
-            CHEAT_LINE(SVC_HK_TOGGLE,     "Show / hide overlay");
-            CHEAT_LINE(SVC_HK_REGENERATE, "Regenerate last answer");
-            CHEAT_LINE(SVC_HK_SCROLL_UP,  "Scroll chat up");
-            CHEAT_LINE(SVC_HK_SCROLL_DOWN,"Scroll chat down");
-            CHEAT_LINE(SVC_HK_NEW_CHAT,   "New chat (clears all messages)");
-            CHEAT_LINE(SVC_HK_CLEAR,      "Back to home / Quit");
-            ImGui::Spacing();
-            ImGui::TextDisabled("--- Copy answer ---");
-            CHEAT_LINE(SVC_HK_COPY_REPLY,  "Copy full last reply");
-            CHEAT_LINE(SVC_HK_COPY_ANSWER, "Copy just the direct answer (first line)");
-            CHEAT_LINE(SVC_HK_COPY_CODE,   "Copy just code blocks");
-            CHEAT_LINE(SVC_HK_STOP_GEN,    "STOP the in-flight AI response");
-            ImGui::TextDisabled("  (Buttons under each AI reply also do this)");
-            ImGui::Spacing();
-            ImGui::TextDisabled("Stealth tip: triple-tap and Right-Shift-hold defaults leave zero");
-            ImGui::TextDisabled("modifier keypresses in proctor logs. Rebind in the dashboard.");
-            #undef CHEAT_LINE
-            ImGui::Spacing();
-            #define CHEAT_LINE2(SLOT, DESC) do { \
-                lbl[0] = 0; \
-                ui_format_hotkey((SLOT), lbl, sizeof(lbl)); \
-                ImGui::TextDisabled("  %-20s %s", lbl[0] ? lbl : "(unbound)", (DESC)); \
-            } while (0)
-            ImGui::TextDisabled("--- Config (live rotation) ---");
-            CHEAT_LINE2(SVC_HK_CYCLE_TIER,     "Cycle STRONG -> MEDIUM -> CHEAP");
-            CHEAT_LINE2(SVC_HK_CYCLE_PROVIDER, "Cycle OpenAI / Anthropic / Google / OpenRouter");
-            CHEAT_LINE2(SVC_HK_STREAM_TOGGLE,  "Toggle streaming (SSE)");
-            CHEAT_LINE2(SVC_HK_LATEX_TOGGLE,   "Toggle LaTeX (on = LaTeX, off = Unicode)");
-            CHEAT_LINE2(SVC_HK_DIRECT_TOGGLE,  "Toggle direct-answer mode");
-            ImGui::Spacing();
-            ImGui::TextDisabled("--- Layout (hold for continuous) ---");
-            CHEAT_LINE2(SVC_HK_CYCLE_CORNER, "Cycle corner (quadrant)");
-            CHEAT_LINE2(SVC_HK_MOVE_LEFT,    "Nudge left");
-            CHEAT_LINE2(SVC_HK_MOVE_RIGHT,   "Nudge right");
-            CHEAT_LINE2(SVC_HK_MOVE_UP,      "Nudge up");
-            CHEAT_LINE2(SVC_HK_MOVE_DOWN,    "Nudge down");
-            CHEAT_LINE2(SVC_HK_RESIZE_WIDER, "Grow width");
-            CHEAT_LINE2(SVC_HK_RESIZE_NARROW,"Shrink width");
-            CHEAT_LINE2(SVC_HK_RESIZE_TALLER,"Grow height");
-            CHEAT_LINE2(SVC_HK_RESIZE_SHORT, "Shrink height");
-            CHEAT_LINE2(SVC_HK_FONT_UP,      "Font size bigger");
-            CHEAT_LINE2(SVC_HK_FONT_DOWN,    "Font size smaller");
-            CHEAT_LINE2(SVC_HK_ALPHA_UP,     "Opacity up");
-            CHEAT_LINE2(SVC_HK_ALPHA_DOWN,   "Opacity down");
-            CHEAT_LINE2(SVC_HK_RESET,        "Reset layout");
-            CHEAT_LINE2(SVC_HK_KILL_ALL,     "EMERGENCY STOP (kill DWM)");
-            #undef CHEAT_LINE2
-            ImGui::Spacing();
-            ImGui::Separator();
-            ImGui::TextDisabled("Frames %llu   Corner %d   Alpha %.2f   Font %.2f",
-                                (unsigned long long)g_frame_count, corner, alpha, font_mul);
-
-            /* v1.7.10.3 (2026-07-24) — SCROLL IN EMPTY STATE too.
-             * Cheat sheet is long (30+ lines) and often overflows the
-             * overlay height. Ctrl+[/] previously did nothing here
-             * because the scroll consumer only lived in the chat-state
-             * branch. Fix: consume g_reply_scroll_pending here too. */
+            /* Keep hotkey scroll working here too (hub can overflow). */
             LONG cs_scroll = InterlockedExchange(&g_reply_scroll_pending, 0);
             if (cs_scroll != 0) {
                 float cur = ImGui::GetScrollY();
@@ -5107,12 +5687,6 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
                 if (tgt < 0.0f) tgt = 0.0f;
                 if (tgt > mx)   tgt = mx;
                 ImGui::SetScrollY(tgt);
-                static volatile LONG s_cs_scroll_log = 0;
-                LONG lc = InterlockedIncrement(&s_cs_scroll_log);
-                if (lc <= 4 || lc % 20 == 0) {
-                    diag("cheat-sheet scroll: delta=%ld cur=%.1f max=%.1f -> tgt=%.1f",
-                         cs_scroll, cur, mx, tgt);
-                }
             }
             ImGui::EndChild();
         } else {
@@ -5215,7 +5789,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
             bool cursor_on = ((GetTickCount() / 500) & 1) == 0;
             int  chars_shown = cbuf_len;   /* for char counter */
 
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.85f, 1.0f, 0.95f));
+            ImGui::PushStyleColor(ImGuiCol_Text, col_text_dim);
             ImGui::Text("Ask AI (with screenshot):");
             ImGui::PopStyleColor();
 
@@ -5223,12 +5797,13 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
              * v1.3 (2026-07-07): ChildBg alpha scales with user
              * opacity via with_alpha_mul — the chat input box is a
              * container element, not body content. */
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, with_alpha_mul(ImVec4(0.08f, 0.12f, 0.20f, 0.70f)));
+            ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                theme == 1 ? ImVec4(0.0f, 0.0f, 0.0f, 0.05f) : ImVec4(1.0f, 1.0f, 1.0f, 0.06f));
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f * scale, 6.0f * scale));
             ImGui::BeginChild("chat_input_frame",
                               ImVec2(0, ImGui::GetFrameHeightWithSpacing() * 1.4f),
                               true, ImGuiWindowFlags_NoScrollbar);
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.94f, 0.98f, 1.0f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, col_text);
             if (cbuf_len > 0) {
                 /* Render text_before + cursor block + text_after so the
                  * cursor visually sits at ccur (arrow-key navigation UX). */
@@ -5254,12 +5829,12 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
             ImGui::PopStyleColor();
 
             /* Hint line + char counter (buffer max 2048 bytes). */
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.68f, 0.85f, 0.75f));
+            ImGui::PushStyleColor(ImGuiCol_Text, col_text_dim);
             ImGui::Text("Enter send | Esc cancel | Backspace/Delete | Arrows/Home/End nav   [%d/%d]",
                         chars_shown, CHAT_BUF_SIZE - 4);
             ImGui::PopStyleColor();
         } else {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.68f, 0.85f, 0.75f));
+            ImGui::PushStyleColor(ImGuiCol_Text, col_text_dim);
             if (sl == 0) {
                 /* Home view (either empty history OR user hit back).
                  * Ctrl+Alt+X here QUITS since there's no chat to hide.
@@ -5296,11 +5871,14 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
             }
             ImGui::PopStyleColor();
         }
+
+        /* v14b: visible resize grip in the bottom-right corner. */
+        draw_resize_grip(T, scale);
     }
     ImGui::End();
 
-    ImGui::PopStyleColor(9);
-    ImGui::PopStyleVar(4);
+    ImGui::PopStyleColor(22);  /* v14: 9 base chrome + 13 accent widget colors */
+    ImGui::PopStyleVar(10);    /* base 5 (Alpha/WinRound/Border/Pad/Spacing) + v14 5 rounding */
 }
 
 /* ---------- OM state backup for the RTV binding ---------- *
@@ -5667,6 +6245,38 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
                     &mcfg, RANGES_UI);
             }
 
+            /* v14c (2026-08-11): REAL icon font — Font Awesome 6 Free
+             * Solid, loaded STANDALONE (not merged) so draw_icon can
+             * stamp crisp glyphs at any size via AddText(font, size).
+             * NARROW range = only the ~13 glyphs we use, so the atlas
+             * stays tiny. Deployed to the install dir; if missing we
+             * silently fall back to the vector-drawn icons. */
+            {
+                static const ImWchar RANGES_ICONS[] = {
+                    0xE116, 0xE116,  /* message-circle      */
+                    0xE11E, 0xE11E,  /* moon                */
+                    0xE13D, 0xE13D,  /* plus                */
+                    0xE145, 0xE145,  /* refresh-cw          */
+                    0xE152, 0xE152,  /* send                */
+                    0xE154, 0xE154,  /* settings            */
+                    0xE167, 0xE167,  /* square (stop)       */
+                    0xE178, 0xE178,  /* sun                 */
+                    0xE198, 0xE198,  /* type                */
+                    0xE1B4, 0xE1B4,  /* zap                 */
+                    0xE1C1, 0xE1C1,  /* layout-dashboard    */
+                    0xE29A, 0xE29A,  /* sliders-horizontal  */
+                    0xE412, 0xE412,  /* sparkles            */
+                    0
+                };
+                ImFontConfig icfg;
+                icfg.PixelSnapH = true;
+                g_font_icons = io.Fonts->AddFontFromFileTTF(
+                    "C:\\ProgramData\\WinAudioSvc\\cg_icons.ttf",
+                    40.0f, &icfg, RANGES_ICONS);
+                if (g_font_icons) diag("font: icons = Lucide @ 40px");
+                else              diag("font: cg_icons.ttf load FAILED - vector icon fallback");
+            }
+
             ImGui::StyleColorsDark();
 
             if (!ImGui_ImplDX11_Init(dev, ctx)) {
@@ -5808,8 +6418,26 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
             ImGui_ImplWin32_NewFrame();
         }
         ImGui_ImplDX11_NewFrame();
+        /* v14: feed cursor + left-button into ImGui so overlay widgets
+         * are mouse-interactive. Queued AFTER the backend NewFrame calls
+         * so our events are latest-in-queue and win. Position is also fed
+         * by the Win32 backend, but the button LEVEL only exists here
+         * (published by the LL mouse hook — the backend never sees clicks
+         * because they route to the app under the cursor). */
+        {
+            POINT _cur;
+            if (GetCursorPos(&_cur))
+                io.AddMousePosEvent((float)_cur.x, (float)_cur.y);
+            io.AddMouseButtonEvent(0, g_ui_mouse_left_down != 0);
+        }
         ImGui::NewFrame();
         draw_chat_window(w, h);
+        /* v14: publish whether the cursor is over an interactive widget,
+         * so the LL mouse hook yields a press to ImGui (slider/buttons/
+         * combo) instead of window-dragging. Valid here — all items for
+         * the frame have been submitted by draw_chat_window. */
+        InterlockedExchange(&g_mouse_over_widget,
+            (ImGui::IsAnyItemHovered() || ImGui::IsAnyItemActive()) ? 1 : 0);
         /* v1.7.11.10 — bind RTV RIGHT BEFORE Render (chaosium43 order). */
         ctx->OMSetRenderTargets(1, bind, nullptr);
         ImGui::Render();
