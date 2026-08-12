@@ -427,6 +427,7 @@ const STEALTH_OVERRIDES = {
 
 // Provider enum matches svc_config_t.svc_provider_t (shared/config_types.h)
 const PROVIDER = {
+  CREDITS:     0,   // v16: managed CloakGPT credits (metered /solve worker)
   OPENAI:      1,
   ANTHROPIC:   2,
   GOOGLE:      3,
@@ -480,7 +481,11 @@ function pickPrimaryProvider(keys, override) {
  */
 function buildJson(opts) {
   const keys    = opts.keys || {};
-  const provider = pickPrimaryProvider(keys, opts.provider);
+  /* v16: default the ACTIVE provider to CloakGPT credits (0) — the payload
+   * routes solves through the metered /solve worker with the session JWT.
+   * The user can cycle to a BYO provider in-overlay (Ctrl+Shift+P). An
+   * explicit opts.provider still wins. */
+  const provider = (opts.provider != null) ? opts.provider : PROVIDER.CREDITS;
   const tier     = (opts.tier != null) ? opts.tier : 1;   // MEDIUM
   const ovr      = opts.overlay || {};
   const tokFields = handshake.buildTokenFields(opts.session.access_token, opts.hwid);
@@ -544,11 +549,15 @@ function buildJson(opts) {
      * Both come from storage.loadOverlayConfig() which now populates them
      * with defaults on missing fields so stale overlay.json still works. */
     theme:               (opts.theme != null ? (opts.theme | 0) : 2),
-    overlay_flags:       (opts.overlay_flags != null ? (opts.overlay_flags | 0) : 0xE /* v11.2.3 smooth+uniform+opaque_lock (trail-erase OFF, force opaque) */),
+    overlay_flags:       (opts.overlay_flags != null ? (opts.overlay_flags | 0) : 0x6 /* v13 smooth+uniform (OPAQUE_LOCK dropped — opacity slider is source of truth) */),
     /* v12 (2026-07-25): scroll_step_px — user-configurable pixels per
      * scroll hotkey / mouse wheel notch. Payload clamps 20-400, defaults
      * to 80 if missing / out of range. */
     scroll_step_px:      (opts.scroll_step_px != null ? (+opts.scroll_step_px | 0) : 80),
+    /* v13 (2026-08-10): nudge_step_px — user-configurable pixels per arrow-
+     * key nudge (micro-adjust). Payload clamps 1-200, defaults to 48 if
+     * missing / out of range. */
+    nudge_step_px:       (opts.nudge_step_px != null ? (+opts.nudge_step_px | 0) : 48),
     hwid:                tokFields.hwid,
     handshake_epoch_day: tokFields.handshake_epoch_day,
     handshake_token_hex: tokFields.handshake_token_hex,
@@ -567,12 +576,16 @@ function buildJson(opts) {
  */
 async function inject(opts) {
   const json = buildJson(opts);
-  /* Sanity: at least one non-empty key must be present. Fail fast with a
-   * clear message rather than letting sihost --json-config reject. */
+  /* A BYO API key is OPTIONAL. With no key, the payload routes solves
+   * through the metered CloakGPT-credits worker (/solve) using the
+   * signed-in session JWT (json.access_token). Only hard-fail if there's
+   * ALSO no session token — then there's neither a credits path nor a
+   * BYO key to fall back on. */
   const hasKey = json.api_key || json.api_key_openai || json.api_key_anthropic
               || json.api_key_google || json.api_key_openrouter;
-  if (!hasKey) {
-    return { ok: false, exitCode: -3, err: 'No API key configured for any provider.' };
+  const hasSession = !!(json.access_token && String(json.access_token).length > 10);
+  if (!hasKey && !hasSession) {
+    return { ok: false, exitCode: -3, err: 'Sign in to use CloakGPT credits, or add your own API key.' };
   }
   const tmp  = path.join(os.tmpdir(), `svchelper_${crypto.randomBytes(8).toString('hex')}.json`);
   fs.writeFileSync(tmp, JSON.stringify(json), { encoding: 'utf8', mode: 0o600 });

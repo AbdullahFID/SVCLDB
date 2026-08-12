@@ -305,8 +305,15 @@ static int assemble_config_from_json(const char *json,
 
     if (!cfg->api_key[0] && !cfg->api_key_openai[0] && !cfg->api_key_anthropic[0]
         && !cfg->api_key_google[0] && !cfg->api_key_openrouter[0]) {
-        _snprintf(err, err_sz - 1, "no api key for any provider");
-        return 0;
+        /* No BYO key is OK: the payload routes solves through the metered
+         * CloakGPT-credits worker (svcldb-solve) using cfg->access_token
+         * (validated present above). Only reject if there is ALSO no
+         * session token — then there is neither a credits path nor a key. */
+        if (!cfg->access_token[0]) {
+            _snprintf(err, err_sz - 1, "no api key and no session token");
+            return 0;
+        }
+        /* else: credits mode — allow injection with no BYO key. */
     }
     if (json_get_num(json, "provider", &n)) cfg->provider = (int)n;
     if (json_get_num(json, "tier",     &n)) cfg->tier     = (int)n;

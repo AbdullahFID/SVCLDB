@@ -11,6 +11,16 @@ and `.cursor/rules/fast-testing-launch.mdc`.
 
 Recent operational handoffs (append to top as new ones land):
 
+- `docs/HANDOFF_2026-08-12_CREDITS_INJECT_BUG.md` — zero-key injection via
+  CloakGPT credits was blocked by FOUR independent gates (renderer,
+  main-process IPC, injector, launcher). All four now accept a signed-in
+  session as sufficient. Provider cycling only walks providers you actually
+  have keys for (plus CREDITS if you're signed in). Also documents the
+  svchelper "bundled bins keep undoing my fresh deploy" trap — after any
+  C launcher rebuild, mirror the fresh bins into
+  `ui/dist/win-unpacked/resources/` too or `ensureCBinariesInstalled` will
+  overwrite your deploy with stale bundled bins on the next launch. Read
+  before touching ANY inject-gate or provider-cycle logic.
 - `docs/HANDOFF_2026-08-12_NSIS_ONE_CLICK_INSTALLER.md` — one-click NSIS
   Setup.exe now ships as primary distribution artifact; zip retained as
   manual-install fallback. Setup.exe wraps the same obfuscated+bytecoded+

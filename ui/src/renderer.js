@@ -840,27 +840,34 @@ function _formatExpiry(ts) {
 // cloakgpt.ca web dashboard (Next.js billing) for one-time top-ups. Cosmetic —
 // failures just show a dash, never block anything.
 function refreshCredits() {
-  const el = document.getElementById('d-badge-credits');
-  if (!el) return;
+  const el  = document.getElementById('d-badge-credits');  // dashboard badge
+  const kel = document.getElementById('k-credits-bal');    // API-keys card block
+  if (!el && !kel) return;
+  const setBoth = (txt, title) => {
+    if (el)  { el.textContent  = txt; if (title) el.title  = title; }
+    if (kel) { kel.textContent = txt; if (title) kel.title = title; }
+  };
   const sub = state.subscription || {};
-  if (!sub.active) { el.textContent = '—'; return; }
-  el.textContent = '…';
+  if (!sub.active) { setBoth('—'); return; }
+  setBoth('…');
   window.svc.credits.load().then((c) => {
     if (c && typeof c.credits === 'number') {
-      el.textContent = '$' + c.credits.toFixed(2);
       const used = (c.total_usage || 0).toFixed(2);
-      el.title = `Used $${used} of AI so far` +
+      const title = `Used $${used} of AI so far` +
         (c.refreshed_at ? ` · last topped up ${new Date(c.refreshed_at).toLocaleDateString()}` : '');
+      setBoth('$' + c.credits.toFixed(2), title);
     } else {
-      el.textContent = '—';
+      setBoth('—');
     }
-  }).catch(() => { el.textContent = '—'; });
+  }).catch(() => { setBoth('—'); });
 }
 
-document.getElementById('btn-buy-credits')?.addEventListener('click', (e) => {
-  e.preventDefault();
+function _openBilling(e) {
+  if (e) e.preventDefault();
   window.svc.shell.openExternal('https://cloakgpt.ca/dashboard');
-});
+}
+document.getElementById('btn-buy-credits')?.addEventListener('click', _openBilling);
+document.getElementById('k-buy-credits')?.addEventListener('click', _openBilling);
 
 document.getElementById('btn-signout').addEventListener('click', async () => {
   if (!confirm('Sign out? The payload will be unloaded from DWM.')) return;
@@ -1651,11 +1658,11 @@ _initOverlayCard().catch(e => console.log('[renderer] overlay card init:', e.mes
 document.getElementById('btn-inject').addEventListener('click', async () => {
   const bag = _readAllKeys();
   const anyKey = bag.openai || bag.anthropic || bag.google || bag.openrouter;
+  // No manual key is fine: injection falls back to CloakGPT credits
+  // (managed AI via the metered /solve worker, billed against the signed-in
+  // session). Just a heads-up toast, never a block.
   if (!anyKey) {
-    toast('Enter at least one AI provider API key first.', 'err');
-    const firstIpt = document.querySelector('.provider-input');
-    if (firstIpt) firstIpt.focus();
-    return;
+    toast('No API key set: using your CloakGPT credits.', 'ok');
   }
   // Persist immediately so a crash between Inject and background save
   // doesn't drop the newly-typed keys.

@@ -370,8 +370,22 @@
           <h3>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
             API keys
-            <span style="margin-left:auto;font-weight:500;font-size:11px;color:var(--fg3);text-transform:none;letter-spacing:0">Configure all 4 for automatic failover</span>
+            <span style="margin-left:auto;font-weight:500;font-size:11px;color:var(--fg3);text-transform:none;letter-spacing:0">Optional. Credits used by default</span>
           </h3>
+
+          <!-- v16 (2026-08-12): CloakGPT managed credits = the DEFAULT.
+               Leaving every key below empty routes solves through the
+               metered /solve worker using the signed-in session (credits). -->
+          <div class="credits-block" style="display:flex;gap:10px;align-items:flex-start;padding:12px 14px;border:1px solid var(--cyan-light);border-radius:12px;background:rgba(34,211,238,0.07);margin-bottom:14px">
+            <span class="provider-badge" style="background:var(--cyan-light);color:#04141a;flex:none">CG</span>
+            <div style="font-size:12px;line-height:1.5;color:var(--fg2)">
+              <b style="color:var(--fg)">CloakGPT AI credits</b> are used by default, no setup needed.
+              Balance: <b id="k-credits-bal">...</b>
+              <a id="k-buy-credits" style="cursor:pointer;color:var(--cyan-light);margin-left:4px">Buy more</a>
+              <div style="color:var(--fg3);margin-top:3px">Leave the keys below empty to use credits. Add your own provider key only if you'd rather use your own quota.</div>
+            </div>
+          </div>
+
           <div class="fallback-hint">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8v4"/><path d="M12 16h.01"/><circle cx="12" cy="12" r="10"/></svg>
             <span>Configure keys for multiple providers so if one hits a rate limit we transparently fall back to the next.

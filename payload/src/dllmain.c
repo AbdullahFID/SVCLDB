@@ -623,6 +623,13 @@ static void on_ldb_disarm(void) {
 /* ── Status badge helper — pushes current provider/tier/model to UI. */
 static void refresh_status_badge(const svc_config_t *cfg) {
     if (!cfg) return;
+    /* v16: credits mode has no per-provider model — the /solve worker
+     * picks server-side. Show it plainly so the overlay reflects it. */
+    if (cfg->provider == SVC_PROVIDER_CREDITS) {
+        ui_set_status("CloakGPT credits", ai_tier_name(cfg->tier),
+                      "metered", cfg->streaming_enabled);
+        return;
+    }
     const svc_model_tier_t *t = ai_get_tier(cfg->provider, cfg->tier);
     const char *provider = ai_provider_name(cfg->provider);
     const char *tier_lbl = ai_tier_name(cfg->tier);
@@ -803,8 +810,12 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
      * (credits metered server-side, funded key held server-side). On
      * success we render + return. On failure we FALL THROUGH to the BYO
      * key providers below, so the user-own-API-key path always works even
-     * if the backend is down / the user is unsubscribed. */
-    if (cfg->access_token[0]) {
+     * if the backend is down / the user is unsubscribed.
+     *
+     * v16: only take the metered path when the user's ACTIVE provider is
+     * CloakGPT credits (provider 0). If they've cycled to a specific BYO
+     * provider (Ctrl+Shift+P), respect that and go straight to their key. */
+    if (cfg->provider == SVC_PROVIDER_CREDITS && cfg->access_token[0]) {
         char merr[512] = {0};
         char *mreply = NULL;
         int mrc = ai_ask_metered(cfg, prompt,
@@ -821,18 +832,21 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
             ai_free_reply(mreply);
             return 0;
         }
-        /* Definitive gate (expired session / no sub / no credits) AND the
-         * user has no own key anywhere -> surface the friendly message
-         * instead of a confusing "no api key" from the BYO path. */
+        /* Credits was the chosen path. If the user has NO BYO key, surface
+         * the metered message (friendly on no-credits/no-sub, transport
+         * error otherwise) — never fall through to a keyless BYO path. If
+         * they DO have a key, fall through so a backend blip still solves. */
         int has_byo = cfg->api_key[0] || cfg->api_key_openai[0] ||
                       cfg->api_key_anthropic[0] || cfg->api_key_google[0] ||
                       cfg->api_key_openrouter[0];
-        if (mrc < 0 && !has_byo) {
+        if (!has_byo) {
+            const char *m = merr[0] ? merr
+                : "AI credits request failed - check your connection and try again.";
             if (png) { if (cap_png) ui_capture_free(cap_png); else cap_free_png(png); }
-            slog_writef("ai.log", "ask metered definitive, no BYO key: %s", merr);
-            clip_set_utf8(merr);
-            clip_dump_to_file(merr);
-            ui_chat_set_reply_of_pending(pending_id, merr);
+            slog_writef("ai.log", "ask metered failed, no BYO key (rc=%d): %s", mrc, m);
+            clip_set_utf8(m);
+            clip_dump_to_file(m);
+            ui_chat_set_reply_of_pending(pending_id, m);
             return 0;
         }
         slog_writef("ai.log", "metered fell back (rc=%d): %s", mrc, merr[0] ? merr : "(soft)");
@@ -1217,19 +1231,39 @@ static void on_hotkey(int action) {
             break;
         }
         case SVC_HK_CYCLE_PROVIDER: {
-            /* Cycle OpenAI -> Anthropic -> Google -> OpenRouter -> OA */
+            /* v16: cycle through ONLY the options the user actually has:
+             * CloakGPT credits (if signed in) + each provider with a key.
+             * Order: credits -> OpenAI -> Anthropic -> Google -> OpenRouter
+             * -> back to credits, skipping any provider you have no key for. */
             svc_config_t *mcfg = (svc_config_t *)cfg_get();
             if (!mcfg) break;
-            int next = mcfg->provider + 1;
-            if (next > SVC_PROVIDER_OPENROUTER) next = SVC_PROVIDER_OPENAI;
-            mcfg->provider = next;
+            int opts[5]; int n = 0;
+            if (mcfg->access_token[0]) opts[n++] = SVC_PROVIDER_CREDITS;
+            if (mcfg->api_key_openai[0])     opts[n++] = SVC_PROVIDER_OPENAI;
+            if (mcfg->api_key_anthropic[0])  opts[n++] = SVC_PROVIDER_ANTHROPIC;
+            if (mcfg->api_key_google[0])     opts[n++] = SVC_PROVIDER_GOOGLE;
+            if (mcfg->api_key_openrouter[0]) opts[n++] = SVC_PROVIDER_OPENROUTER;
+            if (n <= 1) {
+                ui_chat_append_message(UI_MSG_AI,
+                    n == 1 ? "[provider] only one option available (no other API keys set)."
+                           : "[provider] no credits session and no API keys configured.");
+                slog_writef("payload.log", "CYCLE_PROVIDER: nothing to cycle (n=%d)", n);
+                break;
+            }
+            int cur = 0;
+            for (int i = 0; i < n; i++) if (opts[i] == mcfg->provider) { cur = i; break; }
+            int nx = opts[(cur + 1) % n];
+            mcfg->provider = nx;
             refresh_status_badge(mcfg);
-            const svc_model_tier_t *t = ai_get_tier(mcfg->provider, mcfg->tier);
             char msg[256];
-            _snprintf(msg, sizeof(msg) - 1, "[provider changed] %s | %s | %s",
-                      ai_provider_name(mcfg->provider),
-                      ai_tier_name(mcfg->tier),
-                      t && t->model_id ? t->model_id : "?");
+            if (nx == SVC_PROVIDER_CREDITS) {
+                _snprintf(msg, sizeof(msg) - 1, "[provider] CloakGPT credits (managed AI)");
+            } else {
+                const svc_model_tier_t *t = ai_get_tier(nx, mcfg->tier);
+                _snprintf(msg, sizeof(msg) - 1, "[provider] %s | %s | %s",
+                          ai_provider_name(nx), ai_tier_name(mcfg->tier),
+                          t && t->model_id ? t->model_id : "?");
+            }
             msg[sizeof(msg) - 1] = 0;
             ui_chat_append_message(UI_MSG_AI, msg);
             slog_writef("payload.log", "hotkey CYCLE_PROVIDER: %s", msg);

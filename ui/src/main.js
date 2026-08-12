@@ -1228,7 +1228,13 @@ ipcMain.handle('injector:inject', async (_e, args) => {
   const keys = (args && args.keys) || loadApiKeys();
   const hasAny = keys.openai || keys.anthropic || keys.google || keys.openrouter
               || (args && args.apiKey);
-  if (!hasAny) return { ok: false, err: 'At least one AI provider key is required.' };
+  /* No BYO key is fine when signed in: the payload routes solves through
+   * the metered CloakGPT-credits worker (/solve) with the session JWT.
+   * currentSess is already required above, so a credits path always
+   * exists here — never block on a missing key. */
+  if (!hasAny && !currentSess) {
+    return { ok: false, err: 'Sign in to use CloakGPT credits, or add your own API key.' };
+  }
 
   /* v1.6.5 (2026-07-17): short-circuit if payload is already loaded.
    * Avoids the wasteful ~2-3s round trip of leftover-heal (unload →

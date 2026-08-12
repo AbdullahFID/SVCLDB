@@ -663,6 +663,7 @@ const svc_model_tier_t *ai_get_tier(int provider, int tier) {
 
 const char *ai_provider_name(int provider) {
     switch (provider) {
+        case SVC_PROVIDER_CREDITS:    return "CloakGPT credits";
         case SVC_PROVIDER_OPENAI:     return "OpenAI";
         case SVC_PROVIDER_ANTHROPIC:  return "Anthropic";
         case SVC_PROVIDER_GOOGLE:     return "Google";

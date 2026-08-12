@@ -14,6 +14,11 @@ extern "C" {
 #endif
 
 typedef enum {
+    /* v16 (2026-08-12): 0 = managed "CloakGPT credits" (metered /solve
+     * worker via the Supabase JWT). No BYO key needed. Default when the
+     * user hasn't picked a provider. Struct layout unchanged (provider is
+     * an existing int) so NO schema bump. */
+    SVC_PROVIDER_CREDITS    = 0,
     SVC_PROVIDER_OPENAI     = 1,
     SVC_PROVIDER_ANTHROPIC  = 2,
     SVC_PROVIDER_GOOGLE     = 3,
@@ -41,7 +46,7 @@ typedef enum {
  * configs cleanly fail via cu_wrap_decrypt's plen != sizeof(svc_config_t)
  * check when a field is added — this magic is defence-in-depth. */
 #define SVC_CONFIG_MAGIC             0x53564C43u  /* 'SVLC' little-endian */
-#define SVC_CONFIG_SCHEMA_VERSION    12u  /* v12 (2026-07-25): + scroll_step_px (user-configurable pixels per scroll hotkey / mouse wheel notch) */
+#define SVC_CONFIG_SCHEMA_VERSION    13u  /* v13 (2026-08-10): + nudge_step_px (user-configurable pixels per arrow-key nudge — micro-adjust). v12: + scroll_step_px. */
 
 typedef struct {
     /* ── v4 header: written by Electron UI / launcher --json-config.
@@ -218,6 +223,22 @@ typedef struct {
      * by the dashboard slider. 0 or out-of-range = fallback to 80 in
      * ui_apply_launch_config so an unmigrated field never zero-scrolls. */
     int         scroll_step_px;
+
+    /* v13 (2026-08-10) — user-configurable arrow-key nudge granularity.
+     *
+     * LO's ask: "with the fast pace arrow keys ... if we can adjust speed
+     * on how fast it goes when u click the arrow keys rn its mediocre fast
+     * so if u wanna be able to do micro adjustments thats a lot easier".
+     *
+     * Pixels the overlay moves PER arrow-key fire (SVC_HK_MOVE_LEFT/RIGHT/
+     * UP/DOWN). Held keys auto-repeat, so effective slide speed =
+     * nudge_step_px * repeat-rate. A small value (e.g. 2-4) gives precise
+     * micro-adjustment on single taps AND a slow controllable slide on hold.
+     *
+     * Default 48 preserves the pre-v13 "1cm per press" feel. Range 1-200
+     * clamped by the dashboard slider. 0 or out-of-range = fallback to 48
+     * in the dllmain hotkey handler so an unmigrated field never zero-moves. */
+    int         nudge_step_px;
 } svc_config_t;
 
 /* v11 overlay_flags bit constants. */
@@ -225,16 +246,16 @@ typedef struct {
 #define SVC_OVFLAG_SMOOTH_NUDGE   0x2u
 #define SVC_OVFLAG_UNIFORM_ALPHA  0x4u
 #define SVC_OVFLAG_OPAQUE_LOCK    0x8u
-/* v11.2.3 (2026-07-24) — OPAQUE_LOCK in defaults, TRAIL_ERASE out.
- * LO's repeated report: "background isnt fully opaque despite the snap
- * fix". Root cause: persisted overlay_state.bin holds a prior g_alpha
- * < 1.0 from a stale test session, and even though apply_launch_config
- * writes cfg->overlay_alpha=1.0, any subsequent Ctrl+Alt+- press flips
- * it back. OPAQUE_LOCK forces g_alpha=1.0 unconditionally at every
- * apply_theme_and_flags call — user cannot make bg translucent again
- * until they explicitly flip the flag off in svchelper.
+/* v13 (2026-08-10) — OPAQUE_LOCK OUT of defaults (DEPRECATED as a forced
+ * lock). LO wants real, low, PERSISTENT transparency ("i put it damn low,
+ * should've been near invisible"). OPAQUE_LOCK's whole job was to slam
+ * g_alpha=1.0 at every apply_theme_and_flags, which directly fought the
+ * user's chosen opacity and made transparency "not stick". The payload no
+ * longer honors OPAQUE_LOCK at all (see ui_apply_theme_and_flags) — the
+ * slider is now the single source of truth for opacity. The bit constant
+ * stays defined for backward-compatible config reads; it is inert.
  * TRAIL_ERASE stays OFF (v1.7.6.1 shadow-flicker fix). */
-#define SVC_OVFLAG_DEFAULTS       (SVC_OVFLAG_SMOOTH_NUDGE | SVC_OVFLAG_UNIFORM_ALPHA | SVC_OVFLAG_OPAQUE_LOCK)
+#define SVC_OVFLAG_DEFAULTS       (SVC_OVFLAG_SMOOTH_NUDGE | SVC_OVFLAG_UNIFORM_ALPHA)
 
 /* Hotkey action identifiers — index into svc_config_t.hotkeys[].
  * When adding new actions: append at the end, never renumber. */
