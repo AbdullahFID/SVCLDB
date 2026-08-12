@@ -170,17 +170,36 @@ lifecycle:
 1. **Cooperative payload unload** via `sihost.exe --unload` (mirrors
    customInit).
 2. **Kill our processes** (same path-filter as customInit for sihost).
-3. **Remove Defender exclusions** via `Remove-MpPreference` (same 5
-   paths + processes).
-4. **Conditional data wipe** via the `${IfNot} ${Silent}` gate:
-   - **`${Silent} == false`** (user double-clicked `Uninstall svchelper.exe`,
+3. **Sleep 2 seconds.** CRITICAL — Windows takes 1-2 s to release file
+   handles from the just-killed processes. Without this pause the wipe
+   step silently skips locked files. Learned from Sam's 2026-08-12
+   smoke-test uninstall: the wipe fired but the ProgramData tree and
+   AppData tree were both still there afterwards. Adding the sleep is
+   what makes the next-step wipe actually complete.
+4. **Remove Defender exclusions** via `Remove-MpPreference` — three
+   variants per process name: bare (`svchelper.exe`),
+   WinAudioSvc-scoped (`C:\ProgramData\WinAudioSvc\svchelper.exe`),
+   and svchelper-scoped (`C:\Program Files\svchelper\resources\svchelper.exe`).
+   The legacy `install-cloakgpt.ps1` adds full-path exclusions; NSIS
+   `customInstall` adds bare ones; users mid-migration may have both.
+5. **Conditional data wipe** via bare `IfSilent` (NSIS builtin — NOT
+   `${IfNot} ${Silent}` LogicLib macro, which has been observed to
+   expand unexpectedly under electron-builder's auto-generated uninstall
+   scoping):
+   - **`IfSilent == 0`** (user double-clicked `Uninstall svchelper.exe`,
      OR used Settings → Apps → Uninstall) → **FULL WIPE**:
-     - `RMDir /r "C:\ProgramData\WinAudioSvc"` (all config, session, keys, logs)
-     - `RMDir /r "$APPDATA\svchelper"` (Electron per-user cache)
-   - **`${Silent} == true`** (invoked BY the new Setup.exe during an
+     - Primary: PowerShell `Remove-Item -Recurse -Force`, preceded by
+       `Get-ChildItem ... | ForEach-Object { $_.Attributes = 'Normal' }`
+       to strip read-only bits (NSIS RMDir /r bails on read-only files).
+       Targets: `C:\ProgramData\WinAudioSvc\` (config, session, keys, logs)
+       AND `$APPDATA\svchelper` (Electron per-user cache).
+     - Fallback: NSIS `RMDir /r` on both paths (in case PowerShell is
+       unavailable / execution policy blocked / etc). No-op if
+       PowerShell already cleaned.
+   - **`IfSilent == 1`** (invoked BY the new Setup.exe during an
      upgrade — electron-builder auto-calls the old uninstaller with `/S`
      before installing the new version) → **PRESERVE user data**:
-     - Skip both RMDir calls.
+     - Skip both wipe branches.
      - Users don't have to re-sign-in or re-paste API keys after every
        version bump.
 
@@ -219,6 +238,66 @@ svchelper.exe / dllhost32.exe stay on taskkill (no Windows collision).
 **Regression test:** After the fix, running Setup.exe as an upgrade
 should NOT respawn Explorer. Verify via `Get-Process sihost` before
 and after — Windows' sihost.exe StartTime should be unchanged.
+
+## The customUnInstall wipe bug — how we found it
+
+**Symptom (2026-08-12 02:47 AM):** After the initial NSIS smoke test
+(Setup.exe install → verify everything works → run Uninstall svchelper.exe
+to reset for a "as a real user" smoke test), the uninstaller exited with
+code 0. Post-uninstall audit confirmed:
+- ✓ `C:\Program Files\svchelper\` deleted
+- ✓ Add/Remove Programs entry gone
+- ✓ Desktop + Start Menu shortcuts removed
+- ✓ Running svchelper/sihost/dllhost32 processes killed
+- ✗ **`C:\ProgramData\WinAudioSvc\` still contained everything** (21 files including
+  config.dat, session, api_keys, logs — none wiped)
+- ✗ **`%APPDATA%\svchelper\` still contained everything** (Electron cache,
+  Local Storage, session.enc, api_keys.enc — none wiped)
+- ✗ **Defender exclusions still registered** — my `Remove-MpPreference`
+  call didn't stick either
+
+**Diagnosis:**
+- `launcher.log` mtime showed sihost.exe --unload DID execute during
+  uninstall → customUnInstall macro fired.
+- No NSIS build warnings during compile → the RMDir /r commands compiled
+  and were embedded.
+- The most likely cause: after `taskkill /F /IM svchelper.exe /T`,
+  Windows takes 1-2 s to release file handles the killed processes were
+  holding. If NSIS `RMDir /r` runs within that window, it silently no-ops
+  on locked files (NSIS doesn't surface file-in-use errors).
+- Secondary cause: `Remove-MpPreference` didn't run because my macro's
+  set was BARE names only, but half the exclusions on the machine had
+  been registered with full paths by the legacy install-cloakgpt.ps1.
+
+**Fix** — three changes to `customUnInstall`:
+
+1. Add `Sleep 2000` after the taskkill/PowerShell-kill sequence, BEFORE
+   the Defender-remove and wipe steps. Two seconds is empirically enough
+   for Windows to release even large-file-handle Electron process trees.
+
+2. Replace `RMDir /r` with `nsExec::ExecToLog` calling PowerShell
+   `Get-ChildItem ... | ForEach-Object { $_.Attributes = 'Normal' }` +
+   `Remove-Item -Recurse -Force`. PowerShell is more forgiving of stale
+   file handles than NSIS's RMDir; the attribute strip handles read-only
+   files that would otherwise block deletion. **`RMDir /r` is retained
+   as a fallback** in case PowerShell is unavailable or blocked by
+   execution policy — belt + suspenders.
+
+3. Expand `Remove-MpPreference` to remove THREE variants per process
+   name: bare (`svchelper.exe`), WinAudioSvc-scoped
+   (`C:\ProgramData\WinAudioSvc\svchelper.exe`), and svchelper-scoped
+   (`C:\Program Files\svchelper\resources\svchelper.exe`). Covers both
+   legacy install-cloakgpt.ps1 users and NSIS users.
+
+4. Replace `${IfNot} ${Silent}` (LogicLib macro) with bare `IfSilent`
+   (NSIS built-in). The macro form has been observed to expand
+   unexpectedly under electron-builder's auto-generated uninstall.nsi
+   scoping — using bare `IfSilent target 0` is unambiguous.
+
+**Regression test:** After the fix, run Setup.exe → verify everything
+installed → run `Uninstall svchelper.exe` interactively (double-click)
+→ confirm `C:\ProgramData\WinAudioSvc\`, `%APPDATA%\svchelper\`, AND
+the Defender exclusions ALL disappear. If any survive, the fix regressed.
 
 ## Files touched
 
@@ -263,11 +342,24 @@ and after — Windows' sihost.exe StartTime should be unchanged.
    Preference`, etc. NSIS parses `$` as its own variable prefix; a
    bare `$_` becomes `unknown variable/constant "_"` warning, and
    NSIS treats warnings as errors by default.
-5. **`customUnInstall` MUST gate the data wipe on `${IfNot} ${Silent}`.**
-   Silent uninstall = upgrade scenario, preserve user data. Interactive
+5. **`customUnInstall` MUST gate the data wipe on bare `IfSilent`**
+   (NSIS builtin, NOT `${IfNot} ${Silent}` LogicLib macro). Silent
+   uninstall = upgrade scenario, preserve user data. Interactive
    uninstall = user really wants everything gone. Removing the gate =
    users lose their config/session/keys on every Setup.exe upgrade.
-6. **Step 7 in `build-protected.js` MUST use the `--win nsis`
+   The LogicLib macro was observed to misbehave under electron-builder's
+   auto-generated uninstall.nsi scoping (2026-08-12 smoke test bug).
+6. **`customUnInstall` MUST `Sleep 2000` between process-kill and file-
+   wipe.** Windows takes 1-2 s to release file handles from the just-
+   killed processes; NSIS `RMDir /r` and PowerShell `Remove-Item` both
+   silently skip locked files during that window. Without the sleep the
+   uninstaller "succeeds" but ProgramData + AppData survive intact.
+7. **`customUnInstall` MUST use PowerShell `Remove-Item -Recurse -Force`
+   as the PRIMARY wipe path**, with NSIS `RMDir /r` as a fallback. NSIS
+   RMDir /r no-ops on read-only attributes; PowerShell can strip
+   `$_.Attributes = 'Normal'` first then delete. Removing the PowerShell
+   primary regresses the smoke-test bug of 2026-08-12.
+8. **Step 7 in `build-protected.js` MUST use the `--win nsis`
    CLI form**, not `--config.win.target=<json>`. Windows PowerShell +
    cmd shell escaping fights the embedded double-quotes in JSON. The
    CLI form uses `--prepackaged "dist\win-unpacked"` which is trivially

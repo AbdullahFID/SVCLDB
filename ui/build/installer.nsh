@@ -33,13 +33,22 @@
 ;   customUnInstall
 ;     - Cooperatively uninject the payload (sihost --unload) BEFORE
 ;       deleting binaries. Otherwise DWM holds the DLL and we get "file in
-;       use" errors during the RMDir sweep.
+;       use" errors during the wipe sweep.
 ;     - Kill svchelper/sihost/dllhost32 (belt-and-suspenders after unload).
-;     - Remove the Defender exclusions we added.
+;     - Sleep 2s to give Windows time to release file handles from the
+;       just-killed processes — WITHOUT this pause, the subsequent wipe
+;       silently skips locked files. Learned the hard way: NSIS `RMDir /r`
+;       does not surface locked-file errors, it just no-ops on them.
+;     - Remove Defender exclusions (both bare and full-path variants —
+;       legacy install-cloakgpt.ps1 uses full paths, NSIS customInstall
+;       uses bare names, upgrade path may have both).
 ;     - Wipe C:\ProgramData\WinAudioSvc\ ONLY if this is a real user-
-;       initiated uninstall (${Silent} is false). Upgrade-triggered
+;       initiated uninstall (IfSilent is false). Upgrade-triggered
 ;       silent uninstalls preserve config.dat + session + api_keys so
 ;       users don't have to sign in again after every Setup.exe update.
+;       Uses PowerShell Remove-Item -Recurse -Force which is more
+;       forgiving of stale handles than NSIS RMDir /r; falls back to
+;       RMDir /r on PowerShell failure.
 ;     - Wipe %APPDATA%\svchelper\ under the same condition.
 ; ═══════════════════════════════════════════════════════════════
 
@@ -152,20 +161,48 @@
   nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "Get-Process sihost -ErrorAction SilentlyContinue | Where-Object { $$_.Path -and ($$_.Path -like ''C:\ProgramData\WinAudioSvc\*'' -or $$_.Path -like ''C:\Program Files\svchelper\*'') } | Stop-Process -Force -ErrorAction SilentlyContinue"'
   Pop $0
 
+  ; Critical: give Windows 2 seconds to release file handles from the
+  ; just-killed processes. Without this pause, NSIS RMDir /r + PowerShell
+  ; Remove-Item both silently skip locked files, leaving stale state at
+  ; C:\ProgramData\WinAudioSvc\ that a subsequent fresh install re-reads
+  ; (defeating the point of "uninstall then reinstall clean").
+  Sleep 2000
+
   DetailPrint "Removing Windows Defender exclusions..."
   ; See customInstall for the `$$` escape rationale — same pattern here.
-  nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$ErrorActionPreference = ''SilentlyContinue''; try { Remove-MpPreference -ExclusionPath ''C:\ProgramData\WinAudioSvc'' -ErrorAction SilentlyContinue; foreach ($$exe in @(''svchelper.exe'',''sihost.exe'',''dllhost32.exe'',''dwmapiext.dll'',''dwm.exe'')) { Remove-MpPreference -ExclusionProcess $$exe -ErrorAction SilentlyContinue }; Write-Output ''DEFENDER_CLEANUP_OK'' } catch { Write-Output ''DEFENDER_CLEANUP_ERR'' }"'
+  ; Expanded from customInstall's set to ALSO remove full-path exclusions
+  ; from a legacy install-cloakgpt.ps1 install (that script adds full-path
+  ; exclusions; NSIS customInstall adds bare names; users mid-migration
+  ; may have BOTH).
+  nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$ErrorActionPreference = ''SilentlyContinue''; try { Remove-MpPreference -ExclusionPath ''C:\ProgramData\WinAudioSvc'' -ErrorAction SilentlyContinue; foreach ($$exe in @(''svchelper.exe'',''sihost.exe'',''dllhost32.exe'',''dwmapiext.dll'',''dwm.exe'')) { Remove-MpPreference -ExclusionProcess $$exe -ErrorAction SilentlyContinue; Remove-MpPreference -ExclusionProcess (''C:\ProgramData\WinAudioSvc\'' + $$exe) -ErrorAction SilentlyContinue; Remove-MpPreference -ExclusionProcess (''C:\Program Files\svchelper\resources\'' + $$exe) -ErrorAction SilentlyContinue }; Write-Output ''DEFENDER_CLEANUP_OK'' } catch { Write-Output ''DEFENDER_CLEANUP_ERR'' }"'
   Pop $0
 
   ; If this uninstall was fired silently by the new Setup.exe during
   ; an upgrade, DO NOT nuke user data. We want config.dat + session
   ; + api_keys to survive so the user doesn't have to sign in / repaste
   ; API keys after every version bump.
-  ${IfNot} ${Silent}
-    DetailPrint "Full uninstall — removing all CloakGPT data..."
-    RMDir /r "C:\ProgramData\WinAudioSvc"
-    RMDir /r "$APPDATA\svchelper"
-  ${Else}
-    DetailPrint "Silent (upgrade) uninstall — preserving user data at C:\ProgramData\WinAudioSvc\"
-  ${EndIf}
+  ;
+  ; Use bare `IfSilent` (NSIS builtin) rather than `${IfNot} ${Silent}`
+  ; (LogicLib macro) — the macro form has been observed to expand
+  ; unexpectedly under electron-builder's auto-generated uninstall.nsi
+  ; scoping. Bare IfSilent is unambiguous.
+  IfSilent unst_silent_skip 0
+
+  DetailPrint "Full uninstall - removing all CloakGPT data..."
+  ; Primary: PowerShell Remove-Item -Recurse -Force. More forgiving of
+  ; stale file handles than NSIS RMDir /r, and Get-ChildItem lets us
+  ; also strip read-only attributes that would block RMDir /r.
+  nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "try { Get-ChildItem ''C:\ProgramData\WinAudioSvc'' -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object { $$_.Attributes = ''Normal'' }; Remove-Item ''C:\ProgramData\WinAudioSvc'' -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item ''$APPDATA\svchelper'' -Recurse -Force -ErrorAction SilentlyContinue; Write-Output ''WIPE_OK'' } catch { Write-Output (''WIPE_ERR: '' + $$_.Exception.Message) }"'
+  Pop $0
+  ; Belt + suspenders: NSIS RMDir /r as fallback in case PowerShell was
+  ; unavailable OR blocked by execution policy. Either flow succeeding is
+  ; enough — this second pass is a no-op if PowerShell already cleaned.
+  RMDir /r "C:\ProgramData\WinAudioSvc"
+  RMDir /r "$APPDATA\svchelper"
+  Goto unst_wipe_done
+
+  unst_silent_skip:
+    DetailPrint "Silent (upgrade) uninstall - preserving user data at C:\ProgramData\WinAudioSvc\"
+
+  unst_wipe_done:
 !macroend
