@@ -139,6 +139,21 @@ Verify with SHA1: `Get-FileHash build/launcher/sihost.exe`,
   Redeploy from `shared/fonts/lucide.ttf` and the Lucide font-load
   succeeds (`font: icons = Lucide @ 40px` in the log). This deployment
   should be moved into the installer / packager as a proper ship step.
+  **FIXED 2026-08-12 (deployment redo):** `shared/fonts/lucide.ttf` is now
+  wired into the ship pipeline in three places so fresh users get real
+  icons with zero manual steps:
+    1. `ui/package.json` extraResources — `{ from: "../shared/fonts/lucide.ttf",
+       to: "cg_icons.ttf" }` → lands in `dist/win-unpacked/resources/cg_icons.ttf`.
+    2. `ui/src/main.js::ensureCBinariesInstalled` — a dedicated `assets`
+       array (separate from `bins` so a font change never trips the payload-
+       uninject upgrade path) copies `resources/cg_icons.ttf` →
+       `C:\ProgramData\WinAudioSvc\` on every launch (covers the zip flow).
+    3. `ui/build/installer.nsh` customInstall — `CopyFiles` places the font
+       at install time so icons are correct on the very first overlay draw,
+       before the Electron app has even run (covers the NSIS flow).
+  Verified: both `CloakGPTWindowsMaxStealth-Setup.exe` and
+  `CloakGPTWindowsMaxStealth.zip` now contain `resources/cg_icons.ttf`
+  (853920 B, SHA1 23607A0EEE1417A2FF1BEBDC3EA60C74242BA7B8).
 
 ## Files touched
 
@@ -163,7 +178,10 @@ Verify with SHA1: `Get-FileHash build/launcher/sihost.exe`,
 - After ANY launcher rebuild, keep `ui/dist/win-unpacked/resources/` in
   sync with the fresh build, or `ensureCBinariesInstalled` will re-install
   the stale bundled bins on the next svchelper launch.
-- `cg_icons.ttf` is currently loaded from disk. If it's ever missing the
-  overlay silently falls back to hand-drawn vector icons. Consider
-  embedding the TTF (compressed C array) before ship so there's no disk
-  dependency.
+- `cg_icons.ttf` is loaded from disk at
+  `C:\ProgramData\WinAudioSvc\cg_icons.ttf`. As of 2026-08-12 it ships
+  in the installer + bundle + first-launch copy (see the "Icons buns"
+  FIXED note above), so a fresh install always has it. If you ever want
+  to eliminate the disk dependency entirely, embed the TTF as a
+  compressed C array (`binary_to_compressed_c` → `AddFontFromMemory-
+  CompressedTTF`) — but that's a nice-to-have now, not a ship blocker.

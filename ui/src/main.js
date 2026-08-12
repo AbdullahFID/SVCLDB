@@ -123,6 +123,34 @@ function ensureCBinariesInstalled() {
       catch (e) { console.log(`[install] copy ${b} FAILED: ${e.message}`); }
     }
   }
+
+  /* Non-executable runtime assets that the payload reads by absolute path
+   * from SVC_INSTALL_DIR. Kept OUT of the `bins` array above so a future
+   * asset change never trips the upgrade-detection uninject path (assets
+   * don't need the payload torn down before overwrite).
+   *
+   *   cg_icons.ttf — Lucide icon font the DWM overlay loads via
+   *   AddFontFromFileTTF("C:\ProgramData\WinAudioSvc\cg_icons.ttf", ...).
+   *   Bundled as extraResources (from shared/fonts/lucide.ttf → cg_icons.ttf).
+   *   Without this copy the overlay silently falls back to hand-drawn vector
+   *   icons ("buns") — see docs/HANDOFF_2026-08-12_CREDITS_INJECT_BUG.md. */
+  const assets = ['cg_icons.ttf'];
+  for (const a of assets) {
+    const src = path.join(srcDir, a);
+    if (!fs.existsSync(src)) continue;
+    const dst = path.join(SVC_INSTALL_DIR, a);
+    let needCopy = !fs.existsSync(dst);
+    if (!needCopy) {
+      try {
+        const s = fs.statSync(src), d = fs.statSync(dst);
+        needCopy = s.mtimeMs > d.mtimeMs || s.size !== d.size;
+      } catch { needCopy = true; }
+    }
+    if (needCopy) {
+      try { fs.copyFileSync(src, dst); console.log(`[install] copied asset ${a} (${fs.statSync(dst).size} B)`); }
+      catch (e) { console.log(`[install] copy asset ${a} FAILED: ${e.message}`); }
+    }
+  }
 }
 
 // ─── Windows Defender self-exclusion ──────────────────────────

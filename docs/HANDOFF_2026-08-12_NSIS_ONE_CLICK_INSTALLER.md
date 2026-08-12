@@ -153,13 +153,18 @@ Fires AFTER electron-builder has written every packaged file into
    the user first runs the app. Failures are swallowed (Tamper Protection,
    third-party AV, corporate GPO — none of those are ours to argue with).
 
-2. **ProgramData binary mirror** — the same 5 C bins that electron-builder
-   places at `$INSTDIR\resources\` are `CopyFiles`'d to
-   `C:\ProgramData\WinAudioSvc\`. Belt-and-suspenders with main.js's
-   `ensureCBinariesInstalled()` which does the same on every launch —
-   the install-time copy means `sihost.exe --json-config` + `dllhost32.exe`
-   are reachable at their C-side-hardcoded paths from the very first
-   Inject click, without waiting for a first-run Electron cycle.
+2. **ProgramData binary + asset mirror** — the same 5 C bins PLUS
+   `cg_icons.ttf` that electron-builder places at `$INSTDIR\resources\`
+   are `CopyFiles`'d to `C:\ProgramData\WinAudioSvc\`. Belt-and-suspenders
+   with main.js's `ensureCBinariesInstalled()` which does the same on every
+   launch — the install-time copy means `sihost.exe --json-config` +
+   `dllhost32.exe` are reachable at their C-side-hardcoded paths from the
+   very first Inject click, and the overlay's Lucide icon font
+   (`cg_icons.ttf`, loaded by absolute path in imgui_layer.cpp) is present
+   on the very first overlay draw, without waiting for a first-run Electron
+   cycle. The font is bundled via `package.json` extraResources
+   (`shared/fonts/lucide.ttf` → `cg_icons.ttf`) — added 2026-08-12, see
+   `HANDOFF_2026-08-12_CREDITS_INJECT_BUG.md` "Icons buns FIXED".
 
 ### `customUnInstall` — reverse everything
 

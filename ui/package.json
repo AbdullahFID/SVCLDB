@@ -92,6 +92,10 @@
       {
         "from": "../build/resolver/symsrv.dll",
         "to": "symsrv.dll"
+      },
+      {
+        "from": "../shared/fonts/lucide.ttf",
+        "to": "cg_icons.ttf"
       }
     ],
     "extraMetadata": {

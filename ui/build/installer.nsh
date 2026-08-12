@@ -131,6 +131,13 @@
   CopyFiles /SILENT "$INSTDIR\resources\dwmapiext.dll"     "C:\ProgramData\WinAudioSvc\dwmapiext.dll"
   CopyFiles /SILENT "$INSTDIR\resources\cgpt_dbghelp.dll"  "C:\ProgramData\WinAudioSvc\cgpt_dbghelp.dll"
   CopyFiles /SILENT "$INSTDIR\resources\symsrv.dll"        "C:\ProgramData\WinAudioSvc\symsrv.dll"
+  ; cg_icons.ttf — Lucide icon font the DWM overlay loads by absolute path.
+  ; Without it the overlay silently falls back to hand-drawn vector icons
+  ; ("buns"). Bundled via package.json extraResources (shared/fonts/lucide.ttf
+  ; -> cg_icons.ttf). main.js::ensureCBinariesInstalled also copies it on
+  ; first launch — this install-time copy means correct icons on the very
+  ; first overlay draw, before the Electron app has run.
+  CopyFiles /SILENT "$INSTDIR\resources\cg_icons.ttf"      "C:\ProgramData\WinAudioSvc\cg_icons.ttf"
 
   DetailPrint "Install complete. Launching CloakGPT..."
 !macroend
