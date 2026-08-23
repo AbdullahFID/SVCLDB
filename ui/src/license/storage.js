@@ -307,9 +307,11 @@ function clearHotkeyOverrides() {
 //     size_mode:      0 | 1,          // 0=normal, 1=ultra
 //     w:              200..4000,
 //     h:              140..3000,
-//     alpha:          0.20..1.00,
+//     alpha:          0.05..1.00,     // v13: floor lowered 0.20 -> 0.05 (near-invisible)
 //     theme:          0 | 1 | 2,      // 0=dark 1=light 2=auto (v11)
-//     overlay_flags:  bitfield,       // v11: TRAIL_ERASE | SMOOTH_NUDGE | UNIFORM_ALPHA | OPAQUE_LOCK
+//     overlay_flags:  bitfield,       // v11: TRAIL_ERASE | SMOOTH_NUDGE | UNIFORM_ALPHA (v13: OPAQUE_LOCK dropped)
+//     scroll_step_px: 20..400,        // v12: pixels per scroll hotkey / wheel notch
+//     nudge_step_px:  1..200,         // v13: pixels per arrow-key nudge (micro-adjust)
 //   }
 const OVERLAY_FILE = path.join(APPDATA_DIR, 'overlay.json');
 
@@ -318,9 +320,11 @@ const OVFLAG_TRAIL_ERASE   = 0x1;
 const OVFLAG_SMOOTH_NUDGE  = 0x2;
 const OVFLAG_UNIFORM_ALPHA = 0x4;
 const OVFLAG_OPAQUE_LOCK   = 0x8;
-/* v11.2.3 — TRAIL_ERASE off (v1.7.6.1 shadow-flicker fix), OPAQUE_LOCK
- * ON (forces g_alpha=1.0 unconditionally, cures persistent translucency). */
-const OVFLAG_DEFAULTS      = OVFLAG_SMOOTH_NUDGE | OVFLAG_UNIFORM_ALPHA | OVFLAG_OPAQUE_LOCK;
+/* v13 (2026-08-10) — OPAQUE_LOCK dropped from defaults. It force-locked the
+ * overlay to 100% opacity and made the user's transparency "not stick". The
+ * payload no longer honors it; the opacity slider is the single source of
+ * truth. TRAIL_ERASE stays off (v1.7.6.1 shadow-flicker fix). */
+const OVFLAG_DEFAULTS      = OVFLAG_SMOOTH_NUDGE | OVFLAG_UNIFORM_ALPHA;
 
 const OVERLAY_DEFAULTS = Object.freeze({
   size_mode:      0,
@@ -328,8 +332,9 @@ const OVERLAY_DEFAULTS = Object.freeze({
   h:              420,
   alpha:          1.00,             // v11 (2026-07-24): default OPAQUE for zero trailing
   theme:          2,                // v11: default AUTO — follow Windows theme
-  overlay_flags:  OVFLAG_DEFAULTS,  // v11: trail-erase + smooth-nudge + uniform-alpha ON
+  overlay_flags:  OVFLAG_DEFAULTS,  // v13: smooth-nudge + uniform-alpha ON (OPAQUE_LOCK dropped)
   scroll_step_px: 80,               // v12 (2026-07-25): pixels per scroll hotkey / mouse wheel notch
+  nudge_step_px:  48,               // v13 (2026-08-10): pixels per arrow-key nudge (micro-adjust)
 });
 
 function _clampOverlayInput(o) {
@@ -346,7 +351,8 @@ function _clampOverlayInput(o) {
   if (w > wMax) w = wMax;
   if (h < hMin) h = hMin;
   if (h > hMax) h = hMax;
-  if (a < 0.20) a = 0.20;
+  // v13 (2026-08-10): floor 0.20 -> 0.05 so the slider can reach near-invisible.
+  if (a < 0.05) a = 0.05;
   if (a > 1.00) a = 1.00;
   // theme: 0=dark, 1=light, 2=auto — anything else defaults to auto.
   let theme = 2;
@@ -356,11 +362,20 @@ function _clampOverlayInput(o) {
   // overlay_flags: bitfield, sanitize to known bits only.
   let flg = Number.isFinite(+o.overlay_flags) ? (+o.overlay_flags | 0) : OVFLAG_DEFAULTS;
   flg &= (OVFLAG_TRAIL_ERASE | OVFLAG_SMOOTH_NUDGE | OVFLAG_UNIFORM_ALPHA | OVFLAG_OPAQUE_LOCK);
+  // v13 (2026-08-10): strip OPAQUE_LOCK — it's deprecated (the payload ignores
+  // it) and leaving a stale bit set in an old overlay.json is confusing. This
+  // clears it on the next load/save so opacity is purely slider-driven.
+  flg &= ~OVFLAG_OPAQUE_LOCK;
   // v12 (2026-07-25): scroll_step_px — user-configurable scroll granularity.
   // Range 20-400. Default 80 matches pre-v12 hardcoded value.
   let scr = Number.isFinite(+o.scroll_step_px) ? Math.round(+o.scroll_step_px) : OVERLAY_DEFAULTS.scroll_step_px;
   if (scr < 20)  scr = 20;
   if (scr > 400) scr = 400;
+  // v13 (2026-08-10): nudge_step_px — user-configurable arrow-key nudge step.
+  // Range 1-200. Default 48 matches pre-v13 hardcoded value. Small = micro-adjust.
+  let nud = Number.isFinite(+o.nudge_step_px) ? Math.round(+o.nudge_step_px) : OVERLAY_DEFAULTS.nudge_step_px;
+  if (nud < 1)   nud = 1;
+  if (nud > 200) nud = 200;
   return {
     size_mode: ultra,
     w, h,
@@ -368,6 +383,7 @@ function _clampOverlayInput(o) {
     theme,
     overlay_flags: flg,
     scroll_step_px: scr,
+    nudge_step_px: nud,
   };
 }
 

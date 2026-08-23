@@ -168,6 +168,23 @@ node C:\Users\<you>\Desktop\hooksdll\lumio\tools\decrypt-logs.js `
 
 If the key ever rotates (edit `shared/log_key.c`), recompute via the derivation `SHA256((MATERIAL_A XOR MATERIAL_B) || SALT)` — helper block in `CLAUDE.md`.
 
+## Cloudflare / backend secrets (svcldb-solve + openrouter-proxy)
+
+Plaintext source of truth lives in `cloudflare/svcldb-solve/.dev.vars` (gitignored). Recorded here so we don't have to dig transcripts again. If any of these rotate, update BOTH `.dev.vars` and the deployed `wrangler secret put` value.
+
+- **`RELAY_SECRET` (a.k.a. `SVC_RELAY_SECRET` on openrouter-proxy)** — shared secret sent as the `X-Svc-Relay` header when `svcldb-solve` relays AI calls to viper's `openrouter-proxy` (which holds the funded OpenRouter key). Same value on both workers.
+  ```
+  0047f23ddb7acf85796c09f0a08ce781d243b7bfcf1b1255555214ab2df6baf4
+  ```
+- **`SVC_METERING_SECRET`** — gates the credit RPCs (acquire/release/preflight); sha256 hash stored in `public.svc_config` (key `metering_secret`).
+  ```
+  f74b0686f9244ffad1e6a41f9cf75f27a25b175e014b9d4c48345ca4f55861bd
+  ```
+- **`RELAY_URL`** = `https://openrouter-proxy.c-viperdevelopment.workers.dev/__svc_relay`
+- **`SUPABASE_URL`** = `https://rrrpkmzdnaodmvsuxdkw.supabase.co` (svcldb-solve talks to Supabase with the PUBLIC anon key — no service_role key).
+
+Wiring: `relayToOpenRouter()` in `cloudflare/svcldb-solve/src/worker.js` POSTs to `RELAY_URL` with `X-Svc-Relay: <RELAY_SECRET>`; `openrouter-proxy` early-returns on that header (relay branch). Full context: `docs/HANDOFF_2026-08-12_AI_CREDITS_BACKEND.md`. Account: viperdevelopment `2e79ac0ed8bea87aca2c7ac4a9c336c6`.
+
 ## Never regress
 
 Every invariant in `CLAUDE.md` is load-bearing. In particular:

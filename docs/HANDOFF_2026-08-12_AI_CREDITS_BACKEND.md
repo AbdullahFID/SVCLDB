@@ -80,11 +80,11 @@ subscription. Unsubscribed/anonymous callers get `401`/`403` before any AI/spend
 
 - `GET  /validate` → `{ ok, plan, credits }` (auth + sub, no spend).
 - `GET  /credits`  → `{ ok, credits, total_usage, refreshed_at, plan }`.
-- `POST /solve`    → body `{ images?: string[] (data URLs), question?: string, model?: string, reasoning_effort?: "low"|"medium"|"high", explain?: bool }`
+- `POST /solve`    → body `{ images?: string[] (data URLs), question?: string, tier?: "strong"|"medium"|"cheap", model?: string, reasoning_effort?: "none"|"low"|"medium"|"high"|"xhigh", explain?: bool }`
   → `{ ok, answer, explanation?, model, cost, creditsRemaining }`.
   - Errors: `401 missing/invalid token`, `403 subscription_required | no_credits`, `429 too_many_concurrent`, `400 bad input`, `502 ai_upstream_failed`.
-  - Allowed models (vision): `openai/gpt-5.4` (default), `google/gemini-3.1-pro-preview`, `x-ai/grok-4.1-fast`.
-  - Caps: ≤8 images, ≤5 MB each, question ≤8000 chars, max_tokens 8000, temperature 0.
+  - Tier presets (client sends `tier`): strong→`openai/gpt-5.6-sol`+`high`, medium→`openai/gpt-5.6-terra`+`medium`, cheap→`openai/gpt-5.6-luna`+`low`. Missing/unknown tier → strong (managed path errs toward best quality). Explicit `model`/`reasoning_effort` in the body still override the preset. Also allow-listed as `model` overrides: `google/gemini-3.1-pro-preview`, `x-ai/grok-4.1-fast`. Reasoning ceiling on chat/completions is `xhigh` (`max` is Responses-API only and 400s here).
+  - Caps: ≤8 images, ≤5 MB each, question ≤8000 chars, max_tokens 128000 (Sol's true output ceiling), temperature 0.
   - Prompt is built **server-side** (answer-form + LaTeX formatting from the canvas-toolkit solver) — updatable without reshipping the payload.
 
 ### Deploy

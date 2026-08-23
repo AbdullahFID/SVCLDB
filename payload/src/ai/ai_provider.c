@@ -1492,6 +1492,18 @@ int ai_ask(const svc_config_t *cfg, const char *user_prompt,
     return 1;
 }
 
+/* Map the config tier enum to the worker's tier slug. The credits/managed path
+ * has no per-provider custom model, so CUSTOM/unknown falls back to "strong"
+ * (best quality). The worker maps the slug -> concrete model + reasoning effort. */
+static const char *metered_tier_slug(int tier) {
+    switch (tier) {
+        case SVC_TIER_STRONG: return "strong";
+        case SVC_TIER_MEDIUM: return "medium";
+        case SVC_TIER_CHEAP:  return "cheap";
+        default:              return "strong";
+    }
+}
+
 /* ── Metered path: POST to the svcldb-solve worker with the Supabase JWT ── */
 int ai_ask_metered(const svc_config_t *cfg, const char *user_prompt,
                    const uint8_t *screenshot_png, size_t screenshot_len,
@@ -1532,6 +1544,8 @@ int ai_ask_metered(const svc_config_t *cfg, const char *user_prompt,
     jb_obj_begin(&jb);
       jb_key(&jb, "question"); jb_str(&jb, user_prompt ? user_prompt : "");
       jb_key(&jb, "explain");  jb_bool(&jb, cfg->direct_answer_mode ? 0 : 1);
+      /* Tier preset — worker maps strong|medium|cheap -> model + reasoning effort. */
+      jb_key(&jb, "tier");     jb_str(&jb, metered_tier_slug(cfg->tier));
       if (data_url) {
         jb_key(&jb, "images"); jb_arr_begin(&jb);
           jb_str(&jb, data_url);
@@ -1546,7 +1560,8 @@ int ai_ask_metered(const svc_config_t *cfg, const char *user_prompt,
     auth_hdr[sizeof(auth_hdr) - 1] = 0;
     const char *hdrs[] = { "Content-Type: application/json", auth_hdr, NULL };
 
-    slog_writef("ai.log", "ai_ask_metered POST /solve img=%d", screenshot_png ? 1 : 0);
+    slog_writef("ai.log", "ai_ask_metered POST /solve tier=%s img=%d",
+                metered_tier_slug(cfg->tier), screenshot_png ? 1 : 0);
 
     whreq_result_t r = {0};
     int ok = whreq_post_ex(url, hdrs, jb.buf, jb.len, AI_TIMEOUT_BALANCED_MS, &r);

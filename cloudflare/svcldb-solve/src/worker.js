@@ -23,18 +23,48 @@
 
 import { createClient } from "@supabase/supabase-js";
 
+// Metered-path models (OpenRouter slugs). The client sends a `tier`
+// (strong|medium|cheap) and TIER_PRESETS maps it to a concrete model + reasoning
+// effort, so all model choices live here and can be retuned without reshipping
+// the payload. gemini-3.1-pro / grok stay allow-listed as vision alternates
+// (reachable only if a caller sends an explicit `model`).
+// NOTE: slugs here MUST exist on OpenRouter or the relay 502s (upstream 404).
+// `x-ai/grok-4.1-fast` was never a real OpenRouter slug (the 4.x line is
+// grok-4.3/4.5/4.6) — swapped to grok-4.6 so the alternate actually resolves.
 const ALLOWED_MODELS = new Set([
-  "openai/gpt-5.4",
-  "google/gemini-3.1-pro-preview",
-  "x-ai/grok-4.1-fast",
+  "openai/gpt-5.6-sol",             // STRONG / flagship
+  "openai/gpt-5.6-terra",           // MEDIUM / balanced (GPT-5.5-class, ~1/2 cost)
+  "openai/gpt-5.6-luna",            // CHEAP / fast (~1/5 cost)
+  "google/gemini-3.1-pro-preview",  // alternate (vision, frontier)
+  "x-ai/grok-4.6",                  // alternate (vision, fast)
 ]);
-const DEFAULT_MODEL = "openai/gpt-5.4";
+
+// Reasoning effort on the chat/completions path (what the relay uses). GPT-5.6
+// accepts none | low | medium | high | xhigh here; "max" is Responses-API-only
+// and 400s through chat/completions, so xhigh is the ceiling.
+const REASONING_EFFORTS = new Set(["none", "low", "medium", "high", "xhigh"]);
+
+// Tier -> (model, reasoning effort). Strong is OpenAI's flagship at high effort;
+// Medium/Cheap trade quality for credit-longevity + speed. Unknown/missing tier
+// falls back to Strong so the managed path always errs toward best quality.
+const TIER_PRESETS = {
+  strong: { model: "openai/gpt-5.6-sol",   reasoning_effort: "high"   },
+  medium: { model: "openai/gpt-5.6-terra", reasoning_effort: "medium" },
+  cheap:  { model: "openai/gpt-5.6-luna",  reasoning_effort: "low"    },
+};
+const DEFAULT_TIER = "strong";
 
 const MAX_IMAGES = 8;
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_QUESTION_CHARS = 8000;
-const MAX_TOKENS = 8000;
-const COST_FALLBACK = 0.02;
+// GPT-5.6 Sol's true OUTPUT ceiling is 128K tokens (1.05M ctx ≈ 922K in / 128K
+// out) — NOT the 1.05M context window. We cap at that max so reasoning + answer
+// never truncate. It's a CAP: normal exam answers spend a few hundred/thousand
+// tokens and only those are billed; the ceiling only bites a pathological runaway.
+const MAX_TOKENS = 128000;
+// Only used if OpenRouter omits usage.cost. Sol at high effort runs pricier than
+// the old gpt-5.4 default, so keep the safety-net estimate realistic.
+const COST_FALLBACK = 0.04;
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -156,9 +186,13 @@ export default {
 
     const question = typeof body.question === "string" ? body.question : "";
     const explain = body.explain === true;
-    const reasoningEffort = ["low", "medium", "high"].includes(body.reasoning_effort) ? body.reasoning_effort : null;
-    let model = typeof body.model === "string" && body.model.trim() ? body.model.trim() : DEFAULT_MODEL;
-    if (!ALLOWED_MODELS.has(model)) model = DEFAULT_MODEL;
+
+    // Tier preset selects model + effort; an explicit body.model / reasoning_effort
+    // still overrides it (kept for flexibility). Unknown/missing tier -> Strong.
+    const preset = TIER_PRESETS[body.tier] || TIER_PRESETS[DEFAULT_TIER];
+    let model = typeof body.model === "string" && body.model.trim() ? body.model.trim() : preset.model;
+    if (!ALLOWED_MODELS.has(model)) model = preset.model;
+    const reasoningEffort = REASONING_EFFORTS.has(body.reasoning_effort) ? body.reasoning_effort : preset.reasoning_effort;
 
     let images = Array.isArray(body.images) ? body.images.filter((s) => typeof s === "string" && s.length > 0) : [];
     if (images.length > MAX_IMAGES) return jsonRes({ error: "too_many_images", max: MAX_IMAGES }, 400);
@@ -205,7 +239,7 @@ export default {
         max_tokens: MAX_TOKENS,
         response_format,
       };
-      if (reasoningEffort) payload.reasoning = { effort: reasoningEffort };
+      payload.reasoning = { effort: reasoningEffort };
 
       const orRes = await relayToOpenRouter(env, payload);
       if (!orRes.ok) {
