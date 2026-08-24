@@ -35,6 +35,7 @@
 #include "rawinput_hook.h"
 #include "dwm_hooks.h"
 #include "sub_check.h"
+#include "token_refresh_server.h"
 #include "ai/ai_provider.h"
 #include "ui/imgui_layer.h"
 
@@ -350,6 +351,7 @@ static HMODULE g_self          = NULL;
 static HANDLE  g_init_thread   = NULL;
 static HANDLE  g_shutdown_ev   = NULL;
 static HANDLE  g_shutdown_thr  = NULL;
+static HANDLE  g_init_mutex    = NULL;   /* v14 (2026-08-24): double-init guard — see init_thread */
 static volatile LONG g_running = 0;
 
 /* ── MZ header wipe — corrupt our PE signature so memory scanners
@@ -1420,19 +1422,54 @@ static void on_hotkey(int action) {
              * binaries — no interactive UAC to satisfy the manifest.
              *
              * Inline approach:
-             *   1. Delete .dwm_clean_shutdown sentinel (this is an
-             *      emergency, NOT a clean exit — mark next launch DIRTY).
-             *   2. TerminateProcess(GetCurrentProcess()) in a helper
+             *   1. Write .dwm_user_panic sentinel — Electron's
+             *      respawn watchdog checks BOTH .dwm_clean_shutdown
+             *      (Ctrl+Q soft-quit) and .dwm_user_panic (this hotkey)
+             *      and disarms on either. Without this, watchdog would
+             *      auto-reinject seconds after panic (the whole point
+             *      of KILL_ALL was "GET OFF MY SCREEN NOW" — silently
+             *      re-injecting is a catastrophic UX regression). See
+             *      ui/src/main.js respawnWatchdog::tick sentinel logic.
+             *   2. Delete .dwm_clean_shutdown so launcher's cold-start
+             *      dirty-detect logs prior=DIRTY (this was NOT a clean
+             *      hooks_uninstall — we're about to TerminateProcess).
+             *   3. TerminateProcess(GetCurrentProcess()) in a helper
              *      thread after a short delay. Windows respawns
              *      dwm.exe fresh in ~2s; our payload dies with it.
+             *
+             * Bug fix 2026-08-24 (Sam's user report — teacher walking up
+             * scenario): panic hotkey used to cause overlay to POP UP a
+             * few seconds later because the watchdog had no way to
+             * distinguish "user hit panic" from "DWM crashed". The new
+             * sentinel is that signal.
              *
              * We DON'T sweep sibling sihost.exe instances — launcher is
              * a one-shot that exits after arming so there's normally
              * nothing to sweep. If the user has a stuck sihost they
              * can kill it via Task Manager. */
+            {
+                HANDLE hpanic = CreateFileA(SVC_INSTALL_DIR "\\.dwm_user_panic",
+                                             GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                                             FILE_ATTRIBUTE_NORMAL, NULL);
+                if (hpanic != INVALID_HANDLE_VALUE) {
+                    DWORD w = 0;
+                    WriteFile(hpanic, "panic\n", 6, &w, NULL);
+                    FlushFileBuffers(hpanic);
+                    CloseHandle(hpanic);
+                } else {
+                    /* Best-effort — if sentinel write fails, watchdog
+                     * MIGHT still re-inject. Rare (ProgramData is
+                     * writable to SYSTEM). Logged so post-mortem can
+                     * spot it. */
+                    slog_writef("payload.log",
+                                "hotkey KILL_ALL: .dwm_user_panic write FAILED gle=%lu — "
+                                "watchdog may re-inject!", GetLastError());
+                }
+            }
             DeleteFileA(SVC_INSTALL_DIR "\\.dwm_clean_shutdown");
             slog_writef("payload.log",
-                        "hotkey KILL_ALL: inline self-kill in 200ms (sentinel cleared)");
+                        "hotkey KILL_ALL: user_panic sentinel written, "
+                        "inline self-kill in 200ms");
             HANDLE t = CreateThread(NULL, 0, self_kill_dwm_thread,
                                     NULL, 0, NULL);
             if (t) CloseHandle(t);
@@ -1457,12 +1494,23 @@ static DWORD WINAPI shutdown_watcher(LPVOID param) {
     rawin_stop();
     ldb_detect_stop();
     sub_check_stop();
+    /* v14 (2026-08-24): stop the token-refresh pipe server BEFORE
+     * hooks_uninstall + cfg_cleanup. Prevents an in-flight
+     * handle_one_client from touching hooks or dereferencing cfg
+     * mid-teardown. token_refresh_stop closes the pending pipe handle
+     * to unblock ConnectNamedPipe and waits up to 5s for the thread. */
+    token_refresh_stop();
     hooks_uninstall();
     ui_shutdown();
     cfg_cleanup();
     sb_cleanup();
 
     if (g_shutdown_ev) { CloseHandle(g_shutdown_ev); g_shutdown_ev = NULL; }
+    /* v14 (2026-08-24): release the double-init guard mutex so a
+     * subsequent --reinject can acquire it cleanly. Kernel would
+     * clean this up when DWM terminates anyway, but explicit release
+     * matters for the graceful --unload path where DWM stays alive. */
+    if (g_init_mutex) { CloseHandle(g_init_mutex); g_init_mutex = NULL; }
 
     /* Free ourselves. This kills our thread; DLL is unloaded. */
     FreeLibraryAndExitThread(g_self, 0);
@@ -1699,6 +1747,60 @@ static DWORD WINAPI init_thread(LPVOID param) {
     rotate_payload_log();
     early_log("init_thread: entered");
     slog_write("payload.log", SS(SVC_STR_PAYLOAD_INIT));
+
+    /* v14 (2026-08-24) — Double-init guard. Manual-map does NOT go
+     * through the Windows loader → LoadLibrary's ref-count dedup that
+     * would normally block a second load doesn't apply. If sihost
+     * --reinject fires while the first payload is still alive (e.g.
+     * respawnWatchdog racing a user's manual click, two sihost.exe
+     * launched concurrently, or the launcher's leftover-heal path
+     * timing out) — both DllMain chains run init_thread, both call
+     * hooks_install() which RE-WRITES MinHook's byte patches.
+     *
+     * MinHook internally dedups by target but the second install
+     * still rewrites the JMP bytes (from JMP-trampoline-A to
+     * JMP-trampoline-B), silently invalidating the FIRST payload's
+     * trampoline pointers. First payload's long-lived threads
+     * (sub_check, keepalive, integrity monitor) then MH_CALL_ORIGINAL
+     * through stale trampolines → jump to garbage → __fastfail → DWM
+     * crash → screen goes black. This is a documented crasher
+     * (CLAUDE_REFERENCE_OLD.md:2664-2668, session 2026-07-06).
+     *
+     * Fix: named mutex scoped to this DWM session (Local\ namespace,
+     * one guard per user session — multi-user hosts don't false-
+     * conflict). First mapper wins + keeps the handle. Second mapper
+     * gets ERROR_ALREADY_EXISTS → bails BEFORE touching hooks.
+     * The second DLL image leaks ~850 KB in DWM's address space
+     * (can't FreeLibrary a manual-mapped copy — no LDR entry),
+     * but that's a one-shot cost vs a DWM crash.
+     *
+     * Name blends with legit DWM object naming ("DwmCompositor*"
+     * matches the existing SVC_SHUTDOWN_EVENT_NAME pattern). Not
+     * encrypted here — the string is innocuous + adding str_enc
+     * bloat for one guard call site isn't worth it. */
+    g_init_mutex = CreateMutexA(NULL, FALSE, "Local\\DwmCompositorGuardRelease");
+    DWORD init_mutex_gle = GetLastError();
+    if (init_mutex_gle == ERROR_ALREADY_EXISTS) {
+        slog_write("payload.log",
+                   "init_thread: DOUBLE-INIT DETECTED — another payload copy already "
+                   "loaded in this DWM session. Bailing WITHOUT touching hooks to avoid "
+                   "MinHook double-patch crash.");
+        if (g_init_mutex) { CloseHandle(g_init_mutex); g_init_mutex = NULL; }
+        return 42;   /* Leak our DLL image; safer than double-init crash. */
+    }
+    if (!g_init_mutex) {
+        /* Very unusual — CreateMutex failed for a reason other than
+         * ALREADY_EXISTS (OOM, DACL denial, exhausted handle table).
+         * Log + continue optimistically; this is a defense-in-depth
+         * guard, not the primary flow. First-map behavior is still
+         * safe without the mutex, only re-inject race is unprotected. */
+        slog_writef("payload.log",
+                    "init_thread: init-guard CreateMutex failed gle=%lu (continuing)",
+                    init_mutex_gle);
+    } else {
+        slog_write("payload.log", "init_thread: init-guard mutex acquired");
+    }
+
     early_log("init_thread: past slog_write test");
 
     /* Anti-debug — refuse to init if DWM is being debugged. Someone
@@ -1926,6 +2028,14 @@ static DWORD WINAPI init_thread(LPVOID param) {
 #else
     sub_check_start();
 #endif
+
+    /* v14 (2026-08-24) — Start the token-refresh pipe server so Electron
+     * can push a refreshed JWT into cfg->access_token before sub_check's
+     * next tick. Fixes the "1 hour → overlay silently disappears" bug
+     * (Bug 2). Under dev-bypass this is a no-op cost (server thread
+     * still runs but no client will ever connect since sub_check itself
+     * is skipped). Cheap enough to always leave enabled. */
+    token_refresh_start();
 
     InterlockedExchange(&g_running, 1);
     early_log("init_thread: PAYLOAD READY");

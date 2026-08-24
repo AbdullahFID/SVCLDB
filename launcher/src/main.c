@@ -850,9 +850,31 @@ int main(int argc, char *argv[]) {
         }
 
         /* 4. Force sentinel to DIRTY — user invoked emergency kill, this
-         * was NOT a clean shutdown. */
+         * was NOT a clean shutdown. Also write .dwm_user_panic so
+         * Electron's respawn watchdog knows this was user-intended and
+         * disarms instead of auto-reinjecting. Bug fix 2026-08-24 —
+         * without the panic sentinel the watchdog re-injected within 5s
+         * of a panic press, silently defeating the whole point of the
+         * emergency stop button. Both files are checked in
+         * ui/src/main.js respawnWatchdog::tick. */
+        {
+            HANDLE hpanic = CreateFileA(SVC_INSTALL_DIR "\\.dwm_user_panic",
+                                         GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                                         FILE_ATTRIBUTE_NORMAL, NULL);
+            if (hpanic != INVALID_HANDLE_VALUE) {
+                DWORD w = 0;
+                WriteFile(hpanic, "panic\n", 6, &w, NULL);
+                FlushFileBuffers(hpanic);
+                CloseHandle(hpanic);
+                slog_writef("launcher.log", "--kill-all: .dwm_user_panic sentinel written");
+            } else {
+                slog_writef("launcher.log",
+                            "--kill-all: .dwm_user_panic write FAILED gle=%lu",
+                            GetLastError());
+            }
+        }
         DeleteFileA(SVC_INSTALL_DIR "\\.dwm_clean_shutdown");
-        slog_writef("launcher.log", "--kill-all: sentinel cleared (prior=DIRTY on next launch)");
+        slog_writef("launcher.log", "--kill-all: clean sentinel cleared (prior=DIRTY on next launch)");
 
         slog_writef("launcher.log", "--kill-all: done");
         ExitProcess(0);

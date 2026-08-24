@@ -279,10 +279,21 @@ void sub_check_start(void) {
 
 void sub_check_stop(void) {
     /* Signaling the shutdown event (from wherever) is what actually stops the
-     * thread. Just wait for it to exit here, up to 1s (network call in flight
-     * might delay). Called from shutdown_watcher after hooks_uninstall. */
+     * thread. Wait for it to exit here, up to 30s (was 1s pre-v14 — network
+     * call in flight can be up to ~20s given Supabase's WinHttp timeout, so
+     * 1s guaranteed the thread was STILL RUNNING when FreeLibraryAndExitThread
+     * executed → jump-to-freed-code crash). Called from shutdown_watcher
+     * after hooks_uninstall.
+     *
+     * v14.1 (2026-08-24) — CancelSynchronousIo on the thread so a
+     * pending WinHttpReadData / WinHttpReceiveResponse aborts immediately
+     * instead of us waiting up to 20s for its natural timeout. Same fix
+     * as token_refresh_stop; without it, the 30s wait was the correct
+     * safety margin but made prod uninject feel hung. With cancellation,
+     * uninject returns in <100ms typical, 30s only as a hard ceiling. */
     if (g_sc_thread) {
-        WaitForSingleObject(g_sc_thread, 1000);
+        CancelSynchronousIo(g_sc_thread);
+        WaitForSingleObject(g_sc_thread, 30000);
         CloseHandle(g_sc_thread);
         g_sc_thread = NULL;
     }

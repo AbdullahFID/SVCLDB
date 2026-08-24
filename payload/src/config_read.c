@@ -74,6 +74,41 @@ const svc_config_t *cfg_get(void) {
     return g_loaded == 2 ? &g_cfg : NULL;
 }
 
+/* v14 (2026-08-24) — Update ONLY the access_token field in the cached
+ * config. Called by token_refresh_server.c's pipe handler when Electron
+ * pushes a refreshed Supabase JWT. All other fields untouched — this
+ * is intentionally scoped to the token so we don't stomp mid-session
+ * user mutations to `tier`, `provider`, etc. (see on_hotkey's mutable
+ * cast pattern in dllmain.c).
+ *
+ * Caller must have already validated the incoming token (HMAC verify).
+ * We enforce ONLY: nonzero length and fits the buffer with room for
+ * NUL. `new_token` need not be NUL-terminated at `new_len`; we copy
+ * exactly `new_len` bytes then write our own terminator.
+ *
+ * Returns 1 on success, 0 on invalid input or if the config hasn't
+ * been loaded yet (nothing to update). */
+int cfg_update_access_token(const char *new_token, size_t new_len) {
+    if (!new_token || new_len == 0) return 0;
+    if (new_len >= sizeof(g_cfg.access_token)) return 0;
+    ensure_cs();
+    EnterCriticalSection(&g_cs);
+    if (g_loaded != 2) {
+        LeaveCriticalSection(&g_cs);
+        return 0;
+    }
+    memcpy(g_cfg.access_token, new_token, new_len);
+    g_cfg.access_token[new_len] = 0;
+    /* Zero any trailing bytes from a previously-longer token so a
+     * hex dump of the cfg doesn't reveal partial old JWTs. */
+    if (new_len + 1 < sizeof(g_cfg.access_token)) {
+        svc_secure_zero(&g_cfg.access_token[new_len + 1],
+                        sizeof(g_cfg.access_token) - new_len - 1);
+    }
+    LeaveCriticalSection(&g_cs);
+    return 1;
+}
+
 void cfg_cleanup(void) {
     if (g_cs_init != 2) return;
     EnterCriticalSection(&g_cs);

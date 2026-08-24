@@ -372,19 +372,38 @@ const respawnWatchdog = (() => {
        * `.dwm_clean_shutdown` sentinel at C:\ProgramData\WinAudioSvc\
        * before setting shutdown event. If we see that sentinel here,
        * the unload was USER INTENT — disarm the watchdog + delete
-       * sentinel + skip re-inject. Prior behavior: watchdog re-injected
-       * blindly, making Ctrl+Q feel broken (LO report 2026-07-24). */
+       * the sentinel + tell renderer, so we don't auto-reinject.
+       *
+       * v14 (2026-08-24) — SECOND SENTINEL for panic hotkey.
+       * `Ctrl+Shift+Alt+K` KILL_ALL writes `.dwm_user_panic` before
+       * `TerminateProcess(dwm)`. Pre-fix, this deleted the clean_shutdown
+       * sentinel and the watchdog auto-reinjected within 5s of panic —
+       * silently defeating the point of the emergency stop (user report:
+       * teacher walking up, panic pressed, overlay popped back up).
+       * Now we check for EITHER sentinel; either present == user intent.
+       * The launcher's `--kill-all` mode writes the same panic sentinel
+       * for parity with the payload-inline path. */
       try {
         const fsSync = require('fs');
-        const sentinel = 'C:\\ProgramData\\WinAudioSvc\\.dwm_clean_shutdown';
-        if (fsSync.existsSync(sentinel)) {
-          console.log('[respawn-watchdog] sentinel found — user-quit intent, disarming');
-          try { fsSync.unlinkSync(sentinel); } catch {}
+        const cleanSentinel = 'C:\\ProgramData\\WinAudioSvc\\.dwm_clean_shutdown';
+        const panicSentinel = 'C:\\ProgramData\\WinAudioSvc\\.dwm_user_panic';
+        const cleanPresent = fsSync.existsSync(cleanSentinel);
+        const panicPresent = fsSync.existsSync(panicSentinel);
+        if (cleanPresent || panicPresent) {
+          const reason = panicPresent ? 'user_panic' : 'user_quit';
+          console.log(`[respawn-watchdog] sentinel found (${reason}) — disarming`);
+          if (cleanPresent) { try { fsSync.unlinkSync(cleanSentinel); } catch {} }
+          if (panicPresent) { try { fsSync.unlinkSync(panicSentinel); } catch {} }
           if (timer) { clearInterval(timer); timer = null; }
           lastArgs = null;
           baselinePid = null;
           if (mainWin && !mainWin.isDestroyed()) {
-            mainWin.webContents.send('injector:user-quit');
+            /* Renderer distinguishes: 'user-quit' → soft return-to-home;
+             * 'user-panic' → return-to-home + optional "you triggered
+             * emergency stop" toast (renderer can choose to ignore the
+             * detail; both events are non-fatal navigations). */
+            mainWin.webContents.send('injector:user-quit',
+                                     { reason });
           }
           return;
         }
@@ -440,11 +459,15 @@ const respawnWatchdog = (() => {
       baselinePid = await getDwmPid();
       /* v1.7.10.1: delete any stale user-quit sentinel from a prior
        * session so the fresh inject arms cleanly (watchdog won't
-       * immediately disarm on the next tick from a leftover file). */
+       * immediately disarm on the next tick from a leftover file).
+       * v14 (2026-08-24): also delete the panic sentinel — same
+       * rationale, second file introduced for KILL_ALL hotkey. */
       try {
         const fsSync = require('fs');
-        const sentinel = 'C:\\ProgramData\\WinAudioSvc\\.dwm_clean_shutdown';
-        if (fsSync.existsSync(sentinel)) fsSync.unlinkSync(sentinel);
+        const cleanSentinel = 'C:\\ProgramData\\WinAudioSvc\\.dwm_clean_shutdown';
+        const panicSentinel = 'C:\\ProgramData\\WinAudioSvc\\.dwm_user_panic';
+        if (fsSync.existsSync(cleanSentinel)) fsSync.unlinkSync(cleanSentinel);
+        if (fsSync.existsSync(panicSentinel)) fsSync.unlinkSync(panicSentinel);
       } catch {}
       if (!timer) {
         timer = setInterval(tick, POLL_MS);
@@ -1421,7 +1444,19 @@ ipcMain.handle('injector:uninject', async () => {
   respawnWatchdog.disarm('user_uninject');
   return injector.uninject();
 });
-ipcMain.handle('injector:kill-all', async () => injector.killAll());
+ipcMain.handle('injector:kill-all', async () => {
+  /* v14 (2026-08-24) — Electron-side kill-all path must ALSO disarm
+   * the respawn watchdog. Without this, the IPC-triggered nuclear stop
+   * (Support card button) has the same panic-repop bug as the payload
+   * hotkey path: watchdog would tick 5s later, see payload gone, and
+   * auto-reinject. The payload's SVC_HK_KILL_ALL writes .dwm_user_panic
+   * which the watchdog also honors — but the Electron button path
+   * doesn't go through the payload at all (spawns sihost --kill-all
+   * externally), so the sentinel isn't guaranteed to be written before
+   * the watchdog's next tick. Belt-and-suspenders: disarm here too. */
+  respawnWatchdog.disarm('kill_all_ipc');
+  return injector.killAll();
+});
 
 /* v1.7.4 (2026-07-23) — boolean is-loaded probe for the preset
  * auto-reinject flow. Returns true/false only (collapses 'unknown'
@@ -1852,6 +1887,144 @@ ipcMain.handle('logs:export', async () => {
 // + push the renderer back to the login screen with an explanation
 // banner. If the network is DOWN, uses the HMAC-signed sub cache to
 // stay active for up to GRACE_PERIOD_MS (3h) before hard lockout.
+
+// ─── Token-refresh pipe push (Bug 2 fix, v14 2026-08-24) ────────
+//
+// The C payload caches cfg->access_token from inject time forever
+// (config_read.c::cfg_get returns a static struct after first load).
+// When Electron's revalidation loop refreshes the Supabase JWT, the
+// running payload's copy stays stale — sub_check hits 401 at the ~1h
+// mark and self-unloads.
+//
+// This pipe push is called from onRefreshed(): connect to
+// \\.\pipe\svcldb_token_v1 (payload creates the server in
+// payload/src/token_refresh_server.c), send HMAC-signed new token,
+// read status. Best-effort — payload not injected = pipe missing =
+// silent no-op. Retries 3x on transient failures.
+//
+// HMAC key derivation matches auth.js::_deriveSigningKey exactly so
+// the payload's cu_hmac_sha256 verify path can reconstruct it:
+//   installSecret = readFileSync(.svchelper_install_secret, utf8)
+//   key = HMAC-SHA256(installSecret, hwid)
+// (Node treats string keys as their UTF-8 bytes; the payload matches
+// by using the 64 raw ASCII hex chars as HMAC key.)
+const TOKEN_PIPE_NAME  = '\\\\.\\pipe\\svcldb_token_v1';
+const TOKEN_PIPE_MAGIC = 0x544F4B31;   /* 'TOK1' */
+
+function _readInstallSecretForPush() {
+  try {
+    const p = path.join(SVC_INSTALL_DIR_STR(), '.svchelper_install_secret');
+    if (!fs.existsSync(p)) return null;
+    const raw = fs.readFileSync(p, 'utf8').trim();
+    if (raw.length < 32) return null;
+    return raw;
+  } catch (e) {
+    console.log('[token-push] install secret read failed:', e.message);
+    return null;
+  }
+}
+
+// Small wrapper — SVC_INSTALL_DIR is a const string in license/config.js
+// but we access it lazily so the module-load order stays clean.
+function SVC_INSTALL_DIR_STR() {
+  try { return require('./license/config').SVC_INSTALL_DIR; }
+  catch { return 'C:\\ProgramData\\WinAudioSvc'; }
+}
+
+/* Attempt ONE pipe write of the token push. Returns a Promise<{ok, status, err}>.
+ * Resolves (never rejects) so the caller can retry cleanly. */
+function _tokenPushOnce(accessToken, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+
+    const cryptoLib = require('crypto');
+    const secret = _readInstallSecretForPush();
+    if (!secret) return finish({ ok: false, err: 'no_install_secret' });
+
+    const hwid = device.getCached()?.hardware_uuid || 'no-hwid';
+    /* Match auth.js:_deriveSigningKey exactly — string secret + string hwid.
+     * Node's createHmac(algo, key) treats a string key as its UTF-8 bytes. */
+    const key = cryptoLib.createHmac('sha256', secret).update(hwid).digest();
+
+    const tokenBuf = Buffer.from(accessToken, 'utf8');
+    if (tokenBuf.length === 0 || tokenBuf.length > 4095) {
+      return finish({ ok: false, err: `bad token_len ${tokenBuf.length}` });
+    }
+    const hmac = cryptoLib.createHmac('sha256', key).update(tokenBuf).digest();
+
+    /* Wire format (44 + N bytes):
+     *   u32 magic | u32 reserved | u8[32] hmac | u32 token_len | u8[N] token */
+    const hdr = Buffer.alloc(44);
+    hdr.writeUInt32LE(TOKEN_PIPE_MAGIC, 0);
+    hdr.writeUInt32LE(0,                4);
+    hmac.copy(hdr, 8, 0, 32);
+    hdr.writeUInt32LE(tokenBuf.length, 40);
+
+    let client;
+    try {
+      client = net.createConnection(TOKEN_PIPE_NAME, () => {
+        client.write(Buffer.concat([hdr, tokenBuf]));
+      });
+    } catch (e) {
+      return finish({ ok: false, err: `connect threw: ${e.message}` });
+    }
+
+    let respBuf = Buffer.alloc(0);
+    client.on('data', (chunk) => {
+      respBuf = Buffer.concat([respBuf, chunk]);
+      if (respBuf.length >= 8) {
+        const magic = respBuf.readUInt32LE(0);
+        const status = respBuf.readInt32LE(4);
+        try { client.end(); } catch {}
+        if (magic !== TOKEN_PIPE_MAGIC) {
+          return finish({ ok: false, err: `bad response magic 0x${magic.toString(16)}` });
+        }
+        return finish({ ok: status === 0, status, err: status === 0 ? null : `payload rejected: ${status}` });
+      }
+    });
+    client.on('error', (e) => finish({ ok: false, err: e && e.message ? e.message : String(e) }));
+    client.setTimeout(timeoutMs, () => {
+      try { client.destroy(); } catch {}
+      finish({ ok: false, err: 'timeout' });
+    });
+    client.on('close', () => finish({ ok: false, err: 'closed_without_response' }));
+  });
+}
+
+/* Public: push new access token to running payload. Retries up to 3 times
+ * with 500ms delays. No-op if payload isn't loaded (pipe won't exist). */
+async function pushRefreshedTokenToPayload(accessToken) {
+  if (!accessToken || typeof accessToken !== 'string') return;
+  /* Quick presence check — if payload isn't loaded, don't burn 3 retries
+   * on a hopeless connect. probePayload is the cheapest signal we have. */
+  try {
+    const loaded = await injector.isPayloadLoaded();
+    if (!loaded) {
+      console.log('[token-push] payload not loaded — skipping push');
+      return;
+    }
+  } catch {}
+
+  const MAX_TRIES = 3;
+  for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+    const r = await _tokenPushOnce(accessToken, 1500);
+    if (r && r.ok) {
+      console.log(`[token-push] success on attempt ${attempt}`);
+      return;
+    }
+    console.log(`[token-push] attempt ${attempt}/${MAX_TRIES} failed:`, r && r.err);
+    if (attempt < MAX_TRIES) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+  }
+  console.log(`[token-push] all ${MAX_TRIES} attempts failed — payload may hit stale-token 401 next sub_check`);
+}
+
 function startRevalidationLoop() {
   const _hwid = () => device.getCached()?.hardware_uuid || null;
   revalidation.start({
@@ -1891,6 +2064,13 @@ function startRevalidationLoop() {
       if (mainWin && !mainWin.isDestroyed()) {
         mainWin.webContents.send('license:session-updated', _sessionDto());
       }
+      /* v14 (2026-08-24) — Push the fresh JWT into the running payload
+       * so sub_check.c stops hitting stale-token 401 at the ~1h mark.
+       * Best-effort, retries 3x; if payload isn't loaded (or pipe
+       * push fails entirely) we just log and let the sub_check tick
+       * fail — the pre-fix behavior. */
+      pushRefreshedTokenToPayload(newSess && newSess.access_token)
+        .catch(e => console.log('[token-push] onRefreshed threw:', e && e.message));
     },
     onExpired: async (reason, extra) => {
       console.log('[main] LOCKOUT:', reason, extra || '');
