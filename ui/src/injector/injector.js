@@ -21,48 +21,85 @@ const {
   SVC_INSTALL_DIR, LAUNCHER_EXE, SVC_SHUTDOWN_EVENT,
 } = require('../license/config');
 
-// ─── Injected-status probe via PowerShell + OpenEvent ────────────
+// ─── Injected-status probe ───────────────────────────────────────
 //
-// Node.js has no built-in Win32 kernel-object bindings, and pulling
-// in koffi just for a single OpenEvent call would inflate the
-// installer by ~15 MB. Instead: spawn a tiny PowerShell one-liner
-// that does the OpenEvent call via P/Invoke. Result: 200-500 ms
-// per poll (acceptable — we only poll every 2 s or on demand).
+// Existence of the payload's Global\ shutdown event == payload alive.
 //
-// v1.6.5 (2026-07-17): three-state return.
-//   'yes'     — payload is loaded (OpenEvent succeeded)
-//   'no'      — payload is definitively unloaded (OpenEvent returned NULL)
-//   'unknown' — probe itself failed (PowerShell spawn error, timeout,
-//               EDR interference). Callers (esp. respawnWatchdog) MUST
-//               NOT trigger re-inject on 'unknown' — that caused
-//               unnecessary re-injects when WSAC / AV intermittently
-//               blocked our PowerShell probe.
+// Tri-state contract: 'yes' / 'no' / 'unknown'.
+//   'yes'     — payload is loaded (event exists)
+//   'no'      — payload is definitively unloaded (event does not exist)
+//   'unknown' — the probe ITSELF failed (spawn error, timeout, EDR/AV
+//               interference, WDAC Constrained-Language-Mode). Callers
+//               MUST NOT treat 'unknown' as "not injected" — the
+//               respawn-watchdog skips re-inject on it, and main.js
+//               latches the last DEFINITIVE state so the dashboard never
+//               flips a live overlay to "Payload: Not Injected".
 //
-// isPayloadLoaded() (boolean) retained as a thin wrapper for callers
-// that only need "definitely loaded" — 'unknown' collapses to false
-// there, so downstream boolean-consumers get the safe default. The
-// watchdog uses probePayload() (tri-state) for its re-inject decision.
+// v1.9.1 (2026-09-04): robustness overhaul. The OLD probe spawned
+// PowerShell + `Add-Type` — which compiles C# via csc.exe, writes a
+// temp assembly, gets AMSI-scanned, THEN P/Invokes OpenEventA. On a
+// freshly-installed box (Defender still real-time-scanning every new
+// powershell/csc spawn, exclusions not yet effective) that round-trip
+// readily blew the 5 s timeout → 'unknown'; and on WDAC/AppLocker boxes
+// `Add-Type` is blocked outright by Constrained Language Mode. Both
+// were then collapsed to "not injected" — the app said NOT INJECTED
+// while the overlay was very much alive. Worst on the NSIS one-click /
+// `irm|iex` installs (Defender exclusion + watchdog + status polls all
+// contending right after install); occasionally on manual zip too.
+//
+// New probe, in order of preference:
+//   1. NATIVE  — spawn `sihost.exe --status`. The launcher does the
+//      OpenEvent in C and exits 0 (loaded) / 3 (not loaded). sihost is
+//      Defender-excluded + trusted → NO powershell/csc/AMSI/CLM surface.
+//      ~10-50 ms. This is the primary path.
+//   2. POWERSHELL fallback — `[System.Threading.EventWaitHandle]::
+//      OpenExisting`. Pure .NET, NO Add-Type/csc compile, so it is fast
+//      and survives the Defender-scan window. Distinguishes a definite
+//      "not loaded" (WaitHandleCannotBeOpenedException) from an
+//      indeterminate failure. Used only if sihost is missing / returns
+//      an unexpected code.
+//   3. 'unknown' — every probe failed.
+//
+// Co-deployment invariant that keeps step 1 safe: main.js::
+// ensureCBinariesInstalled() mirrors the bundled sihost.exe into
+// SVC_INSTALL_DIR at the very top of app.whenReady() — before the
+// renderer ever polls status — so `--status` always reaches a launcher
+// build that understands it (an older launcher would treat an unknown
+// arg as a legacy arm request).
 async function probePayload() {
+  const viaNative = await _probeViaLauncher();
+  if (viaNative === 'yes' || viaNative === 'no') return viaNative;
+  return _probeViaPowershell();
+}
+
+// Native probe: `sihost.exe --status` → exit 0 (loaded) / 3 (not loaded).
+function _probeViaLauncher() {
   return new Promise((resolve) => {
+    const exePath = path.join(SVC_INSTALL_DIR, LAUNCHER_EXE);
+    if (!fs.existsSync(exePath)) { resolve('unknown'); return; }
+    execFile(exePath, ['--status'],
+      { windowsHide: true, timeout: 4000 },
+      (err) => {
+        // execFile: err===null on exit 0; on a clean nonzero exit err.code
+        // is the numeric exit code; on spawn failure/timeout err.code is a
+        // string (ENOENT / ETIMEDOUT / …).
+        if (!err) { resolve('yes'); return; }        // exit 0 == loaded
+        if (err.code === 3) { resolve('no'); return; } // exit 3 == not loaded
+        resolve('unknown');                            // anything else → fall back
+      });
+  });
+}
+
+// Fallback probe: pure-.NET EventWaitHandle::OpenExisting (no Add-Type).
+function _probeViaPowershell() {
+  return new Promise((resolve) => {
+    const name = SVC_SHUTDOWN_EVENT.replace(/'/g, "''");
     const ps = `
-      $sig = @'
-        using System;
-        using System.Runtime.InteropServices;
-        public class E {
-          [DllImport("kernel32.dll", CharSet=CharSet.Ansi, SetLastError=true)]
-          public static extern IntPtr OpenEventA(uint access, bool inherit, string name);
-          [DllImport("kernel32.dll")]
-          public static extern bool CloseHandle(IntPtr h);
-        }
-'@
-      Add-Type -TypeDefinition $sig -Language CSharp -ErrorAction SilentlyContinue | Out-Null
-      $h = [E]::OpenEventA(0x0002, $false, '${SVC_SHUTDOWN_EVENT.replace(/'/g, "''")}')
-      if ($h -ne [IntPtr]::Zero) {
-        [E]::CloseHandle($h) | Out-Null
-        Write-Output 'YES'
-      } else {
-        Write-Output 'NO'
-      }
+      try {
+        $h = [System.Threading.EventWaitHandle]::OpenExisting('${name}')
+        $h.Close(); 'YES'
+      } catch [System.Threading.WaitHandleCannotBeOpenedException] { 'NO' }
+      catch { 'UNKNOWN' }
     `.trim();
     execFile('powershell.exe',
       ['-NoProfile', '-NonInteractive', '-Command', ps],

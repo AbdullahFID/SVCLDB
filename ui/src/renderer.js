@@ -93,6 +93,7 @@ let state = {
   subscription: null,
   hwid: null,
   injected: false,
+  payloadUnverified: false, // v1.9.1: probe returned 'unknown' with no latched state yet
   chosen_provider: null,   // 0 (auto) or 1..4
   chosen_tier: 1,          // 0..3
 };
@@ -1757,6 +1758,12 @@ async function _refreshStatus() {
   try {
     const s = await window.svc.injector.status();
     state.injected = !!s.payload_loaded;
+    // main.js already latches payload_loaded through transient 'unknown'
+    // probes; this flag only drives a neutral "verifying…" hint at cold
+    // start when there is no definitive read yet (e.g. a WDAC/Constrained-
+    // Language box or an AV scan storm) so we never show a false
+    // "Not Injected" while the overlay is actually alive.
+    state.payloadUnverified = (s.payload_state === 'unknown') && !s.payload_loaded;
   } catch (e) {
     console.log('[renderer] status failed:', e.message);
   }
@@ -1773,6 +1780,13 @@ function _renderStatus() {
     title.textContent = 'Payload: Active';
     sub.textContent = 'Overlay is armed. Hotkeys are live — Ctrl+Shift+Space to ask AI.';
     document.getElementById('btn-inject').disabled = true;
+    document.getElementById('btn-uninject').disabled = false;
+  } else if (state.payloadUnverified) {
+    // Probe couldn't get a definitive answer (locked-down PowerShell / AV
+    // scan). Do NOT claim "Not Injected" — that's the false-negative bug.
+    title.textContent = 'Payload: Verifying\u2026';
+    sub.textContent = 'Couldn\u2019t confirm the overlay state (locked-down PowerShell / AV scan). If your overlay is on screen, it\u2019s still running.';
+    document.getElementById('btn-inject').disabled = false;
     document.getElementById('btn-uninject').disabled = false;
   } else {
     title.textContent = 'Payload: Not Injected';

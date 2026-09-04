@@ -115,7 +115,7 @@ module.exports = {
   // an option to remove the old device.
   MAX_DEVICES: 1,
 
-  APP_VERSION: '1.9.0',
+  APP_VERSION: '1.9.1',
 
   // svcldb-specific install directory (must match shared/common.h
   // SVC_INSTALL_DIR).

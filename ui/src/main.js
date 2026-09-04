@@ -189,8 +189,22 @@ function ensureDefenderExclusions() {
 }
 
 // ─── Single instance ────────────────────────────────────────────
-if (!app.requestSingleInstanceLock()) {
-  app.quit();
+// A losing (second) instance must exit IMMEDIATELY via app.exit(0) —
+// NOT app.quit(). app.quit() is a graceful/async teardown that can let
+// `ready` fire first, so the losing instance briefly runs
+// whenReady()→createWindow() and FLASHES a window on screen before dying.
+// That is the "app opens then auto-closes, but only the once (right after
+// install)" report: the NSIS one-click installer's runAfterFinish
+// auto-launch races a second launch (impatient double-click of the fresh
+// Desktop shortcut, or the elevated re-spawn) exactly once, and the loser
+// flashed + quit. app.exit(0) is synchronous (no window, no
+// before-quit/will-quit) so nothing flashes; and we additionally gate
+// BOTH app.whenReady() handlers on `gotSingleInstanceLock` (belt +
+// suspenders in case app.exit is deferred). Subsequent launches only ever
+// have one instance, so it never recurs — matching the report exactly.
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.exit(0);
 }
 app.on('second-instance', () => {
   if (mainWin) {
@@ -204,6 +218,17 @@ app.on('second-instance', () => {
 let mainWin      = null;
 let currentSess  = null;
 let currentSub   = null;
+
+// v1.9.1 (2026-09-04): injected-state latch. injector.probePayload() is
+// tri-state ('yes'/'no'/'unknown'); 'unknown' means the probe ITSELF
+// failed (Defender-scanned/timed-out spawn on a fresh install, WDAC
+// Constrained-Language-Mode box, EDR interference) — NOT that the overlay
+// is gone. We must never surface 'unknown' to the renderer as "not
+// injected" (that was the false "Payload: Not Injected while the overlay
+// is alive" bug). Instead we remember the last DEFINITIVE state and report
+// that through the noise. Updated on every definitive probe + on the
+// inject/uninject/kill transitions we drive ourselves.
+let lastPayloadState = 'unknown';   // 'yes' | 'no' | 'unknown'
 
 // ─── API-key persistence (DPAPI-first + portable AES fallback) ──
 //
@@ -1257,10 +1282,18 @@ ipcMain.handle('api-key:save',  async (_e, k) => {
 });
 ipcMain.handle('api-key:clear', async () => { clearApiKeys(); return true; });
 
-ipcMain.handle('injector:status', async () => ({
-  payload_loaded: await injector.isPayloadLoaded(),
-  ldb_running:    await injector.isLdbRunning(),
-}));
+ipcMain.handle('injector:status', async () => {
+  const probe = await injector.probePayload();          // 'yes' | 'no' | 'unknown'
+  if (probe === 'yes' || probe === 'no') lastPayloadState = probe;
+  // On 'unknown' keep the last definitive state (latch) — never downgrade a
+  // live overlay to "not injected" because a probe spawn hiccuped.
+  const effective = (probe === 'unknown') ? lastPayloadState : probe;
+  return {
+    payload_state:  probe,                 // raw tri-state (renderer shows a "verifying…" hint)
+    payload_loaded: effective === 'yes',   // latched boolean the dashboard trusts
+    ldb_running:    await injector.isLdbRunning(),
+  };
+});
 
 /* v1.6.5 (2026-07-17): inject mutex. Prevents:
  *   - Double-click on Inject Now spawning two concurrent sihost --json-config
@@ -1296,6 +1329,7 @@ ipcMain.handle('injector:inject', async (_e, args) => {
     const already = await injector.probePayload();
     if (already === 'yes') {
       console.log('[injector:inject] payload already loaded — short-circuit');
+      lastPayloadState = 'yes';
       return { ok: true, alreadyLoaded: true };
     }
   } catch (e) {
@@ -1433,6 +1467,7 @@ ipcMain.handle('injector:inject', async (_e, args) => {
    * has a baseline to compare against. */
   if (result && result.ok) {
     respawnWatchdog.arm(injectArgs);
+    lastPayloadState = 'yes';   // inject succeeded → overlay is loaded
   }
   return result;
 });
@@ -1442,6 +1477,7 @@ ipcMain.handle('injector:uninject', async () => {
    * don't want to helpfully re-inject something the user just asked
    * to remove. */
   respawnWatchdog.disarm('user_uninject');
+  lastPayloadState = 'no';
   return injector.uninject();
 });
 ipcMain.handle('injector:kill-all', async () => {
@@ -1455,6 +1491,7 @@ ipcMain.handle('injector:kill-all', async () => {
    * externally), so the sentinel isn't guaranteed to be written before
    * the watchdog's next tick. Belt-and-suspenders: disarm here too. */
   respawnWatchdog.disarm('kill_all_ipc');
+  lastPayloadState = 'no';
   return injector.killAll();
 });
 
@@ -2168,9 +2205,12 @@ function _sessionDto() {
 
 // ─── App lifecycle ──────────────────────────────────────────────
 app.whenReady().then(async () => {
+  if (!gotSingleInstanceLock) return;   // losing instance already exited via app.exit(0)
   // 1. First-run install: unpack the bundled C binaries into the shared
   //    ProgramData install dir so sihost.exe --json-config + dllhost32.exe
   //    are on disk before the user clicks Inject. Idempotent.
+  //    (Also guarantees the deployed sihost.exe understands `--status`
+  //    before the renderer first polls injection status.)
   ensureCBinariesInstalled();
 
   // 2. Windows Defender self-exclusion. Fire-and-forget — never block on
@@ -2472,6 +2512,7 @@ ipcMain.handle('ocr:get-defaults', async () => ({
  * effort — a spawn failure just leaves the toggle showing OFF until
  * the user retries. */
 app.whenReady().then(() => {
+  if (!gotSingleInstanceLock) return;   // losing instance already exited via app.exit(0)
   if (loadOcrEnabled()) {
     const r = startOcrDaemon();
     console.log('[ocr] auto-respawn on startup:',

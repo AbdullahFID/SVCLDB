@@ -592,6 +592,7 @@ int main(int argc, char *argv[]) {
     int reinject_mode = 0;   /* skip config regen; use existing config.dat */
     int json_config_mode = 0;
     int ocr_daemon_mode = 0; /* stay resident, serve OCR redaction over pipe */
+    int status_mode = 0;     /* read-only "is payload injected?" probe */
     const char *json_config_path = NULL;
 #if SVCLDB_DEV_BYPASS_AUTH
     /* v1.7.4.10 (2026-07-24): --custom-dll <path> — dev-only. Manual-
@@ -613,6 +614,12 @@ int main(int argc, char *argv[]) {
             quiet_mode = 1;
         } else if (strcmp(argv[i], "--kill-all") == 0) {
             kill_all_mode = 1;
+            quiet_mode = 1;
+        } else if (strcmp(argv[i], "--status") == 0) {
+            /* Read-only injected-state probe for the Electron status poll.
+             * Handled EARLY (below), before the elevation gate and before
+             * any arm path — pure OpenEvent, zero side effects. */
+            status_mode = 1;
             quiet_mode = 1;
 #if SVCLDB_DEV_BYPASS_AUTH
         } else if (strcmp(argv[i], "--custom-dll") == 0 && i + 1 < argc) {
@@ -657,6 +664,20 @@ int main(int argc, char *argv[]) {
     svc_str_init();
 
     slog_launcher("=== launcher start ===");
+
+    /* ── --status: read-only injected-state probe (Electron status poll) ──
+     * Existence of the payload's Global\ shutdown event == overlay alive.
+     * Exit 0 == loaded, 3 == not loaded. Handled here, BEFORE the elevation
+     * gate, the production launch-lockdown gate, and every arm path, so a
+     * status poll can NEVER trigger OAuth / subscription-check / inject and
+     * needs no elevation — it is a pure OpenEvent(SYNCHRONIZE). This is the
+     * robust, PowerShell-free probe the Electron injector prefers; see
+     * ui/src/injector/injector.js probePayload(). */
+    if (status_mode) {
+        int loaded = inject_is_loaded();
+        slog_writef("launcher.log", "--status: loaded=%d", loaded);
+        ExitProcess(loaded ? 0 : 3);
+    }
 
     if (!is_elevated()) {
         if (quiet_mode) {
