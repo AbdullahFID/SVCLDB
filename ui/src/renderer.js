@@ -2991,9 +2991,9 @@ function _obSteps() {
       body: `
         <p>On the dashboard\'s <b>API keys</b> card, paste keys for one or more providers:</p>
         <ul>
-          <li><b>OpenAI</b> — GPT-5.6 family (Sol / Terra / Luna)</li>
-          <li><b>Anthropic</b> — Claude Opus 5, Sonnet 5, Haiku 4.5</li>
-          <li><b>Google</b> — Gemini 3.1 Pro, 3.6 Flash, 3.5 Flash-Lite</li>
+          <li><b>OpenAI</b> — GPT-6 Astra (Strong) + GPT-5.6 Terra / Luna</li>
+          <li><b>Anthropic</b> — Claude Fable 5.1, Sonnet 5, Haiku 4.5</li>
+          <li><b>Google</b> — Gemini 3.1 Pro, 3.8 Flash, 3.5 Flash-Lite</li>
           <li><b>OpenRouter</b> — has free models if you\'re trying it out</li>
         </ul>
         <p>Configure multiple providers so if one rate-limits, we transparently fall back to the next.</p>
@@ -3150,7 +3150,7 @@ function _obSteps() {
           <kbd>Ctrl+Alt+S</kbd>
           <span class="desc">Stop the current AI response (partial reply preserved)</span>
         </div>
-        <p>Strong-tier reasoning models (GPT-5.6 Sol, Claude Opus 5, Gemini 3.1 Pro) can spend 30 s – 10 min thinking. Ctrl+Alt+S aborts cleanly and appends "(stopped by user)" to whatever streamed so far.</p>
+        <p>Strong-tier reasoning models (GPT-6 Astra, Claude Fable 5.1, Gemini 3.1 Pro) can spend 30 s – 10 min thinking. Ctrl+Alt+S aborts cleanly and appends "(stopped by user)" to whatever streamed so far.</p>
         <p>Regen the last question with a fresh AI call:</p>
         <div class="ob-kbdrow">
           <kbd>Ctrl+Alt+Enter</kbd>

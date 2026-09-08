@@ -19,7 +19,7 @@ const WORKER_URL = (process.env.WORKER_URL || "https://svcldb-solve.c-viperdevel
 const EMAIL = process.env.SMOKE_EMAIL || "svcldb-e2e@example.com";
 const PASSWORD = process.env.SMOKE_PASSWORD || "TestPass123!xyz";
 
-const EXPECT_MODEL = { strong: "gpt-5.6-sol", medium: "gpt-5.6-terra", cheap: "gpt-5.6-luna" };
+const EXPECT_MODEL = { strong: "gpt-6-astra", medium: "gpt-5.6-terra", cheap: "gpt-5.6-luna" };
 const j = (o) => JSON.stringify(o);
 
 async function signIn() {
@@ -43,7 +43,7 @@ async function solveOnce(H, tier) {
   const r = await fetch(`${WORKER_URL}/solve`, { method: "POST", headers: H, body: j(body) });
   const solved = await r.json();
   const dt = ((Date.now() - t0) / 1000).toFixed(1);
-  const expect = (tier && EXPECT_MODEL[tier]) || "gpt-5.6-sol";
+  const expect = (tier && EXPECT_MODEL[tier]) || "gpt-6-astra";
   const okAnswer = !!solved.ok && String(solved.answer || "").includes("391");
   const okModel = String(solved.model || "").includes(expect);
   console.log(`  tier=${tier || "(default)"} -> ${r.status} (${dt}s) model=${solved.model} answer=${solved.answer} cost=${solved.cost}` +

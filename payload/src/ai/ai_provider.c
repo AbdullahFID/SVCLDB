@@ -73,12 +73,29 @@ static const char *ai_google_stable_fallback(const char *model_id) {
      * BEFORE the generic "flash" pattern so we don't route a lite request
      * to a full 2.5-flash (unnecessary cost bump). */
     if (strstr(model_id, "gemini-3.5-flash-lite")) return "gemini-2.5-flash";  /* stable equivalent */
+    if (strstr(model_id, "gemini-3.8-flash"))      return "gemini-2.5-flash";  /* v-bump 2026-09-08 MEDIUM */
     if (strstr(model_id, "gemini-3.6-flash"))      return "gemini-2.5-flash";
     if (strstr(model_id, "gemini-3.5-flash"))      return "gemini-2.5-flash";
     if (strstr(model_id, "gemini-3-flash"))        return "gemini-2.5-flash";
     if (strstr(model_id, "gemini-3.1-flash-lite")) return "gemini-2.5-flash";
     if (strstr(model_id, "gemini-3.1-flash"))      return "gemini-2.5-flash";
     /* Already on 2.5.x or older -> no better fallback */
+    return NULL;
+}
+
+/* v-bump 2026-09-08 — Anthropic STRONG fallback. STRONG Anthropic is now
+ * Fable 5.1; if it's unavailable to the user's key (HTTP 404/400) or
+ * overloaded/rate-limited (429/500/503/529), we retry ONCE on Opus 5 —
+ * the prior STRONG, still a frontier reasoner and served on the SAME
+ * Anthropic key — at the same xHigh effort before hopping to another
+ * provider (which the user may not even have a key for). This is the
+ * "a brand-new slug 404s for un-provisioned accounts" guard: without a
+ * concrete fallback here, a user whose key can't see Fable 5.1 yet would
+ * get a hard failure. Returns a static model_id, or NULL if no fallback. */
+static const char *ai_anthropic_stable_fallback(const char *model_id) {
+    if (!model_id) return NULL;
+    if (strstr(model_id, "fable") || strstr(model_id, "mythos"))
+        return "claude-opus-5";
     return NULL;
 }
 
@@ -591,32 +608,37 @@ static const char SVCLDB_DEFAULT_SYSTEM_PROMPT[] =
  * `reasoning_effort` accepts {low, medium, high} on all three; the
  * `minimal` value was rejected in tests.
  *
- * Final mapping per user's ask ("strongest highest reasoning" for
- * STRONG, "medium reasoning medium model" for MEDIUM, "low reasoning
- * low model" for CHEAP):
- *   STRONG -> gpt-5.6-sol   + reasoning_effort=high    (flagship)
+ * Final mapping (v-bump 2026-09-08 — STRONG bumped to GPT-6 Astra,
+ * OpenAI's new flagship released 2026-09-04; Terra/Luna stay on the
+ * cost-balanced GPT-5.6 line for MEDIUM/CHEAP):
+ *   STRONG -> gpt-6-astra   + reasoning_effort=high    (flagship, 2026-09-04)
  *   MEDIUM -> gpt-5.6-terra + reasoning_effort=medium  (balanced)
  *   CHEAP  -> gpt-5.6-luna  + reasoning_effort=low     (efficiency)
  *
  * The default reasoning_effort comes from cfg->reasoning_effort which
  * user sets in the dashboard (default 4=high). The map here reflects
- * "recommended for tier" not "hardcoded" — user's setting overrides. */
+ * "recommended for tier" not "hardcoded" — user's setting overrides.
+ * (gpt-6-astra also accepts xhigh/max; high is our balanced default.) */
 static const svc_model_tier_t OPENAI_TIERS[SVC_TIER_COUNT] = {
-    { "gpt-5.6-sol",   "STRONG (GPT-5.6 Sol)",   "Flagship max-reasoning, $5/$30, Intelligence Index 59, 400K ctx", 1, 1, 32768 },
+    { "gpt-6-astra",   "STRONG (GPT-6 Astra)",   "Flagship end-to-end reasoning + agentic, released 2026-09-04, 400K ctx", 1, 1, 32768 },
     { "gpt-5.6-terra", "MEDIUM (GPT-5.6 Terra)", "Balanced daily driver, $2.50/$15, GPT-5.5-class at 1/2 cost",      1, 1, 16384 },
     { "gpt-5.6-luna",  "CHEAP  (GPT-5.6 Luna)",  "Fast + cheap, $1/$6, 1/5 Sol cost (short-context only)",           1, 1,  8192 },
     { NULL,            "CUSTOM",                 "user-specified model",                                              0, 0,  8192 },
 };
 
-/* Anthropic tiers. Per user request: opus-5 NOT fable-5 (too expensive).
- * All 3 tiers verified against platform.claude.com/docs/models/overview. */
+/* Anthropic tiers.
+ * v-bump 2026-09-08 — STRONG bumped Opus 5 → Fable 5.1 (Anthropic's new
+ * frontier coding/knowledge model, released 2026-09-01, $10/$50, 1M ctx,
+ * adaptive thinking always-on). Fable 5.1 is FORCED to xHigh effort in
+ * build_anthropic_body, and Opus 5 stays as its automatic fallback target
+ * (ai_anthropic_stable_fallback): if Fable 5.1 is unavailable to the
+ * user's key (404/400) or overloaded, the request retries on Opus 5 —
+ * also at xHigh — before hopping providers. Direct Claude API slug is
+ * `claude-fable-5-1` (dashes, NOT dots; the dotted `claude-fable-5.1` is
+ * the OpenRouter slug used by the solver worker, not this direct path).
+ * All tiers verified against platform.claude.com/docs/models/overview. */
 static const svc_model_tier_t ANTHROPIC_TIERS[SVC_TIER_COUNT] = {
-    /* v1.7.11.17 (2026-07-25) — Bumped Opus 4.8 → Opus 5 (Anthropic
-     * launched 2026-07-24, same $5/$25 pricing, 1M ctx, adaptive
-     * thinking on by default, knowledge cutoff May 2026). Positioned
-     * by Anthropic as "close to Fable 5 frontier intelligence at half
-     * the price". */
-    { "claude-opus-5",     "STRONG (Opus 5)",    "Frontier reasoning + agentic coding, $5/$25, 1M ctx, adaptive thinking", 1, 1, 12288 },
+    { "claude-fable-5-1",  "STRONG (Fable 5.1)", "Frontier coding + knowledge @ xHigh, $10/$50, 1M ctx (falls back to Opus 5)", 1, 1, 12288 },
     { "claude-sonnet-5",   "MEDIUM (Sonnet 5)",  "Balanced workhorse, $3/$15, 1M ctx, adaptive thinking",       1, 1,  8192 },
     { "claude-haiku-4-5",  "CHEAP  (Haiku 4.5)", "Fast + affordable, $1/$5, 200K ctx, extended thinking",       1, 1,  6144 },
     { NULL,                "CUSTOM",             "user-specified model",                                          0, 0,  6144 },
@@ -630,10 +652,14 @@ static const svc_model_tier_t ANTHROPIC_TIERS[SVC_TIER_COUNT] = {
  * (successor, verified working). MEDIUM upgraded to
  * `gemini-3.6-flash` (newer than 3.5-flash + fewer 503s during peak).
  * STRONG stays `gemini-3.1-pro-preview` (still accessible, best
- * multimodal). */
+ * multimodal).
+ * v-bump 2026-09-08 — MEDIUM bumped 3.6 Flash → 3.8 Flash (GA 2026-09-02,
+ * Google's most intelligent Flash; thinkingLevel low/medium/high — note
+ * `minimal` is unsupported on 3.8, but our MEDIUM tier maps to medium so
+ * that edge never triggers). STRONG/CHEAP unchanged. */
 static const svc_model_tier_t GOOGLE_TIERS[SVC_TIER_COUNT] = {
     { "gemini-3.1-pro-preview", "STRONG (Gemini 3.1 Pro)",     "Frontier reasoning + multimodal, 1M ctx",           1, 1, 12288 },
-    { "gemini-3.6-flash",       "MEDIUM (Gemini 3.6 Flash)",   "Near-Pro intelligence at Flash cost, 1M ctx",       1, 1,  8192 },
+    { "gemini-3.8-flash",       "MEDIUM (Gemini 3.8 Flash)",   "Most intelligent Flash, released 2026-09-02, 1M ctx", 1, 1,  8192 },
     { "gemini-3.5-flash-lite",  "CHEAP  (Gemini 3.5 Flash-L)", "Cheapest, low-latency (successor to 2.5-lite)",     1, 1,  4096 },
     { NULL,                     "CUSTOM",                       "user-specified model",                              0, 0,  4096 },
 };
@@ -743,6 +769,12 @@ static int is_openai_reasoning_model(const char *model) {
     /* GPT-5 family: gpt-5, gpt-5-mini, gpt-5-nano, gpt-5.1, gpt-5.2,
      * gpt-5.4, gpt-5.4-mini, gpt-5.5, gpt-5.5-mini, gpt-5.5-pro. */
     if (strncmp(model, "gpt-5", 5) == 0) return 1;
+    /* GPT-6 family: gpt-6-astra (+ future gpt-6-*). Same reasoning-model
+     * request shape (max_completion_tokens + reasoning_effort). Added
+     * 2026-09-08 when STRONG bumped to gpt-6-astra — WITHOUT this, the
+     * body builder would send `max_tokens` + no reasoning param and the
+     * flagship would run non-reasoning / reject the request. */
+    if (strncmp(model, "gpt-6", 5) == 0) return 1;
     /* o-series: o1, o1-mini, o1-preview, o3, o3-mini, o4, o4-mini. */
     if ((model[0] == 'o' || model[0] == 'O') &&
         model[1] >= '1' && model[1] <= '9' &&
@@ -860,7 +892,15 @@ static int build_anthropic_body(const svc_config_t *cfg, const char *user_prompt
     int adaptive  = is_fable || is_opus || is_sonnet;
     int extended  = is_haiku;  /* Haiku 4.5+ supports extended thinking */
 
-    const char *effort = effort_str(cfg->reasoning_effort);
+    /* v-bump 2026-09-08 — STRONG Anthropic (Fable 5.1) and its Opus 5
+     * fallback both run at xHigh thinking per spec ("Fable 5.1 xHigh …
+     * fall back to Opus 5 xHigh"). Anthropic returns 400 if reasoning is
+     * DISABLED at xhigh, but adaptive thinking is always-on for these two
+     * so reasoning stays enabled — safe. Sonnet (MEDIUM) / Haiku (CHEAP)
+     * keep the user's configured effort. */
+    const char *effort = (is_fable || is_opus)
+                         ? "xhigh"
+                         : effort_str(cfg->reasoning_effort);
 
     jb_obj_begin(jb);
       jb_key(jb, "model");      jb_str(jb, model_id);
@@ -1410,7 +1450,8 @@ int ai_ask(const svc_config_t *cfg, const char *user_prompt,
     memcpy(&eff_cfg, cfg, sizeof(eff_cfg));
     materialize_default_system(&eff_cfg);
 
-    /* Base64-encode screenshot once. */
+    /* Base64-encode screenshot once — kept alive across the model-fallback
+     * retry below so we never re-encode an 8MB PNG per attempt. */
     char *image_b64 = NULL;
     if (screenshot_png && screenshot_len > 0) {
         image_b64 = png_to_b64(screenshot_png, screenshot_len);
@@ -1420,76 +1461,136 @@ int ai_ask(const svc_config_t *cfg, const char *user_prompt,
         }
     }
 
-    json_builder_t jb = {0};
-    char url[512] = {0};
-    char auth_hdr[1024] = {0};
-    char extra_hdr[256] = {0};
-    const char *hdrs[6] = { NULL };
+    /* v-bump 2026-09-08 — non-streaming Anthropic model-fallback. STRONG
+     * Anthropic is now Fable 5.1; if the send fails because Fable is
+     * unavailable to the user's key (404/400) or overloaded/rate-limited
+     * (408/429/5xx), we rebuild ONCE against Opus 5 (via
+     * ai_anthropic_stable_fallback) at the same xHigh effort before giving
+     * up. Mirrors the streaming path so a brand-new slug that 404s for
+     * un-provisioned accounts isn't a dead end. `ai_status_retryable` is
+     * defined later in the file, so the retryable set is inlined here. */
+    const char *model_override  = NULL;   /* NULL = use tier-resolved model */
+    int         model_fallback_used = 0;
+    int         ret = 0;
 
-    if (!build_request(&eff_cfg, user_prompt, image_b64, model_id,
-                       0 /*no streaming*/, &jb, url, sizeof(url),
-                       auth_hdr, sizeof(auth_hdr),
-                       extra_hdr, sizeof(extra_hdr),
-                       hdrs, err, err_sz)) {
-        if (image_b64) free(image_b64);
-        return 0;
-    }
-    if (image_b64) { free(image_b64); image_b64 = NULL; }
+    for (;;) {
+        const char *use_model = model_override ? model_override : model_id;
 
-    slog_writef("ai.log", "ai_ask provider=%s model=%s tier=%s prompt_len=%zu img=%d",
-                ai_provider_name(cfg->provider),
-                model_id,
-                ai_tier_name(cfg->tier),
-                strlen(user_prompt),
-                screenshot_png ? 1 : 0);
-    /* Retry with backoff on 429 / 5xx. */
-    whreq_result_t r = {0};
-    int attempt = 0, max_attempts = 3;
-    int ok = 0;
-    for (; attempt < max_attempts; attempt++) {
-        ok = whreq_post(url, hdrs, jb.buf, jb.len, &r);
-        if (!ok) {
-            _snprintf(err, err_sz - 1, "transport: %s", r.err); err[err_sz - 1] = 0;
-            whreq_free_result(&r);
+        json_builder_t jb = {0};
+        char url[512] = {0};
+        char auth_hdr[1024] = {0};
+        char extra_hdr[256] = {0};
+        const char *hdrs[6] = { NULL };
+
+        if (!build_request(&eff_cfg, user_prompt, image_b64, use_model,
+                           0 /*no streaming*/, &jb, url, sizeof(url),
+                           auth_hdr, sizeof(auth_hdr),
+                           extra_hdr, sizeof(extra_hdr),
+                           hdrs, err, err_sz)) {
             jb_free(&jb);
-            return 0;
+            break;   /* build error — ret stays 0 */
         }
-        if (r.status == 429 || (r.status >= 500 && r.status < 600)) {
-            /* Rate-limited or transient — back off. */
-            DWORD backoff_ms = 800UL * (1UL << attempt);   /* 800, 1600, 3200 */
-            slog_writef("ai.log", "ai_ask http=%u attempt=%d backing off %lums",
-                        r.status, attempt, backoff_ms);
+
+        slog_writef("ai.log", "ai_ask provider=%s model=%s tier=%s prompt_len=%zu img=%d",
+                    ai_provider_name(cfg->provider),
+                    use_model,
+                    ai_tier_name(cfg->tier),
+                    strlen(user_prompt),
+                    screenshot_png ? 1 : 0);
+
+        /* Retry with backoff on 429 / 5xx. */
+        whreq_result_t r = {0};
+        unsigned last_status = 0;
+        int attempt = 0, max_attempts = 3;
+        int ok = 0;
+        int transport_fail = 0;
+        for (; attempt < max_attempts; attempt++) {
+            ok = whreq_post(url, hdrs, jb.buf, jb.len, &r);
+            if (!ok) {
+                _snprintf(err, err_sz - 1, "transport: %s", r.err); err[err_sz - 1] = 0;
+                transport_fail = 1;
+                last_status = 0;
+                break;
+            }
+            last_status = r.status;
+            if (r.status == 429 || (r.status >= 500 && r.status < 600)) {
+                /* Rate-limited or transient — back off. On the LAST attempt
+                 * keep `r` intact so the error path can read its body
+                 * (prior code freed it here then read r.body — a UAF). */
+                DWORD backoff_ms = 800UL * (1UL << attempt);   /* 800, 1600, 3200 */
+                slog_writef("ai.log", "ai_ask http=%u attempt=%d backing off %lums",
+                            r.status, attempt, backoff_ms);
+                if (attempt < max_attempts - 1) {
+                    whreq_free_result(&r);
+                    Sleep(backoff_ms);
+                    continue;
+                }
+                break;   /* retries exhausted — fall through with r populated */
+            }
+            break;
+        }
+        jb_free(&jb);
+
+        /* Decide whether the Fable→Opus fallback applies to this failure. */
+        int anthropic_fb_eligible =
+            (cfg->provider == SVC_PROVIDER_ANTHROPIC) && !model_fallback_used;
+
+        if (transport_fail) {
             whreq_free_result(&r);
-            Sleep(backoff_ms);
-            continue;
+            if (anthropic_fb_eligible) {
+                const char *fb = ai_anthropic_stable_fallback(use_model);
+                if (fb) {
+                    slog_writef("ai.log", "ai_ask Anthropic model-fallback %s -> %s (transport)",
+                                use_model, fb);
+                    model_override = fb;
+                    model_fallback_used = 1;
+                    continue;
+                }
+            }
+            break;   /* ret stays 0 */
         }
+
+        if (r.status < 200 || r.status >= 300) {
+            _snprintf(err, err_sz - 1, "http %u: %.256s", r.status, r.body ? r.body : "");
+            err[err_sz - 1] = 0;
+            slog_writef("ai.log", "ai_ask FAILED http=%u body_len=%zu",
+                        r.status, r.body_len);
+            whreq_free_result(&r);
+            if (anthropic_fb_eligible &&
+                (last_status == 408 || last_status == 429 ||
+                 (last_status >= 500 && last_status < 600) ||
+                 last_status == 404 || last_status == 400)) {
+                const char *fb = ai_anthropic_stable_fallback(use_model);
+                if (fb) {
+                    slog_writef("ai.log", "ai_ask Anthropic model-fallback %s -> %s (status=%u)",
+                                use_model, fb, last_status);
+                    model_override = fb;
+                    model_fallback_used = 1;
+                    continue;
+                }
+            }
+            break;   /* ret stays 0 */
+        }
+
+        int extracted = 0;
+        if (cfg->provider == SVC_PROVIDER_ANTHROPIC)     extracted = extract_anthropic_reply(r.body, out_reply);
+        else if (cfg->provider == SVC_PROVIDER_GOOGLE)   extracted = extract_google_reply(r.body,    out_reply);
+        else                                              extracted = extract_openai_reply(r.body,    out_reply);
+
+        if (!extracted) {
+            _snprintf(err, err_sz - 1, "no reply text in response body"); err[err_sz - 1] = 0;
+            slog_writef("ai.log", "ai_ask parse FAILED body[0..300]=%.300s", r.body ? r.body : "");
+            whreq_free_result(&r);
+            break;   /* ret stays 0 */
+        }
+        slog_writef("ai.log", "ai_ask ok model=%s reply_len=%zu", use_model, strlen(*out_reply));
+        whreq_free_result(&r);
+        ret = 1;
         break;
     }
-    jb_free(&jb);
 
-    if (r.status < 200 || r.status >= 300) {
-        _snprintf(err, err_sz - 1, "http %u: %.256s", r.status, r.body ? r.body : "");
-        err[err_sz - 1] = 0;
-        slog_writef("ai.log", "ai_ask FAILED http=%u body_len=%zu",
-                    r.status, r.body_len);
-        whreq_free_result(&r);
-        return 0;
-    }
-
-    int extracted = 0;
-    if (cfg->provider == SVC_PROVIDER_ANTHROPIC)     extracted = extract_anthropic_reply(r.body, out_reply);
-    else if (cfg->provider == SVC_PROVIDER_GOOGLE)   extracted = extract_google_reply(r.body,    out_reply);
-    else                                              extracted = extract_openai_reply(r.body,    out_reply);
-
-    if (!extracted) {
-        _snprintf(err, err_sz - 1, "no reply text in response body"); err[err_sz - 1] = 0;
-        slog_writef("ai.log", "ai_ask parse FAILED body[0..300]=%.300s", r.body ? r.body : "");
-        whreq_free_result(&r);
-        return 0;
-    }
-    slog_writef("ai.log", "ai_ask ok reply_len=%zu", strlen(*out_reply));
-    whreq_free_result(&r);
-    return 1;
+    if (image_b64) free(image_b64);
+    return ret;
 }
 
 /* Map the config tier enum to the worker's tier slug. The credits/managed path
@@ -2093,6 +2194,45 @@ int ai_ask_streaming(const svc_config_t *cfg,
                     continue;   /* re-enter attempt loop with new model */
                 }
             }
+
+            /* v-bump 2026-09-08 — Anthropic STRONG (Fable 5.1) model-
+             * fallback → Opus 5. Fires when Fable is unavailable to the
+             * user's key (404/400) OR overloaded/rate-limited (retryable),
+             * mirroring the Google 503 path above. This is the "if there's
+             * no fallback that's cooked" guard: a brand-new model slug can
+             * 404 for accounts without access, so we MUST have Opus 5 to
+             * fall back to (same key, same xHigh effort) before giving up
+             * on the whole provider. */
+            if (prov == SVC_PROVIDER_ANTHROPIC && !model_fallback_used &&
+                (ai_status_retryable(last_status) ||
+                 last_status == 404 || last_status == 400)) {
+                svc_config_t eff = *cfg;
+                eff.provider = prov;
+                const char *tried_model = model_override
+                                          ? model_override
+                                          : resolve_effective_model(&eff);
+                if (tried_model) {
+                    _snprintf(last_model_id, sizeof(last_model_id) - 1, "%s", tried_model);
+                    last_model_id[sizeof(last_model_id) - 1] = 0;
+                }
+                const char *fallback = ai_anthropic_stable_fallback(last_model_id);
+                if (fallback) {
+                    if (on_chunk) {
+                        char note[192];
+                        int nl = _snprintf(note, sizeof(note) - 1,
+                                           "\n\n_(Anthropic `%s` unavailable, "
+                                           "retrying with `%s`...)_\n\n",
+                                           last_model_id, fallback);
+                        if (nl > 0) on_chunk(note, (size_t)nl, userdata);
+                    }
+                    slog_writef("ai.log",
+                                "ai_ask_streaming Anthropic model-fallback %s -> %s (status=%u)",
+                                last_model_id, fallback, last_status);
+                    model_override = fallback;
+                    model_fallback_used = 1;
+                    continue;   /* re-enter attempt loop with Opus 5 */
+                }
+            }
             break;   /* no model fallback -> stop iterating models */
         }
         /* All models on this provider exhausted — try next provider. */
@@ -2128,12 +2268,15 @@ int ai_is_reasoning_model(const char *model_id) {
      * all three qualify for the extended timeout window since they
      * can spend >30s on thinking before emitting any token on complex
      * prompts. Older 5.x-pro slugs kept for legacy config compat. */
+    if (strstr(model_id, "gpt-6"))        return 1;    /* GPT-6 Astra (2026-09-04) */
     if (strstr(model_id, "gpt-5.6"))      return 1;    /* Sol / Terra / Luna all */
     if (strstr(model_id, "gpt-5.5-pro")) return 1;
     if (strstr(model_id, "gpt-5-pro"))   return 1;
     if (strstr(model_id, "gpt-5.4-pro"))   return 1;
     if (strstr(model_id, "gpt-5.2-pro"))   return 1;
     /* Anthropic reasoning */
+    if (strstr(model_id, "fable"))       return 1;    /* Fable 5.1 STRONG (2026-09-01) */
+    if (strstr(model_id, "mythos"))      return 1;    /* Fable 5.1's trusted-access twin */
     if (strstr(model_id, "opus-4"))      return 1;
     if (strstr(model_id, "opus-5"))      return 1;
     /* Google reasoning */

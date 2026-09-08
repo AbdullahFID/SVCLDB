@@ -26,29 +26,34 @@ import { createClient } from "@supabase/supabase-js";
 // Metered-path models (OpenRouter slugs). The client sends a `tier`
 // (strong|medium|cheap) and TIER_PRESETS maps it to a concrete model + reasoning
 // effort, so all model choices live here and can be retuned without reshipping
-// the payload. gemini-3.1-pro / grok stay allow-listed as vision alternates
-// (reachable only if a caller sends an explicit `model`).
+// the payload. fable-5.1 / opus-5 / gemini-3.8-flash / grok stay allow-listed
+// as alternates (reachable only if a caller sends an explicit `model`).
 // NOTE: slugs here MUST exist on OpenRouter or the relay 502s (upstream 404).
 // `x-ai/grok-4.1-fast` was never a real OpenRouter slug (the 4.x line is
 // grok-4.3/4.5/4.6) — swapped to grok-4.6 so the alternate actually resolves.
+// v-bump 2026-09-08: STRONG bumped gpt-5.6-sol -> gpt-6-astra (OpenAI flagship,
+// 2026-09-04); added anthropic/claude-fable-5.1 (+ its opus-5 fallback) and
+// google/gemini-3.8-flash to match the per-provider swaps in the payload.
 const ALLOWED_MODELS = new Set([
-  "openai/gpt-5.6-sol",             // STRONG / flagship
+  "openai/gpt-6-astra",             // STRONG / flagship (2026-09-04, replaces gpt-5.6-sol)
   "openai/gpt-5.6-terra",           // MEDIUM / balanced (GPT-5.5-class, ~1/2 cost)
   "openai/gpt-5.6-luna",            // CHEAP / fast (~1/5 cost)
-  "google/gemini-3.1-pro-preview",  // alternate (vision, frontier)
+  "anthropic/claude-fable-5.1",     // alternate (Anthropic frontier, 2026-09-01)
+  "anthropic/claude-opus-5",        // alternate (Fable 5.1's fallback target)
+  "google/gemini-3.8-flash",        // alternate (Google's most intelligent Flash, 2026-09-02)
   "x-ai/grok-4.6",                  // alternate (vision, fast)
 ]);
 
-// Reasoning effort on the chat/completions path (what the relay uses). GPT-5.6
-// accepts none | low | medium | high | xhigh here; "max" is Responses-API-only
-// and 400s through chat/completions, so xhigh is the ceiling.
+// Reasoning effort on the chat/completions path (what the relay uses). GPT-6
+// Astra accepts none | low | medium | high | xhigh here; "max" is Responses-
+// API-only and 400s through chat/completions, so xhigh is the ceiling.
 const REASONING_EFFORTS = new Set(["none", "low", "medium", "high", "xhigh"]);
 
 // Tier -> (model, reasoning effort). Strong is OpenAI's flagship at high effort;
 // Medium/Cheap trade quality for credit-longevity + speed. Unknown/missing tier
 // falls back to Strong so the managed path always errs toward best quality.
 const TIER_PRESETS = {
-  strong: { model: "openai/gpt-5.6-sol",   reasoning_effort: "high"   },
+  strong: { model: "openai/gpt-6-astra",   reasoning_effort: "high"   },
   medium: { model: "openai/gpt-5.6-terra", reasoning_effort: "medium" },
   cheap:  { model: "openai/gpt-5.6-luna",  reasoning_effort: "low"    },
 };
@@ -57,13 +62,13 @@ const DEFAULT_TIER = "strong";
 const MAX_IMAGES = 8;
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_QUESTION_CHARS = 8000;
-// GPT-5.6 Sol's true OUTPUT ceiling is 128K tokens (1.05M ctx ≈ 922K in / 128K
-// out) — NOT the 1.05M context window. We cap at that max so reasoning + answer
-// never truncate. It's a CAP: normal exam answers spend a few hundred/thousand
-// tokens and only those are billed; the ceiling only bites a pathological runaway.
+// GPT-6 Astra's OUTPUT ceiling is 128K tokens (large ctx window ≠ output
+// budget). We cap at that max so reasoning + answer never truncate. It's a
+// CAP: normal exam answers spend a few hundred/thousand tokens and only those
+// are billed; the ceiling only bites a pathological runaway.
 const MAX_TOKENS = 128000;
-// Only used if OpenRouter omits usage.cost. Sol at high effort runs pricier than
-// the old gpt-5.4 default, so keep the safety-net estimate realistic.
+// Only used if OpenRouter omits usage.cost. Astra at high effort runs pricier
+// than the old gpt-5.x defaults, so keep the safety-net estimate realistic.
 const COST_FALLBACK = 0.04;
 
 const CORS = {
