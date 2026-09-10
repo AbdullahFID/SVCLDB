@@ -1,5 +1,5 @@
 /* ================================================================== *
- * imgui_layer.h — C-callable interface over the ImGui + D3D11 layer.  *
+ * imgui_layer.h -- C-callable interface over the ImGui + D3D11 layer.  *
  *                                                                    *
  * The .cpp compiles ImGui internals (C++). This header exposes the   *
  * C entry points the payload's C code (dllmain.c, dwm_hooks.c) uses. *
@@ -13,10 +13,10 @@ extern "C" {
 
 /* Lazy-init on first fire. Called from Detour_COverlayContextPresent.
  * `pCtx` is COverlayContext this-ptr; `pLayer` is the layer being presented.
- * MUST BE SEH-SAFE — any fault takes down the entire desktop. */
+ * MUST BE SEH-SAFE -- any fault takes down the entire desktop. */
 void ui_present_frame(void *pCtx, void *pLayer);
 
-/* Save the CURRENT layer texture directly to a BMP file — no WIC, no COM,
+/* Save the CURRENT layer texture directly to a BMP file -- no WIC, no COM,
  * no memory allocation beyond a staging texture. Uses raw WriteFile
  * calls to write the BMP header + BGRA pixel data.
  *
@@ -43,7 +43,7 @@ typedef enum { UI_MSG_USER = 0, UI_MSG_AI = 1 } ui_msg_role_t;
 /* Append a new message with the given role + text. `text` is copied. */
 void ui_chat_append_message(int role, const char *text);
 
-/* Append a placeholder AI message showing "Thinking..." — returns
+/* Append a placeholder AI message showing "Thinking..." -- returns
  * the message id so ui_chat_stream_append / ui_chat_finalize_pending
  * can target it. Returns -1 on failure. */
 int  ui_chat_append_pending(void);
@@ -51,7 +51,7 @@ int  ui_chat_append_pending(void);
 /* Append a chunk of text to a specific pending message id (streaming). */
 void ui_chat_stream_append(int msg_id, const char *chunk, size_t len);
 
-/* Finalize a pending message — clears the "thinking" flag. */
+/* Finalize a pending message -- clears the "thinking" flag. */
 void ui_chat_finalize_pending(int msg_id);
 
 /* If the last AI message is still pending, replace its full content
@@ -75,34 +75,34 @@ void ui_copy_last_ai_code(void);
  * "answer first" contract. NO-OP if reply empty. */
 void ui_copy_last_ai_answer(void);
 
-/* Legacy setter — kept for compatibility. Appends as a new AI message. */
+/* Legacy setter -- kept for compatibility. Appends as a new AI message. */
 void ui_set_reply(const char *utf8);
 
-/* Return the text of the last USER message (heap-alloc'd) — used by
+/* Return the text of the last USER message (heap-alloc'd) -- used by
  * the REGENERATE hotkey. Returns NULL if none. Caller frees. */
 char *ui_chat_last_user_text(void);
 
-/* Clear ENTIRE chat history — wipes all messages (Ctrl+Alt+N New Chat).
- * DESTRUCTIVE — the messages are gone forever. */
+/* Clear ENTIRE chat history -- wipes all messages (Ctrl+Alt+N New Chat).
+ * DESTRUCTIVE -- the messages are gone forever. */
 void ui_chat_clear_history(void);
 
 /* Force overlay to show the empty "home" cheat-sheet view even if the
- * chat history isn't empty. Non-destructive — messages stay in memory
+ * chat history isn't empty. Non-destructive -- messages stay in memory
  * and are shown again as soon as a new message arrives (or user hits
  * REGENERATE etc). This is the Ctrl+Alt+X "back" behavior: hide the
  * conversation without deleting it. */
 void ui_view_show_home(void);
 
-/* Undo ui_view_show_home() — allow the chat view to render if there
+/* Undo ui_view_show_home() -- allow the chat view to render if there
  * are messages. Called automatically when a new message is appended. */
 void ui_view_show_chat(void);
 
 /* TRUE if the chat view is currently VISIBLE (i.e. has messages AND
  * not home-forced). Used by the Ctrl+Alt+X handler to decide between
- * "back" (chat view visible → hide) and "quit" (home view showing). */
+ * "back" (chat view visible -> hide) and "quit" (home view showing). */
 int  ui_is_showing_chat(void);
 
-/* Legacy alias: NON-DESTRUCTIVE — same as ui_view_show_home().
+/* Legacy alias: NON-DESTRUCTIVE -- same as ui_view_show_home().
  * (Kept for API stability with earlier callers; new code should call
  * ui_view_show_home() directly.) */
 void ui_clear_reply(void);
@@ -111,10 +111,10 @@ void ui_clear_reply(void);
 void ui_toggle_visible(void);
 int  ui_is_visible(void);
 
-/* v1.7.10 (2026-07-24) — LEAN MODE toggle. When ON, draw_chat_window
+/* v1.7.10 (2026-07-24) -- LEAN MODE toggle. When ON, draw_chat_window
  * skips the standard ImGui::Begin/End window and instead renders the
  * overlay via ImDrawList::AddRectFilled + AddText on
- * ImGui::GetForegroundDrawList() — Bypassify's exact render pattern
+ * ImGui::GetForegroundDrawList() -- Bypassify's exact render pattern
  * (verified via RPM: BP's ImGui Windows vector = 1 unnamed entry).
  * Sacrifices chat scrollback, MD/LaTeX rendering, per-bubble buttons,
  * code-block copy, styled chrome. Kept: last AI reply text, background
@@ -123,7 +123,7 @@ int  ui_is_visible(void);
 void ui_toggle_lean(void);
 int  ui_is_lean(void);
 
-/* Reply pane scroll — signed pixel delta consumed on next frame.
+/* Reply pane scroll -- signed pixel delta consumed on next frame.
  * Positive = scroll DOWN (toward end), negative = scroll UP. */
 void ui_scroll_reply(int delta_px);
 
@@ -164,12 +164,12 @@ void ui_set_hotkey_bindings(const unsigned *hks, int n);
  * NUL. `action` corresponds to a svc_hotkey_action_t index. */
 size_t ui_format_hotkey(int action, char *out, size_t out_sz);
 
-/* Geometry adjustments — called from hotkey callbacks in dllmain.c.
+/* Geometry adjustments -- called from hotkey callbacks in dllmain.c.
  * All are best-effort; if the requested value goes out of range, we
  * clamp to a sane bound. Persisted-back to disk on next frame (v2). */
 void ui_nudge(int dx, int dy);       /* move by (dx, dy) pixels */
 void ui_resize(int dw, int dh);      /* grow/shrink by (dw, dh) pixels */
-void ui_cycle_corner(void);          /* TL → TR → BR → BL → TL */
+void ui_cycle_corner(void);          /* TL -> TR -> BR -> BL -> TL */
 void ui_bump_alpha(float delta);     /* + or - to bg alpha [0.20 .. 1.00] */
 void ui_bump_font(float delta);      /* + or - to font scale factor */
 void ui_reset_geometry(void);        /* back to defaults */
@@ -179,7 +179,7 @@ void ui_reset_geometry(void);        /* back to defaults */
  * discover the correct vtable slot indices at first Present() call
  * (dynamic-preferred, hardcoded-fallback). Called once at init from
  * dllmain, AFTER pl_offsets_load succeeds. Any of the three RVAs
- * being 0 means "no PDB hint — use hardcoded slot" for that entry.
+ * being 0 means "no PDB hint -- use hardcoded slot" for that entry.
  * Thread-safe (single-writer at init before any Present detour). */
 typedef unsigned long long ui_rva_t;
 void ui_set_vtable_slot_hints(ui_rva_t gpb_rva, ui_rva_t gd3d_rva, ui_rva_t acc_rva);
@@ -191,7 +191,7 @@ void ui_set_vtable_slot_hints(ui_rva_t gpb_rva, ui_rva_t gd3d_rva, ui_rva_t acc_
  * skipped. Called once at init from dllmain with all resolved
  * offsets from pl_offsets_t. Enables log lines like:
  *   "slot=5 rva=0x1DD690 (== getDevice)"
- * instead of just "slot=5 rva=0x1DD690" — support can identify by
+ * instead of just "slot=5 rva=0x1DD690" -- support can identify by
  * method name what each user's slot is actually calling. */
 typedef struct {
     ui_rva_t     rva;
@@ -211,17 +211,17 @@ void ui_set_known_rva_table(const ui_rva_symbol_t *table, int count);
 void ui_apply_launch_config(int base_w, int base_h,
                             float alpha, int size_mode);
 
-/* v11 (2026-07-24) — theme + overlay-flags apply, called from dllmain right
+/* v11 (2026-07-24) -- theme + overlay-flags apply, called from dllmain right
  * after ui_apply_launch_config with the values from cfg->theme + cfg->overlay_flags.
  *   theme         : 0=dark, 1=light, 2=auto (payload polls Windows Personalize
  *                   registry every ~2s and follows AppsUseLightTheme).
- *   overlay_flags : bitfield of SVC_OVFLAG_* — controls trail-erase (paint
+ *   overlay_flags : bitfield of SVC_OVFLAG_* -- controls trail-erase (paint
  *                   over prior positions with opaque bg color), smooth-nudge
  *                   (8px @ 60Hz vs 20px @ 20Hz), uniform-alpha, opaque-lock.
  * Thread-safe (guarded by g_ui_cs). */
 void ui_apply_theme_and_flags(int theme, unsigned overlay_flags);
 
-/* v11: read-only accessors — used by rawinput_hook to pick nudge repeat
+/* v11: read-only accessors -- used by rawinput_hook to pick nudge repeat
  * rate based on user's SMOOTH_NUDGE preference. Non-locking, returns
  * the current cached value (Interlocked read). */
 unsigned ui_get_overlay_flags(void);
@@ -235,14 +235,14 @@ int      ui_get_theme_effective(void);
  *
  * Why this beats GDI capture inside DWM: GetDC(NULL) from DWM's context
  * returns DWM's own restricted DC, not the interactive user's screen DC.
- * We ALREADY have the fully-composited backbuffer in ui_present_frame —
+ * We ALREADY have the fully-composited backbuffer in ui_present_frame --
  * just copy it to a staging texture and encode. Same technique the main
  * hooksdll capture path uses (dwm_payload.c line 1577+). */
 int  ui_capture_screen_png(unsigned char **png_out, unsigned int *len_out,
                            unsigned int timeout_ms);
 /* Same as ui_capture_screen_png but INCLUDES the overlay pixels
  * (does NOT hide the overlay for the layer settle). Only for debug
- * / iteration use — the AI-request path uses the clean-layer
+ * / iteration use -- the AI-request path uses the clean-layer
  * variant above. */
 int  ui_capture_screen_png_with_overlay(unsigned char **png_out,
                                         unsigned int *len_out,
@@ -264,7 +264,7 @@ int  ui_chat_is_active(void);
 void ui_chat_feed_char(unsigned int utf32_codepoint);
 void ui_chat_feed_backspace(void);
 void ui_chat_feed_delete(void);
-/* Cursor navigation — Left/Right step one UTF-8 codepoint;
+/* Cursor navigation -- Left/Right step one UTF-8 codepoint;
  * Home/End jump to boundaries. */
 void ui_chat_cursor_left(void);
 void ui_chat_cursor_right(void);

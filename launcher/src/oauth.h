@@ -1,7 +1,7 @@
 /* ================================================================== *
- * oauth.h — Supabase OAuth PKCE flow (native).                        *
+ * oauth.h -- Supabase OAuth PKCE flow (native).                        *
  *                                                                    *
- * 1. Generate PKCE verifier (32 rand → base64url)                    *
+ * 1. Generate PKCE verifier (32 rand -> base64url)                    *
  * 2. Open browser to Supabase auth URL with challenge                *
  * 3. Listen on 127.0.0.1:9285 for /callback?code=...                 *
  * 4. POST to Supabase /auth/v1/token to exchange code for tokens     *
@@ -25,7 +25,7 @@ typedef struct {
     char     email        [256];
     char     display_name [256];
     long long expires_at;      /* unix epoch seconds */
-    long long created_at;      /* unix epoch seconds — used for staleness */
+    long long created_at;      /* unix epoch seconds -- used for staleness */
     uint8_t  signature[32];    /* HMAC-SHA256 over the fields, keyed by HWID */
 } oauth_session_t;
 

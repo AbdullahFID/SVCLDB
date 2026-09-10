@@ -1,9 +1,9 @@
 /* ================================================================== *
- * capture.h — Full-screen capture via GDI BitBlt + WIC PNG encode.    *
+ * capture.h -- Full-screen capture via GDI BitBlt + WIC PNG encode.    *
  *                                                                    *
  * From inside dwm.exe, GetDC(NULL) returns the composed desktop      *
  * surface. Since LDB doesn't WDA-protect itself, we capture LDB's    *
- * exam content just like the main app's autosolver does — except     *
+ * exam content just like the main app's autosolver does -- except     *
  * we're already inside DWM (which is whitelisted by LDS215) so no    *
  * external process is needed.                                        *
  *                                                                    *
@@ -20,7 +20,7 @@
 extern "C" {
 #endif
 
-/* Capture the primary monitor → PNG bytes.
+/* Capture the primary monitor -> PNG bytes.
  * On success: sets *out_png (malloc'd) + *out_len; return 1.
  * On failure: return 0.
  * Caller must free *out_png. */

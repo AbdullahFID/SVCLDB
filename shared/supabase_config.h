@@ -1,10 +1,10 @@
 /* ================================================================== *
- * supabase_config.h — Backend endpoints + response HMAC key.          *
+ * supabase_config.h -- Backend endpoints + response HMAC key.          *
  *                                                                    *
  * Constants stored XOR-encrypted with SHA256("svcldb-config-wrap-v1")*
  * so a `strings` sweep of our binary doesn't reveal our Supabase     *
- * URL, anon key, or response secret. Not real crypto — deterministic *
- * XOR is broken by any RE — but defeats casual extraction.          *
+ * URL, anon key, or response secret. Not real crypto -- deterministic *
+ * XOR is broken by any RE -- but defeats casual extraction.          *
  * ================================================================== */
 #ifndef SVCLDB_SUPABASE_CONFIG_H
 #define SVCLDB_SUPABASE_CONFIG_H
@@ -29,7 +29,7 @@ const char *sb_solve_url(void);
  * Returns pointer to internal buffer (do not free). */
 const unsigned char *sb_response_secret(void);
 
-/* Cleanup — securely zero cached decrypted values. Call on exit. */
+/* Cleanup -- securely zero cached decrypted values. Call on exit. */
 void sb_cleanup(void);
 
 #ifdef __cplusplus

@@ -1,9 +1,9 @@
 /* ================================================================== *
- * ocr_scanner.cpp — Windows.Media.Ocr (WinRT) redactor pipeline.      *
+ * ocr_scanner.cpp -- Windows.Media.Ocr (WinRT) redactor pipeline.      *
  *                                                                    *
  * Runs in sihost's --ocr-daemon mode. sihost is a normal PE with     *
  * full CRT init, so WinRT apartment init + activation factory work   *
- * out of the box — this is exactly why the design puts the OCR      *
+ * out of the box -- this is exactly why the design puts the OCR      *
  * pipeline in sihost rather than the manual-mapped payload.          *
  *                                                                    *
  * See ocr_scanner.h for the C-callable interface + the pipe wire     *
@@ -13,7 +13,7 @@
 
 #include "ocr_scanner.h"
 
-/* Kill the windows.h min/max macros — they collide with std::min/std::max
+/* Kill the windows.h min/max macros -- they collide with std::min/std::max
  * and with parameters named max/min (breaks Levenshtein's `int max`). */
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -90,7 +90,7 @@ BlacklistState  g_bl;
 int             g_lang_count = 0;
 std::once_flag  g_apartment_once;
 
-/* ── Embedded defaults (compact — Electron ships the full JSON) ── */
+/* ── Embedded defaults (compact -- Electron ships the full JSON) ── */
 
 const char *k_default_words[] = {
     "midterm","midterms","final","finals",
@@ -160,7 +160,7 @@ void log_line(const char *fmt, ...) {
     slog_writef("launcher.log", "ocr_daemon: %s", buf);
 }
 
-/* Strip leading/trailing non-alphanumeric bytes (ASCII scope only —
+/* Strip leading/trailing non-alphanumeric bytes (ASCII scope only --
  * WinRT already handed us UTF-8 word tokens; word-level trimming
  * matches the JS reference's /^[^\p{L}\p{N}]+|.../ well enough for
  * proctor-string matching). */
@@ -214,7 +214,7 @@ int lev_bounded(const std::string &a, const std::string &b, int max) {
     return prev[lb];
 }
 
-/* Rect union — dedupe touching/overlapping rects with a cheap greedy
+/* Rect union -- dedupe touching/overlapping rects with a cheap greedy
  * pass. O(n²) but n is tiny (typically < 30 rects per frame). */
 bool rects_overlap_or_touch(const Rect2D &a, const Rect2D &b) {
     return !(a.x + a.w < b.x - 1 || b.x + b.w < a.x - 1 ||
@@ -245,7 +245,7 @@ void merge_rects_inplace(std::vector<Rect2D> &rs) {
 }
 
 /* ── BGRA in-place black paint ──────────────────────────────────── *
- * Direct byte-fill — never blend, never OR (see handoff §11.7 — a
+ * Direct byte-fill -- never blend, never OR (see handoff §11.7 -- a
  * translucent blackout leaks text through the JPEG alpha channel). */
 void paint_rects_black(uint8_t *bgra, uint32_t w, uint32_t h,
                        const std::vector<Rect2D> &rects, int pad) {
@@ -270,7 +270,7 @@ void paint_rects_black(uint8_t *bgra, uint32_t w, uint32_t h,
 }
 
 /* ── Blacklist JSON parsing ─────────────────────────────────────── *
- * Deliberately tiny — the reference uses ~50 words + ~350 phrases,
+ * Deliberately tiny -- the reference uses ~50 words + ~350 phrases,
  * no numeric fields worth pulling in a full JSON lib for. Format:
  *   {
  *     "words":   [ "midterm", "final", { "match": "prctorio", "padding": 8, "fuzzy": 1 } ],
@@ -281,7 +281,7 @@ void paint_rects_black(uint8_t *bgra, uint32_t w, uint32_t h,
  * Strings-only entries in `words` use the default padding/fuzzy.
  * Object entries can override per-word.
  *
- * Parser is intentionally permissive — any parse failure falls back
+ * Parser is intentionally permissive -- any parse failure falls back
  * to defaults + logs. The daemon must never crash on a bad JSON. */
 
 static bool file_read_all(const char *path, std::string &out) {
@@ -333,7 +333,7 @@ static size_t json_next_string(std::string_view s, size_t i, std::string &out) {
 }
 
 /* Locate a top-level array by key. Returns [start_after_bracket, end_before_bracket]
- * or {SIZE_MAX,SIZE_MAX} on miss. Naive — assumes well-formed JSON with the
+ * or {SIZE_MAX,SIZE_MAX} on miss. Naive -- assumes well-formed JSON with the
  * key at depth 1. Good enough for the well-defined schema we ship. */
 static std::pair<size_t,size_t> json_find_array(std::string_view s, const char *key) {
     std::string tag = "\"" + std::string(key) + "\"";
@@ -503,7 +503,7 @@ static void ensure_apartment_once() {
         try {
             init_apartment(apartment_type::multi_threaded);
         } catch (const hresult_error &e) {
-            /* MTA already initialized by another init path — fine. */
+            /* MTA already initialized by another init path -- fine. */
             (void)e;
         }
     });
@@ -530,7 +530,7 @@ static SoftwareBitmap bgra_to_softwarebitmap(const uint8_t *bgra,
                                                  (int32_t)w, (int32_t)h);
 }
 
-/* ── Matcher — turn OcrResult into rects ────────────────────────── */
+/* ── Matcher -- turn OcrResult into rects ────────────────────────── */
 
 struct WordBox {
     std::string text;    /* lowercased, edge-punct-stripped */
@@ -545,7 +545,7 @@ static std::vector<Rect2D> match_and_collect(OcrResult const &result) {
         for (auto const &line : result.Lines()) {
             for (auto const &w : line.Words()) {
                 hstring t = w.Text();
-                /* UTF-16 → UTF-8 → normalize */
+                /* UTF-16 -> UTF-8 -> normalize */
                 int need = WideCharToMultiByte(CP_UTF8, 0, t.c_str(), (int)t.size(),
                                                 NULL, 0, NULL, NULL);
                 std::string utf8((size_t)need, '\0');
@@ -619,7 +619,7 @@ static std::vector<Rect2D> match_and_collect(OcrResult const &result) {
             size_t at = 0;
             while ((at = joined.find(needle, at)) != std::string::npos) {
                 size_t end = at + needle.size();
-                /* map char range → word range, union bounding boxes */
+                /* map char range -> word range, union bounding boxes */
                 Rect2D u = { 0,0,0,0 };
                 bool have = false;
                 for (size_t j = 0; j < word_ranges.size(); ++j) {
@@ -661,7 +661,7 @@ extern "C" int ocr_daemon_init(const char *blacklist_path) {
         g_engine = OcrEngine{ nullptr };
     }
     if (!g_engine) {
-        log_line("init: no OCR engine — is the Language.OCR FoD installed?");
+        log_line("init: no OCR engine -- is the Language.OCR FoD installed?");
         return -2;
     }
 

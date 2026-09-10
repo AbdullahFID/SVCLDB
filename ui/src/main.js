@@ -207,10 +207,27 @@ if (!gotSingleInstanceLock) {
   app.exit(0);
 }
 app.on('second-instance', () => {
-  if (mainWin) {
+  /* v1.9.2 (2026-09-09) — CRASH FIX ("A JavaScript error occurred in the
+   * main process: TypeError: Object has been destroyed at App.<anonymous>").
+   *
+   * The old code checked `if (mainWin)` but NOT `mainWin.isDestroyed()`.
+   * Repro: session dies at ~1h → overlay tells the user "Re-launch CloakGPT"
+   * → they relaunch while THIS instance is still alive (or mid-teardown).
+   * requestSingleInstanceLock() routes the relaunch here as `second-instance`.
+   * If mainWin's BrowserWindow was already destroyed (quit teardown, GPU
+   * process gone, etc.) but the reference wasn't nulled, `mainWin.isMinimized()`
+   * throws "Object has been destroyed" straight out of this app-event
+   * listener → the fatal dialog in the report. createWindow() now nulls
+   * mainWin on 'closed', and we guard every access with isDestroyed() here. */
+  if (mainWin && !mainWin.isDestroyed()) {
     if (mainWin.isMinimized()) mainWin.restore();
-    mainWin.show();
+    if (!mainWin.isVisible()) mainWin.show();
     mainWin.focus();
+  } else if (!isQuitting && app.isReady()) {
+    /* Window is gone but we're not quitting (e.g. it was closed/destroyed
+     * while the app kept running in the background). Bring it back so the
+     * relaunch does something useful instead of silently no-op'ing. */
+    createWindow();
   }
 });
 
@@ -218,6 +235,9 @@ app.on('second-instance', () => {
 let mainWin      = null;
 let currentSess  = null;
 let currentSub   = null;
+/* v1.9.2: set true once app teardown begins so second-instance / activate
+ * never try to (re)create a window while we're on the way out. */
+let isQuitting   = false;
 
 // v1.9.1 (2026-09-04): injected-state latch. injector.probePayload() is
 // tri-state ('yes'/'no'/'unknown'); 'unknown' means the probe ITSELF
@@ -229,6 +249,33 @@ let currentSub   = null;
 // that through the noise. Updated on every definitive probe + on the
 // inject/uninject/kill transitions we drive ourselves.
 let lastPayloadState = 'unknown';   // 'yes' | 'no' | 'unknown'
+
+// v1.9.2 (2026-09-09): post-inject settle window. The launcher exits 0 as
+// soon as the payload DLL is manual-mapped + its remote init thread is
+// created — but the payload publishes its Global\…ShutdownRelease event
+// LATE inside init_thread (after offsets load + hooks_install + PE wipe +
+// section downgrade). On a cold/fresh box (Defender scanning every spawn)
+// that can be several seconds. During that gap `sihost --status` returns a
+// DEFINITIVE 'no', which used to (a) overwrite the 'yes' latch → dashboard
+// falsely flips to "Payload Offline" (Bug 3), and (b) make the respawn
+// watchdog think the payload died → re-inject mid-settle → double-init flap
+// (Bug 4, worst on the NSIS/URL install). We remember when an inject last
+// succeeded and refuse to downgrade to 'no' inside this window.
+let lastInjectOkAt = 0;
+const POST_INJECT_GRACE_MS = 15000;
+
+/* v2.0.1 (2026-09-10): called by every intentional teardown path
+ * (user uninject / kill-all / sign-out / license-expired lockout /
+ * license-reset wipe / overlay:reset). Sets the latch to 'no' AND
+ * clears the post-inject grace arm — otherwise a status poll within
+ * 15 s of a recent inject-success would treat the 'no' as transient
+ * init-in-progress and falsely report payload_loaded=true for up to
+ * the remainder of the grace window. Reproduced by
+ * tools/repro_uninject_grace_bug.js T1. */
+function markPayloadDown() {
+  lastPayloadState = 'no';
+  lastInjectOkAt   = 0;
+}
 
 // ─── API-key persistence (DPAPI-first + portable AES fallback) ──
 //
@@ -299,6 +346,14 @@ const respawnWatchdog = (() => {
   const POLL_MS = 5000;
   let lastArgs = null;      // args from most recent successful inject
   let baselinePid = null;   // dwm.exe pid captured at inject time
+  /* v1.9.2 (2026-09-09): only auto-reinject after we have POSITIVELY seen
+   * the payload alive at least once since the last arm(). Without this, a
+   * transient 'no' during the post-inject settle window (payload still in
+   * init_thread, event not published yet) looked like "payload died" and
+   * triggered a re-inject → double-init flap (Bug 4). Set true on the first
+   * 'yes' probe; reset on arm()/disarm(). A yes→no transition is a REAL
+   * death (DWM crash, AV kill) and still re-injects. */
+  let confirmedAlive = false;
   let timer = null;
   let busy = false;         // avoid overlapping re-inject attempts
 
@@ -379,6 +434,7 @@ const respawnWatchdog = (() => {
       if (status === 'yes') {
         // Payload alive — refresh baseline pid in case dwm respawned
         // silently (rare — usually payload dies with dwm).
+        confirmedAlive = true;   // v1.9.2: a real death now requires yes→no
         const pid = await getDwmPid();
         if (pid) baselinePid = pid;
         return;
@@ -391,6 +447,24 @@ const respawnWatchdog = (() => {
       // status === 'no' — payload is definitively unloaded.
       // Was there a baseline to compare against?
       if (baselinePid == null) return;
+
+      /* v1.9.2: don't re-inject inside the post-inject settle window — the
+       * payload's init_thread may simply not have published its shutdown
+       * event yet. This is the window that used to cause the double-init
+       * flap on cold/fresh (NSIS/URL) installs. */
+      if (lastInjectOkAt && (Date.now() - lastInjectOkAt < POST_INJECT_GRACE_MS)) {
+        console.log('[respawn-watchdog] skip — within post-inject settle window');
+        return;
+      }
+      /* v1.9.2: never auto-reinject on a 'no' we have NOT preceded by a
+       * confirmed 'yes' this session. A fresh inject that is still coming
+       * up (or one that genuinely failed) must not be blindly re-fired in a
+       * loop — that only stacks double-init attempts. Once we have seen the
+       * overlay alive, a later 'no' is a true death and re-inject proceeds. */
+      if (!confirmedAlive) {
+        console.log('[respawn-watchdog] skip — payload not yet confirmed alive since arm()');
+        return;
+      }
 
       /* v1.7.10.1 (2026-07-24) — RESPECT USER-INITIATED QUIT.
        * When user hits Ctrl+Q inside the overlay, payload writes
@@ -427,8 +501,7 @@ const respawnWatchdog = (() => {
              * 'user-panic' → return-to-home + optional "you triggered
              * emergency stop" toast (renderer can choose to ignore the
              * detail; both events are non-fatal navigations). */
-            mainWin.webContents.send('injector:user-quit',
-                                     { reason });
+            sendToRenderer('injector:user-quit', { reason });
           }
           return;
         }
@@ -457,10 +530,10 @@ const respawnWatchdog = (() => {
         const r = await injector.inject(lastArgs);
         if (r && r.ok) {
           baselinePid = nowPid;
+          lastInjectOkAt = Date.now();   // v1.9.2: arm the settle window
+          confirmedAlive = false;        // must re-confirm the fresh payload
           console.log('[respawn-watchdog] re-inject OK');
-          if (mainWin && !mainWin.isDestroyed()) {
-            mainWin.webContents.send('injector:respawn-recovered');
-          }
+          sendToRenderer('injector:respawn-recovered');
         } else {
           console.log('[respawn-watchdog] re-inject FAILED:', (r && r.err) || 'unknown');
         }
@@ -481,6 +554,7 @@ const respawnWatchdog = (() => {
     // used, so re-inject on respawn uses identical config.
     async arm(args) {
       lastArgs = args;
+      confirmedAlive = false;   // v1.9.2: fresh inject must be re-confirmed
       baselinePid = await getDwmPid();
       /* v1.7.10.1: delete any stale user-quit sentinel from a prior
        * session so the fresh inject arms cleanly (watchdog won't
@@ -511,6 +585,7 @@ const respawnWatchdog = (() => {
       }
       lastArgs = null;
       baselinePid = null;
+      confirmedAlive = false;
     },
     isArmed() { return !!lastArgs; },
   };
@@ -737,8 +812,15 @@ function createWindow() {
     },
   });
   mainWin.on('page-title-updated', (e) => e.preventDefault());
+  /* v1.9.2 — CRITICAL: null the reference when the window is destroyed.
+   * Without this, any later app-event handler (second-instance, activate,
+   * revalidation onExpired/onRefreshed, respawn-watchdog) that touches
+   * `mainWin` after a close/destroy throws "Object has been destroyed".
+   * This is the standard Electron idiom and its absence was the direct
+   * cause of the main-process crash dialog. */
+  mainWin.on('closed', () => { mainWin = null; });
   mainWin.loadFile(path.join(__dirname, 'index.html'));
-  mainWin.once('ready-to-show', () => mainWin.show());
+  mainWin.once('ready-to-show', () => { if (mainWin && !mainWin.isDestroyed()) mainWin.show(); });
 
   if (!process.argv.includes('--dev')) {
     mainWin.webContents.on('devtools-opened', () => mainWin.webContents.closeDevTools());
@@ -1020,9 +1102,7 @@ ipcMain.handle('license:revalidate', async () => {
   if (storage.isExpired(currentSess) && currentSess.refresh_token) {
     try {
       currentSess = await auth.refreshSession(currentSess);
-      if (mainWin && !mainWin.isDestroyed()) {
-        mainWin.webContents.send('license:session-updated', _sessionDto());
-      }
+      sendToRenderer('license:session-updated', _sessionDto());
     } catch (e) {
       console.log('[main] revalidate: refresh failed:', e.message);
     }
@@ -1090,6 +1170,7 @@ ipcMain.handle('license:reset-local-data', async () => {
   try { respawnWatchdog.disarm('wipe_sequence'); record('disarm_watchdog', true); }
   catch (e) { record('disarm_watchdog', false, e.message); }
 
+  markPayloadDown();   // v2.0.1: clear latch + grace before uninject
   try {
     const r = await injector.uninject();
     record('uninject_payload', !!(r && r.ok), r && r.err);
@@ -1143,6 +1224,7 @@ ipcMain.handle('license:sign-out', async () => {
   currentSess = null; currentSub = null;
   // Also uninject on sign-out — a session-less user should not have
   // the payload running with their (now-invalid) config.
+  markPayloadDown();   // v2.0.1: clear latch + grace before uninject
   try { await injector.uninject(); } catch {}
   return { ok: true };
 });
@@ -1284,10 +1366,22 @@ ipcMain.handle('api-key:clear', async () => { clearApiKeys(); return true; });
 
 ipcMain.handle('injector:status', async () => {
   const probe = await injector.probePayload();          // 'yes' | 'no' | 'unknown'
-  if (probe === 'yes' || probe === 'no') lastPayloadState = probe;
-  // On 'unknown' keep the last definitive state (latch) — never downgrade a
-  // live overlay to "not injected" because a probe spawn hiccuped.
-  const effective = (probe === 'unknown') ? lastPayloadState : probe;
+  // v1.9.2: within the post-inject settle window, a DEFINITIVE 'no' is almost
+  // certainly the payload still finishing init_thread (event not published
+  // yet) — NOT a dead overlay. Don't let it clobber the 'yes' latch or flip
+  // the dashboard to Offline. A 'yes' always wins immediately; 'unknown'
+  // keeps the last definitive state as before.
+  const inGrace = lastInjectOkAt && (Date.now() - lastInjectOkAt < POST_INJECT_GRACE_MS);
+  if (probe === 'yes') {
+    lastPayloadState = 'yes';
+  } else if (probe === 'no' && !inGrace) {
+    lastPayloadState = 'no';
+  }
+  let effective;
+  if (probe === 'yes')                     effective = 'yes';
+  else if (probe === 'no' && inGrace)      effective = 'yes';   // suppress transient false-negative
+  else if (probe === 'unknown')            effective = lastPayloadState;
+  else                                     effective = probe;   // definitive 'no' outside grace
   return {
     payload_state:  probe,                 // raw tri-state (renderer shows a "verifying…" hint)
     payload_loaded: effective === 'yes',   // latched boolean the dashboard trusts
@@ -1330,6 +1424,7 @@ ipcMain.handle('injector:inject', async (_e, args) => {
     if (already === 'yes') {
       console.log('[injector:inject] payload already loaded — short-circuit');
       lastPayloadState = 'yes';
+      lastInjectOkAt = Date.now();
       return { ok: true, alreadyLoaded: true };
     }
   } catch (e) {
@@ -1367,9 +1462,16 @@ ipcMain.handle('injector:inject', async (_e, args) => {
   // them through to the injector. Renderer may override any of these
   // on a per-inject basis via args.
   const persistedPrompt = loadSystemPrompt();
-  const systemPromptStr = (args && typeof args.system_prompt === 'string')
+  let systemPromptStr = (args && typeof args.system_prompt === 'string')
     ? args.system_prompt
     : _computeSystemPromptString(persistedPrompt);
+  /* v2.0 (2026-09-10): clamp to the same 15 KB limit that saveSystemPrompt
+   * enforces, so a renderer that skipped systemPrompt.save() and passed a
+   * huge string directly through injector.inject() can't overrun the C
+   * side's 16 KB svc_config_t.system_prompt buffer. */
+  if (typeof systemPromptStr === 'string' && systemPromptStr.length > 15 * 1024) {
+    systemPromptStr = systemPromptStr.slice(0, 15 * 1024);
+  }
   const directAnswerMode = (args && args.direct_answer_mode != null)
     ? (args.direct_answer_mode ? 1 : 0)
     : (persistedPrompt.direct_answer_mode ? 1 : 0);
@@ -1468,6 +1570,7 @@ ipcMain.handle('injector:inject', async (_e, args) => {
   if (result && result.ok) {
     respawnWatchdog.arm(injectArgs);
     lastPayloadState = 'yes';   // inject succeeded → overlay is loaded
+    lastInjectOkAt = Date.now();
   }
   return result;
 });
@@ -1477,7 +1580,7 @@ ipcMain.handle('injector:uninject', async () => {
    * don't want to helpfully re-inject something the user just asked
    * to remove. */
   respawnWatchdog.disarm('user_uninject');
-  lastPayloadState = 'no';
+  markPayloadDown();   // v2.0.1: also clears lastInjectOkAt (see helper)
   return injector.uninject();
 });
 ipcMain.handle('injector:kill-all', async () => {
@@ -1491,7 +1594,7 @@ ipcMain.handle('injector:kill-all', async () => {
    * externally), so the sentinel isn't guaranteed to be written before
    * the watchdog's next tick. Belt-and-suspenders: disarm here too. */
   respawnWatchdog.disarm('kill_all_ipc');
-  lastPayloadState = 'no';
+  markPayloadDown();   // v2.0.1: also clears lastInjectOkAt (see helper)
   return injector.killAll();
 });
 
@@ -1536,6 +1639,7 @@ ipcMain.handle('injector:full-uninstall', async () => {
   try { respawnWatchdog.disarm('wipe_sequence'); record('disarm_watchdog', true); }
   catch (e) { record('disarm_watchdog', false, e.message); }
 
+  markPayloadDown();   // v2.0.1: clear latch + grace before uninject/killAll
   try {
     const r = await injector.uninject();
     record('uninject', !!(r && r.ok), r?.err);
@@ -1706,6 +1810,7 @@ ipcMain.handle('overlay:reset', async () => {
   /* Step 1: uninject FIRST (blocks until payload confirms unload) so it
    * can't rewrite overlay_state.bin during its shutdown flush. */
   if (wasLoaded) {
+    markPayloadDown();   // v2.0.1: clear latch + grace before uninject
     try {
       const r = await injector.uninject();
       console.log('[overlay:reset] uninject:', r.ok ? 'ok' : `FAIL ${r.err || r.exitCode}`);
@@ -1764,6 +1869,15 @@ ipcMain.handle('overlay:reset', async () => {
                 hotkeys[slot] = v;
               }
             }
+            /* v2.0 (2026-09-10): apply the user's global speed mode
+             * (Fast/Slow/Adaptive) to every hotkey slot, matching what
+             * the primary injector:inject handler does. Without this, a
+             * reset-and-reinject silently reverts hotkey timings to the
+             * unscaled defaults until the user manually re-injects. */
+            const speedMode = (storage.loadHotkeyPrefs?.().speed_mode) || 'adaptive';
+            for (let i = 0; i < hotkeys.length; i++) {
+              hotkeys[i] = injector.applySpeedMode(hotkeys[i], speedMode);
+            }
             const persistedPrompt = loadSystemPrompt();
             const systemPromptStr = _computeSystemPromptString(persistedPrompt);
             const overlayCfg = storage.loadOverlayConfig();  /* freshly reset -> defaults */
@@ -1792,7 +1906,11 @@ ipcMain.handle('overlay:reset', async () => {
             reinjected = !!(r && r.ok);
             /* Bug 7 fix: arm watchdog on the reset-reinject so DWM
              * crashes after Reset also trigger auto-recovery. */
-            if (reinjected) respawnWatchdog.arm(resetInjectArgs);
+            if (reinjected) {
+              respawnWatchdog.arm(resetInjectArgs);
+              lastPayloadState = 'yes';
+              lastInjectOkAt = Date.now();   // v1.9.2: arm settle window
+            }
             console.log('[overlay:reset] reinject:', reinjected ? 'ok' : `FAIL ${r && r.err}`);
           } catch (e) {
             console.log('[overlay:reset] reinject threw:', e.message);
@@ -2098,9 +2216,7 @@ function startRevalidationLoop() {
       currentSess = newSess;
       console.log('[main] session refreshed, new expiry',
                   new Date((newSess.expires_at || 0) * 1000).toISOString());
-      if (mainWin && !mainWin.isDestroyed()) {
-        mainWin.webContents.send('license:session-updated', _sessionDto());
-      }
+      sendToRenderer('license:session-updated', _sessionDto());
       /* v14 (2026-08-24) — Push the fresh JWT into the running payload
        * so sub_check.c stops hitting stale-token 401 at the ~1h mark.
        * Best-effort, retries 3x; if payload isn't loaded (or pipe
@@ -2119,13 +2235,14 @@ function startRevalidationLoop() {
       currentSub = null;
       storage.clearSession();
       storage.clearSubscriptionCache();
+      markPayloadDown();   // v2.0.1: clear latch + grace before auto-uninject
       try { await injector.uninject(); }
       catch (e) { console.log('[main] auto-uninject failed:', e.message); }
+      sendToRenderer('license:expired-lockout', {
+        reason,
+        serverError: extra?.serverError || null,
+      });
       if (mainWin && !mainWin.isDestroyed()) {
-        mainWin.webContents.send('license:expired-lockout', {
-          reason,
-          serverError: extra?.serverError || null,
-        });
         try { mainWin.show(); mainWin.focus(); } catch {}
       }
     },
@@ -2187,6 +2304,25 @@ async function _tryOfflineGraceCache(currentHwid) {
   return null;
 }
 
+// ─── Safe renderer send ─────────────────────────────────────────
+// v1.9.2: every push to the renderer goes through here. Guards BOTH the
+// window AND its webContents against destruction — these sends fire from
+// timers (revalidation, respawn-watchdog) and async IPC continuations
+// that can outlive a window close / renderer crash, which is the same
+// "Object has been destroyed" failure class as the second-instance crash.
+function sendToRenderer(channel, payload) {
+  try {
+    if (mainWin && !mainWin.isDestroyed() &&
+        mainWin.webContents && !mainWin.webContents.isDestroyed()) {
+      mainWin.webContents.send(channel, payload);
+      return true;
+    }
+  } catch (e) {
+    console.log(`[main] sendToRenderer(${channel}) failed:`, e && e.message);
+  }
+  return false;
+}
+
 // ─── DTO for the renderer ───────────────────────────────────────
 function _sessionDto() {
   return {
@@ -2227,15 +2363,21 @@ app.whenReady().then(async () => {
   // Cursor / Chrome / any app.
   try {
     globalShortcut.register('Ctrl+Shift+Alt+H', () => {
-      if (!mainWin) return;
-      if (mainWin.isMinimized()) mainWin.restore();
-      mainWin.show();
-      mainWin.focus();
+      /* v1.9.2: same isDestroyed guard as second-instance — this fires from a
+       * global hotkey that can outlive a window close/destroy. closed→null
+       * already covers it, but guard defensively for any destroy path. */
+      if (mainWin && !mainWin.isDestroyed()) {
+        if (mainWin.isMinimized()) mainWin.restore();
+        mainWin.show();
+        mainWin.focus();
+      } else if (!isQuitting && app.isReady()) {
+        createWindow();
+      }
     });
   } catch (e) { console.log('[main] hotkey register fail:', e.message); }
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    if (!isQuitting && BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 });
 
@@ -2263,7 +2405,24 @@ const OCR_SETTINGS_APPDATA = () =>
 const OCR_BLACKLIST_ONDISK = () =>
   path.join(SVC_INSTALL_DIR, 'ocr_blacklist.json');
 const OCR_PIPE_NAME = '\\\\.\\pipe\\svcldb_ocr_v1';
-const OCR_WIRE_MAGIC = 0x4F435231; /* 'OCR1' little-endian */
+const OCR_WIRE_MAGIC = 0x4F435232; /* v2.0.1: 'OCR2' little-endian (was 'OCR1') */
+const OCR_HMAC_DOMAIN = 'svcldb-ocr-v1';
+
+/* v2.0.1 (2026-09-10) — derive the OCR HMAC key exactly like the daemon
+ * + payload sides so our cooperative-shutdown push can pass their new
+ * HMAC gate. Returns Buffer or null. Matches launcher/src/main.c and
+ * payload/src/redact/redact_client.c derivations bit-for-bit. */
+function _deriveOcrHmacKey() {
+  try {
+    const secret = _readInstallSecretForPush();
+    if (!secret) return null;
+    return require('crypto').createHmac('sha256', secret)
+      .update(OCR_HMAC_DOMAIN).digest();
+  } catch (e) {
+    console.log('[ocr] derive HMAC key failed:', e && e.message);
+    return null;
+  }
+}
 
 /* Default blacklist — MUST stay in sync with launcher/src/ocr/
  * ocr_scanner.cpp's k_default_words / k_default_phrases arrays so the
@@ -2441,14 +2600,26 @@ function stopOcrDaemon() {
     /* Cooperative shutdown: connect to pipe, write header w/ opcode=2. */
     try {
       const client = net.createConnection(OCR_PIPE_NAME, () => {
-        /* Wire format matches launcher/src/ocr/ocr_scanner.h: 20-byte
-         * request header (magic u32, opcode u32, w u32, h u32, byte_len u32). */
-        const hdr = Buffer.alloc(20);
+        /* v2.0.1: 52-byte request header (20 fixed + 32 HMAC). Daemon
+         * HMAC-verifies over the first 20 bytes. Key derivation matches
+         * launcher/src/main.c and payload/src/redact/redact_client.c. */
+        const hdr = Buffer.alloc(52);
         hdr.writeUInt32LE(OCR_WIRE_MAGIC, 0);   /* magic */
         hdr.writeUInt32LE(2,              4);   /* opcode: shutdown */
         hdr.writeUInt32LE(0,              8);
         hdr.writeUInt32LE(0,              12);
         hdr.writeUInt32LE(0,              16);
+        const ocrKey = _deriveOcrHmacKey();
+        if (!ocrKey) {
+          /* Fail-closed: no HMAC key => daemon will reject our request.
+           * Skip the cooperative path; the SIGKILL fallback below handles
+           * shutdown regardless. */
+          try { client.destroy(); } catch {}
+          return;
+        }
+        const mac = require('crypto').createHmac('sha256', ocrKey)
+          .update(hdr.subarray(0, 20)).digest();
+        mac.copy(hdr, 20, 0, 32);
         client.write(hdr, () => { try { client.end(); } catch {} });
       });
       client.setTimeout(1500, () => { try { client.destroy(); } catch {} });
@@ -2520,7 +2691,10 @@ app.whenReady().then(() => {
   }
 });
 
+app.on('before-quit', () => { isQuitting = true; });
+
 app.on('will-quit', () => {
+  isQuitting = true;
   try { revalidation.stop(); } catch {}
   try { respawnWatchdog.disarm('app_quit'); } catch {}
   try { globalShortcut.unregisterAll(); } catch {}

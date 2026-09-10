@@ -1,5 +1,5 @@
 /* ================================================================== *
- * supabase_config.c — XOR-obfuscated Supabase constants.              *
+ * supabase_config.c -- XOR-obfuscated Supabase constants.              *
  *                                                                    *
  * Values encrypted with SHA256("svcldb-config-wrap-v1") and stored   *
  * as base64 blobs. Decrypted at runtime into heap-alloc'd cached     *

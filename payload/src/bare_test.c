@@ -1,4 +1,4 @@
-/* Bulletproof bare DLL — writes to THREE places + OutputDebugString.
+/* Bulletproof bare DLL -- writes to THREE places + OutputDebugString.
  * If NONE of these fire, DllMain literally isn't running. */
 
 #define WIN32_LEAN_AND_MEAN

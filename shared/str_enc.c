@@ -1,5 +1,5 @@
 /* ================================================================== *
- * str_enc.c — Runtime XOR-decryption of the encrypted string blob.   *
+ * str_enc.c -- Runtime XOR-decryption of the encrypted string blob.   *
  *                                                                    *
  * See str_enc.h for the full design rationale.                        *
  * ================================================================== */
@@ -15,9 +15,9 @@
 static volatile LONG g_str_init_done = 0;
 
 /* Per-index XOR key. Matches the generator in gen_str_enc.ps1 exactly.
- * Simple mixing so patterns don't repeat across strings — a "known
+ * Simple mixing so patterns don't repeat across strings -- a "known
  * plaintext" attack on one string doesn't help with another (different
- * len → different key stream). Not cryptographic; just enough to defeat
+ * len -> different key stream). Not cryptographic; just enough to defeat
  * `strings`, grep, and pattern-based binary diffing. */
 static unsigned char _svc_key_byte(size_t idx, size_t len) {
     return (unsigned char)(((idx * 37) + (len * 91) + SVC_STR_KEY_MIX) & 0xFF);
@@ -39,11 +39,18 @@ void svc_str_init(void) {
     DWORD old_prot = 0;
     if (!VirtualProtect((LPVOID)g_svc_enc_blob, sizeof(g_svc_enc_blob),
                         PAGE_READWRITE, &old_prot)) {
-        /* Fallback: without protect flip we can't decrypt. Set flag back
-         * to 0 so a later call retries; leave blob as-is (encrypted).
-         * All svc_str() lookups will return garbage — a visible failure
-         * mode rather than a silent wrong-value one. */
-        InterlockedExchange(&g_str_init_done, 0);
+        /* v2.0 (2026-09-10) -- Permanently failed. DO NOT reset g_str_init_done
+         * to 0. Pre-fix: on VirtualProtect failure this reset the flag,
+         * which let a second thread see 0, race in, retry VirtualProtect
+         * (which may now succeed), and XOR the blob a SECOND time. XOR
+         * twice restores the ENCRYPTED form -> every SS() lookup returns
+         * garbage bytes after that point. Since VirtualProtect on our own
+         * .rdata page is extraordinarily unlikely to fail, giving up
+         * permanently (state=3) is safer than an ambiguous retry that
+         * can silently corrupt the whole string table. Post-failure,
+         * svc_str() will return the still-encrypted blob (visible-garbage
+         * failure mode, per the design intent noted below). */
+        InterlockedExchange(&g_str_init_done, 3);
         return;
     }
 
@@ -65,7 +72,7 @@ void svc_str_init(void) {
 
 const char *svc_str(int idx) {
     if (idx < 0 || idx >= SVC_STR_COUNT) return "";
-    /* Lazy init — cheap after first call (single Interlocked load). */
+    /* Lazy init -- cheap after first call (single Interlocked load). */
     if (!g_str_init_done) svc_str_init();
     return &g_svc_enc_blob[g_svc_enc_table[idx].offset];
 }

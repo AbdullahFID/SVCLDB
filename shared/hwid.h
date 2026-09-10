@@ -1,9 +1,9 @@
 /* ================================================================== *
- * hwid.h — Hardware ID derivation.                                    *
+ * hwid.h -- Hardware ID derivation.                                    *
  *                                                                    *
  * Mirrors main app's lumio/src/license/device.js. Same fallback     *
  * chain so a session signed against the main app can (in theory)     *
- * be validated by us too — though we bind to different backends so   *
+ * be validated by us too -- though we bind to different backends so   *
  * this is more about consistent HWID than session interop.           *
  * ================================================================== */
 #ifndef SVCLDB_HWID_H
@@ -17,7 +17,7 @@ extern "C" {
  * Order:
  *   1. SMBIOS UUID via wmic csproduct (matches device.js primary path)
  *   2. HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid (fallback #1)
- *   3. SHA-256(computer_name || volume_c_serial) → formatted as UUID (fallback #2)
+ *   3. SHA-256(computer_name || volume_c_serial) -> formatted as UUID (fallback #2)
  * Returns 1 on success, 0 on failure (out unchanged).
  */
 int hwid_get(char *out, unsigned outsize);

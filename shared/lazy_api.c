@@ -1,11 +1,11 @@
 /* ================================================================== *
- * lazy_api.c — PEB-walker + export-table hash resolver.               *
+ * lazy_api.c -- PEB-walker + export-table hash resolver.               *
  *                                                                    *
  * See lazy_api.h for design + threat model.                          *
  *                                                                    *
  * All hot functions are inlined into the caller by /O2 /GL so the    *
  * only bytes that end up in the shipped binary are the export-table  *
- * walk logic — no import name strings anywhere.                       *
+ * walk logic -- no import name strings anywhere.                       *
  * ================================================================== */
 
 #include "lazy_api.h"
@@ -63,7 +63,7 @@ static LAZY_PEB *lazy_get_peb(void) {
 
 /* Compare a UNICODE_STRING module name against a hash. Returns 1 on
  * match. Handles the trailing ".dll" that PEB entries include but our
- * callers may or may not — we try BOTH ways to be tolerant. */
+ * callers may or may not -- we try BOTH ways to be tolerant. */
 static int lazy_module_matches(const LAZY_UNICODE_STRING *name, uint32_t target_hash) {
     /* PEB Buffer isn't null-terminated within the length field; make a
      * bounded local copy on the stack + null-terminate. */
@@ -108,7 +108,7 @@ void *lazy_get_proc_by_hash(void *module_base, uint32_t proc_name_hash) {
     IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
     /* Some modules (or our own, post-wipe_pe_headers()) have their MZ
      * signature nulled. e_lfanew still points at NT headers in that
-     * case — DOS stub's e_lfanew field lives at offset 0x3C and is
+     * case -- DOS stub's e_lfanew field lives at offset 0x3C and is
      * NOT wiped by our PE-header-wipe. */
     IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
     IMAGE_DATA_DIRECTORY *exp_dd =
@@ -135,7 +135,7 @@ void *lazy_get_proc_by_hash(void *module_base, uint32_t proc_name_hash) {
         if (fn_rva >= exp_dd->VirtualAddress &&
             fn_rva <  exp_dd->VirtualAddress + exp_dd->Size) {
             const char *fwd = (const char *)fn;
-            /* Split on the LAST '.' — some forwards are "api-ms-win-...".RtlXxx" */
+            /* Split on the LAST '.' -- some forwards are "api-ms-win-...".RtlXxx" */
             char mod_name[64] = {0};
             const char *dot = NULL;
             for (const char *p = fwd; *p; p++) if (*p == '.') dot = p;

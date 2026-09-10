@@ -690,9 +690,16 @@ async function uninject() {
     const child = spawn(exePath, ['--unload'], {
       windowsHide: true, stdio: 'ignore', detached: false,
     });
-    child.on('exit', (code) => resolve({ ok: code === 0, exitCode: code }));
-    child.on('error', (e)   => resolve({ ok: false, err: e.message }));
-    setTimeout(() => { try { child.kill(); } catch {}; resolve({ ok: false, err: 'timeout' }); }, 20_000);
+    /* v2.0 (2026-09-10): capture + clear the 20s timeout on exit/error so
+     * a normal uninject (~500ms) doesn't leave a dangling timer that
+     * (a) tries to kill an already-dead process and (b) keeps Node's
+     * event loop alive for 20s after each call. Mirrors inject()'s pattern. */
+    const tmr = setTimeout(() => {
+      try { child.kill(); } catch {}
+      resolve({ ok: false, err: 'timeout' });
+    }, 20_000);
+    child.once('exit',  (code) => { clearTimeout(tmr); resolve({ ok: code === 0, exitCode: code }); });
+    child.once('error', (e)    => { clearTimeout(tmr); resolve({ ok: false, err: e.message }); });
   });
 }
 
@@ -707,9 +714,15 @@ async function killAll() {
     const child = spawn(exePath, ['--kill-all'], {
       windowsHide: true, stdio: 'ignore', detached: false,
     });
-    child.on('exit', (code) => resolve({ ok: code === 0, exitCode: code }));
-    child.on('error', (e)   => resolve({ ok: false, err: e.message }));
-    setTimeout(() => { try { child.kill(); } catch {}; resolve({ ok: false, err: 'timeout' }); }, 20_000);
+    /* v2.0 (2026-09-10): same clearTimeout pattern as uninject() — a
+     * successful kill-all takes ~1s; the dangling 20s timer used to
+     * fire a redundant .kill() + a second (swallowed) resolve. */
+    const tmr = setTimeout(() => {
+      try { child.kill(); } catch {}
+      resolve({ ok: false, err: 'timeout' });
+    }, 20_000);
+    child.once('exit',  (code) => { clearTimeout(tmr); resolve({ ok: code === 0, exitCode: code }); });
+    child.once('error', (e)    => { clearTimeout(tmr); resolve({ ok: false, err: e.message }); });
   });
 }
 

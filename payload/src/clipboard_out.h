@@ -1,6 +1,6 @@
 /* ================================================================== *
- * clipboard_out.h — Write UTF-8 text to the interactive user's        *
- * clipboard. Best-effort — falls back to writing to a file the       *
+ * clipboard_out.h -- Write UTF-8 text to the interactive user's        *
+ * clipboard. Best-effort -- falls back to writing to a file the       *
  * launcher's tray helper can pop up.                                 *
  * ================================================================== */
 #ifndef SVCLDB_CLIPBOARD_OUT_H
@@ -21,13 +21,13 @@ int  clip_set_utf8(const char *utf8);
 /* Same as clip_set_utf8 but takes an explicit byte length so callers
  * can copy a range slice without an intermediate NUL-terminated dup.
  * len is the number of UTF-8 bytes at `bytes` (NOT including any
- * trailing NUL — this helper adds one internally). Returns 1/0.
+ * trailing NUL -- this helper adds one internally). Returns 1/0.
  *
  * v9 (2026-07-06): all imgui_layer copy paths (Ctrl+Alt+C,
  * Ctrl+Shift+Alt+C, Ctrl+Alt+A, per-block copy buttons) route through
  * this so they inherit the retry loop AND CF_UNICODETEXT semantics
  * that clip_set_utf8 already had. Previously each writer did a single
- * OpenClipboard attempt with CF_TEXT — first-attempt failures silently
+ * OpenClipboard attempt with CF_TEXT -- first-attempt failures silently
  * ate the request, and non-ASCII (Greek/math/emoji) got mangled by
  * the ANSI codepage round-trip. */
 int  clip_set_utf8_bytes(const char *bytes, size_t len);

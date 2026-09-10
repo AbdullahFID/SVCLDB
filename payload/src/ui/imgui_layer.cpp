@@ -1,5 +1,5 @@
 /* ================================================================== *
- * imgui_layer.cpp — ImGui + D3D11 inside DWM's compositor pass.       *
+ * imgui_layer.cpp -- ImGui + D3D11 inside DWM's compositor pass.       *
  *                                                                    *
  * Design:                                                            *
  *  - Hook `COverlayContext::Present(pCtx, pLayer, ...)` in dwmcore.  *
@@ -7,10 +7,10 @@
  *    just presented to the compositor for THIS specific layer.       *
  *  - Get the D3D device via COM ID3D11DeviceChild::GetDevice slot 3. *
  *  - Only render into the FULLSCREEN layer (>= 800x600). DWM Present *
- *    is per-layer — cursor overlay is 32x32, tooltips are small.     *
+ *    is per-layer -- cursor overlay is 32x32, tooltips are small.     *
  *  - HDR-aware: if the texture is R16G16B16A16_FLOAT, we create the  *
  *    RTV with the SAME format (ImGui outputs scRGB-compatible sRGB   *
- *    values → 1.0 in float = SDR white on both SDR and HDR monitors).*
+ *    values -> 1.0 in float = SDR white on both SDR and HDR monitors).*
  *  - Complete D3D11 state save/restore around ImGui render (ImGui's  *
  *    internal backup handles the shader/IA/RS/BS/DS/PS-SRV state; we *
  *    additionally back up OM RTVs + viewport + scissor since ImGui   *
@@ -20,7 +20,7 @@
  * (not slog) because slog uses __declspec(thread) internally, and    *
  * TLS is broken under manual map (loader-only init step skipped).    *
  *                                                                    *
- * Vtable slots — verified via production hooksdll/dwm/dwm_payload.c  *
+ * Vtable slots -- verified via production hooksdll/dwm/dwm_payload.c  *
  * capture path (25/25 audit; used in production for 800+ users):     *
  *   pLayer.vtable[5] () = GetPhysicalBackBuffer                      *
  *   pLayer.vtable[24]() = GetD3D11Resource                           *
@@ -62,29 +62,29 @@ extern "C" {
 
 /* ---------- Vtable slots (production-verified via PDB dump 2026-07-16) ----------
  *
- * IMPORTANT NAMING NOTE (v1.6.5 — corrected via RE):
+ * IMPORTANT NAMING NOTE (v1.6.5 -- corrected via RE):
  *
- * The names GPB_SLOT / GD3D_SLOT / ACC3_SLOT are HISTORICAL — they
+ * The names GPB_SLOT / GD3D_SLOT / ACC3_SLOT are HISTORICAL -- they
  * pre-date the actual RE of dwmcore.dll. Actual method identity at
  * each slot on a REFERENCE build (Win11 26100.8115, PDB-verified):
  *
- *   GPB_SLOT   =  5  → COverlaySwapChain::GetDevice
- *                       (result THROWN AWAY — sanity probe only, kept
+ *   GPB_SLOT   =  5  -> COverlaySwapChain::GetDevice
+ *                       (result THROWN AWAY -- sanity probe only, kept
  *                        because removing it would change behavior on
  *                        obscure builds where slot 24 depends on the
  *                        object state after GetDevice runs)
- *   GD3D_SLOT  = 24  → CDDisplaySwapChain::GetPhysicalBackBuffer
+ *   GD3D_SLOT  = 24  -> CDDisplaySwapChain::GetPhysicalBackBuffer
  *                       (THIS returns pBuffer used downstream)
- *   ACC3_SLOT  = 19  → CDDisplaySwapChainBuffer::GetD3D11Resource
+ *   ACC3_SLOT  = 19  -> CDDisplaySwapChainBuffer::GetD3D11Resource
  *                       (called on pBuffer, returns pResource)
- *   VTBL_QI    =  0  → IUnknown::QueryInterface (COM-standard)
+ *   VTBL_QI    =  0  -> IUnknown::QueryInterface (COM-standard)
  *
  * CDDisplaySwapChain has 6 vftables (multi-inheritance). GetPhysicalBackBuffer
  * lives at slot 24 on vftable[1/6], slot 45 on [2/6], 44 on [3/6],
  * 43 on [4/6], 28 on [5/6]. When DWM passes pLayer cast as a
  * non-primary subobject on older Windows builds, hardcoded slot 24
- * points at a completely different function → wrong-object chain →
- * garbage QI target → __fastfail. Dynamic RVA-based scan handles this.
+ * points at a completely different function -> wrong-object chain ->
+ * garbage QI target -> __fastfail. Dynamic RVA-based scan handles this.
  *
  * See tools/re_probe/dwmcore_dump.c for the tool used to produce
  * the definitive per-build slot mapping. */
@@ -98,11 +98,11 @@ static const GUID IID_ID3D11Texture2D_LOCAL = {
     0x6f15aaf2, 0xd208, 0x4e89, {0x9a,0xb4,0x48,0x95,0x35,0xd3,0x4f,0x9c}
 };
 
-/* v1.7.11.2 (2026-07-25) — BP-parity Device1 QI for DiscardView.
+/* v1.7.11.2 (2026-07-25) -- BP-parity Device1 QI for DiscardView.
  * BP RE (bp_decomp.c line 65-77 + bp_decomp2.c FUN_18000c390) confirms
  * BP QIs the underlying pDevice to ID3D11Device1, then uses
  * GetImmediateContext1 to get ID3D11DeviceContext1. That unlocks
- * DiscardView / DiscardResource — the D3D11.1 compositor-hint APIs
+ * DiscardView / DiscardResource -- the D3D11.1 compositor-hint APIs
  * that tell DWM "these pixels are discardable, feel free to fully
  * repaint on the next compose". Likely the missing piece for BP's
  * glide + no-trails behavior on Chrome/DirectComposition apps. */
@@ -120,7 +120,7 @@ typedef void   *(__fastcall *pfnVGet)(void *);
 /* ---------- Diagnostic writer (bypasses slog TLS issue entirely) ----------
  * Every important line ALSO goes to payload_early.txt as plaintext. The
  * TLS-in-manual-map problem swallowed all slog_write calls before this
- * commit — plaintext bypass is unaffected and always works. */
+ * commit -- plaintext bypass is unaffected and always works. */
 static CRITICAL_SECTION g_diag_cs;
 static volatile LONG    g_diag_cs_init = 0;
 
@@ -134,7 +134,7 @@ static void diag_init_lock(void) {
 }
 
 /* Route UI-layer diag through encrypted slog. Enable plaintext mirror
- * with DWM_EXT_TRACE=1 env var. Anti-strings-scan pattern —
+ * with DWM_EXT_TRACE=1 env var. Anti-strings-scan pattern --
  * see dllmain.c early_log for the same shape. */
 static int g_ui_diag_plaintext = -1;
 static void diag(const char *fmt, ...) {
@@ -175,13 +175,13 @@ static void diag(const char *fmt, ...) {
     LeaveCriticalSection(&g_diag_cs);
 }
 
-/* Forward decl — used by ui_toggle_visible / ui_nudge / etc. below.
+/* Forward decl -- used by ui_toggle_visible / ui_nudge / etc. below.
  * Definition is further down alongside the capture path. */
 static void wake_dwm_composition(void);
-/* v1.6.5: lightweight variant for visibility toggles — one composition
+/* v1.6.5: lightweight variant for visibility toggles -- one composition
  * pass, no cursor jitter, no 300ms SCP burst. See ui_toggle_visible. */
 static void wake_dwm_composition_lite(void);
-/* v1.7.2: throttled typing wake — used per-keystroke to avoid strobing. */
+/* v1.7.2: throttled typing wake -- used per-keystroke to avoid strobing. */
 static void wake_dwm_composition_typing(void);
 
 /* ---------- Readability probe ---------- */
@@ -195,7 +195,7 @@ static bool is_readable(const void *addr, size_t bytes) {
     return true;
 }
 
-/* v1.6.1 (2026-07-15) — Executability probe for vtable-slot validation.
+/* v1.6.1 (2026-07-15) -- Executability probe for vtable-slot validation.
  *
  * The hardcoded vtable slots in get_backbuffer_texture (GPB_SLOT=5,
  * GD3D_SLOT=24, ACC3_SLOT=19) were reverse-engineered from a specific
@@ -204,19 +204,19 @@ static bool is_readable(const void *addr, size_t bytes) {
  * to the WRONG function pointer for that build. Calling the wrong
  * pointer either:
  *   - Lands in valid code that happens to have a different signature
- *     → stack corruption → later __fastfail
- *   - Lands in NON-code (heap, .data, unmapped) → __fastfail via CFG
+ *     -> stack corruption -> later __fastfail
+ *   - Lands in NON-code (heap, .data, unmapped) -> __fastfail via CFG
  *     or CET Shadow Stack (BYPASSES __try/__except entirely)
  *
  * Reported by jay.perkerson@gmail.com 2026-07-15: DWM crashed within
  * ~1s of every inject. Payload log stopped exactly at first-frame
  * BEFORE any ImGui init line, which is where get_backbuffer_texture
- * runs. His resolver hit 11/21 symbols vs 17/21 on the dev box —
+ * runs. His resolver hit 11/21 symbols vs 17/21 on the dev box --
  * confirming different dwmcore build.
  *
  * Fix: validate each vtable slot fetch returns a pointer INSIDE
  * dwmcore.dll's executable memory before calling. If not, log and
- * bail — overlay doesn't render (returns NULL from
+ * bail -- overlay doesn't render (returns NULL from
  * get_backbuffer_texture) but DWM STAYS ALIVE, hotkeys still work,
  * and payload emits diagnostic that tells support what happened. */
 static HMODULE g_dwmcore_mod  = NULL;
@@ -243,11 +243,11 @@ static bool is_ptr_in_dwmcore(const void *p) {
 /* v1.6.1: Any executable memory owned by an IMAGE-mapped section (i.e.
  * inside a legitimately-loaded DLL/EXE). Used for looser slot validation
  * on COM-standard vtable positions (e.g. IUnknown::QueryInterface at
- * slot 0) which legitimately dispatch across module boundaries — the
+ * slot 0) which legitimately dispatch across module boundaries -- the
  * accessor's QI might point into d3d11.dll or dxgi.dll, not dwmcore.
  *
  * MEM_IMAGE + PAGE_EXECUTE_* is the correct signature for loaded-DLL
- * code — excludes heap/stack/manual-map regions where a corrupted vtable
+ * code -- excludes heap/stack/manual-map regions where a corrupted vtable
  * pointer might otherwise land. */
 static bool is_ptr_in_loaded_module_code(const void *p) {
     if (!p) return false;
@@ -260,11 +260,11 @@ static bool is_ptr_in_loaded_module_code(const void *p) {
     return (mbi.Protect & exec_mask) != 0;
 }
 
-/* ── v1.6.2 (2026-07-15) — dynamic vtable-slot discovery ──
+/* ── v1.6.2 (2026-07-15) -- dynamic vtable-slot discovery ──
  *
  * dllmain plumbs the resolver-discovered RVAs of the vtable target
  * methods into the UI layer via ui_set_vtable_slot_hints(). Any RVA
- * being 0 means "no PDB hint — fall back to hardcoded slot" for
+ * being 0 means "no PDB hint -- fall back to hardcoded slot" for
  * that entry.
  *
  * At first Present() call, get_backbuffer_texture walks pLayer's
@@ -276,11 +276,11 @@ static bool is_ptr_in_loaded_module_code(const void *p) {
  *
  * Solves the "DWM crashes ~1s after inject on Windows patches with
  * re-ordered vtable" bug (jay.perkerson@gmail.com 2026-07-15).
- * Zero regression risk for users where hardcoded works — dynamic
+ * Zero regression risk for users where hardcoded works -- dynamic
  * discovers the SAME slot the hardcoded constant points to, uses
  * it, no user-visible change.
  *
- * v1.6.5 (2026-07-16): raised from 64 → 256 after user log analysis.
+ * v1.6.5 (2026-07-16): raised from 64 -> 256 after user log analysis.
  * CDDisplaySwapChain has 6 vftables in modern dwmcore (multi-inherit).
  * On subobjects other than vtable[1/6], GetPhysicalBackBuffer lives at
  * slot 28/43/44/45. 64 caught the primary vtable but MISSed all others.
@@ -294,7 +294,7 @@ static volatile ui_rva_t g_rva_gd3d = 0;   /* GetD3D11Resource RVA hint      */
 static volatile ui_rva_t g_rva_acc  = 0;   /* accessor RVA hint              */
 
 /* Discovered slot indices (cached across calls). -1 = not yet resolved
- * or dynamic scan failed → falls back to hardcoded constant. */
+ * or dynamic scan failed -> falls back to hardcoded constant. */
 static volatile int g_dyn_slot_gpb  = -1;
 static volatile int g_dyn_slot_gd3d = -1;
 static volatile int g_dyn_slot_acc  = -1;
@@ -303,14 +303,14 @@ extern "C" void ui_set_vtable_slot_hints(ui_rva_t gpb_rva, ui_rva_t gd3d_rva, ui
     g_rva_gpb  = gpb_rva;
     g_rva_gd3d = gd3d_rva;
     g_rva_acc  = acc_rva;
-    /* Note: don't log here — this runs before slog is fully set up in
+    /* Note: don't log here -- this runs before slog is fully set up in
      * some code paths. Discovery attempts log their own diagnostics. */
 }
 
 /* v1.6.3: known-RVA lookup table. Populated once at init by
  * ui_set_known_rva_table(); read (lock-free) at first Present() to
  * name each vtable slot's actual function in the diag log. Small
- * bounded copy (MAX_KNOWN_RVA = 32) — plenty for offsets.blob's ~20
+ * bounded copy (MAX_KNOWN_RVA = 32) -- plenty for offsets.blob's ~20
  * meaningful entries. */
 #define MAX_KNOWN_RVA 32
 static ui_rva_symbol_t g_known_rva[MAX_KNOWN_RVA];
@@ -328,7 +328,7 @@ extern "C" void ui_set_known_rva_table(const ui_rva_symbol_t *table, int count) 
     g_known_rva_count = written;
 }
 
-/* O(N) linear search — N is tiny (~20). Called at most 3 times per
+/* O(N) linear search -- N is tiny (~20). Called at most 3 times per
  * DWM lifetime (once per slot on first Present success). Returns
  * name of the symbol whose RVA matches, or "?" if unknown. */
 static const char *lookup_rva_name(ui_rva_t rva) {
@@ -345,7 +345,7 @@ static const char *lookup_rva_name(ui_rva_t rva) {
  * lives at without needing to run RE tools on the user's machine.
  *
  * Only logs slots where the fn's RVA matches something in the known-RVA
- * table (~20 entries from offsets.blob) — the vast majority of the ~50
+ * table (~20 entries from offsets.blob) -- the vast majority of the ~50
  * scanned slots point to methods we don't have RVAs for, so listing them
  * would just be noise. */
 static void dump_known_slots_in_vtable(const char *vtbl_label, void **vtbl) {
@@ -370,10 +370,10 @@ static void dump_known_slots_in_vtable(const char *vtbl_label, void **vtbl) {
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        diag("  (SEH during vtable walk — vtable ended early)");
+        diag("  (SEH during vtable walk -- vtable ended early)");
     }
     if (!found_any) {
-        diag("  (no slots matched any known-RVA — pLayer type is unknown "
+        diag("  (no slots matched any known-RVA -- pLayer type is unknown "
              "OR resolver missed too many symbols)");
     }
 }
@@ -392,7 +392,7 @@ static int find_vtable_slot_by_rva(void **vtbl, ui_rva_t target_rva) {
     int found = -1;
     __try {
         for (int i = 0; i < MAX_VTABLE_SCAN_SLOTS; i++) {
-            /* Bounds-check the pointer read itself — vtable might end
+            /* Bounds-check the pointer read itself -- vtable might end
              * before slot MAX_VTABLE_SCAN_SLOTS. */
             if (!is_readable(&vtbl[i], sizeof(void *))) break;
             void *fn = vtbl[i];
@@ -407,7 +407,7 @@ static int find_vtable_slot_by_rva(void **vtbl, ui_rva_t target_rva) {
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        /* Vtable turned out shorter than we scanned or unmapped — bail. */
+        /* Vtable turned out shorter than we scanned or unmapped -- bail. */
     }
     return found;
 }
@@ -425,11 +425,11 @@ static void discover_gpb_slot_once(void **layer_vtbl, int hardcoded) {
         if (dyn == hardcoded) {
             diag("vtable: gpb_slot dynamic=%d hardcoded=%d MATCH", dyn, hardcoded);
         } else {
-            diag("vtable: gpb_slot dynamic=%d hardcoded=%d DRIFT — using dynamic",
+            diag("vtable: gpb_slot dynamic=%d hardcoded=%d DRIFT -- using dynamic",
                  dyn, hardcoded);
         }
     } else {
-        diag("vtable: gpb_slot dynamic-scan MISS (rva_hint=0x%llx) — falling back to hardcoded %d",
+        diag("vtable: gpb_slot dynamic-scan MISS (rva_hint=0x%llx) -- falling back to hardcoded %d",
              (unsigned long long)g_rva_gpb, hardcoded);
         /* v1.6.5: dump full known-symbol map for pLayer so support can
          * see what's ACTUALLY at each slot on this Windows build. */
@@ -445,15 +445,15 @@ static void discover_gd3d_slot_once(void **layer_vtbl, int hardcoded) {
         if (dyn == hardcoded) {
             diag("vtable: gd3d_slot dynamic=%d hardcoded=%d MATCH", dyn, hardcoded);
         } else {
-            diag("vtable: gd3d_slot dynamic=%d hardcoded=%d DRIFT — using dynamic",
+            diag("vtable: gd3d_slot dynamic=%d hardcoded=%d DRIFT -- using dynamic",
                  dyn, hardcoded);
         }
     } else {
-        diag("vtable: gd3d_slot dynamic-scan MISS (rva_hint=0x%llx) — falling back to hardcoded %d",
+        diag("vtable: gd3d_slot dynamic-scan MISS (rva_hint=0x%llx) -- falling back to hardcoded %d",
              (unsigned long long)g_rva_gd3d, hardcoded);
-        /* v1.6.5: dump layer_vtbl once — same vtable as gpb, but the gpb
+        /* v1.6.5: dump layer_vtbl once -- same vtable as gpb, but the gpb
          * dump already fired on its MISS. Only dump here if gpb HIT
-         * (rare — both hints would then be plausibly present). Cheap. */
+         * (rare -- both hints would then be plausibly present). Cheap. */
         if (g_dyn_slot_gpb >= 0) {
             dump_known_slots_in_vtable("pLayer(gd3d)", layer_vtbl);
         }
@@ -468,11 +468,11 @@ static void discover_acc_slot_once(void **res_vtbl, int hardcoded) {
         if (dyn == hardcoded) {
             diag("vtable: acc_slot dynamic=%d hardcoded=%d MATCH", dyn, hardcoded);
         } else {
-            diag("vtable: acc_slot dynamic=%d hardcoded=%d DRIFT — using dynamic",
+            diag("vtable: acc_slot dynamic=%d hardcoded=%d DRIFT -- using dynamic",
                  dyn, hardcoded);
         }
     } else {
-        diag("vtable: acc_slot dynamic-scan MISS (rva_hint=0x%llx) — falling back to hardcoded %d",
+        diag("vtable: acc_slot dynamic-scan MISS (rva_hint=0x%llx) -- falling back to hardcoded %d",
              (unsigned long long)g_rva_acc, hardcoded);
         /* v1.6.5: res_vtbl is a DIFFERENT vtable than layer_vtbl (belongs
          * to the buffer object returned by GetPhysicalBackBuffer). Dump it
@@ -481,7 +481,7 @@ static void discover_acc_slot_once(void **res_vtbl, int hardcoded) {
     }
 }
 
-/* Convenience — returns the slot to USE (dynamic if discovered, else hardcoded). */
+/* Convenience -- returns the slot to USE (dynamic if discovered, else hardcoded). */
 static inline int effective_gpb_slot(void)  { int d = g_dyn_slot_gpb;  return d >= 0 ? d : GPB_SLOT;  }
 static inline int effective_gd3d_slot(void) { int d = g_dyn_slot_gd3d; return d >= 0 ? d : GD3D_SLOT; }
 static inline int effective_acc_slot(void)  { int d = g_dyn_slot_acc;  return d >= 0 ? d : ACC3_SLOT; }
@@ -508,7 +508,7 @@ static bool             g_ui_cs_init  = false;
  * BLOCKS DirectComposition apps (Chrome, Cursor, Electron, Slack,
  * Discord, VS Code) from taking their direct-flip fast path. Every
  * keystroke redraw of the typed-into app falls back to the composited
- * swapchain → visible strobe on each key.
+ * swapchain -> visible strobe on each key.
  *
  * v6.3 documented this trade-off: "when overlay IS visible we NEED
  * composition (that's how our pixels get on screen) so the trade-off
@@ -516,20 +516,20 @@ static bool             g_ui_cs_init  = false;
  * so DirectComp apps direct-flip. User presses TOGGLE (hold Right-Shift
  * in stealth, or Ctrl+Alt+G) to peek at answers, then hides again.
  *
- * ASK / stream / copy still work silently while hidden — invariant #120
+ * ASK / stream / copy still work silently while hidden -- invariant #120
  * ensures the chat append + pending handlers DON'T force-show. The
  * whole stealth workflow: triple-tap ` -> ASK fires invisibly -> wait
  * a beat -> triple-tap A -> answer in clipboard -> paste. Zero pixels
  * on screen. */
-static bool             g_visible     = true;   /* v11.2.4 (2026-07-24) — LO ask: show overlay immediately on inject (was default HIDDEN — required Ctrl+B toggle). Bypassify parity. */
+static bool             g_visible     = true;   /* v11.2.4 (2026-07-24) -- LO ask: show overlay immediately on inject (was default HIDDEN -- required Ctrl+B toggle). Bypassify parity. */
 static bool             g_imgui_inited= false;
 
-/* v1.7.10 (2026-07-24) — LEAN MODE.
+/* v1.7.10 (2026-07-24) -- LEAN MODE.
  *
  * When ON, draw_chat_window skips ImGui::Begin/End and renders the
  * overlay via ImGui::GetForegroundDrawList()->AddRectFilled + AddText.
  * Matches Bypassify's exact render pattern (RPM-verified: BP's
- * ImGuiContext::Windows.Size = 1, single unnamed entry — proving they
+ * ImGuiContext::Windows.Size = 1, single unnamed entry -- proving they
  * bypass the Begin/End window system entirely).
  *
  * Trade-offs given up:
@@ -548,14 +548,14 @@ static bool             g_imgui_inited= false;
  * via svchelper UI at inject time. */
 static volatile LONG    g_lean_mode   = 0;
 
-/* v12 (2026-07-24) — ARCHITECTURAL REFACTOR TO BP PARITY.
+/* v12 (2026-07-24) -- ARCHITECTURAL REFACTOR TO BP PARITY.
  *
  * Deep Ghidra decomp of Bypassify (bp-architecture-full-picture.md
  * memory note) proved BP uses PROGMAN's HWND as a fake parent Win32
  * window + standard ImGui-Win32 backend. That's why their input works
  * per-frame + why DWM's dirty-region tracker knows about them + why
  * they don't ghost-trail. Our custom no-HWND setup was architecturally
- * different — every surface tweak (trail-erase, hide-grace, RTV swap,
+ * different -- every surface tweak (trail-erase, hide-grace, RTV swap,
  * opaque-lock, message pump) was fighting this gap and losing.
  *
  * v12 architectural change:
@@ -596,7 +596,7 @@ static bool ensure_fake_hwnd_valid(void) {
     if (newh == g_fake_hwnd) {
         return g_fake_hwnd != NULL;   /* nothing changed */
     }
-    /* Progman changed (explorer restart, session switch, etc.) —
+    /* Progman changed (explorer restart, session switch, etc.) --
      * teardown Win32 backend, swap HWND, re-init on next frame. */
     if (g_win32_backend_inited) {
         diag("[RECOVERY] Progman changed %p -> %p; teardown Win32 backend",
@@ -641,9 +641,9 @@ static volatile LONG    g_chat_next_id  = 1;
  * shows the empty home cheat-sheet even if messages exist. Any new
  * message appended flips this back to 0 so the user sees new activity
  * immediately. Toggled by:
- *   - Ctrl+Alt+X on chat view → set to 1 (hide messages, preserve them)
- *   - ui_chat_append_* → set to 0 (new activity, show chat again)
- *   - Ctrl+Alt+N → also implicitly resets (messages gone entirely) */
+ *   - Ctrl+Alt+X on chat view -> set to 1 (hide messages, preserve them)
+ *   - ui_chat_append_* -> set to 0 (new activity, show chat again)
+ *   - Ctrl+Alt+N -> also implicitly resets (messages gone entirely) */
 static volatile LONG    g_home_view_forced = 0;
 
 /* Status badge (provider/tier/model shown top-right). */
@@ -745,7 +745,7 @@ static void chat_msg_append_bytes(struct chat_msg_t *m,
 /* Fonts. Loaded in ImGui init path. g_font_ui = Segoe UI (sans-serif,
  * matches Win11 UI), g_font_mono = Cascadia Mono / Consolas (fenced-
  * code + math blocks). Both fall back to ImGui default (Proggy Clean)
- * if loading fails — everything still renders, just smaller / uglier.
+ * if loading fails -- everything still renders, just smaller / uglier.
  *
  * Base size 16px @ 1x DPI. Runtime scaling happens via
  * ImGuiIO::FontGlobalScale in draw_chat_window (screen_h/1080 factor
@@ -767,16 +767,16 @@ static int   g_offset_x = 0;
 static int   g_offset_y = 0;
 static int   g_extra_w  = 0;
 static int   g_extra_h  = 0;
-static float g_alpha    = 1.00f;   /* v11: default OPAQUE (was 0.94f) — Bypassify-parity, zero trailing */
+static float g_alpha    = 1.00f;   /* v11: default OPAQUE (was 0.94f) -- Bypassify-parity, zero trailing */
 static float g_font     = 1.00f;   /* multiplicative on top of DPI-derived scale */
 
-/* v1.7.8 (2026-07-24) — TRAIL FIX via UNDERLYING-APP INVALIDATE.
+/* v1.7.8 (2026-07-24) -- TRAIL FIX via UNDERLYING-APP INVALIDATE.
  *
  * LO reported: overlay OVER the foreground-at-inject-time app = no
- * trails (that app repaints every frame → DWM re-composites → old
+ * trails (that app repaints every frame -> DWM re-composites -> old
  * overlay pixels overwritten). Overlay OVER any static background
- * app = trails (no app invalidation → DWM never re-composes those
- * pixels → our old-position overlay pixels sit in the layer forever).
+ * app = trails (no app invalidation -> DWM never re-composes those
+ * pixels -> our old-position overlay pixels sit in the layer forever).
  *
  * Fix: track the LAST drawn overlay rect (screen coords). On any
  * geometry change (nudge / resize / cycle_corner / reset / toggle_
@@ -784,15 +784,15 @@ static float g_font     = 1.00f;   /* multiplicative on top of DPI-derived scale
  * NULL, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW) which
  * cascades a repaint through every top-level window overlapping the
  * old rect. That forces DWM to invalidate its layer compose at that
- * region → underlying apps' fresh pixels overwrite our stale overlay
- * pixels → trails gone.
+ * region -> underlying apps' fresh pixels overwrite our stale overlay
+ * pixels -> trails gone.
  *
  * Rect is padded 32px on each side to cover ImGui window shadows
  * and any ~1-frame anti-aliased fringe. */
 static RECT  g_last_overlay_rect = {0, 0, 0, 0};
 static void invalidate_last_overlay_region(const char *why);   /* forward decl for callers above the def */
 
-/* v1.7.8c (2026-07-24) — GLIDE ANIMATION (Bypassify-parity, LO ask).
+/* v1.7.8c (2026-07-24) -- GLIDE ANIMATION (Bypassify-parity, LO ask).
  *
  * BP's overlay glides across the screen; ours snapped instantly per
  * nudge. Fix: interpolate the DISPLAYED position toward the TARGET
@@ -805,7 +805,7 @@ static void invalidate_last_overlay_region(const char *why);   /* forward decl f
  *   frame 3: 66%
  *   frame 4: 76%   (halfway feel around frame 2)
  *   frame ~8: ~95% (visually settled)
- * → ~130ms total settling for a single 48px nudge, feels smooth without
+ * -> ~130ms total settling for a single 48px nudge, feels smooth without
  * being sluggish. Rapid Ctrl+arrow bursts extend the target smoothly;
  * displayed position tracks with a slight lag = the butter feel.
  *
@@ -816,14 +816,14 @@ static float g_disp_off_x = 0.0f;
 static float g_disp_off_y = 0.0f;
 static bool  g_disp_off_primed = false;
 
-/* v1.7.4 (2026-07-23) — GHOST FRAME / WINDOW MOVE FIX.
+/* v1.7.4 (2026-07-23) -- GHOST FRAME / WINDOW MOVE FIX.
  *
  * User bug reports:
  *   1. "AI overlay" title bar renders 7-8 times horizontally stacked
  *      (screenshot showed "AI AI AI AI AI AI AI AI overlay") after
  *      the user nudged the overlay via Ctrl+Alt+Right several times.
  *   2. "Moving the window won't register until I hide it and open it
- *      again to see his new position" — user moves overlay via nudge
+ *      again to see his new position" -- user moves overlay via nudge
  *      hotkey but the visible position doesn't update on-screen.
  *
  * Root cause: DWM's overlay-layer texture is NOT cleared between
@@ -831,21 +831,21 @@ static bool  g_disp_off_primed = false;
  *   - Renders ImGui overlay AT CURRENT position INTO the layer texture
  *   - DWM composites the layer over the desktop
  *   - Next frame, layer texture STILL has the previous overlay pixels
- *   - We render at NEW position → both old + new pixels visible
+ *   - We render at NEW position -> both old + new pixels visible
  *
  * Fix: track the "geometry generation" (bump every time position/size/
  * corner/alpha changes) + snapshot it in the Present path. When the
  * generation changed since the last successful draw, force a
  * ClearRenderTargetView(rtv, {0,0,0,0}) BEFORE ImGui renders. This
  * wipes the entire overlay layer to fully transparent, so only the
- * new frame's ImGui draws contribute — no ghost from prior positions.
+ * new frame's ImGui draws contribute -- no ghost from prior positions.
  *
  * SAFE because: DWM's overlay layer holds ONLY our overlay pixels
- * (verified by RE — pLayer's backbuffer is dedicated to overlay
+ * (verified by RE -- pLayer's backbuffer is dedicated to overlay
  * content, NOT desktop composite). Clearing to (0,0,0,0) is
  * semantically "no overlay pixels this frame" which DWM handles
  * correctly. If for some Windows build the layer were shared with
- * desktop content, we'd see the desktop flash — but empirically the
+ * desktop content, we'd see the desktop flash -- but empirically the
  * layer is exclusive.
  *
  * NON-CHANGES-CLEAR: we ALSO clear on the first-ever draw and after
@@ -871,9 +871,9 @@ static int   g_base_h_cfg = 0;   /* 0 = use fallback 460 */
  * live resize hotkeys. Ultra allows tiny 80x60 pip AND near-fullscreen. */
 static volatile LONG g_size_mode = 0;   /* 0 normal, 1 ultra */
 
-/* v11 (2026-07-24) — Bypassify-parity theme + behavior flags.
+/* v11 (2026-07-24) -- Bypassify-parity theme + behavior flags.
  *   g_theme_pref: 0=dark, 1=light, 2=auto (poll AppsUseLightTheme every 2s)
- *   g_theme_effective: 0=dark, 1=light — the CURRENT rendering theme after
+ *   g_theme_effective: 0=dark, 1=light -- the CURRENT rendering theme after
  *                      auto-resolution. Consulted every frame by
  *                      draw_chat_window to pick color palette.
  *   g_overlay_flags: bitfield of SVC_OVFLAG_* (see shared/config_types.h).
@@ -883,21 +883,21 @@ static volatile LONG g_size_mode = 0;   /* 0 normal, 1 ultra */
  *                    counter. On each frame we paint each entry with our
  *                    opaque WindowBg color via ImGui::GetBackgroundDrawList()
  *                    to overwrite trailing pixels from prior positions.
- *                    Entries age out after TRAIL_ERASE_FRAMES frames — long
+ *                    Entries age out after TRAIL_ERASE_FRAMES frames -- long
  *                    enough for DWM natural compose to catch up, short
  *                    enough to not leave a visible "solid navy tail".
  *
- * All accesses via Interlocked* — read-hot from Present thread,
+ * All accesses via Interlocked* -- read-hot from Present thread,
  * write-cold from ui_* handlers and the theme poll thread. */
 static volatile LONG g_theme_pref      = 2;                       /* 0=dark, 1=light, 2=auto */
 static volatile LONG g_theme_effective = 0;                       /* 0=dark, 1=light         */
 static volatile LONG g_overlay_flags   = (LONG)SVC_OVFLAG_DEFAULTS;
 
-/* v11.2 (2026-07-24) — TRAIL_HIST_MAX 6→48 slots but FRAMES 12→3.
+/* v11.2 (2026-07-24) -- TRAIL_HIST_MAX 6->48 slots but FRAMES 12->3.
  * v11.2-a live test with 12 frames left a visible dark-navy "afterglow"
  * rectangle where the trail-erase rects hung around too long, forming
  * a solid opaque block behind the moving overlay. FRAMES=3 keeps the
- * erase paint alive for ~50ms @60Hz — long enough to catch DWM's compose
+ * erase paint alive for ~50ms @60Hz -- long enough to catch DWM's compose
  * lag but short enough that the user reads it as instant-invisible.
  * 48 slots still covers a rapid 12-nudge sequence without wrap. */
 #define TRAIL_HIST_MAX      48
@@ -915,7 +915,7 @@ static float               g_last_pushed_y = -99999.0f;
 static float               g_last_pushed_w = 0.0f;
 static float               g_last_pushed_h = 0.0f;
 
-/* v11.2 (2026-07-24) — HIDE GRACE for instant Ctrl+B hide.
+/* v11.2 (2026-07-24) -- HIDE GRACE for instant Ctrl+B hide.
  *
  * ROOT CAUSE OF v11.1 "hide takes too long" BUG: draw_chat_window
  * returns early on !g_visible, so nothing paints our region. But the
@@ -923,7 +923,7 @@ static float               g_last_pushed_h = 0.0f;
  * next natural refresh (which may take many frames). User sees the
  * overlay "hang around" or "partially hide" for 100-500ms.
  *
- * FIX: on visibility → hidden transition, seed the trail history with
+ * FIX: on visibility -> hidden transition, seed the trail history with
  * the last overlay rect, and force draw_chat_window to CONTINUE
  * rendering the erase-paint pass (only the trail-erase rects, no
  * overlay content) for HIDE_GRACE_FRAMES. That forcibly wipes the
@@ -971,11 +971,11 @@ static void trail_push_rect(float x, float y, float w, float h) {
 static int query_windows_apps_use_light_theme(void) {
     HKEY hk = NULL;
     DWORD val = 0, sz = sizeof(val);
-    /* Personalize is under HKCU — but payload runs in DWM's session which
+    /* Personalize is under HKCU -- but payload runs in DWM's session which
      * is SYSTEM. DWM impersonates the interactive user for Personalize
      * reads via HKEY_CURRENT_USER but that may not always work from
      * an arbitrary thread. We try HKCU first, then fall back to reading
-     * the interactive user's hive under HKU\<active-sid>. Failure → 0
+     * the interactive user's hive under HKU\<active-sid>. Failure -> 0
      * (dark theme) which matches the pre-v11 rendering. */
     if (RegOpenKeyExW(HKEY_CURRENT_USER,
         L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
@@ -990,7 +990,7 @@ static int query_windows_apps_use_light_theme(void) {
     return 0;   /* dark theme default when we can't read */
 }
 
-/* v1.3 (2026-07-07): per-frame alpha multiplier — snapshotted from
+/* v1.3 (2026-07-07): per-frame alpha multiplier -- snapshotted from
  * g_alpha at the top of draw_chat_window and used by nested
  * renderers (draw_chat_bubble, md_render_tinted_block, code/math
  * block wrappers) to scale their INTERIOR background + border alphas.
@@ -999,14 +999,14 @@ static int query_windows_apps_use_light_theme(void) {
  * alpha=0.95, code-block bg was 0.98, math-block bg was 0.98. The
  * outer ImGui window's WindowBg respected g_alpha but everything
  * INSIDE was near-opaque. User set alpha=0.20 and got a very
- * transparent frame with almost-opaque chat bubbles inside — the
+ * transparent frame with almost-opaque chat bubbles inside -- the
  * "transparency only applies to the edges, not the chat box" report.
  *
  * Threading model: draw_chat_window is called from the DWM Present
  * detour on the compositor thread. Every downstream call chain
  * (draw_chat_bubble, md_render, md_render_code_block,
  * md_render_math_display, md_render_tinted_block) runs synchronously
- * on that same thread. No concurrent access — a plain static
+ * on that same thread. No concurrent access -- a plain static
  * suffices, no atomic needed.
  *
  * Contract: draw_chat_window MUST set g_frame_alpha_mul at the top
@@ -1017,14 +1017,14 @@ static float g_frame_alpha_mul = 1.0f;
 
 /* Return `c` with its alpha channel multiplied by g_frame_alpha_mul.
  * Applied to bubble bg + border, code/math block bg + border, and
- * button colors — everything that visually constitutes the "chat
+ * button colors -- everything that visually constitutes the "chat
  * box container" so the whole container respects user transparency
- * uniformly. Body TEXT is deliberately NOT scaled — text alpha
+ * uniformly. Body TEXT is deliberately NOT scaled -- text alpha
  * scaling below ~0.5 makes prose unreadable, which is worse UX than
  * having text render at full opacity against a partially-transparent
  * background. */
 static inline ImVec4 with_alpha_mul(ImVec4 c) {
-    /* v11.2.1 (2026-07-24) — kept snap-to-opaque semantics: at user's
+    /* v11.2.1 (2026-07-24) -- kept snap-to-opaque semantics: at user's
      * 100% opacity slider position, force all bg/border/chrome colors
      * to alpha=1.0 so bubble/code/math bgs (designed at 0.85/0.98/etc)
      * don't stay visibly translucent inside an otherwise-opaque overlay.
@@ -1036,7 +1036,7 @@ static inline ImVec4 with_alpha_mul(ImVec4 c) {
 }
 
 /* ---------- Fullscreen-layer discovery ---------- *
- * DWM's COverlayContext::Present fires many times per frame — once per
+ * DWM's COverlayContext::Present fires many times per frame -- once per
  * layer. Cursor overlay is 32x32, tooltips are ~100x30, etc. We only
  * want to render into the layer that represents the physical display
  * output (which for a single-monitor 1920x1080 setup is the 1920x1080
@@ -1045,7 +1045,7 @@ static UINT g_target_w = 0;   /* Largest layer dimensions we've seen. */
 static UINT g_target_h = 0;
 static ID3D11Texture2D *g_target_tex = nullptr;  /* Last texture matching target. */
 
-/* Frame dedup — Present is called PER LAYER by DWM. Even after size gate
+/* Frame dedup -- Present is called PER LAYER by DWM. Even after size gate
  * multiple ~fullscreen layers can pass through in the same compose cycle
  * (LDB main + LDB modal + full-screen overlay window). We must draw the
  * chat overlay ONCE per frame or the user sees duplicates ghosting into
@@ -1053,18 +1053,18 @@ static ID3D11Texture2D *g_target_tex = nullptr;  /* Last texture matching target
  *
  * Threshold: 3ms. Detailed rationale + refresh-rate table lives in the
  * v1.3 TRANSPARENCY FLICKER FIX comment below (right above the tick
- * comparison in ui_present_frame). Do not restore 12ms — that broke
+ * comparison in ui_present_frame). Do not restore 12ms -- that broke
  * every monitor >= 90Hz. */
 #define FRAME_DEDUP_MS 3
 static ULONGLONG g_last_draw_tick = 0;
 
-/* Reply-pane scroll accumulator — hotkey handler adds delta, next
+/* Reply-pane scroll accumulator -- hotkey handler adds delta, next
  * draw_chat_window frame calls ImGui::SetScrollY with the accumulated
  * amount then resets. Positive = scroll down toward end, negative =
  * scroll up toward top. Auto-repeat produces continuous scroll. */
 static volatile LONG g_reply_scroll_pending = 0;
 
-/* Chat input state — user types via WH_KEYBOARD_LL feeding into
+/* Chat input state -- user types via WH_KEYBOARD_LL feeding into
  * ui_chat_feed_char. When g_chat_active, the LL hook diverts EVERY
  * non-hotkey key into this buffer instead of passing it through.
  * Buffer is UTF-8 to survive non-ASCII input on the way to the AI. */
@@ -1084,7 +1084,7 @@ static void ensure_chat_cs() {
 }
 
 /* ================================================================== *
- * Persistent overlay state — save/restore across sessions.            *
+ * Persistent overlay state -- save/restore across sessions.            *
  * ================================================================== *
  *                                                                    *
  * User's tuning (corner + nudge + size + alpha + font) survives DWM   *
@@ -1112,7 +1112,7 @@ static void ensure_chat_cs() {
 static ULONGLONG g_last_save_tick = 0;
 static volatile LONG g_state_dirty = 0;
 
-/* Full path to persistence file. Writable location — SVC_INSTALL_DIR
+/* Full path to persistence file. Writable location -- SVC_INSTALL_DIR
  * (typically C:\ProgramData\WinAudioSvc) is already carved out for us. */
 static void state_file_path(char *out, size_t out_sz) {
     _snprintf(out, out_sz - 1, "%s\\%s", SVC_INSTALL_DIR, STATE_FILE);
@@ -1163,7 +1163,7 @@ static void state_mark_dirty(void) {
     InterlockedExchange(&g_state_dirty, 1);
 }
 
-/* Throttled flush — called from ui_present_frame every N frames. */
+/* Throttled flush -- called from ui_present_frame every N frames. */
 static void state_flush_if_due(void) {
     if (!InterlockedCompareExchange(&g_state_dirty, 0, 1)) return;
     ULONGLONG now = GetTickCount64();
@@ -1181,7 +1181,7 @@ static void state_flush_if_due(void) {
 /* Restore saved state from disk if the file exists + is well-formed.
  * Called ONCE during ensure_cs(). Silently no-op on any error.
  *
- * Version-tolerant reader (Bypassify parity — they carry v5→v8
+ * Version-tolerant reader (Bypassify parity -- they carry v5->v8
  * migration; we start with v1 and grow forward). Rules:
  *  - Magic MUST match (else file is corrupt or from a different tool)
  *  - version MUST be >= 1 (0 is invalid)
@@ -1196,8 +1196,8 @@ static void state_flush_if_due(void) {
  * and bump STATE_VERSION. Never rearrange existing fields or the
  * migrator breaks. */
 static const unsigned int STATE_SIZE_BY_VERSION[] = {
-    0,   /* v0 — invalid */
-    40,  /* v1 — magic+version + visible/corner/offX/offY/extraW/extraH/alpha/font */
+    0,   /* v0 -- invalid */
+    40,  /* v1 -- magic+version + visible/corner/offX/offY/extraW/extraH/alpha/font */
 };
 #define STATE_MAX_KNOWN_VERSION \
     (sizeof(STATE_SIZE_BY_VERSION) / sizeof(STATE_SIZE_BY_VERSION[0]) - 1)
@@ -1215,7 +1215,7 @@ static void state_load_once(void) {
     unsigned char buf[256] = {0};
     DWORD r = 0;
     if (!ReadFile(h, buf, sizeof(buf), &r, NULL) || r < 8) {
-        /* Need at least magic+version — 8 bytes. */
+        /* Need at least magic+version -- 8 bytes. */
         CloseHandle(h); return;
     }
     CloseHandle(h);
@@ -1225,7 +1225,7 @@ static void state_load_once(void) {
     memcpy(&version, buf + 4, 4);
     if (magic != STATE_MAGIC) return;
     if (version < 1) return;
-    /* Reject files from a FUTURE version — we can't safely read them. */
+    /* Reject files from a FUTURE version -- we can't safely read them. */
     if (version > (unsigned int)STATE_VERSION) return;
 
     /* Sanity: min bytes for this version. */
@@ -1235,7 +1235,7 @@ static void state_load_once(void) {
             : 0;
     if (need == 0 || r < need) return;
 
-    /* v1 fields — always present in every version >= 1. */
+    /* v1 fields -- always present in every version >= 1. */
     int   iv_visible = 0, iv_corner = 0, iv_off_x = 0, iv_off_y = 0;
     int   iv_ew = 0, iv_eh = 0;
     float f_alpha = 0.94f, f_font = 1.0f;
@@ -1270,10 +1270,10 @@ static void state_load_once(void) {
 
     /* v1.7.2 (2026-07-17): DELIBERATELY IGNORE persisted visibility.
      * Fresh inject ALWAYS starts hidden. Rationale documented at
-     * g_visible default declaration — DirectComp apps (Chrome/Cursor/
+     * g_visible default declaration -- DirectComp apps (Chrome/Cursor/
      * Electron) can't direct-flip while overlay is visible, which
      * makes every typed keystroke strobe the app the user is in.
-     * Silently ignore `iv_visible` — position/alpha/font/corner
+     * Silently ignore `iv_visible` -- position/alpha/font/corner
      * still persist normally, only the visibility bit resets. User
      * hits TOGGLE to peek at answers when they want. */
     (void)iv_visible;
@@ -1297,9 +1297,9 @@ static void state_load_once(void) {
 
 /* ---------- DWM-side screen capture ---------- *
  * ui_capture_screen_png() sets these; the next ui_present_frame() with a
- * fullscreen layer captures via CopyResource → staging → Map → WIC PNG,
+ * fullscreen layer captures via CopyResource -> staging -> Map -> WIC PNG,
  * then signals the event. The captured frame is what DWM has JUST
- * finished compositing for THIS frame — i.e., exactly what's on screen
+ * finished compositing for THIS frame -- i.e., exactly what's on screen
  * (including all app windows). Our overlay is drawn AFTER capture in the
  * same present_frame call, so overlay pixels are NOT in the capture. */
 static HANDLE                g_cap_done_ev  = NULL;
@@ -1333,7 +1333,7 @@ static const GUID GUID_WICPixelFormat32bppBGRA_local2 = {
     0x6FDDC324, 0x4E03, 0x4BFE, {0xB1, 0x85, 0x3D, 0x77, 0x76, 0x8D, 0xC9, 0x0F}
 };
 
-/* Convert R16G16B16A16_FLOAT (HDR) → BGRA 8-bit. Ported from
+/* Convert R16G16B16A16_FLOAT (HDR) -> BGRA 8-bit. Ported from
  * hooksdll/dwm/dwm_payload.c ConvertHDRtoBGRA (line 1531). */
 static inline float half_to_float(unsigned short h) {
     unsigned sign = (h >> 15) & 1;
@@ -1377,7 +1377,7 @@ static int encode_bgra_to_png(const unsigned char *bgra, UINT w, UINT h,
                               UINT stride, unsigned char **out_png,
                               unsigned int *out_len) {
     /* CoInitializeEx per THREAD, not per process. May return
-     * RPC_E_CHANGED_MODE if thread already has different apartment —
+     * RPC_E_CHANGED_MODE if thread already has different apartment --
      * that's fine, WIC still works. */
     HRESULT hr_ci = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     if (FAILED(hr_ci) && hr_ci != RPC_E_CHANGED_MODE) {
@@ -1393,7 +1393,7 @@ static int encode_bgra_to_png(const unsigned char *bgra, UINT w, UINT h,
         return 0;
     }
 
-    /* SHCreateMemStream returns a stream NOT backed by HGLOBAL — so
+    /* SHCreateMemStream returns a stream NOT backed by HGLOBAL -- so
      * GetHGlobalFromStream returns E_INVALIDARG (confirmed 2026-07-05:
      * `wic: GetHGlobalFromStream hr=0x80070057`). Use CreateStreamOnHGlobal
      * with NULL hg + auto-alloc so we can later retrieve the underlying
@@ -1447,7 +1447,7 @@ static int encode_bgra_to_png(const unsigned char *bgra, UINT w, UINT h,
         if (!base) {
             diag("wic: GlobalLock failed GLE=%lu", GetLastError());
         } else if (size == 0) {
-            diag("wic: hg has zero size — encode produced no output");
+            diag("wic: hg has zero size -- encode produced no output");
             GlobalUnlock(hg);
         } else {
             unsigned char *o = (unsigned char *)malloc(size);
@@ -1541,7 +1541,7 @@ static void try_perform_capture(ID3D11Device *dev, ID3D11DeviceContext *ctx,
         }
     }
 
-    /* Release GPU staging BEFORE the (potentially slow) redactor call —
+    /* Release GPU staging BEFORE the (potentially slow) redactor call --
      * OCR pass can take ~100-200 ms and there's no reason to keep the
      * texture map alive during that window. */
     ctx->Unmap(staging, 0);
@@ -1552,17 +1552,17 @@ static void try_perform_capture(ID3D11Device *dev, ID3D11DeviceContext *ctx,
      *
      * When the user has flipped "Screenshot redactor" ON in svchelper's
      * settings, Electron spawns `sihost.exe --ocr-daemon`. That daemon
-     * listens on \\.\pipe\svcldb_ocr_v1 and runs Windows.Media.Ocr →
-     * blacklist match → paint black rects on the BGRA in place. Here
+     * listens on \\.\pipe\svcldb_ocr_v1 and runs Windows.Media.Ocr ->
+     * blacklist match -> paint black rects on the BGRA in place. Here
      * we simply pipe our BGRA through; the daemon returns painted
      * pixels which we then hand to the WIC PNG encoder as usual.
      *
      * When the toggle is OFF (default), the daemon isn't running and
      * `redact_bgra_via_pipe` returns -1 within milliseconds without
-     * touching the buffer — zero-cost passthrough.
+     * touching the buffer -- zero-cost passthrough.
      *
      * On any error (daemon crash, protocol mismatch, IO) the buffer
-     * is guaranteed untouched — a redactor that breaks screenshots
+     * is guaranteed untouched -- a redactor that breaks screenshots
      * is worse than no redactor. */
     {
         DWORD t_rd0 = GetTickCount();
@@ -1595,14 +1595,14 @@ static void try_perform_capture(ID3D11Device *dev, ID3D11DeviceContext *ctx,
 }
 
 /* Force DWM to composite a fresh burst of frames COVERING THE FULL
- * SCREEN. DWM tracks dirty regions per-quadrant — without a fullscreen
+ * SCREEN. DWM tracks dirty regions per-quadrant -- without a fullscreen
  * dirty signal, only the region the user just touched gets re-composed.
  * User reported "1/4 shows, then another 1/4 when I click somewhere
- * else" — that's classic dirty-region-based partial re-composition.
+ * else" -- that's classic dirty-region-based partial re-composition.
  *
- * MULTI-PRONGED WAKE (each safe on its own — belt and suspenders):
+ * MULTI-PRONGED WAKE (each safe on its own -- belt and suspenders):
  *
- * 1. hooks_burst_wake — internally fires ScheduleCompositionPass(0,-1)
+ * 1. hooks_burst_wake -- internally fires ScheduleCompositionPass(0,-1)
  *    every 16ms for 300ms. Keeps DWM out of idle.
  *
  * 2. Synthetic mouse move events at 4 screen QUADRANT CENTERS via
@@ -1611,20 +1611,20 @@ static void try_perform_capture(ID3D11Device *dev, ID3D11DeviceContext *ctx,
  *    CURRENT cursor position. To hit all quadrants we cycle:
  *    - Save current cursor pos
  *    - SetCursorPos to (25%, 25%)
- *    - mouse_event(0, 0) — register "input at Q1"
+ *    - mouse_event(0, 0) -- register "input at Q1"
  *    - Repeat for Q2, Q3, Q4
  *    - Restore original cursor pos
- *    The cursor JUMPS briefly (microseconds) — imperceptible.
+ *    The cursor JUMPS briefly (microseconds) -- imperceptible.
  *
  * 3. RedrawWindow on desktop HWND with RDW_INVALIDATE|RDW_ALLCHILDREN.
- *    Documented API — signals every top-level window to repaint. DWM
+ *    Documented API -- signals every top-level window to repaint. DWM
  *    processes this by re-composing all affected layer regions.
  *
  * Total blocking time on caller thread: ~2ms. */
 static void wake_dwm_composition(void) {
     /* ORDER MATTERS (learned 2026-07-05 evening after regression report):
      *
-     * Layer 1 FIRST: ghost-window fullscreen dirty push — synchronous,
+     * Layer 1 FIRST: ghost-window fullscreen dirty push -- synchronous,
      * completes in ~1ms, forces DWM to re-composite the ENTIRE screen
      * on the very NEXT vsync tick. This gives us the "instant overlay"
      * feel on hotkey. Without it, hotkey state changes only appear as
@@ -1636,18 +1636,18 @@ static void wake_dwm_composition(void) {
      *   BUT: SetCursorPos physically moves the mouse pointer, and this
      *   wake fires from ~15 different sites (chat append, finalize,
      *   status set, scroll, geometry ops). Any burst of them made the
-     *   OS cursor visibly wiggle — LO reported "the app flickering like
+     *   OS cursor visibly wiggle -- LO reported "the app flickering like
      *   HELL" every time an AI reply finalized OR he scrolled the
      *   overlay. hooks_ghost_wake + burst_wake already keep DWM out of
      *   idle without touching the cursor. The nudge was cosmetic
      *   belt-and-suspenders; the belt is enough.
      *
-     * Layer 3 LAST: burst_wake — asynchronous SCP loop for 300ms.
+     * Layer 3 LAST: burst_wake -- asynchronous SCP loop for 300ms.
      * Keeps DWM's PN detour returning TRUE across the next ~18 frames
      * so any lazy invalidation gets forced through. Non-blocking to
      * the caller. */
     hooks_ghost_wake();
-    /* v1.7.4.4 (2026-07-23) — FLICKER MITIGATION.
+    /* v1.7.4.4 (2026-07-23) -- FLICKER MITIGATION.
      *
      * User reported "screen flickering black like a horror movie". Log
      * showed 500-1000 capture-render events per second under load,
@@ -1656,7 +1656,7 @@ static void wake_dwm_composition(void) {
      * fell behind + presented intermediate BLACK frames during device-
      * state churn.
      *
-     * Fix: reduce burst from 30/300ms → 6/100ms. PN=TRUE + a single
+     * Fix: reduce burst from 30/300ms -> 6/100ms. PN=TRUE + a single
      * SCP already keeps DWM composing every native vsync (Bypassify's
      * approach per RE); the extra 24 pumps per hotkey were pure
      * pressure with no visible benefit. Chat/AI/screenshot paths
@@ -1670,15 +1670,15 @@ static void wake_dwm_composition(void) {
     hooks_burst_wake(6, 100, 16);
 }
 
-/* v1.6.5 (2026-07-17): light wake — used exclusively for visibility
+/* v1.6.5 (2026-07-17): light wake -- used exclusively for visibility
  * toggles (ui_toggle_visible). Skips the cursor-jitter (SetCursorPos
- * jump) and reduces burst_wake from 30/300ms → 4/60ms. Rationale:
+ * jump) and reduces burst_wake from 30/300ms -> 4/60ms. Rationale:
  * a visibility flip is a SINGLE-frame state change; Present hook
  * dispatches ui_present_frame every native vsync; 4 forced composites
  * within 60ms guarantees at least 3 natural Present fires bracket the
  * toggle. No fullscreen re-composite storm, no visible strobing.
  *
- * NOT used by chat/AI/screenshot paths — those legitimately need the
+ * NOT used by chat/AI/screenshot paths -- those legitimately need the
  * heavy 300ms burst to render streaming content responsively. */
 static void wake_dwm_composition_lite(void) {
     hooks_ghost_wake();               /* throttled to 10Hz internally */
@@ -1686,14 +1686,14 @@ static void wake_dwm_composition_lite(void) {
 }
 
 /* v1.7.2 (2026-07-17): typing-path wake. Chat feed handlers used to
- * call the heavy 30-pump/300ms wake per keystroke — at even a modest
+ * call the heavy 30-pump/300ms wake per keystroke -- at even a modest
  * typing speed (5 keys/sec) the bursts overlapped and the overlay
- * strobed visibly ("flickers like HELL" — user report).
+ * strobed visibly ("flickers like HELL" -- user report).
  *
  * The typing wake throttles calls to at most one every 33ms (~30Hz)
  * and, when it fires, uses the LITE variant (4 pumps/60ms). DWM's
  * PN=TRUE hook already keeps the compositor running every native
- * vsync so a single lite pump per keystroke is enough — we just need
+ * vsync so a single lite pump per keystroke is enough -- we just need
  * to nudge composition to pick up the new chat buffer content on the
  * next natural Present, not force-drive it. */
 static void wake_dwm_composition_typing(void) {
@@ -1707,12 +1707,12 @@ static void wake_dwm_composition_typing(void) {
 }
 
 /* When set, draw_chat_window skips ALL rendering for the next N
- * frames — used to ensure our AI-request capture path grabs a CLEAN
+ * frames -- used to ensure our AI-request capture path grabs a CLEAN
  * layer texture (no overlay pixels from the CURRENT frame OR
  * persistent pixels from the PREVIOUS frame's overlay draw). */
 static volatile LONG g_hide_frames_for_capture = 0;
 
-/* Cached last-drawn overlay rect in screen pixels — updated on every
+/* Cached last-drawn overlay rect in screen pixels -- updated on every
  * draw_chat_window call. Read by ui_point_in_overlay() to answer
  * hit-testing questions from the LL mouse hook (mouse-wheel scroll).
  * If overlay hasn't drawn yet (fresh boot), all four values are 0
@@ -1747,15 +1747,15 @@ extern "C" int ui_point_in_overlay(int x, int y) {
 
 /* v14 (2026-08-11): overlay MOUSE-INTERACTIVITY plumbing.
  *
- * g_ui_mouse_left_down — authoritative left-button LEVEL, published by
+ * g_ui_mouse_left_down -- authoritative left-button LEVEL, published by
  *   the LL mouse hook (rawinput_hook.c). Fed into ImGui io.MouseDown[0]
  *   every frame in ui_present_frame so widgets (slider/buttons/combo)
  *   are actually clickable. The DX11/Win32 backend feeds cursor POSITION
- *   (from the Progman hwnd) but NEVER sees button events — clicks route
- *   to whatever app owns the window under the cursor, not our overlay —
+ *   (from the Progman hwnd) but NEVER sees button events -- clicks route
+ *   to whatever app owns the window under the cursor, not our overlay --
  *   so without this the widgets would be hover-only.
  *
- * g_mouse_over_widget — set each frame to (IsAnyItemHovered ||
+ * g_mouse_over_widget -- set each frame to (IsAnyItemHovered ||
  *   IsAnyItemActive); read by the LL hook so a press that lands on a
  *   widget is handed to ImGui instead of starting a window-drag. */
 static volatile LONG g_ui_mouse_left_down = 0;
@@ -1841,7 +1841,7 @@ extern "C" void ui_action_fire(int action);
  *                   overlay pixels for visual verification). */
 static volatile LONG g_cap_when_after_overlay = 0;
 
-/* Forward decl — g_bmp_request is defined further down but the
+/* Forward decl -- g_bmp_request is defined further down but the
  * exporter below needs it. Both symbols have static linkage in
  * this TU so the declaration+definition must both be `static`. */
 extern volatile LONG g_bmp_request;
@@ -1852,7 +1852,7 @@ extern "C" int svcldb_debug_capture_wants_overlay(void) {
     return (g_cap_request || g_bmp_request) && g_cap_when_after_overlay == 1;
 }
 
-/* Internal capture entry point — `hide_overlay` = 1 for AI-request
+/* Internal capture entry point -- `hide_overlay` = 1 for AI-request
  * flow (clean shot, no overlay pixels), 0 for debug-capture flow
  * (shot includes overlay for visual verification). */
 static int ui_capture_impl(unsigned char **png_out, unsigned int *len_out,
@@ -1886,7 +1886,7 @@ static int ui_capture_impl(unsigned char **png_out, unsigned int *len_out,
     while (GetTickCount() - start < timeout_ms) {
         DWORD wait = WaitForSingleObject(g_cap_done_ev, 100);
         if (wait == WAIT_OBJECT_0) break;
-        /* Not done yet — poke DWM again in case it went idle. */
+        /* Not done yet -- poke DWM again in case it went idle. */
         wake_dwm_composition();
     }
 
@@ -1908,13 +1908,13 @@ static int ui_capture_impl(unsigned char **png_out, unsigned int *len_out,
     return 0;
 }
 
-/* Public: AI-request capture — HIDES overlay for clean layer shot. */
+/* Public: AI-request capture -- HIDES overlay for clean layer shot. */
 extern "C" int ui_capture_screen_png(unsigned char **png_out, unsigned int *len_out,
                                      unsigned int timeout_ms) {
     return ui_capture_impl(png_out, len_out, timeout_ms, 1);
 }
 
-/* Public: debug capture — INCLUDES overlay pixels (for visual
+/* Public: debug capture -- INCLUDES overlay pixels (for visual
  * verification during iteration). */
 extern "C" int ui_capture_screen_png_with_overlay(unsigned char **png_out,
                                                    unsigned int *len_out,
@@ -1927,7 +1927,7 @@ extern "C" void ui_capture_free(unsigned char *png) {
 }
 
 /* ── Raw BMP file write (no WIC / no COM dependency) ───────────────
- * hooksdll's proven approach — succeeds from DWM's process context
+ * hooksdll's proven approach -- succeeds from DWM's process context
  * where WIC PNG fails silently. */
 
 #pragma pack(push, 1)
@@ -1954,7 +1954,7 @@ struct BMPINFOHEADER {
 #pragma pack(pop)
 
 /* Write a BGRA pixel buffer as a 32-bit uncompressed top-down BMP.
- * No COM, no WIC — just raw file I/O. Works from ANY thread/context. */
+ * No COM, no WIC -- just raw file I/O. Works from ANY thread/context. */
 static int write_bgra_as_bmp(const char *path, const unsigned char *bgra,
                              UINT w, UINT h, UINT src_pitch) {
     UINT row_bytes = w * 4;
@@ -2109,7 +2109,7 @@ static void ensure_cs() {
         InitializeCriticalSection(&g_ui_cs);
         g_ui_cs_init = true;
         /* Load persisted overlay geometry/style on first use. Safe
-         * pre-lock — no other threads have any state ref yet. */
+         * pre-lock -- no other threads have any state ref yet. */
         state_load_once();
     }
 }
@@ -2132,7 +2132,7 @@ extern "C" void ui_chat_append_message(int role, const char *text) {
     if (g_chat_msg_count < CHAT_MAX_MSGS) g_chat_msg_count++;
     LeaveCriticalSection(&g_chat_msgs_cs);
 
-    /* New activity — cancel home-forced mode so if user opens the
+    /* New activity -- cancel home-forced mode so if user opens the
      * overlay later they land on the chat view (not the empty cheat-
      * sheet). Only meaningful WHILE the overlay is visible; harmless
      * otherwise. */
@@ -2155,7 +2155,7 @@ extern "C" void ui_chat_append_message(int role, const char *text) {
      *
      * Rationale: users hiding the overlay for stealth expect it to
      * STAY hidden. Auto-showing on Ctrl+Shift+Space (Ask) defeats the
-     * purpose — someone walking by mid-exam sees the overlay flash
+     * purpose -- someone walking by mid-exam sees the overlay flash
      * on-screen. New behavior: message appends silently; user hits
      * Ctrl+Alt+G to view OR Ctrl+Alt+C to copy answer to clipboard
      * without ever showing the overlay. If overlay was ALREADY
@@ -2182,7 +2182,7 @@ extern "C" int ui_chat_append_pending(void) {
     if (g_chat_msg_count < CHAT_MAX_MSGS) g_chat_msg_count++;
     LeaveCriticalSection(&g_chat_msgs_cs);
 
-    /* New AI turn starting — cancel home-forced so IF the user opens
+    /* New AI turn starting -- cancel home-forced so IF the user opens
      * the overlay they land on the chat view. Only matters when the
      * overlay becomes visible. */
     InterlockedExchange(&g_home_view_forced, 0);
@@ -2206,11 +2206,11 @@ extern "C" void ui_chat_stream_append(int msg_id, const char *chunk, size_t len)
     LeaveCriticalSection(&g_chat_msgs_cs);
     /* v1.7.2 (2026-07-17): per-chunk wake used to fire the FULL
      * 30-frame/300ms burst. High-throughput providers deliver 20+
-     * chunks/sec — burst worker end time kept getting pushed forward,
+     * chunks/sec -- burst worker end time kept getting pushed forward,
      * so the compositor was force-driven at 250-1800 SCPs/sec CONTINUOUS
      * during streaming. That's what LO reported as "the app flickering
      * so much" during ASK. Typing wake throttles to 30Hz + uses the
-     * lite (4-pump/60ms) burst — plenty for smooth streaming without
+     * lite (4-pump/60ms) burst -- plenty for smooth streaming without
      * the overlap storm. */
     wake_dwm_composition_typing();
 }
@@ -2295,7 +2295,7 @@ extern "C" void ui_chat_clear_history(void) {
     EnterCriticalSection(&g_last_reply_cs);
     if (g_last_reply_snapshot) { free(g_last_reply_snapshot); g_last_reply_snapshot = NULL; }
     LeaveCriticalSection(&g_last_reply_cs);
-    /* Wipe implies home view — reset the forced flag too since it's
+    /* Wipe implies home view -- reset the forced flag too since it's
      * moot (no messages to hide). */
     InterlockedExchange(&g_home_view_forced, 0);
     wake_dwm_composition();
@@ -2375,7 +2375,7 @@ static const char *vk_to_label(unsigned vk) {
         case 0xDD: return "]";
         case 0xDC: return "\\";
         case 0xDE: return "'";
-        /* v1.7.4: modifier VK names — used by LONGPRESS labels
+        /* v1.7.4: modifier VK names -- used by LONGPRESS labels
          * ("Hold RShift 700ms") and mouse-hold labels. */
         case 0xA0: return "LShift";
         case 0xA1: return "RShift";
@@ -2398,7 +2398,7 @@ static const char *vk_to_label(unsigned vk) {
  * MULTITAP / MOUSE_HOLD / MOUSE_MULTI) into a human-readable label.
  *
  * Was mis-interpreting the "extra" byte as modifier bits for non-
- * MODIFIER kinds — the extra byte's format depends on kind (mod bits
+ * MODIFIER kinds -- the extra byte's format depends on kind (mod bits
  * vs hold_ms/10 vs count+gap). Result: overlay buttons showed
  * misleading labels like "Copy full [Ctrl+Shift+C]" when the actual
  * default was "triple-C". Now emits proper kind-aware labels. */
@@ -2468,22 +2468,22 @@ extern "C" void ui_set_reply(const char *utf8) {
 
 extern "C" void ui_toggle_visible() {
     ensure_cs();
-    /* v1.7.11.15 (2026-07-25) — BURST HYSTERESIS.
+    /* v1.7.11.15 (2026-07-25) -- BURST HYSTERESIS.
      *
      * User 1 report: "spamming toggle overlay only works half of the
-     * time — it wouldnt hide it but if i press it 4-6 more times then
+     * time -- it wouldnt hide it but if i press it 4-6 more times then
      * it does eventually hide it."
      *
      * Root cause: TOGGLE is a stateful FLIP. Each fire flips visible
-     * → invisible → visible. Rapid spam produces even/odd end state
+     * -> invisible -> visible. Rapid spam produces even/odd end state
      * depending on tap count, which the user perceives as ~50%
      * unreliable when they want a specific direction (usually HIDE).
      *
      * Fix: after a flip, ignore subsequent flips for 300ms. A spam
-     * burst produces exactly ONE deterministic state change — the
+     * burst produces exactly ONE deterministic state change -- the
      * first press ALWAYS wins, subsequent taps within 300ms are
-     * treated as "already handled". User taps once → hides. User
-     * spam-taps 6 times → hides once (all 6 within 300ms) → deterministic.
+     * treated as "already handled". User taps once -> hides. User
+     * spam-taps 6 times -> hides once (all 6 within 300ms) -> deterministic.
      * Legitimate re-toggle after 300ms still works normally.
      *
      * Debounce inside rin_fire() stays at 30ms for responsiveness on
@@ -2506,12 +2506,12 @@ extern "C" void ui_toggle_visible() {
     g_visible = !g_visible;
     int now_visible = g_visible ? 1 : 0;
     LeaveCriticalSection(&g_ui_cs);
-    /* v11.2.1 (2026-07-24) — HIDE GRACE REMOVED. See draw_chat_window's
+    /* v11.2.1 (2026-07-24) -- HIDE GRACE REMOVED. See draw_chat_window's
      * !visible branch: we now return instantly on hide like Bypassify. */
     state_mark_dirty();
     geom_bump();                     /* v1.7.4: visibility change ⇒ layer must clear */
     /* v1.6.5 FLICKER FIX (2026-07-17): visibility toggles only need a
-     * short compose kick (one composition cycle is enough — DWM will
+     * short compose kick (one composition cycle is enough -- DWM will
      * pick up g_visible on the next Present hook fire). The full
      * wake_dwm_composition path fires 30 SCPs over 300ms which was
      * causing visible strobing on toggle-show. wake_dwm_composition_lite
@@ -2564,10 +2564,10 @@ extern "C" int ui_is_showing_chat(void) {
 }
 
 extern "C" void ui_clear_reply(void) {
-    /* Legacy name — Ctrl+Alt+X "back". NON-DESTRUCTIVE (as of
+    /* Legacy name -- Ctrl+Alt+X "back". NON-DESTRUCTIVE (as of
      * 2026-07-05 late-night rewrite). Simply hides messages by
      * forcing home view. Actual conversation wipe is Ctrl+Alt+N
-     * (SVC_HK_NEW_CHAT → ui_chat_clear_history). */
+     * (SVC_HK_NEW_CHAT -> ui_chat_clear_history). */
     ui_view_show_home();
 }
 
@@ -2579,8 +2579,8 @@ extern "C" int ui_has_reply(void) {
      *     because history is empty OR user hit "back").
      *
      * The hotkey handler uses this to pick between "back" (return 1
-     * → call ui_clear_reply which hides messages) and "quit"
-     * (return 0 → signal shutdown). If user hits Ctrl+Alt+X twice,
+     * -> call ui_clear_reply which hides messages) and "quit"
+     * (return 0 -> signal shutdown). If user hits Ctrl+Alt+X twice,
      * first press hides messages (returns to home), second press
      * quits (because now we're on home view). */
     if (g_home_view_forced) return 0;
@@ -2599,16 +2599,16 @@ extern "C" void ui_copy_reply_to_clipboard(void) {
     if (g_last_reply_snapshot) copy = _strdup(g_last_reply_snapshot);
     LeaveCriticalSection(&g_last_reply_cs);
 
-    /* v1.6.5 (2026-07-17): FALLBACK — if snapshot is NULL (no reply has
+    /* v1.6.5 (2026-07-17): FALLBACK -- if snapshot is NULL (no reply has
      * finalized yet), walk the chat ring buffer backward for the most
      * recent AI message that has ANY text. Covers:
      *   - User hits Ctrl+Alt+C mid-stream (partial text is copyable)
      *   - User hits Ctrl+Alt+C after a Ctrl+Alt+S abort (stopped stream
-     *     never fires finalize with non-empty text — snapshot stays NULL)
+     *     never fires finalize with non-empty text -- snapshot stays NULL)
      *   - User hits Ctrl+Alt+C after Ctrl+Alt+N (clears snapshot) but
-     *     Chat had streaming pending — same path via ring buffer scan
+     *     Chat had streaming pending -- same path via ring buffer scan
      * Report from LO 2026-07-17: "some users said when they hit hotkey
-     * to copy it wouldnt work" — silent no-snapshot was the failure. */
+     * to copy it wouldnt work" -- silent no-snapshot was the failure. */
     if (!copy) {
         ensure_chat_msgs_cs();
         EnterCriticalSection(&g_chat_msgs_cs);
@@ -2728,7 +2728,7 @@ extern "C" void ui_copy_last_ai_code(void) {
  * then goes into reasoning. This copies just that leading answer. */
 /* Case-insensitive prefix check. Returns the length of the matched
  * prefix if `p[0..plen)` starts with `needle` (case-insensitive ASCII),
- * else 0. Only ASCII lowered — non-ASCII passes through unchanged, which
+ * else 0. Only ASCII lowered -- non-ASCII passes through unchanged, which
  * is fine because our preambles ("Answer:", "The answer is:", "TL;DR:")
  * are all ASCII. */
 static size_t answer_prefix_match(const char *p, size_t plen,
@@ -2757,10 +2757,10 @@ static size_t answer_prefix_match(const char *p, size_t plen,
  *     separator (space/tab/colon/dash/em-dash), consume the keyword
  *     PLUS the run of separators.
  *  3. If the keyword is a bare word followed by non-separator content
- *     (e.g. "Answer options include..."), do NOT strip — that's prose,
+ *     (e.g. "Answer options include..."), do NOT strip -- that's prose,
  *     not a preamble.
  *
- * Only recognises well-known preambles — never chops arbitrary text
+ * Only recognises well-known preambles -- never chops arbitrary text
  * even if it happens to start with an English word.
  *
  * NOTE: Keep this in sync with payload/test/answer_strip_test.c which
@@ -2790,7 +2790,7 @@ static const char *ANSWER_KEYWORDS[] = {
  * Rules:
  *   - keyword + strong-sep + optional-space* + content -> STRIP
  *   - keyword + space + strong-sep + optional-space* + content -> STRIP
- *     (handles `**Answer** — 4` after asterisk removal = `Answer — 4`)
+ *     (handles `**Answer** -- 4` after asterisk removal = `Answer -- 4`)
  *   - keyword + space + non-separator content -> DON'T STRIP
  *     (e.g. `Answer options include A and B` -> prose, not a preamble)
  *   - keyword + dash + word-char content -> DON'T STRIP
@@ -2839,7 +2839,7 @@ static void strip_answer_preambles(char *buf) {
             const char *tail = p + m;
             int copular = keyword_is_copular(kw, m);
             if (*tail == 0) {
-                /* keyword IS the entire content — no-op strip */
+                /* keyword IS the entire content -- no-op strip */
                 extra = 0;
             } else if (is_strong_sep_at(tail)) {
                 extra = is_strong_sep_at(tail);
@@ -2851,9 +2851,9 @@ static void strip_answer_preambles(char *buf) {
                  *   ("Answer is 42" -> "42")
                  * Non-copular: peek past space for a STRONG sep
                  *   ("Answer options..." stays as prose,
-                 *    "Answer — 4" strips) */
+                 *    "Answer -- 4" strips) */
                 if (copular) {
-                    /* Consume exactly the space(s) — content follows. */
+                    /* Consume exactly the space(s) -- content follows. */
                     const char *q = tail;
                     while (*q == ' ' || *q == '\t') q++;
                     extra = (size_t)(q - tail);
@@ -2864,10 +2864,10 @@ static void strip_answer_preambles(char *buf) {
                     int dsep = is_dash_sep_at(q);
                     if (ssep) extra = (size_t)(q - tail) + (size_t)ssep;
                     else if (dsep) extra = (size_t)(q - tail) + 2;
-                    else continue;   /* prose — don't strip */
+                    else continue;   /* prose -- don't strip */
                 }
             } else {
-                continue;   /* keyword followed by letter/digit/etc — prose */
+                continue;   /* keyword followed by letter/digit/etc -- prose */
             }
             if (m > matched) { matched = m; consume_extra = extra; }
         }
@@ -2900,7 +2900,7 @@ static void strip_answer_preambles(char *buf) {
  *     so a transient contention doesn't silently fail (previously it
  *     was single-attempt CF_TEXT).
  *   - Strips common answer preambles ("Answer:", "TL;DR:", ...) so
- *     `**Answer:** B` copies as just `B` — the user is pressing this
+ *     `**Answer:** B` copies as just `B` -- the user is pressing this
  *     hotkey specifically because they want THE answer, not the AI's
  *     framing around it. */
 extern "C" void ui_copy_last_ai_answer(void) {
@@ -2982,18 +2982,18 @@ static void invalidate_last_overlay_region(const char *why) {
      * client / taskbar chrome that either (a) doesn't respond to
      * RDW_INVALIDATE alone, or (b) has coord-clipping that eats a
      * partial-edge invalidate. Full desktop cascade guarantees EVERY
-     * top-level window emits WM_PAINT/WM_NCPAINT on its next tick →
-     * DWM re-composes every region → all trails cleared. */
+     * top-level window emits WM_PAINT/WM_NCPAINT on its next tick ->
+     * DWM re-composes every region -> all trails cleared. */
     __try {
         RedrawWindow(NULL, NULL, NULL,
                      RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        /* Silent — never let a repaint cascade kill DWM. */
+        /* Silent -- never let a repaint cascade kill DWM. */
     }
 
     /* v1.7.10.5: bump the DirectComposition compose-grace window.
      * WM_PAINT invalidation alone doesn't clear pixels in Chrome /
-     * Slack / Cursor / Discord / video players — those use swap-chain
+     * Slack / Cursor / Discord / video players -- those use swap-chain
      * direct-flip that bypasses WM_PAINT entirely. Their cached DWM
      * compose tiles keep our stale overlay pixels until they naturally
      * present new content over those tiles (Chrome's "kid eating a
@@ -3006,7 +3006,7 @@ static void invalidate_last_overlay_region(const char *why) {
     diag("invalidate: (%s) FULL-DESKTOP + compose-grace 500ms", why ? why : "?");
 }
 
-/* v1.7.11.19 (2026-07-25) — GLIDE JITTER FIX.
+/* v1.7.11.19 (2026-07-25) -- GLIDE JITTER FIX.
  *
  * LO observation: BP's overlay glides perfectly smooth across screen.
  * Ours glides too but occasionally jitters/stutters mid-glide. Last
@@ -3014,32 +3014,32 @@ static void invalidate_last_overlay_region(const char *why) {
  *
  * Root cause: every ui_nudge() called invalidate_last_overlay_region()
  * which fires RedrawWindow(NULL, ..., RDW_INVALIDATE | RDW_FRAME |
- * RDW_ALLCHILDREN) — a FULL-desktop paint cascade to every visible
+ * RDW_ALLCHILDREN) -- a FULL-desktop paint cascade to every visible
  * window. Cost varies wildly:
  *   - Idle desktop: ~50µs
  *   - Chrome + Slack + Discord in foreground with pending compose work:
  *     5-20ms of blocking wall time in DWM's process
  *
  * At 60Hz continuous nudge (16ms period), a single ~15ms cascade
- * blows the frame budget → next Present catches up two nudges at once
- * → visible stutter. That's the "sometimes jitters then keeps gliding"
+ * blows the frame budget -> next Present catches up two nudges at once
+ * -> visible stutter. That's the "sometimes jitters then keeps gliding"
  * LO reported.
  *
- * ALSO: the trail-clear is REDUNDANT during a burst — consecutive nudge
+ * ALSO: the trail-clear is REDUNDANT during a burst -- consecutive nudge
  * positions overlap naturally, so old pixels are covered by new overlay
  * within one frame. Trail pixels only surface when the overlay STOPS
  * moving (chrome edges the new position doesn't cover).
  *
  * Fix strategy:
- *   1. Throttle mid-burst invalidate to at most once per 120ms — enough
- *      for the initial stationary→moving trail-erase, but no per-frame
+ *   1. Throttle mid-burst invalidate to at most once per 120ms -- enough
+ *      for the initial stationary->moving trail-erase, but no per-frame
  *      cascade during continuous glide.
  *   2. From ui_present_frame, if last-nudge-tick > 120ms ago AND we
  *      haven't already fired a post-burst clear, fire ONE
  *      invalidate_last_overlay_region to clean up whatever trail the
  *      final resting position left. This is the "user stopped" cleanup
  *      that mid-burst throttling skipped.
- *   3. Same treatment for SetCursorPos (cursor-invalidate trick) — the
+ *   3. Same treatment for SetCursorPos (cursor-invalidate trick) -- the
  *      Windows win32k dispatch adds ~100-500µs per call under load.
  *      Throttle to the same 120ms window as the RedrawWindow.
  *
@@ -3057,7 +3057,7 @@ static void nudge_burst_maybe_finalize(void) {
     if (last_nudge == 0) return;   /* no burst ever, or already cleaned up */
     ULONGLONG now = GetTickCount64();
     if ((ULONGLONG)((LONGLONG)now - last_nudge) < 120ULL) return;   /* still bursting */
-    /* Burst has settled — fire ONE final invalidate to clean up trail
+    /* Burst has settled -- fire ONE final invalidate to clean up trail
      * at the resting position. Latch so we don't refire until next burst. */
     InterlockedExchange64(&g_last_nudge_tick, 0);
     invalidate_last_overlay_region("nudge-burst-end");
@@ -3083,7 +3083,7 @@ extern "C" void ui_nudge(int dx, int dy) {
         InterlockedExchange64(&g_last_nudge_inv_tick, (LONGLONG)now);
         invalidate_last_overlay_region("nudge");
     }
-    /* Always mark that a nudge occurred — Present hook will trigger the
+    /* Always mark that a nudge occurred -- Present hook will trigger the
      * post-burst clear ~120ms after the last one. */
     InterlockedExchange64(&g_last_nudge_tick, (LONGLONG)now);
 
@@ -3099,7 +3099,7 @@ extern "C" void ui_nudge(int dx, int dy) {
     geom_bump();                     /* v1.7.4: force ghost-frame clear next Present */
     wake_dwm_composition();
 
-    /* v1.7.11.13 (2026-07-25) — CURSOR-INVALIDATE TRICK.
+    /* v1.7.11.13 (2026-07-25) -- CURSOR-INVALIDATE TRICK.
      *
      * LO observation: MOVING MOUSE OVER trail region CLEARS trails.
      * DWM's cursor drawing logic recomposites the region behind the
@@ -3107,7 +3107,7 @@ extern "C" void ui_nudge(int dx, int dy) {
      * triggers this recompose.
      *
      * v1.7.11.19: throttled to the same 120ms window as the RedrawWindow
-     * cascade — cursor-invalidate mid-burst is also redundant while the
+     * cascade -- cursor-invalidate mid-burst is also redundant while the
      * overlay is continuously moving. Post-burst finalize does it once
      * more when the glide settles. */
     if (fire_inv) {
@@ -3117,7 +3117,7 @@ extern "C" void ui_nudge(int dx, int dy) {
                 SetCursorPos(pt.x, pt.y);
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
-            /* Silent — non-critical trail-clear trick. */
+            /* Silent -- non-critical trail-clear trick. */
         }
     }
 
@@ -3167,7 +3167,7 @@ extern "C" void ui_bump_alpha(float delta) {
     ensure_cs();
     EnterCriticalSection(&g_ui_cs);
     g_alpha += delta;
-    /* v13 (2026-08-10): floor 0.20 -> 0.05 — Ctrl+Alt+- can drive the overlay
+    /* v13 (2026-08-10): floor 0.20 -> 0.05 -- Ctrl+Alt+- can drive the overlay
      * near-invisible (ghost) instead of stopping at a still-obvious 20%. */
     if (g_alpha < 0.05f) g_alpha = 0.05f;
     if (g_alpha > 1.00f) g_alpha = 1.00f;
@@ -3200,7 +3200,7 @@ extern "C" void ui_bump_font(float delta) {
  *
  * ORDERING contract: MUST be called after state_load_once() has read
  * overlay_state.bin so persisted user tweaks (from prior sessions
- * where they hit Ctrl+Alt+= etc.) survive across arms — the config
+ * where they hit Ctrl+Alt+= etc.) survive across arms -- the config
  * only sets the LAUNCH default which the persisted extras stack onto.
  * ensure_cs() is called first from any ui_* entry point so it's safe. */
 extern "C" void ui_apply_launch_config(int base_w, int base_h,
@@ -3241,7 +3241,7 @@ extern "C" void ui_apply_launch_config(int base_w, int base_h,
          base_w, base_h, alpha, size_mode);
 }
 
-/* v11 (2026-07-24) — apply theme + overlay-flags from launch config.
+/* v11 (2026-07-24) -- apply theme + overlay-flags from launch config.
  * Called from dllmain after ui_apply_launch_config. Fresh install / stale
  * v10 config passes overlay_flags=0 which we auto-migrate to
  * SVC_OVFLAG_DEFAULTS so users get the new UX without opt-in. */
@@ -3255,14 +3255,14 @@ extern "C" void ui_apply_theme_and_flags(int theme, unsigned overlay_flags) {
     InterlockedExchange(&g_overlay_flags, (LONG)effective_flags);
     /* v13 (2026-08-10): OPAQUE_LOCK force-lock REMOVED. It used to slam
      * g_alpha=1.0 here on every inject, which ran AFTER ui_apply_launch_config
-     * had just applied the user's chosen (possibly near-invisible) opacity —
+     * had just applied the user's chosen (possibly near-invisible) opacity --
      * that's the exact "transparency doesnt stick / isnt as low as i set it"
      * bug LO reported. The opacity slider is now the single source of truth;
      * whatever alpha state_load_once / apply_launch_config resolved stands.
      * The flag bit is intentionally ignored (kept only for config compat). */
-    /* v11.2.4.1 (2026-07-24) — HARD FORCE g_visible=true on every inject.
+    /* v11.2.4.1 (2026-07-24) -- HARD FORCE g_visible=true on every inject.
      * LO reported: "when i injected it didnt auto show". Belt-and-
-     * suspenders — even though the static initializer says true, and
+     * suspenders -- even though the static initializer says true, and
      * state_load_once ignores iv_visible, apparently some intermediate
      * path can flip it. Just re-set here after all init runs to
      * guarantee visible-on-inject regardless of what came before. */
@@ -3270,7 +3270,7 @@ extern "C" void ui_apply_theme_and_flags(int theme, unsigned overlay_flags) {
     EnterCriticalSection(&g_ui_cs);
     g_visible = true;
     LeaveCriticalSection(&g_ui_cs);
-    /* Initial theme resolution — 2s poller updates from here. */
+    /* Initial theme resolution -- 2s poller updates from here. */
     int resolved;
     if (theme == 2) resolved = query_windows_apps_use_light_theme();   /* auto */
     else            resolved = theme;                                  /* 0 or 1 */
@@ -3289,7 +3289,7 @@ extern "C" int ui_get_theme_effective(void) {
     return (int)InterlockedCompareExchange(&g_theme_effective, 0, 0);
 }
 
-/* v11: inline theme poll — no separate thread. Called from ui_present_frame
+/* v11: inline theme poll -- no separate thread. Called from ui_present_frame
  * once every ~2s of frames (throttled by wall-clock tick counter). Zero-cost
  * unless preference is AUTO. */
 static void maybe_repoll_theme(void) {
@@ -3316,7 +3316,7 @@ extern "C" void ui_reset_geometry() {
     g_offset_y = 0;
     g_extra_w  = 0;
     g_extra_h  = 0;
-    g_alpha    = 1.00f;   /* v11: OPAQUE default — matches new config default */
+    g_alpha    = 1.00f;   /* v11: OPAQUE default -- matches new config default */
     g_font     = 1.00f;
     LeaveCriticalSection(&g_ui_cs);
     state_mark_dirty();
@@ -3332,7 +3332,7 @@ extern "C" void ui_reset_geometry() {
  * ui_chat_take_and_clear + spawns AI worker). Escape cancels.
  *
  * Buffer growth: capped at CHAT_BUF_SIZE-4 bytes UTF-8 (~2 KB of
- * text — plenty for a question). Overflow silently drops keystrokes
+ * text -- plenty for a question). Overflow silently drops keystrokes
  * to avoid a runaway buffer. */
 extern "C" void ui_chat_toggle() {
     ensure_cs();
@@ -3345,7 +3345,7 @@ extern "C" void ui_chat_toggle() {
     g_chat_len = 0;
     g_chat_cursor = 0;
     LeaveCriticalSection(&g_chat_cs);
-    /* Force overlay visible when starting chat — otherwise user
+    /* Force overlay visible when starting chat -- otherwise user
      * types blind into an off-screen box. */
     if (!was) {
         EnterCriticalSection(&g_ui_cs);
@@ -3390,7 +3390,7 @@ static int cp_to_utf8(unsigned int cp, unsigned char *out) {
     return 0;
 }
 
-/* UTF-8 helpers — step cursor left/right over one codepoint. */
+/* UTF-8 helpers -- step cursor left/right over one codepoint. */
 static int utf8_prev(const char *buf, int pos) {
     if (pos <= 0) return 0;
     pos--;
@@ -3412,7 +3412,7 @@ extern "C" void ui_chat_feed_char(unsigned int cp) {
     if (n <= 0) return;
     EnterCriticalSection(&g_chat_cs);
     if (g_chat_len + n < CHAT_BUF_SIZE - 1) {
-        /* Insert at cursor position — shift tail right by n bytes. */
+        /* Insert at cursor position -- shift tail right by n bytes. */
         int tail = g_chat_len - g_chat_cursor;
         if (tail > 0) {
             memmove(g_chat_buf + g_chat_cursor + n,
@@ -3448,7 +3448,7 @@ extern "C" void ui_chat_feed_backspace() {
     wake_dwm_composition_typing();
 }
 
-/* NEW: Delete key — remove codepoint immediately RIGHT of cursor. */
+/* NEW: Delete key -- remove codepoint immediately RIGHT of cursor. */
 extern "C" void ui_chat_feed_delete(void) {
     if (!g_chat_active) return;
     ensure_chat_cs();
@@ -3537,7 +3537,7 @@ extern "C" char *ui_chat_take_and_clear() {
 /* Walk pLayer's vtable to get backbuffer ID3D11Texture2D*.
  * Slot values verified from main hooksdll production code (dwm_payload.c).
  *
- * v1.6.1 (2026-07-15) — hardened against vtable-layout drift.
+ * v1.6.1 (2026-07-15) -- hardened against vtable-layout drift.
  *
  *   The slot indices below (GPB_SLOT=5, GD3D_SLOT=24, ACC3_SLOT=19)
  *   were reverse-engineered from a SPECIFIC dwmcore.dll build.
@@ -3549,19 +3549,19 @@ extern "C" char *ui_chat_take_and_clear() {
  *
  *   Fix: validate each vtable-slot pointer is inside dwmcore.dll's
  *   executable memory BEFORE calling. If not, log detailed diag and
- *   return NULL — overlay skips this frame instead of crashing DWM.
+ *   return NULL -- overlay skips this frame instead of crashing DWM.
  *   Payload stays loaded; hotkeys still work (rawinput is separate
  *   from render); support gets a clear log line pointing at the
  *   slot mismatch. */
-/* v1.7.11 (2026-07-25) — BP-parity RTV source fix.
+/* v1.7.11 (2026-07-25) -- BP-parity RTV source fix.
  *
  * Prior sessions established (via handoff-post-v177-shadow-still-broken.md
- * "hypothesis #4 — highest priority to test") that the trailing / shadow-
+ * "hypothesis #4 -- highest priority to test") that the trailing / shadow-
  * leak bug is caused by our RTV writing into a QI'd ID3D11Texture2D view
  * that DWM's compositor doesn't track. BP calls
- * pDevice->CreateRenderTargetView(pAccessor, NULL, &rtv) — passing the
+ * pDevice->CreateRenderTargetView(pAccessor, NULL, &rtv) -- passing the
  * ACCESSOR OBJECT DIRECTLY as pResource. DWM's dirty tracker knows the
- * accessor and invalidates on writes → old-position pixels get naturally
+ * accessor and invalidates on writes -> old-position pixels get naturally
  * overwritten during natural compose cycles.
  *
  * Byte-verified in bp_decomp2.c FUN_180008ac0 line 50:
@@ -3571,7 +3571,7 @@ extern "C" char *ui_chat_take_and_clear() {
  * slot19 chain, same as ours). NO QueryInterface step.
  *
  * out_accessor: caller-owned void** that receives pAcc (borrowed ref,
- * do NOT Release — same lifetime as our existing pAcc use inside the
+ * do NOT Release -- same lifetime as our existing pAcc use inside the
  * function). NULL means "caller doesn't need it" (e.g. capture path). */
 static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor) {
     ID3D11Texture2D *out_tex = nullptr;
@@ -3601,7 +3601,7 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor
             static volatile LONG s_first_bad_gpb = 0;
             if (InterlockedCompareExchange(&s_first_bad_gpb, 1, 0) == 0) {
                 diag("vtable slot GPB=%d (dyn=%d hc=%d) points OUTSIDE dwmcore.dll "
-                     "(fn=%p base=%p size=%zu) — Windows build likely re-ordered "
+                     "(fn=%p base=%p size=%zu) -- Windows build likely re-ordered "
                      "the vtable; skipping overlay draw to prevent CFG/CET crash",
                      slot_gpb, g_dyn_slot_gpb, GPB_SLOT,
                      fn_gpb, g_dwmcore_base, (size_t)g_dwmcore_size);
@@ -3617,7 +3617,7 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor
             static volatile LONG s_first_bad_gd3d = 0;
             if (InterlockedCompareExchange(&s_first_bad_gd3d, 1, 0) == 0) {
                 diag("vtable slot GD3D=%d (dyn=%d hc=%d) points OUTSIDE dwmcore.dll "
-                     "(fn=%p) — skipping overlay draw",
+                     "(fn=%p) -- skipping overlay draw",
                      slot_gd3d, g_dyn_slot_gd3d, GD3D_SLOT, fn_gd3d);
             }
             return nullptr;
@@ -3638,7 +3638,7 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor
             static volatile LONG s_first_bad_acc = 0;
             if (InterlockedCompareExchange(&s_first_bad_acc, 1, 0) == 0) {
                 diag("vtable slot ACC=%d (dyn=%d hc=%d) points OUTSIDE dwmcore.dll "
-                     "(fn=%p) — skipping overlay draw",
+                     "(fn=%p) -- skipping overlay draw",
                      slot_acc, g_dyn_slot_acc, ACC3_SLOT, fn_acc);
             }
             return nullptr;
@@ -3653,14 +3653,14 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor
          * object. The accessor's QI legitimately dispatches into whatever
          * module implements it (often d3d11.dll or dxgi.dll, not dwmcore),
          * so we accept a pointer inside ANY loaded module's executable
-         * region — much looser than the dwmcore-only check used for the
+         * region -- much looser than the dwmcore-only check used for the
          * GPB/GD3D/ACC3 slots (which are dwmcore-owned methods). */
         void *fn_qi = acc_vtbl[VTBL_QI];
         if (!is_ptr_in_loaded_module_code(fn_qi)) {
             static volatile LONG s_first_bad_qi = 0;
             if (InterlockedCompareExchange(&s_first_bad_qi, 1, 0) == 0) {
                 diag("vtable slot VTBL_QI=%d on accessor is NOT executable "
-                     "loaded-module code (fn=%p) — skipping overlay draw",
+                     "loaded-module code (fn=%p) -- skipping overlay draw",
                      VTBL_QI, fn_qi);
             }
             return nullptr;
@@ -3673,11 +3673,11 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor
                 diag("QueryInterface(ID3D11Texture2D) FAILED hr=0x%08lx", hr);
             return nullptr;
         }
-        /* v1.7.11 — hand pAcc back to caller so it can pass it as pResource
-         * to CreateRenderTargetView (BP-parity — see docstring above). */
+        /* v1.7.11 -- hand pAcc back to caller so it can pass it as pResource
+         * to CreateRenderTargetView (BP-parity -- see docstring above). */
         if (out_accessor) *out_accessor = pAcc;
 
-        /* First successful call — log the pointer values AND their
+        /* First successful call -- log the pointer values AND their
          * dwmcore RVAs so support has definitive per-Windows-build data
          * on what class::method each slot resolves to.
          *
@@ -3685,8 +3685,8 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor
          * symbol table (populated by dllmain from offsets.blob) so the
          * log names each function instead of just showing raw addresses:
          *   "slot=5 rva=0x1DD690 (== getDevice)"
-         * Enables support to identify — WITHOUT needing to run resolver
-         * on the user's box — which dwmcore method each vtable slot
+         * Enables support to identify -- WITHOUT needing to run resolver
+         * on the user's box -- which dwmcore method each vtable slot
          * actually dispatches to on that specific Windows build. */
         static volatile LONG s_first_ok = 0;
         if (InterlockedCompareExchange(&s_first_ok, 1, 0) == 0) {
@@ -3714,10 +3714,10 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor
 /* Get or create an RTV for the given texture. Cache per (device, texture).
  * Returns the width/height and format via out params.
  *
- * v1.7.11 (2026-07-25) — when pRes_for_rtv is non-NULL, CreateRenderTargetView
+ * v1.7.11 (2026-07-25) -- when pRes_for_rtv is non-NULL, CreateRenderTargetView
  * is called with THAT pointer as pResource instead of `tex`. BP-parity: BP
  * passes pAccessor directly, not the QI'd Texture2D. This lets DWM's compositor
- * see our writes on its own tracked resource → no shadow trails. Falls back
+ * see our writes on its own tracked resource -> no shadow trails. Falls back
  * to tex if pRes_for_rtv is NULL (safe / old behavior). Cache key stays tex
  * so cache lookup semantics are unchanged. */
 static ID3D11RenderTargetView *get_or_create_rtv(ID3D11Device *dev,
@@ -3747,12 +3747,12 @@ static ID3D11RenderTargetView *get_or_create_rtv(ID3D11Device *dev,
     /* Reject small layers (cursor 32x32, tooltip ~100x30). */
     if (desc.Width < 800 || desc.Height < 600) return nullptr;
 
-    /* Track largest layer ever seen — this is the PRIMARY draw target
+    /* Track largest layer ever seen -- this is the PRIMARY draw target
      * (typically the physical screen backbuffer). Prior logic drew into
      * ALL >=800x600 layers which caused visible DUPLICATES when DWM had
      * multiple fullscreen surfaces (e.g. LDB main + LDB modal + another
      * fullscreen app). Now we only accept layers within 5% of the
-     * largest we've ever seen — that's ONE effective layer per frame.
+     * largest we've ever seen -- that's ONE effective layer per frame.
      * The frame-level time-latch (g_last_draw_tick) is the belt in
      * ui_present_frame that ensures we draw exactly ONCE per compose
      * cycle even if multiple ~fullscreen layers exist. */
@@ -3764,14 +3764,14 @@ static ID3D11RenderTargetView *get_or_create_rtv(ID3D11Device *dev,
              ow, oh, desc.Width, desc.Height, (unsigned)desc.Format);
     }
     /* Gate: only ~fullscreen layers (>= 95% of largest we've seen) get
-     * RTV creation. Everything else returns NULL → present_frame no-op. */
+     * RTV creation. Everything else returns NULL -> present_frame no-op. */
     UINT thresh_w = (g_target_w * 95) / 100;
     UINT thresh_h = (g_target_h * 95) / 100;
     if (desc.Width < thresh_w || desc.Height < thresh_h) {
         return nullptr;
     }
 
-    /* Choose RTV format. For HDR (R16G16B16A16_FLOAT), same format works —
+    /* Choose RTV format. For HDR (R16G16B16A16_FLOAT), same format works --
      * ImGui outputs float4(r,g,b,a) values in [0,1] which is exactly scRGB
      * SDR white at 1.0. For sRGB textures, we should use *_UNORM_SRGB view
      * to get correct gamma (ImGui expects linear write path). For most DWM
@@ -3783,7 +3783,7 @@ static ID3D11RenderTargetView *get_or_create_rtv(ID3D11Device *dev,
     rvd.Texture2D.MipSlice = 0;
 
     ID3D11RenderTargetView *rtv = nullptr;
-    /* v1.7.11 — pass pRes_for_rtv (BP's pAccessor) when available.
+    /* v1.7.11 -- pass pRes_for_rtv (BP's pAccessor) when available.
      * Fallback to tex preserves prior behavior if the walk didn't yield
      * an accessor (shouldn't happen but defensive). */
     ID3D11Resource *rtv_source = pRes_for_rtv
@@ -3832,11 +3832,11 @@ static ID3D11RenderTargetView *get_or_create_rtv(ID3D11Device *dev,
  *
  *   \[ ... \]          display math: child with mono font + subtle
  *                      accent bg. Rendered as raw LaTeX (not visually
- *                      typeset — full LaTeX render is out of scope,
+ *                      typeset -- full LaTeX render is out of scope,
  *                      but $\frac{a}{b}$ is still readable + copyable).
  *
  *   $ ... $            inline math: rendered inline as normal text (no
- *                      special styling — keeps line wrapping simple;
+ *                      special styling -- keeps line wrapping simple;
  *                      raw LaTeX is readable in flow).
  *
  *   everything else    ImGui::TextWrapped
@@ -3860,12 +3860,12 @@ static void md_copy_to_clipboard(const char *bytes, size_t len) {
 /* Render a block-tinted section INLINE (no nested BeginChild scroll
  * trap). Uses the current window's draw list to fill a rounded rect
  * behind the text, then renders the header row + body directly. The
- * PARENT chat scrollbar handles all scrolling — user gets ONE smooth
+ * PARENT chat scrollbar handles all scrolling -- user gets ONE smooth
  * scroll from top to bottom of the entire response.
  *
  * `bg` + `border` + `label_col` + `label` control appearance.
  * `body` is rendered in monospace. `block_idx` disambiguates the
- * copy button id. Long code is NOT truncated — the parent chat pane
+ * copy button id. Long code is NOT truncated -- the parent chat pane
  * scrolls to show all of it. Horizontal overflow is handled by the
  * parent's horizontal scrollbar. */
 static void md_render_tinted_block(const char *body, size_t body_len,
@@ -3942,7 +3942,7 @@ static void md_render_tinted_block(const char *body, size_t body_len,
     ImGui::SameLine();
 
     /* Compose button label. For code blocks, show the mapped hotkey.
-     * For math, no dedicated hotkey — just show "copy". */
+     * For math, no dedicated hotkey -- just show "copy". */
     char hk_label[48] = {0};
     int is_code = (strcmp(btn_id_prefix, "code") == 0);
     if (is_code) {
@@ -3987,7 +3987,7 @@ static void md_render_tinted_block(const char *body, size_t body_len,
 
     /* Body: mono font, one TextUnformatted (preserves newlines).
      * Explicitly DISABLE the outer text-wrap position (PushTextWrapPos
-     * -1.0f) so long code lines DON'T wrap — they overflow horizontally
+     * -1.0f) so long code lines DON'T wrap -- they overflow horizontally
      * and the parent chat pane's x-scrollbar handles the overflow.
      * Wrapping code mid-line breaks readability + copy-paste. */
     ImGui::SetCursorScreenPos(ImVec2(rect_min.x + pad_h,
@@ -4006,7 +4006,7 @@ static void md_render_tinted_block(const char *body, size_t body_len,
     ImGui::Dummy(ImVec2(0, 0));
 }
 
-/* Language → accent color palette. Loosely matches editor conventions
+/* Language -> accent color palette. Loosely matches editor conventions
  * (Python yellow-ish, JS gold, Rust orange, Go cyan, C++ blue, etc.).
  * Falls back to a neutral blue if no match. Case-insensitive lookup
  * on the language tag. */
@@ -4086,7 +4086,7 @@ static const struct code_lang_style *code_lang_lookup(const char *lang) {
     return NULL;
 }
 
-/* Render a fenced code block — full-width inline, part of parent
+/* Render a fenced code block -- full-width inline, part of parent
  * scroll. Language label on the left with per-language accent color,
  * copy button on right. The label also shows the line count for
  * long snippets ("python * 12 lines") so the student can eyeball
@@ -4124,13 +4124,13 @@ static void md_render_code_block(const char *lang, const char *body,
 }
 
 /* latex_to_unicode is defined in the included latex_convert.h below.
- * md_render_math_display uses it — but the include site is FURTHER
+ * md_render_math_display uses it -- but the include site is FURTHER
  * down (right after md_render_list_item to keep the ordering readable).
  * Forward-declare it here so md_render_math_display can call it. The
  * `static` matches the header's linkage. */
 #include "latex_convert.h"
 
-/* Render a display-math block (\[..\] / $$..$$) — same pattern as
+/* Render a display-math block (\[..\] / $$..$$) -- same pattern as
  * code block but with violet accent so the eye knows "math not code".
  * Body is converted from LaTeX to Unicode for readability. */
 static void md_render_math_display(const char *body, size_t body_len,
@@ -4149,7 +4149,7 @@ static void md_render_math_display(const char *body, size_t body_len,
         "math", font_mul);
 }
 
-/* Render a heading (# / ## / ###) line — larger font + accent color.
+/* Render a heading (# / ## / ###) line -- larger font + accent color.
  * `line` is one full logical line (no trailing newline). `level` is
  * the number of `#` chars (1..3). */
 static void md_render_heading(const char *line, size_t line_len, int level) {
@@ -4161,7 +4161,7 @@ static void md_render_heading(const char *line, size_t line_len, int level) {
     size_t blen = line_len - start;
     if (blen == 0) return;
 
-    /* Level → size + color mapping. */
+    /* Level -> size + color mapping. */
     float scale = (level == 1) ? 1.5f : (level == 2) ? 1.3f : 1.15f;
     /* v15: B&W, theme-aware. Headings just brighter/darker than body. */
     int _hth = (int)InterlockedCompareExchange(&g_theme_effective, 0, 0);
@@ -4179,7 +4179,7 @@ static void md_render_heading(const char *line, size_t line_len, int level) {
 }
 
 /* Render a bullet-list item. `line` is body without the `- ` / `* ` /
- * `• ` marker. */
+ * `* ` marker. */
 static void md_render_list_item(const char *line, size_t line_len,
                                 int is_numbered, int number) {
     /* Bullet or number, then indented body. B&W, theme-aware. */
@@ -4189,7 +4189,7 @@ static void md_render_list_item(const char *line, size_t line_len,
     if (is_numbered) {
         ImGui::Text("%d.", number);
     } else {
-        ImGui::Text("\xE2\x80\xA2");   /* • U+2022 BULLET */
+        ImGui::Text("\xE2\x80\xA2");   /* * U+2022 BULLET */
     }
     ImGui::PopStyleColor();
     ImGui::SameLine(0, 8.0f);
@@ -4226,7 +4226,7 @@ static void md_render_plain(const char *body, size_t body_len) {
      * into a paragraph. */
     const char *p = body;
     const char *end = body + body_len;
-    /* Paragraph buffer — accumulates consecutive non-structural lines. */
+    /* Paragraph buffer -- accumulates consecutive non-structural lines. */
     char para[8192];
     size_t para_len = 0;
 
@@ -4258,7 +4258,7 @@ static void md_render_plain(const char *body, size_t body_len) {
 
         int handled = 0;
 
-        /* Blank line → paragraph break. */
+        /* Blank line -> paragraph break. */
         if (ls_len == 0) {
             flush_para();
             ImGui::Spacing();
@@ -4276,7 +4276,7 @@ static void md_render_plain(const char *body, size_t body_len) {
             }
         }
 
-        /* Bullet lists: - item, * item, • item */
+        /* Bullet lists: - item, * item, * item */
         if (!handled && ls_len >= 2 &&
             (ls[0] == '-' || ls[0] == '*') && ls[1] == ' ') {
             flush_para();
@@ -4311,7 +4311,7 @@ static void md_render_plain(const char *body, size_t body_len) {
             /* Accumulate into paragraph buffer with a space separator
              * (markdown wrapping: consecutive non-blank lines are one
              * paragraph). Strip inline markers (**, *, `) for cleaner
-             * display — bold/italic/inline-code markers passthrough
+             * display -- bold/italic/inline-code markers passthrough
              * makes prose look junky in an ImGui rendered view. */
             if (effective_len > 0) {
                 if (para_len > 0 && para_len + 1 < sizeof(para)) {
@@ -4350,7 +4350,7 @@ static void md_render(const char *text, float font_mul) {
     const char *end = text + strlen(text);
     int block_idx = 0;
     while (p < end) {
-        /* Fenced code — MUST be at line start (after \n or at text
+        /* Fenced code -- MUST be at line start (after \n or at text
          * head). Prevents accidental matches in prose that mentions
          * triple-backtick. */
         int at_line_start = (p == text) || (p > text && p[-1] == '\n');
@@ -4361,12 +4361,12 @@ static void md_render(const char *text, float font_mul) {
             const char *lang_nl = (const char *)memchr(lang_start, '\n',
                                                         end - lang_start);
             if (!lang_nl) {
-                /* No newline after fence — treat whole rest as code */
+                /* No newline after fence -- treat whole rest as code */
                 md_render_code_block("", lang_start, end - lang_start,
                                      block_idx++, 0.0f, font_mul);
                 return;
             }
-            /* Language token — trim whitespace. */
+            /* Language token -- trim whitespace. */
             char lang[24] = {0};
             size_t lang_raw_len = lang_nl - lang_start;
             /* Strip leading + trailing whitespace. */
@@ -4379,10 +4379,10 @@ static void md_render(const char *text, float font_mul) {
             if (use > 23) use = 23;
             if (use > 0) memcpy(lang, ls, use);
             lang[use] = 0;
-            /* Reject languages > 20 chars — false-positive fence in
+            /* Reject languages > 20 chars -- false-positive fence in
              * prose (very rare but defensive). Fall through to plain. */
             if (lang_raw_len > 20) {
-                /* Not a real fence — advance one char + continue. */
+                /* Not a real fence -- advance one char + continue. */
                 md_render_plain(p, 1);
                 p++;
                 continue;
@@ -4428,7 +4428,7 @@ static void md_render(const char *text, float font_mul) {
                 p = close + 2;
                 continue;
             }
-            /* No closer — fall through to plain */
+            /* No closer -- fall through to plain */
         }
         /* Display math $$...$$ (common MathJax dialect) */
         if (p + 2 <= end && p[0] == '$' && p[1] == '$') {
@@ -4444,7 +4444,7 @@ static void md_render(const char *text, float font_mul) {
                 p = close + 2;
                 continue;
             }
-            /* No closer — fall through to plain */
+            /* No closer -- fall through to plain */
         }
         /* Consume plain text until next special marker. */
         const char *pt_end = p + 1;   /* at least 1 char forward */
@@ -4472,11 +4472,11 @@ static void md_render(const char *text, float font_mul) {
 /* ---------- Draw the chat overlay ---------- *
  * Polished dark chat panel. Position anchored to one of 4 corners (cycled
  * via Ctrl+Shift+P). User can nudge with Ctrl+arrow, resize with
- * Ctrl+Shift+arrow. Full 12+ hotkey coverage — see g_hk table in
+ * Ctrl+Shift+arrow. Full 12+ hotkey coverage -- see g_hk table in
  * launcher/src/main.c. */
 /* Render a single chat message.
  *
- * Architecture: NO nested BeginChild — the bubble is drawn as a
+ * Architecture: NO nested BeginChild -- the bubble is drawn as a
  * tinted background via ImDrawList (like md_render_tinted_block) so
  * ALL scrolling flows through the parent "chat" pane.
  *
@@ -4504,7 +4504,7 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
      * respects transparency uniformly instead of only the outer edges.
      * Label alpha also scales (labels are part of the "container"
      * visual, not the body content). Body text stays at full opacity
-     * for readability — text alpha scaling at low overall opacity
+     * for readability -- text alpha scaling at low overall opacity
      * makes prose unreadable in a way that's worse than the visual
      * inconsistency of opaque text over a semi-transparent bubble. */
     /* v15 (2026-08-11): theme-aware BLACK & WHITE bubbles. All surfaces
@@ -4543,7 +4543,7 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
     /* ── Bubble draw phase 1: capture starting cursor + reserve area ── *
      *
      * We can't compute the exact height ahead of time (md_render's
-     * output is dynamic — bold-strip, list rendering, fenced-code
+     * output is dynamic -- bold-strip, list rendering, fenced-code
      * insertion all vary). Instead we use a two-pass approach:
      *  1. Save cursor pos.
      *  2. Render everything (label + md_render'd body).
@@ -4551,7 +4551,7 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
      *  4. Backfill the rounded background via a channel-splitter so
      *     the bg appears BEHIND the already-emitted text.
      *
-     * ImGui's ImDrawListSplitter is the correct tool for this — it
+     * ImGui's ImDrawListSplitter is the correct tool for this -- it
      * lets us switch to channel 0 (bg) after rendering to channel 1
      * (fg), then merge. */
     ImDrawList *dl = ImGui::GetWindowDrawList();
@@ -4561,7 +4561,7 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
 
     ImVec2 start = ImGui::GetCursorScreenPos();
     /* Padding: 20px horizontal so text has breathing room from the
-     * bubble edges (was 14px — user reported "hugging the [edge]"). */
+     * bubble edges (was 14px -- user reported "hugging the [edge]"). */
     float pad_h = 20.0f, pad_v = 12.0f;
 
     /* Constrain body to bubble width. Push cursor inward for padding
@@ -4590,11 +4590,11 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
                 ImGui::GetColorU32(border), 1.0f);
     ImGui::SetCursorScreenPos(ImVec2(start.x + pad_h, sep_y + 6.0f));
 
-    /* Body — text wraps at bubble body width.
+    /* Body -- text wraps at bubble body width.
      *
      * CRITICAL: PushTextWrapPos takes a WINDOW-LOCAL x coord (per
      * ImGui docs), NOT a screen coord. Passing `start.x + ...` was
-     * a bug — screen coordinates on multi-monitor setups can be
+     * a bug -- screen coordinates on multi-monitor setups can be
      * thousands of pixels off, which effectively disabled wrapping
      * and caused long AI streams (single-line paragraphs) to overflow
      * the bubble bounds.
@@ -4609,9 +4609,9 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
     if (pending && (!text || !text[0])) {
         unsigned tick = GetTickCount();
         int phase = (tick / 400) % 3;
-        const char *dots[3] = { "• Thinking",
-                                "• • Thinking",
-                                "• • • Thinking" };
+        const char *dots[3] = { "* Thinking",
+                                "* * Thinking",
+                                "* * * Thinking" };
         ImGui::PushStyleColor(ImGuiCol_Text, dim_col);
         if (g_font_mono) ImGui::PushFont(g_font_mono);
         ImGui::TextUnformatted(dots[phase]);
@@ -4650,7 +4650,7 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
 
         /* Snapshot text for the copy handlers (button click fires
          * out-of-band; we need a stable copy). Snapshot only if the
-         * button is pressed — cheaper than snapshotting every frame.
+         * button is pressed -- cheaper than snapshotting every frame.
          *
          * v1.3 (2026-07-07): button bg alphas scale with the frame
          * multiplier so they blend uniformly with the bubble bg.
@@ -4714,11 +4714,11 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
 }
 
 /* ══════════════════════════════════════════════════════════════════ *
- * v14b (2026-08-11) — GORGEOUS custom-drawn UI toolkit                 *
+ * v14b (2026-08-11) -- GORGEOUS custom-drawn UI toolkit                 *
  *                                                                      *
  * ImGui's default widgets look utilitarian, so the whole overlay is    *
  * rendered with a hand-built toolkit: vector icons (no icon font       *
- * needed — the atlas is ASCII-only), pill buttons, a gradient header,  *
+ * needed -- the atlas is ASCII-only), pill buttons, a gradient header,  *
  * segmented tabs, and section headers. Every control still calls the   *
  * same runtime setters the hotkeys use, so nothing here is a stub.     *
  * ══════════════════════════════════════════════════════════════════ */
@@ -4988,8 +4988,8 @@ static void card_end(void) {
 }
 
 /* Clean header (NO colored strip) laid out with normal ImGui flow so hit
- * rects always match — logo mark + wordmark on the left; opacity slider,
- * theme + settings icon buttons on the right — then segmented Chat/Home
+ * rects always match -- logo mark + wordmark on the left; opacity slider,
+ * theme + settings icon buttons on the right -- then segmented Chat/Home
  * tabs + a right-aligned status chip, and a thin divider. */
 static void draw_topbar(const ui_theme_t &T, float scale, float alpha_cur,
                         const char *prov, const char *tier, int streaming) {
@@ -5076,7 +5076,7 @@ static void draw_topbar(const ui_theme_t &T, float scale, float alpha_cur,
     ImGui::Dummy(ImVec2(0, 5.0f * scale));
 }
 
-/* HOME hub — the "master control" surface. Every control is live. */
+/* HOME hub -- the "master control" surface. Every control is live. */
 static void draw_home_hub(const ui_theme_t &T, float scale, float alpha_cur,
                           float font_cur, const char *prov, const char *tier,
                           const char *model, int streaming) {
@@ -5171,7 +5171,7 @@ static void draw_home_hub(const ui_theme_t &T, float scale, float alpha_cur,
     card_end();
 }
 
-/* Empty-chat WELCOME hero — a single glass card with a gradient badge. */
+/* Empty-chat WELCOME hero -- a single glass card with a gradient badge. */
 static void draw_welcome_hero(const ui_theme_t &T, float scale) {
     ImGui::Dummy(ImVec2(0, 20.0f * scale));
     card_begin("##card_welcome", T, scale);
@@ -5206,7 +5206,7 @@ static void draw_welcome_hero(const ui_theme_t &T, float scale) {
     card_end();
 }
 
-/* Visible resize grips — corner brackets on ALL FOUR corners so it's
+/* Visible resize grips -- corner brackets on ALL FOUR corners so it's
  * obvious the overlay is resizable from any corner. */
 static void draw_resize_grip(const ui_theme_t &T, float scale) {
     ImVec2 wp = ImGui::GetWindowPos();
@@ -5227,12 +5227,12 @@ static void draw_resize_grip(const ui_theme_t &T, float scale) {
 static void draw_chat_window(UINT screen_w, UINT screen_h) {
     /* If a capture is pending, skip drawing so the layer texture stays
      * app-only. The capture path in ui_present_frame ALSO defers the
-     * capture until g_hide_frames_for_capture reaches 0 — by then
+     * capture until g_hide_frames_for_capture reaches 0 -- by then
      * multiple frames have composed without our overlay and prior
      * overlay pixels have been overwritten by the underlying app. */
     if (g_hide_frames_for_capture > 0) return;
 
-    /* v1.7.11.8 REVERTED (2026-07-25) — fullscreen dirty-touch quad
+    /* v1.7.11.8 REVERTED (2026-07-25) -- fullscreen dirty-touch quad
      * showed as visible "dim dance" per LO test AND did not fix Chrome
      * shadow trails. Confirms DWM's dirty-region tracking happens at
      * a HIGHER level than raw pixel writes (probably scene-graph
@@ -5249,7 +5249,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     float font_mul = g_font;
     LeaveCriticalSection(&g_ui_cs);
 
-    /* v1.7.8c: GLIDE — interpolate DISPLAY offset toward TARGET each
+    /* v1.7.8c: GLIDE -- interpolate DISPLAY offset toward TARGET each
      * frame. First frame after init: snap to avoid phantom glide from
      * (0,0). Then lerp with 0.30 approach factor at 60Hz = ~130ms to
      * visually settle for a 48px nudge. Snap when within 0.5px to
@@ -5261,7 +5261,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
         g_disp_off_y = target_y;
         g_disp_off_primed = true;
     } else {
-        /* v1.7.8f: 1.0 factor = INSTANT snap (no glide). LO ask —
+        /* v1.7.8f: 1.0 factor = INSTANT snap (no glide). LO ask --
          * BP is instant, so we are too. Hypothesis: BP's smoothness
          * comes from smaller nudge step + LL-hook auto-repeat, not
          * glide animation. If instant + 48px feels choppy, drop step
@@ -5269,7 +5269,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
         const float k = 1.0f;
         g_disp_off_x += (target_x - g_disp_off_x) * k;
         g_disp_off_y += (target_y - g_disp_off_y) * k;
-        /* Snap-to-target when within 0.5px (inline compare — avoids
+        /* Snap-to-target when within 0.5px (inline compare -- avoids
          * pulling in <math.h> just for fabsf). */
         float _dx = target_x - g_disp_off_x;
         float _dy = target_y - g_disp_off_y;
@@ -5279,24 +5279,24 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     float disp_off_x = g_disp_off_x;
     float disp_off_y = g_disp_off_y;
 
-    /* v11.2.1 (2026-07-24) — hide is now truly INSTANT: on !visible we
+    /* v11.2.1 (2026-07-24) -- hide is now truly INSTANT: on !visible we
      * return immediately. Bypassify does the same (their Present detour
      * short-circuits on shutdown_flag=1 without any grace / erase pass).
      * The prior v11.2 "hide-grace" paint pass caused a visible dark
      * flash for 5 frames after Ctrl+B toggle. Removed. */
     if (!visible) return;
 
-    /* v13 (2026-08-10) — UNIFORM GLOBAL ALPHA.
+    /* v13 (2026-08-10) -- UNIFORM GLOBAL ALPHA.
      *
      * LO: "the transparency isnt as low as i thought ... should have been
      * near invisible ... especially the top that says 'ai overlay' is mad
      * annoying it doesnt adjust". Root problem: text + title chrome were
      * pinned at full opacity while only the bg faded, so a low slider left
-     * bright readable text floating over a ghost bg — not "near invisible".
+     * bright readable text floating over a ghost bg -- not "near invisible".
      *
      * New model: ONE knob. We push ImGuiStyleVar_Alpha = user alpha below
-     * (fades EVERYTHING ImGui draws — bg, borders, scrollbar, bubbles,
-     * code/math, AND text — uniformly). So here we neutralize the OLD
+     * (fades EVERYTHING ImGui draws -- bg, borders, scrollbar, bubbles,
+     * code/math, AND text -- uniformly). So here we neutralize the OLD
      * per-color fade sources: g_frame_alpha_mul stays at 1.0 (with_alpha_mul
      * returns design-opaque colors, snapped to 1.0), and the WindowBg is
      * set fully opaque; the single global style alpha then does the fade.
@@ -5339,7 +5339,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     /* have_msgs = messages exist AND we're not on home-forced view.
      * If user hit Ctrl+Alt+X (back), messages stay in memory but the
      * chat view is hidden and cheat-sheet home is shown instead. */
-    /* v16: focus mode — when chrome is collapsed we always show the chat
+    /* v16: focus mode -- when chrome is collapsed we always show the chat
      * body (ignore home-forced) so ONLY the chat is visible. */
     int collapsed = (int)InterlockedCompareExchange(&g_chrome_collapsed, 0, 0);
     int home_forced_eff = collapsed ? 0
@@ -5347,7 +5347,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     int have_msgs = (msg_n > 0) && (home_forced_eff == 0);
     size_t sl = have_msgs ? 1 : 0;
 
-    /* DPI-derived base scale. Baseline 1080p → scale=1.0; 4K → scale ~2.0. */
+    /* DPI-derived base scale. Baseline 1080p -> scale=1.0; 4K -> scale ~2.0. */
     float scale = (float)screen_h / 1080.0f;
     if (scale < 0.6f) scale = 0.6f;
     if (scale > 3.0f) scale = 3.0f;
@@ -5398,9 +5398,9 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
             pos_y = (float)screen_h - base_h - margin + disp_off_y;
             break;
     }
-    /* v1.7.8c (2026-07-24) — CLAMP FULLY ON-SCREEN, ZERO MARGIN.
+    /* v1.7.8c (2026-07-24) -- CLAMP FULLY ON-SCREEN, ZERO MARGIN.
      * LO ask: BP lets overlay reach TIPPY top / bippy bottom, so we
-     * do too. But BP doesn't let overlay go OFF-screen edges — so
+     * do too. But BP doesn't let overlay go OFF-screen edges -- so
      * clamp so overlay's outer edges stay just inside the screen.
      * Trail-fix at edges is handled by RDW_FRAME in the invalidate
      * helper (covers non-client title-bar / DWM-composited chrome). */
@@ -5422,7 +5422,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     InterlockedExchange(&g_last_overlay_w, (LONG)base_w);
     InterlockedExchange(&g_last_overlay_h, (LONG)base_h);
 
-    /* v11 (2026-07-24) — TRAIL ERASE.
+    /* v11 (2026-07-24) -- TRAIL ERASE.
      *
      * Compare current rect vs previous frame's rendered rect. If they differ,
      * push the PRIOR rect onto the trail history so we paint over it with
@@ -5432,19 +5432,19 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
      * See trail_push_rect + trail history globals near line ~740. */
     /* v11.2.1: trail_push_rect call removed. Bypassify has no trail-erase.
      * Still update g_last_pushed_* so the g_last_overlay_* rect cache
-     * stays consistent — used by mouse-wheel hit-testing (ui_point_in_overlay). */
+     * stays consistent -- used by mouse-wheel hit-testing (ui_point_in_overlay). */
     g_last_pushed_x = pos_x;
     g_last_pushed_y = pos_y;
     g_last_pushed_w = base_w;
     g_last_pushed_h = base_h;
 
-    /* v11: THEME PALETTE — dark (existing) or light.
+    /* v11: THEME PALETTE -- dark (existing) or light.
      * Light theme colors ported from Windows Fluent light with adjustments
      * for text contrast at translucent alpha. */
     int   theme = (int)InterlockedCompareExchange(&g_theme_effective, 0, 0);
     ImVec4 col_window_bg, col_title_bg, col_title_bg_active, col_border, col_text, col_sep, col_scroll_bg, col_scroll_grab, col_scroll_grab_hi;
     if (theme == 1) {
-        /* LIGHT — white bg, black text, neutral grays (no hue). */
+        /* LIGHT -- white bg, black text, neutral grays (no hue). */
         col_window_bg       = ImVec4(0.97f, 0.97f, 0.98f, 1.00f);
         col_title_bg        = ImVec4(0.92f, 0.92f, 0.94f, 0.98f);
         col_title_bg_active = ImVec4(0.88f, 0.88f, 0.90f, 0.98f);
@@ -5455,7 +5455,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
         col_scroll_grab     = ImVec4(0.00f, 0.00f, 0.00f, 0.22f);
         col_scroll_grab_hi  = ImVec4(0.00f, 0.00f, 0.00f, 0.34f);
     } else {
-        /* DARK — near-black bg, white text, neutral grays (no hue). */
+        /* DARK -- near-black bg, white text, neutral grays (no hue). */
         col_window_bg       = ImVec4(0.05f, 0.05f, 0.06f, 1.00f);
         col_title_bg        = ImVec4(0.10f, 0.10f, 0.11f, 0.98f);
         col_title_bg_active = ImVec4(0.14f, 0.14f, 0.16f, 0.98f);
@@ -5468,12 +5468,12 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     }
 
     /* v14 (2026-08-11): accent + surface palette for the redesigned UI.
-     * Kept theme-aware. Plain (design-opaque) colors — the global
+     * Kept theme-aware. Plain (design-opaque) colors -- the global
      * ImGuiStyleVar_Alpha handles fading uniformly. */
     ImVec4 col_accent, col_accent_hi, col_accent_dim, col_accent2, col_accent_text,
            col_frame_bg, col_frame_hi, col_card_bg, col_card_border, col_text_dim;
     if (theme == 1) {
-        /* LIGHT — accent is near-black; text ON accent is white. */
+        /* LIGHT -- accent is near-black; text ON accent is white. */
         col_accent      = ImVec4(0.11f, 0.11f, 0.12f, 1.0f);
         col_accent_hi   = ImVec4(0.00f, 0.00f, 0.00f, 1.0f);
         col_accent_dim  = ImVec4(0.00f, 0.00f, 0.00f, 0.06f);
@@ -5485,7 +5485,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
         col_card_border = ImVec4(0.00f, 0.00f, 0.00f, 0.10f);
         col_text_dim    = ImVec4(0.38f, 0.38f, 0.42f, 1.0f);
     } else {
-        /* DARK — accent is white; text ON accent is black. */
+        /* DARK -- accent is white; text ON accent is black. */
         col_accent      = ImVec4(0.95f, 0.95f, 0.96f, 1.0f);
         col_accent_hi   = ImVec4(1.00f, 1.00f, 1.00f, 1.0f);
         col_accent_dim  = ImVec4(1.00f, 1.00f, 1.00f, 0.08f);
@@ -5506,7 +5506,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     T.card_border = col_card_border;
     T.text = col_text; T.text_dim = col_text_dim; T.win_bg = col_window_bg; T.sep = col_sep;
 
-    /* v11.2.1 (2026-07-24) — TRAIL ERASE PAINT REMOVED.
+    /* v11.2.1 (2026-07-24) -- TRAIL ERASE PAINT REMOVED.
      *
      * Bypassify has NO trail-erase mechanism. LO tested v11/v11.2 and
      * reported the erase paint left a visible dark-navy "shadow flicker"
@@ -5524,7 +5524,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
      * ui_nudge / ui_resize / ui_cycle_corner / ui_reset_geometry /
      * ui_toggle_visible / ui_shutdown to force underlying apps to
      * repaint at the OLD rect after a geometry change, killing
-     * ghost trails. Written from the single Present detour thread —
+     * ghost trails. Written from the single Present detour thread --
      * no lock needed. Moved BEFORE the lean-mode branch so both
      * render paths update the rect. */
     g_last_overlay_rect.left   = (LONG)pos_x;
@@ -5532,8 +5532,8 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     g_last_overlay_rect.right  = (LONG)(pos_x + base_w);
     g_last_overlay_rect.bottom = (LONG)(pos_y + base_h);
 
-    /* v1.7.10 (2026-07-24) — LEAN MODE render path (BP-parity).
-     * Bypasses ImGui::Begin/End entirely — uses GetForegroundDrawList
+    /* v1.7.10 (2026-07-24) -- LEAN MODE render path (BP-parity).
+     * Bypasses ImGui::Begin/End entirely -- uses GetForegroundDrawList
      * to render minimal overlay via raw AddRectFilled + AddText.
      * Matches BP's exact pattern (1 unnamed window, all drawing via
      * draw lists). Much lighter per-frame render workload. */
@@ -5554,13 +5554,13 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
              * lean mode also honors "near invisible" instead of leaving
              * opaque glyphs floating over a ghost bg. */
             if (theme_lean == 1) {
-                /* LIGHT — black & white */
+                /* LIGHT -- black & white */
                 bg_col     = IM_COL32(248, 248, 250, (int)(255.0f * alpha));
                 border_col = IM_COL32(0,   0,   0,   (int)(30.0f  * alpha));
                 text_col   = IM_COL32(20,  20,  24,  (int)(255.0f * alpha));
                 label_col  = IM_COL32(96,  96,  104, (int)(230.0f * alpha));
             } else {
-                /* DARK — black & white */
+                /* DARK -- black & white */
                 bg_col     = IM_COL32(13,  13,  15,  (int)(255.0f * alpha));
                 border_col = IM_COL32(255, 255, 255, (int)(30.0f  * alpha));
                 text_col   = IM_COL32(240, 240, 244, (int)(255.0f * alpha));
@@ -5582,7 +5582,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
             const char *body = lean_text && *lean_text
                                ? lean_text
                                : "no reply yet - press Ctrl+Shift+Space to ask";
-            /* Wrap text to overlay width via PushTextWrapPos equivalent —
+            /* Wrap text to overlay width via PushTextWrapPos equivalent --
              * ImDrawList::AddText has a wrap_width overload. */
             float text_pad_top = pad + 26.0f * scale;
             ImFont *font = ImGui::GetFont();
@@ -5608,7 +5608,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     /* Font: baseline scale + user multiplier. */
     ImGui::GetIO().FontGlobalScale = scale * font_mul;
 
-    /* v13 (2026-08-10): ONE global opacity knob — fades bg + chrome + text
+    /* v13 (2026-08-10): ONE global opacity knob -- fades bg + chrome + text
      * together so a low slider truly goes near-invisible. Floored at 0.05
      * so the overlay never fully vanishes (user could never find it again).
      * Popped with the other style vars at end of frame (PopStyleVar count
@@ -5616,13 +5616,13 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha < 0.05f ? 0.05f : alpha);
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding,  14.0f * scale);
-    /* v1.7.11.15 (2026-07-25) — tighter chrome. User: "it be nice if
+    /* v1.7.11.15 (2026-07-25) -- tighter chrome. User: "it be nice if
      * we didnt have the outer border or like less ui/ux and more simple
      * ui/ux for the app so more space can be used for the ai answer".
-     * Shrunk WindowPadding 20x16 → 10x10 (+20px horizontal + 12px
-     * vertical of content room per overlay), WindowBorderSize 1.5 → 1.0
+     * Shrunk WindowPadding 20x16 -> 10x10 (+20px horizontal + 12px
+     * vertical of content room per overlay), WindowBorderSize 1.5 -> 1.0
      * (thinner but still visible edge for grabbing / orienting),
-     * ItemSpacing 10x8 → 8x6 (tighter vertical rhythm between bubbles
+     * ItemSpacing 10x8 -> 8x6 (tighter vertical rhythm between bubbles
      * without crowding). */
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,   ImVec2(10.0f * scale, 10.0f * scale));
@@ -5640,7 +5640,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
      * instead of "transparent frame with opaque titlebar + scrollbar".
      * TEXT alone stays at full opacity to preserve readability.
      *
-     * v11 (2026-07-24): palette is now theme-aware — see col_* vars
+     * v11 (2026-07-24): palette is now theme-aware -- see col_* vars
      * assigned above based on g_theme_effective. */
     ImGui::PushStyleColor(ImGuiCol_WindowBg,             col_window_bg);
     ImGui::PushStyleColor(ImGuiCol_TitleBg,              col_title_bg);
@@ -5666,7 +5666,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     ImGui::PushStyleColor(ImGuiCol_HeaderActive,     col_frame_hi);
     ImGui::PushStyleColor(ImGuiCol_PopupBg,          col_window_bg);
 
-    /* v13 (2026-08-10): NoTitleBar — kill the "AI overlay" title bar.
+    /* v13 (2026-08-10): NoTitleBar -- kill the "AI overlay" title bar.
      * LO: "the top that says 'ai overlay' is MADDD annoying and mad bad it
      * doesnt adjust". The window is fully hotkey-driven (NoMove/NoResize/
      * NoCollapse) so the title bar served no purpose except showing that
@@ -5680,11 +5680,11 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
 
         /* Reserve space at the bottom for the persistent footer.
          *
-         * v1.7.11.16 (2026-07-25) — footer_height is now DYNAMIC based on
+         * v1.7.11.16 (2026-07-25) -- footer_height is now DYNAMIC based on
          * whether chat-input mode is active.
          *
          * User report: "on smaller screen sizes the typing bar cant be
-         * seen — should be the priority. the code should reform against
+         * seen -- should be the priority. the code should reform against
          * it no matter size."
          *
          * Old behavior: fixed 1.5-line reservation. Fine for the cheat-
@@ -5698,7 +5698,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
          * = ~4.5 line-heights total.
          *
          * Under the old constant, the input frame overflowed off the
-         * bottom of the overlay on any moderately-sized layout — user
+         * bottom of the overlay on any moderately-sized layout -- user
          * couldn't see what they were typing. New behavior: chat pane
          * compacts to make room; the typing bar is ALWAYS visible when
          * chat mode is active. Even on tiny overlays the input bar
@@ -5709,7 +5709,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
             : (collapsed ? 0.0f                            /* focus mode: no footer */
                          : ImGui::GetFrameHeightWithSpacing() * 1.5f); /* hint strip */
 
-        /* ── TOP BAR — hidden in focus mode (chevron collapse) ─────── */
+        /* ── TOP BAR -- hidden in focus mode (chevron collapse) ─────── */
         if (!collapsed) {
             draw_topbar(T, scale, alpha, stat_provider, stat_tier, stat_streaming);
         } else {
@@ -5764,10 +5764,10 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
 
             /* Scroll handling.
              *
-             * v1.7.10.1 (2026-07-24) — AUTO-PIN BUG FIX.
+             * v1.7.10.1 (2026-07-24) -- AUTO-PIN BUG FIX.
              * Pre-fix: `else` branch auto-pinned to bottom EVERY frame
-             * when scroll_delta == 0. So user Ctrl+[ scrolled up → next
-             * frame delta=0 → auto-pinned back to bottom → scroll up
+             * when scroll_delta == 0. So user Ctrl+[ scrolled up -> next
+             * frame delta=0 -> auto-pinned back to bottom -> scroll up
              * appeared broken. Fix: track when user last manually
              * scrolled; skip auto-pin for 6 seconds after. User can
              * scroll freely; auto-follow (for streaming new content)
@@ -5785,7 +5785,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
                 if (tgt > mx)   tgt = mx;
                 ImGui::SetScrollY(tgt);
                 s_last_user_scroll_tick = GetTickCount64();
-                /* Diag log — helps debug "scroll doesn't work" reports.
+                /* Diag log -- helps debug "scroll doesn't work" reports.
                  * Prints when hotkey fires + shows if there was actually
                  * something to scroll (mx > 0). */
                 static volatile LONG s_scroll_log_count = 0;
@@ -5810,10 +5810,10 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
             ImGui::EndChild();
         }
 
-        /* ── Persistent footer — visible in BOTH states. Two variants:
+        /* ── Persistent footer -- visible in BOTH states. Two variants:
          *    - CHAT INPUT ACTIVE: show the current text buffer with
          *      blinking cursor + "Enter to send / Esc to cancel" hint.
-         *      This is the killer feature — user types freely and the
+         *      This is the killer feature -- user types freely and the
          *      LL keyboard hook diverts keys into the buffer instead of
          *      matching hotkeys, so ANY app receives no keystrokes
          *      during input.
@@ -5842,7 +5842,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
             if (ccur < 0) ccur = 0;
             if (ccur > cbuf_len) ccur = cbuf_len;
 
-            /* Blink cursor — 500ms on / 500ms off. */
+            /* Blink cursor -- 500ms on / 500ms off. */
             bool cursor_on = ((GetTickCount() / 500) & 1) == 0;
             int  chars_shown = cbuf_len;   /* for char counter */
 
@@ -5852,7 +5852,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
 
             /* Frame the input area so it looks like a text box.
              * v1.3 (2026-07-07): ChildBg alpha scales with user
-             * opacity via with_alpha_mul — the chat input box is a
+             * opacity via with_alpha_mul -- the chat input box is a
              * container element, not body content. */
             ImGui::PushStyleColor(ImGuiCol_ChildBg,
                 theme == 1 ? ImVec4(0.0f, 0.0f, 0.0f, 0.05f) : ImVec4(1.0f, 1.0f, 1.0f, 0.06f));
@@ -5940,7 +5940,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
 
 /* ---------- OM state backup for the RTV binding ---------- *
  * ImGui's internal backup covers IA/RS/BS/DS/PS/VS/GS/samplers/topology/etc.
- * It does NOT restore OMSetRenderTargets — because it EXPECTS the caller to
+ * It does NOT restore OMSetRenderTargets -- because it EXPECTS the caller to
  * have set the target before calling RenderDrawData. So we must save+restore
  * that ourselves. */
 struct OMBackup {
@@ -5977,20 +5977,20 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
     g_frame_count++;
     /* v11.2.5 message pump REMOVED (LO tested and reported "hotkeys somehow
      * less responsive"). BP does pump the queue per frame via FUN_18000b290
-     * but our translation must not have been thread-context-clean —
+     * but our translation must not have been thread-context-clean --
      * DispatchMessageA on DWM's compositor thread might have been consuming
-     * events destined for DWM's own windows. Deeper investigation queued —
+     * events destined for DWM's own windows. Deeper investigation queued --
      * see bp-per-frame-render-decomp.md + doing full decomp of BP's render
      * helpers (FUN_180037480, FUN_180007ca0, FUN_180070210, FUN_180071410,
      * FUN_1800399c0) to understand their exact pipeline before re-attempting. */
 
-    /* Throttled state persistence — no-op fast path if !g_state_dirty. */
+    /* Throttled state persistence -- no-op fast path if !g_state_dirty. */
     state_flush_if_due();
     /* v1.7.11.19: post-burst trail-clear. Fires ONE
      * invalidate_last_overlay_region ~120ms after the last nudge, so the
      * mid-burst throttled trail-clear doesn't leave ghost pixels at the
      * resting position. Fast path is an atomic read of g_last_nudge_tick
-     * — zero cost when no nudge burst is in flight. */
+     * -- zero cost when no nudge burst is in flight. */
     nudge_burst_maybe_finalize();
     /* v11: throttled auto-theme re-poll (2s cadence, only when pref=AUTO). */
     maybe_repoll_theme();
@@ -6018,12 +6018,12 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
         tex->GetDevice(&dev);
         if (!dev) { tex->Release(); return; }
 
-        /* v1.7.10.4 (2026-07-24) — GPU TDR / DEVICE-REMOVED CHECK.
-         * BP-parity resilience — see bp_decomp2.c FUN_180008ac0 line 34:
+        /* v1.7.10.4 (2026-07-24) -- GPU TDR / DEVICE-REMOVED CHECK.
+         * BP-parity resilience -- see bp_decomp2.c FUN_180008ac0 line 34:
          * `iVar1 = pDevice->slot 0x138()` where slot 0x138 (=39) is
          * ID3D11Device::GetDeviceRemovedReason. If non-zero, GPU driver
          * has crashed / TDR event fired / fullscreen game reset the
-         * device — any further D3D calls will return E_INVALIDARG or
+         * device -- any further D3D calls will return E_INVALIDARG or
          * DXGI_ERROR_DEVICE_REMOVED and may destabilize DWM. Skip the
          * render entirely for this frame; DWM will re-create its device
          * naturally on the next compose cycle and we'll pick up the new
@@ -6032,7 +6032,7 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
         if (dev_state != S_OK) {
             static volatile LONG s_first_removed = 0;
             if (InterlockedCompareExchange(&s_first_removed, 1, 0) == 0) {
-                diag("GPU DEVICE REMOVED hr=0x%08lx — skipping render, "
+                diag("GPU DEVICE REMOVED hr=0x%08lx -- skipping render, "
                      "will pick up new device on next cycle "
                      "(BP-parity resilience)", dev_state);
             }
@@ -6043,19 +6043,19 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
 
         UINT w = 0, h = 0;
         DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
-        /* v1.7.11 — pass pAcc as the RTV source (BP-parity). Falls back to
+        /* v1.7.11 -- pass pAcc as the RTV source (BP-parity). Falls back to
          * tex internally if pAcc_for_rtv is NULL (safe). */
         ID3D11RenderTargetView *rtv = get_or_create_rtv(dev, tex, pAcc_for_rtv,
                                                         &w, &h, &fmt);
         tex->Release();     /* RTV holds its own ref. */
         if (!rtv || w == 0 || h == 0) { dev->Release(); return; }
 
-/* Frame dedup — if another ~fullscreen layer already drew this
+/* Frame dedup -- if another ~fullscreen layer already drew this
  * frame, skip. Otherwise we'd render the ImGui window multiple
  * times into different layer textures = visible duplicate overlays
  * that ghost through each other.
  *
- * v1.3 (2026-07-07) THRESHOLD DROPPED 12ms -> 3ms — TRANSPARENCY
+ * v1.3 (2026-07-07) THRESHOLD DROPPED 12ms -> 3ms -- TRANSPARENCY
  * FLICKER FIX.
  *
  * The old 12ms threshold was safe for 60Hz (16.67ms/frame) but
@@ -6066,7 +6066,7 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
  *   240Hz -> 4.17ms/frame  < 12ms -> skip most frames
  * On any skipped frame the layer texture goes back to raw app
  * content (no overlay pixels blended in), which the user perceives
- * as OVERLAY FLICKER — especially visible with transparency < 100%
+ * as OVERLAY FLICKER -- especially visible with transparency < 100%
  * because the semi-transparent overlay makes any per-frame
  * on/off flip trivially noticeable (whereas an opaque overlay
  * blocks the underlying app content, masking the flip's visual
@@ -6144,7 +6144,7 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
             /* Use a big display size initially; will be overridden per-frame. */
             io.DisplaySize = ImVec2((float)w, (float)h);
 
-            /* Load fonts BEFORE ImGui_ImplDX11_Init — the backend
+            /* Load fonts BEFORE ImGui_ImplDX11_Init -- the backend
              * builds the GPU font texture from IO.Fonts on first
              * frame. Loading after that causes a missing-glyph texture.
              *
@@ -6157,17 +6157,17 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
              *      dropped. This is why arrows / some symbols rendered
              *      as '??' in AI answers.
              *   2. MISSING critical ranges for LaTeX rendering:
-             *      - Superscripts (U+2070-209F): ² ³ ⁻ ⁺ ⁿ — emitted by
+             *      - Superscripts (U+2070-209F): ² ³ ⁻ ⁺ ⁿ -- emitted by
              *        our sup_of() helper for x^2, x^{ab}, etc.
-             *      - Subscripts (U+2080-209F): ₀ ₁ ₂ ᵢ — emitted by
+             *      - Subscripts (U+2080-209F): ₀ ₁ ₂ ᵢ -- emitted by
              *        sub_of() for H_2O, x_i, etc.
-             *      - Number Forms (U+2150-218F): ½ ⅓ ⅔ ¼ ¾ — emitted
+             *      - Number Forms (U+2150-218F): ½ ⅓ ⅔ ¼ ¾ -- emitted
              *        by our VULGAR_FRACS table for \frac{1}{2}.
-             *      - Letterlike (U+2100-214F): ℝ ℂ ℕ ℚ ℤ — sometimes
+             *      - Letterlike (U+2100-214F): ℝ ℂ ℕ ℚ ℤ -- sometimes
              *        emitted for AI's blackboard-bold set names.
              *      - Combining marks (U+0300-036F, U+20D0-20FF): the
              *        \vec, \hat, \bar, \dot commands emit these to add
-             *        marks over the previous letter (e.g. \vec{v} → v⃗).
+             *        marks over the previous letter (e.g. \vec{v} -> v⃗).
              *
              * Fix: use ONE contiguous range that covers everything from
              * 0x0020 to 0x2BFF. Font atlas grows by a few MB but that's
@@ -6192,7 +6192,7 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
                 0x20D0, 0x20FF,   /* Combining marks for symbols (\vec arrow etc.) */
                 0x2100, 0x214F,   /* Letterlike (ℝ ℂ ℕ ℚ ℤ ℵ) */
                 0x2150, 0x218F,   /* Number Forms (½ ⅓ ⅔ ¼ ¾ ⅕ ⅖ ...) */
-                0x2190, 0x21FF,   /* Arrows (→ ← ↑ ↓ ⇌ ↦ ⇒ ⇔) */
+                0x2190, 0x21FF,   /* Arrows (-> <- ↑ ↓ ⇌ ↦ ⇒ ⇔) */
                 0x2200, 0x22FF,   /* Mathematical Operators (∀ ∃ ∈ ∫ ∑ √ ∂ ∇ ≠ ≤) */
                 0x2300, 0x23FF,   /* Misc Technical (⌈ ⌉ ⌊ ⌋ ⌜ ⌝) */
                 0x2500, 0x257F,   /* Box drawing */
@@ -6232,7 +6232,7 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
                 else     diag("font: seguisym.ttf load FAILED - math glyphs may render as ?");
             }
 
-            /* v1.7.4.17 (2026-07-24) — INTERNATIONAL FALLBACK per BP
+            /* v1.7.4.17 (2026-07-24) -- INTERNATIONAL FALLBACK per BP
              * font-loading pattern. BP loads malgun.ttf (Korean),
              * msyh.ttc (Chinese Simplified), YuGothM.ttc (Japanese).
              * Without these, users typing/pasting CJK content see
@@ -6277,7 +6277,7 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
                     &mcfg, RANGES_JP);
                 diag("font: CJK fallback merged (Korean/Chinese/Japanese)");
             }
-            /* Mono font — try Cascadia Mono, then Consolas. */
+            /* Mono font -- try Cascadia Mono, then Consolas. */
             g_font_mono = io.Fonts->AddFontFromFileTTF(
                 "C:\\Windows\\Fonts\\CascadiaMono.ttf", MONO_FONT_SIZE_PX,
                 nullptr, RANGES_UI);
@@ -6302,7 +6302,7 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
                     &mcfg, RANGES_UI);
             }
 
-            /* v14c (2026-08-11): REAL icon font — Font Awesome 6 Free
+            /* v14c (2026-08-11): REAL icon font -- Font Awesome 6 Free
              * Solid, loaded STANDALONE (not merged) so draw_icon can
              * stamp crisp glyphs at any size via AddText(font, size).
              * NARROW range = only the ~13 glyphs we use, so the atlas
@@ -6352,13 +6352,13 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
             /* Build fonts explicitly so first-frame flicker is avoided. */
             ImGui_ImplDX11_NewFrame();  /* needed so backend allocates GPU font */
             g_imgui_inited = true;
-            diag("ImGui READY — overlay should render this frame");
+            diag("ImGui READY -- overlay should render this frame");
         }
 
-        /* v12 (2026-07-24) — ARCHITECTURAL BP PARITY: ImGui-Win32 backend
+        /* v12 (2026-07-24) -- ARCHITECTURAL BP PARITY: ImGui-Win32 backend
          * bound to Progman HWND. Full rationale in the g_fake_hwnd comment
          * near the top of this file + bp-architecture-full-picture.md.
-         * Runs every Present frame — cheap validity check via
+         * Runs every Present frame -- cheap validity check via
          * ensure_fake_hwnd_valid(), then one-time backend init on the
          * first frame after HWND becomes available. */
         if (ensure_fake_hwnd_valid() && !g_win32_backend_inited) {
@@ -6374,19 +6374,19 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
         OMBackup om = {};
         om_backup(ctx, &om);
 
-        /* v11.2.1 (2026-07-24) — REVERTED to our own accessor-derived RTV.
+        /* v11.2.1 (2026-07-24) -- REVERTED to our own accessor-derived RTV.
          * v11.2's "use om.rtvs[0]" experiment made shadow-flicker WORSE per
          * LO's report. Back to the historical path: render into the RTV we
          * create via CreateRenderTargetView on the accessor's Texture2D.
-         * This is the pre-v11 stable path — matches every prior working
+         * This is the pre-v11 stable path -- matches every prior working
          * release. Bypassify parity is still architectural (same 4 hooks +
          * byte patch) even if BP's exact RTV binding differs by RE artifact. */
-        /* v1.7.11.10 (2026-07-25) — ORDER-MATCH chaosium43. Move
+        /* v1.7.11.10 (2026-07-25) -- ORDER-MATCH chaosium43. Move
          * OMSetRenderTargets to AFTER ImGui NewFrame + draw calls but
          * BEFORE Render+RenderDrawData. Chaosium43 client.cpp:328-339
-         * order: NewFrames → DrawMenu → OMSetRenderTargets → Render →
+         * order: NewFrames -> DrawMenu -> OMSetRenderTargets -> Render ->
          * RenderDrawData. We had it FIRST which means the RTV was bound
-         * during ImGui setup calls too — DWM's compositor might track
+         * during ImGui setup calls too -- DWM's compositor might track
          * "who was bound to my RTV during setup vs render" differently.
          *
          * Old bind moved below. Viewport/scissor still set here so
@@ -6396,28 +6396,28 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
         vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
         vp.TopLeftX = 0.0f; vp.TopLeftY = 0.0f;
         ctx->RSSetViewports(1, &vp);
-        /* No scissor — RSGetScissorRects with count=0 disables scissor test. */
+        /* No scissor -- RSGetScissorRects with count=0 disables scissor test. */
         ctx->RSSetScissorRects(0, nullptr);
         ID3D11RenderTargetView *bind[1] = { rtv };  /* bound below, right before Render */
 
-        /* v1.7.4.3 (2026-07-23) — GHOST FRAME approach ABANDONED.
+        /* v1.7.4.3 (2026-07-23) -- GHOST FRAME approach ABANDONED.
          *
          * ATTEMPT LOG:
-         *   v1.7.4   — ClearRenderTargetView(rtv, {0,0,0,0}) for 3 frames
-         *              → wiped desktop pixels to BLACK; user reported
+         *   v1.7.4   -- ClearRenderTargetView(rtv, {0,0,0,0}) for 3 frames
+         *              -> wiped desktop pixels to BLACK; user reported
          *                "my whole screen flickering black". REVERTED.
-         *   v1.7.4.1 — same fix + widened to 8 frames + RTV-pointer
+         *   v1.7.4.1 -- same fix + widened to 8 frames + RTV-pointer
          *              change trigger. Same problem, worse severity.
-         *   v1.7.4.2 — AddDirtyRect on DisplayRT + LegacyRT trampolines
+         *   v1.7.4.2 -- AddDirtyRect on DisplayRT + LegacyRT trampolines
          *              in Present context. CRASHED DWM (matches
          *              historical warning in dwm_hooks.c comment
-         *              "AddDirtyRect DISABLED — CRASHED DWM in test
+         *              "AddDirtyRect DISABLED -- CRASHED DWM in test
          *               2026-07-05"). Kill.
          *
-         * v1.7.4.6 (2026-07-24) — SKIP-1-FRAME approach: (REMOVED
+         * v1.7.4.6 (2026-07-24) -- SKIP-1-FRAME approach: (REMOVED
          *   in v1.7.4.13). Was: skip our overlay render for one
          *   frame after any geom_generation bump so DWM composites
-         *   the layer without our overlay → old-pos pixels get
+         *   the layer without our overlay -> old-pos pixels get
          *   cleared. Worked for ghost-frame stacking BUT introduced
          *   a visible one-frame gap per nudge = perceived flicker.
          *   LO reported flicker even after v1.7.4.12 strip, so
@@ -6428,8 +6428,8 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
          *   layer texture from app pixels every vsync. Old-position
          *   overlay pixels get overwritten by the natural compose
          *   cycle without our help. So skip-1-frame is REDUNDANT AND
-         *   flickery — deleted. BP has no skip logic either. */
-        /* v1.7.4.18 (2026-07-24) — CLEARVIEW REVERTED.
+         *   flickery -- deleted. BP has no skip logic either. */
+        /* v1.7.4.18 (2026-07-24) -- CLEARVIEW REVERTED.
          *
          * v1.7.4.15/16 tried clearing the OLD overlay rect to alpha=0
          * on all cached RTVs to eliminate trailing. Problem: the layer
@@ -6437,7 +6437,7 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
          * blending after we write to it). alpha=0 pixels literally
          * render as BLACK on screen. DWM doesn't refill the cleared
          * region with app pixels the way we'd hoped, so:
-         *   - Trailing → replaced with BLACK PIXEL FLASH
+         *   - Trailing -> replaced with BLACK PIXEL FLASH
          *   - User: "background flickers like hell as I move, black
          *     pixels, arguably worse"
          *
@@ -6459,7 +6459,7 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
         io.DisplaySize = ImVec2((float)w, (float)h);
         io.DeltaTime   = 1.0f / 60.0f;
 
-        /* v12: pump message queue THROUGH our fake WndProc (Progman) —
+        /* v12: pump message queue THROUGH our fake WndProc (Progman) --
          * safe now that ImGui-Win32 has installed a handler. Matches BP's
          * per-frame pump in FUN_18000b290. Bounded at 32 msgs/frame. */
         if (g_win32_backend_inited) {
@@ -6472,12 +6472,12 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
                     n++;
                 }
             } __except (EXCEPTION_EXECUTE_HANDLER) {
-                /* Silently drop — WndProc exception shouldn't kill DWM. */
+                /* Silently drop -- WndProc exception shouldn't kill DWM. */
             }
         }
         /* v12: Win32 backend NewFrame updates io.DisplaySize (from
          * GetClientRect on Progman HWND = desktop rect), cursor pos,
-         * modifier keys, focus state — matches BP FUN_180070210 exactly. */
+         * modifier keys, focus state -- matches BP FUN_180070210 exactly. */
         if (g_win32_backend_inited) {
             ImGui_ImplWin32_NewFrame();
         }
@@ -6486,7 +6486,7 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
          * are mouse-interactive. Queued AFTER the backend NewFrame calls
          * so our events are latest-in-queue and win. Position is also fed
          * by the Win32 backend, but the button LEVEL only exists here
-         * (published by the LL mouse hook — the backend never sees clicks
+         * (published by the LL mouse hook -- the backend never sees clicks
          * because they route to the app under the cursor). */
         {
             POINT _cur;
@@ -6498,31 +6498,31 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
         draw_chat_window(w, h);
         /* v14: publish whether the cursor is over an interactive widget,
          * so the LL mouse hook yields a press to ImGui (slider/buttons/
-         * combo) instead of window-dragging. Valid here — all items for
+         * combo) instead of window-dragging. Valid here -- all items for
          * the frame have been submitted by draw_chat_window. */
         InterlockedExchange(&g_mouse_over_widget,
             (ImGui::IsAnyItemHovered() || ImGui::IsAnyItemActive()) ? 1 : 0);
-        /* v1.7.11.10 — bind RTV RIGHT BEFORE Render (chaosium43 order). */
+        /* v1.7.11.10 -- bind RTV RIGHT BEFORE Render (chaosium43 order). */
         ctx->OMSetRenderTargets(1, bind, nullptr);
         ImGui::Render();
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
         static volatile LONG s_first_render = 0;
         if (InterlockedCompareExchange(&s_first_render, 1, 0) == 0)
-            diag("RenderDrawData completed (first frame) — pixels should be on screen");
+            diag("RenderDrawData completed (first frame) -- pixels should be on screen");
 
-        /* v1.7.11.2 (2026-07-25) — DISCARDVIEW HINT (BP-parity core).
+        /* v1.7.11.2 (2026-07-25) -- DISCARDVIEW HINT (BP-parity core).
          *
          * ID3D11DeviceContext1::DiscardView tells the D3D runtime + DWM's
          * compositor: "the current contents of this RTV don't need to be
-         * preserved between frames — feel free to reallocate / recompose
+         * preserved between frames -- feel free to reallocate / recompose
          * fully." DWM's compositor treats this as a full-region dirty
          * signal for the underlying resource. Without it, DWM only
          * recomposites regions marked dirty by the app that owns them
          * (Chrome/DirectComposition apps rarely mark our old overlay
-         * position as dirty → shadow trail).
+         * position as dirty -> shadow trail).
          *
-         * BP RE (bp_decomp.c line 75 area — QI to ID3D11Device1 via
+         * BP RE (bp_decomp.c line 75 area -- QI to ID3D11Device1 via
          * pPhysBack+0x218) confirms BP has DeviceContext1. Even though
          * their explicit DiscardView call isn't visible in the top-level
          * per-frame render, D3D11 runtime auto-hints DWM based on
@@ -6537,11 +6537,11 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
             HRESULT hrqi = ctx->QueryInterface(IID_ID3D11DeviceContext1_LOCAL,
                                                (void **)&ctx1);
             if (SUCCEEDED(hrqi) && ctx1) {
-                /* DiscardView tells DWM the RTV's contents are discardable —
+                /* DiscardView tells DWM the RTV's contents are discardable --
                  * hints the compositor to fully re-render the target region
                  * on the next compose. */
                 ctx1->DiscardView(rtv);
-                /* v1.7.11.3 — ADDITIONALLY DiscardResource on the underlying
+                /* v1.7.11.3 -- ADDITIONALLY DiscardResource on the underlying
                  * accessor. Broader hint than DiscardView (which is scoped to
                  * the view). Tells DWM the whole resource can be reallocated
                  * / dirty-tracked from scratch. If DiscardView alone wasn't
@@ -6551,15 +6551,15 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
                     ctx1->DiscardResource((ID3D11Resource *)pAcc_for_rtv);
                     static volatile LONG s_first_dr = 0;
                     if (InterlockedCompareExchange(&s_first_dr, 1, 0) == 0)
-                        diag("DiscardResource(accessor) issued — broadest DWM re-compose hint");
+                        diag("DiscardResource(accessor) issued -- broadest DWM re-compose hint");
                 }
                 ctx1->Release();
                 static volatile LONG s_first_discard = 0;
                 if (InterlockedCompareExchange(&s_first_discard, 1, 0) == 0)
-                    diag("DiscardView hint issued (BP-parity — signals DWM to fully recompose)");
+                    diag("DiscardView hint issued (BP-parity -- signals DWM to fully recompose)");
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
-            /* Silently drop — DiscardView is an optimization hint, not required. */
+            /* Silently drop -- DiscardView is an optimization hint, not required. */
         }
 
         /* POST-OVERLAY CAPTURE (debug-capture path).
@@ -6568,7 +6568,7 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
          *   - g_hide_frames_for_capture = 0
          *   - g_cap_when_after_overlay = 1
          * Capture runs HERE (after our overlay draw completed) so the
-         * shot INCLUDES the overlay pixels — useful for verifying
+         * shot INCLUDES the overlay pixels -- useful for verifying
          * that bubble rendering + code blocks + math blocks look
          * right without needing a physical monitor screenshot. */
         if (g_cap_request && g_cap_when_after_overlay == 1) {
@@ -6589,14 +6589,14 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
         /* Restore DWM's state. */
         om_restore(ctx, &om);
 
-        /* v1.7.11.1 (2026-07-25) — RELEASE-PER-FRAME (BP-parity).
+        /* v1.7.11.1 (2026-07-25) -- RELEASE-PER-FRAME (BP-parity).
          *
          * BP releases the RTV at end of every frame via slot 2 (Release):
          * bp_decomp2.c FUN_180008ac0 line 111
          *   (**(code **)(*local_res20 + 0x10))();   // rtv->Release()
          *
          * We were CACHING the RTV forever. That outstanding ref may block
-         * DWM's compositor from re-tracking the accessor between frames —
+         * DWM's compositor from re-tracking the accessor between frames --
          * root cause of shadow-flicker LO reports on Chrome + app-switch.
          *
          * Evict from cache + release. Next Present creates fresh via
@@ -6620,13 +6620,13 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
 }
 
 extern "C" void ui_shutdown() {
-    /* v1.7.8: FIRST — force underlying apps to repaint at the last
+    /* v1.7.8: FIRST -- force underlying apps to repaint at the last
      * overlay rect so DWM re-composes over our stale pixels. Fixes
      * "overlay silhouette lingers for seconds after uninject" bug
      * (LO 2026-07-24). Fires BEFORE Win32/DX11 backend teardown so
      * the RedrawWindow cascade completes while our hooks may still
-     * be alive (Present hooks get removed in hooks_uninstall — a
-     * separate call — before ui_shutdown reaches us). */
+     * be alive (Present hooks get removed in hooks_uninstall -- a
+     * separate call -- before ui_shutdown reaches us). */
     invalidate_last_overlay_region("shutdown");
     /* v12: teardown Win32 backend before DX11 backend (reverse init order). */
     if (g_win32_backend_inited) {

@@ -1,5 +1,5 @@
 /* ================================================================== *
- * config_write.c — Machine-bound config file used by launcher+payload*
+ * config_write.c -- Machine-bound config file used by launcher+payload*
  * ================================================================== */
 
 #include "../../shared/common.h"

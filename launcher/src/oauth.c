@@ -1,5 +1,5 @@
 /* ================================================================== *
- * oauth.c — Supabase PKCE OAuth via WinHTTP + WinSock2 listener.      *
+ * oauth.c -- Supabase PKCE OAuth via WinHTTP + WinSock2 listener.      *
  * ================================================================== */
 
 #include "../../shared/common.h"
@@ -86,7 +86,7 @@ static const char ERROR_HTML_BODY_POST[] =
 
 /* ── Open a URL in the default browser (best-effort, non-blocking). */
 static void open_in_browser(const char *url) {
-    /* Prefer rundll32 url.dll — same trick auth.js uses to escape elevated context. */
+    /* Prefer rundll32 url.dll -- same trick auth.js uses to escape elevated context. */
     char cmd[4096];
     _snprintf(cmd, sizeof(cmd) - 1,
               "rundll32.exe url.dll,FileProtocolHandler %s", url);
@@ -208,7 +208,7 @@ static int wait_for_callback(char *code_out, size_t code_size,
                 *eq = 0;
                 const char *k = tok;
                 const char *v = eq + 1;
-                /* URL-decode v in place (safe — smaller output than input). */
+                /* URL-decode v in place (safe -- smaller output than input). */
                 char decoded[2048]; size_t di = 0;
                 for (size_t i = 0; v[i] && di < sizeof(decoded) - 1; i++) {
                     if (v[i] == '%' && v[i+1] && v[i+2]) {
@@ -250,7 +250,7 @@ static int wait_for_callback(char *code_out, size_t code_size,
             continue;
         }
 
-        /* Success — send success HTML, capture code. */
+        /* Success -- send success HTML, capture code. */
         send(cli, SUCCESS_HTML, (int)strlen(SUCCESS_HTML), 0);
         closesocket(cli);
         closesocket(srv);
@@ -322,7 +322,7 @@ static int exchange_code(const char *code, const char *verifier, oauth_session_t
         out->expires_at = (long long)time(NULL) + (long long)expires_in;
     }
 
-    /* Nested user{}: extract via crude but correct approach — find "user":
+    /* Nested user{}: extract via crude but correct approach -- find "user":
      * then apply json_get_str against the object substring. */
     const char *user_start = strstr(r.body, "\"user\"");
     if (user_start) {

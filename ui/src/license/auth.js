@@ -119,29 +119,61 @@ function createSession(tokenResp) {
 }
 
 function signSession(session) {
+  /* v2.0.1 (2026-09-10): stamped as sig_v=2. Fresh sessions and post-
+   * refresh sessions always land here. Existing on-disk v1 sessions
+   * keep validating under the v1 formula (see validateSignature) until
+   * their next natural refresh, at which point they rotate up cleanly. */
+  session.sig_v = 2;
+  session.signature = _computeSig(session, 2);
+  if (!session.created_at) session.created_at = Math.floor(Date.now() / 1000);
+}
+
+/* v2.0.1: HMAC computation, version-aware. Kept as a pure function
+ * (no mutation of `session`) so validateSignature can call it too.
+ * v1 (legacy): access_token + user_id + email + expires_at
+ * v2 (current): + refresh_token + avatar_url, with '|' separators to
+ *   prevent length-extension ambiguity between adjacent string fields.
+ * Binding refresh_token closes a same-user attacker's ability to swap
+ * a different account's refresh_token into ui_session.dat under our
+ * signature (audit finding P2-1). Binding avatar_url is defense-in-
+ * depth against display-only tamper. */
+function _computeSig(session, ver) {
   const hwid = device.getCached()?.hardware_uuid;
   const key  = _deriveSigningKey(hwid);
   const h    = crypto.createHmac('sha256', key);
-  h.update(session.access_token || '');
-  h.update(session.user_id || '');
-  h.update(session.email || '');
-  const buf = Buffer.alloc(8);
-  buf.writeBigInt64LE(BigInt(session.expires_at || 0));
-  h.update(buf);
-  session.signature = h.digest('base64url');
-  if (!session.created_at) session.created_at = Math.floor(Date.now() / 1000);
+  if (ver === 2) {
+    h.update(session.access_token || '');
+    h.update('|'); h.update(session.refresh_token || '');
+    h.update('|'); h.update(session.user_id || '');
+    h.update('|'); h.update(session.email || '');
+    h.update('|'); h.update(session.avatar_url || '');
+    const buf = Buffer.alloc(8);
+    buf.writeBigInt64LE(BigInt(session.expires_at || 0));
+    h.update(buf);
+  } else {
+    /* v1 legacy — accepted for validating pre-2.0.1 on-disk sessions. */
+    h.update(session.access_token || '');
+    h.update(session.user_id || '');
+    h.update(session.email || '');
+    const buf = Buffer.alloc(8);
+    buf.writeBigInt64LE(BigInt(session.expires_at || 0));
+    h.update(buf);
+  }
+  return h.digest('base64url');
 }
 
 function validateSignature(session) {
   if (!session || !session.signature) return false;
   const saved = session.signature;
-  signSession(session);
-  const ok = crypto.timingSafeEqual(
-    Buffer.from(session.signature, 'base64url'),
-    Buffer.from(saved, 'base64url'),
-  );
-  session.signature = saved;
-  return ok;
+  /* v2.0.1: honour whichever version stamped this session on disk. */
+  const ver = session.sig_v === 2 ? 2 : 1;
+  const actual = _computeSig(session, ver);
+  try {
+    return crypto.timingSafeEqual(
+      Buffer.from(actual, 'base64url'),
+      Buffer.from(saved, 'base64url'),
+    );
+  } catch { return false; }
 }
 
 function loadSessionWithRecovery() {

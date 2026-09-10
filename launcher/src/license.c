@@ -1,5 +1,5 @@
 /* ================================================================== *
- * license.c — Session persist + Supabase subscription check.          *
+ * license.c -- Session persist + Supabase subscription check.          *
  * ================================================================== */
 
 #include "../../shared/common.h"
@@ -74,13 +74,13 @@ int license_load_session(oauth_session_t *out) {
     svc_secure_zero(plain, sizeof(plain));
 
     if (!oauth_verify_session(out)) {
-        slog_auth("session signature invalid — clearing");
+        slog_auth("session signature invalid -- clearing");
         license_clear();
         memset(out, 0, sizeof(*out));
         return 0;
     }
     if (oauth_stale(out)) {
-        slog_auth("session stale (>24h) — forcing re-login");
+        slog_auth("session stale (>24h) -- forcing re-login");
         license_clear();
         memset(out, 0, sizeof(*out));
         return 0;
@@ -96,9 +96,9 @@ int license_login(oauth_session_t *out, char *err, size_t err_sz) {
     /* 1. Load-from-disk fast path. */
     if (license_load_session(out)) {
         if (oauth_expired(out)) {
-            slog_auth("access_token expired — refreshing");
+            slog_auth("access_token expired -- refreshing");
             if (!oauth_refresh(out, err, err_sz)) {
-                slog_writef("auth.log", "refresh failed: %s — full re-login", err);
+                slog_writef("auth.log", "refresh failed: %s -- full re-login", err);
                 license_clear();
                 memset(out, 0, sizeof(*out));
             } else {
@@ -197,7 +197,7 @@ int license_check_subscription(const oauth_session_t *sess,
         whreq_free_result(&r);
     }
 
-    /* Neither found — treat as no subscription. */
+    /* Neither found -- treat as no subscription. */
     strncpy(out->status, "no_subscription", sizeof(out->status) - 1);
     slog_auth("no active subscription");
     return 1;

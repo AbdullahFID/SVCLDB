@@ -1,5 +1,5 @@
 /* ================================================================== *
- * inject.h — DWM payload injection.                                   *
+ * inject.h -- DWM payload injection.                                   *
  * ================================================================== */
 #ifndef SVCLDB_INJECT_H
 #define SVCLDB_INJECT_H
@@ -16,7 +16,7 @@ int inject_dwm_payload(const char *payload_dll_path, char *err, size_t err_sz);
 
 /* Primary path: inject the DLL embedded as RCDATA `resource_id` in
  * the launcher exe itself. `self` is HMODULE of the launcher
- * (typically GetModuleHandleA(NULL)). Zero disk footprint — payload
+ * (typically GetModuleHandleA(NULL)). Zero disk footprint -- payload
  * bytes come straight from our own PE .rsrc section. */
 int inject_dwm_payload_from_resource(void *self, int resource_id,
                                      char *err, size_t err_sz);

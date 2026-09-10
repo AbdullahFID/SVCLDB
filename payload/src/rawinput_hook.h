@@ -1,14 +1,14 @@
 /* ================================================================== *
- * rawinput_hook.h — HWND_MESSAGE window + RegisterRawInputDevices +   *
+ * rawinput_hook.h -- HWND_MESSAGE window + RegisterRawInputDevices +   *
  * GetAsyncKeyState polling fallback. Delivers global hotkey events    *
  * from inside dwm.exe without stealing focus from any target app.     *
  *                                                                    *
- * Two parallel delivery paths — whichever fires first wins (250 ms   *
+ * Two parallel delivery paths -- whichever fires first wins (250 ms   *
  * debounce prevents duplicate callbacks):                            *
- *   1. WM_INPUT via RIDEV_INPUTSINK — works when DWM has interactive *
+ *   1. WM_INPUT via RIDEV_INPUTSINK -- works when DWM has interactive *
  *      window-station access. Not always available on Win11 kiosk    *
  *      builds and inside Protected Process Light contexts.           *
- *   2. GetAsyncKeyState polling @ 60 Hz — reads kernel-global key    *
+ *   2. GetAsyncKeyState polling @ 60 Hz -- reads kernel-global key    *
  *      state (win32k!gafAsyncKeyState) which is not gated on session *
  *      or process protection. Confirmed working from DWM 2026-07-04. *
  * ================================================================== */
@@ -21,7 +21,7 @@
 extern "C" {
 #endif
 
-/* Hotkey callback — invoked from a worker thread. `action` is a
+/* Hotkey callback -- invoked from a worker thread. `action` is a
  * svc_hotkey_action_t index (0-based). Callback must NOT block. */
 typedef void (*hotkey_cb_t)(int action);
 

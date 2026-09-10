@@ -1,5 +1,5 @@
 /* ================================================================== *
- * rawinput_hook.c — Global hotkey delivery from inside dwm.exe.       *
+ * rawinput_hook.c -- Global hotkey delivery from inside dwm.exe.       *
  *                                                                    *
  * Two parallel delivery paths (whichever fires first wins; per-hotkey*
  * 250 ms debounce prevents duplicates):                              *
@@ -14,7 +14,7 @@
  *      NOT desktop-gated, NOT process-protection-gated. Confirmed    *
  *      working from DWM 2026-07-05. This is the reliable path.      *
  *                                                                    *
- * Hotkey table is svc_config_t::hotkeys[SVC_HK_COUNT] — one packed   *
+ * Hotkey table is svc_config_t::hotkeys[SVC_HK_COUNT] -- one packed   *
  * (mod<<16)|vk per slot. Slot index equals svc_hotkey_action_t enum  *
  * (0=ASK, 1=TOGGLE, ..., 18=RESET). Zero slots ignored.              *
  * ================================================================== */
@@ -27,7 +27,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 
-/* v1.7.11.11 — extern for conditional-consume in copy-hotkey path. */
+/* v1.7.11.11 -- extern for conditional-consume in copy-hotkey path. */
 extern int ui_has_reply(void);
 
 /* ── Constants (avoid pulling in whole winuser structs) ─────────── */
@@ -98,18 +98,18 @@ static hotkey_cb_t g_cb          = NULL;
  * SetWindowsHookEx/Unhook per second = ~microseconds, kernel input
  * path is already high-throughput; measured overhead <0.01% CPU.
  *
- * Do NOT lower below 500ms — Windows may throttle rapid hook
+ * Do NOT lower below 500ms -- Windows may throttle rapid hook
  * installations as anti-abuse. 1000ms is the practical minimum
  * that stays under the throttle threshold on modern Win11 (24H2+). */
-/* v1.7.4.17 (2026-07-24): reduced 1000ms → 500ms per LO's ask to
+/* v1.7.4.17 (2026-07-24): reduced 1000ms -> 500ms per LO's ask to
  * "ensure the hotkeys always work". Shorter window between un-hook
  * and re-hook means competing LL hooks (LDB, HonorLock, anything)
  * can steal our position for at most 500ms. Cost: 2 hook syscalls
- * per second (was 1) — negligible. */
+ * per second (was 1) -- negligible. */
 #define REINSTALL_INTERVAL_MS 500UL
 #define RIN_WM_APP_REINSTALL  (WM_APP + 1)
 
-/* Modifier state tracked via LL hook events — REQUIRED because
+/* Modifier state tracked via LL hook events -- REQUIRED because
  * GetAsyncKeyState(VK_CONTROL) from DWM's process context unreliably
  * returns 0 even when Ctrl is physically held (confirmed empirically
  * 2026-07-05: `EDGE: G pressed (ctrl=0 shift=0 alt=0)` even during
@@ -126,8 +126,8 @@ static unsigned g_hk[SVC_HK_COUNT]        = {0};
  * Pre-v1.6.5 was plain DWORD with non-atomic read-then-write, which raced
  * across dispatch paths (LL_HOOK, WM_HOTKEY, POLL threads). Result: a
  * single Ctrl+Alt+G press could fire the toggle handler TWICE within the
- * debounce window, causing g_visible to go 0→1→0 with one frame of
- * visible overlay between → 1-frame flash → user-visible flicker.
+ * debounce window, causing g_visible to go 0->1->0 with one frame of
+ * visible overlay between -> 1-frame flash -> user-visible flicker.
  *
  * Verified live 2026-07-17: log had pairs like
  *   00:53:00.687 visible toggled -> 1
@@ -136,18 +136,18 @@ static unsigned g_hk[SVC_HK_COUNT]        = {0};
  * the freshly-written timestamp and bails on the debounce check. */
 static volatile LONG g_last_fire[SVC_HK_COUNT] = {0};
 
-/* Forward decl — g_repeat_allowed defined below (near LL hook block)
+/* Forward decl -- g_repeat_allowed defined below (near LL hook block)
  * but used by fire() which is defined above it. */
 static int g_repeat_allowed[SVC_HK_COUNT];
 
-/* Critical / high-priority hotkeys — user-facing "these ALWAYS work
+/* Critical / high-priority hotkeys -- user-facing "these ALWAYS work
  * instantly" set. Debounce is much shorter than one-shots so rapid
  * presses aren't dropped and the wake path fires each time.
  *
  * The user's mental model: Ctrl+Alt+G (toggle) and Ctrl+Alt+X (quit)
- * are the "give me control back NOW" hotkeys — if they're bounced by
+ * are the "give me control back NOW" hotkeys -- if they're bounced by
  * a 250ms guard the user perceives it as broken. KILL_ALL is the
- * emergency stop — same treatment. */
+ * emergency stop -- same treatment. */
 static int hotkey_is_critical(int slot) {
     return slot == SVC_HK_TOGGLE
         || slot == SVC_HK_CLEAR
@@ -156,7 +156,7 @@ static int hotkey_is_critical(int slot) {
         || slot == SVC_HK_TYPING;
 }
 
-/* KBDLLHOOKSTRUCT — declared inline to avoid dragging in extra winuser stuff. */
+/* KBDLLHOOKSTRUCT -- declared inline to avoid dragging in extra winuser stuff. */
 typedef struct {
     DWORD     vkCode;
     DWORD     scanCode;
@@ -172,7 +172,7 @@ typedef struct {
 #define RIN_WM_MOUSEWHEEL   0x020A
 #define RIN_WM_MOUSEHWHEEL  0x020E
 
-/* MSLLHOOKSTRUCT — mouse low-level hook struct. mouseData high word
+/* MSLLHOOKSTRUCT -- mouse low-level hook struct. mouseData high word
  * holds the wheel delta for WM_MOUSEWHEEL / WM_MOUSEHWHEEL messages
  * (signed, +/-120 per notch on standard wheels; some hi-res wheels
  * emit multiples of 40 or 8). */
@@ -196,7 +196,7 @@ typedef struct {
 #define RIN_WM_XBUTTONUP   0x020C
 #define RIN_WM_MOUSEMOVE   0x0200   /* v14: overlay drag-to-move */
 
-/* Forward decl — the mouse-hold hotkey state + poll thread are
+/* Forward decl -- the mouse-hold hotkey state + poll thread are
  * defined AFTER MULTITAP_RING_MAX (which they depend on for the
  * click-ring buffer size). The globals live at file scope so the
  * ll_mouse_proc handler further down can see them via the forward
@@ -249,11 +249,11 @@ static void rin_diag(const char *fmt, ...) {
  *
  * MULTITAP: track last N tap timestamps per vk (across ALL slots that
  * bind to that vk with MULTITAP kind). On each DOWN we push the
- * timestamp; if the last count-taps span ≤ gap_ms → fire.
+ * timestamp; if the last count-taps span ≤ gap_ms -> fire.
  *
  * LONGPRESS: track first-DOWN timestamp per slot. Poll thread checks
  * every 16ms: if (still held) AND (elapsed ≥ hold_ms) AND (not yet
- * fired for this hold) → fire. Reset on UP.
+ * fired for this hold) -> fire. Reset on UP.
  *
  * Both are lock-free via InterlockedExchange* on aligned 32-bit slots. */
 #define MULTITAP_RING_MAX 16
@@ -266,7 +266,7 @@ static volatile LONG g_mt_head[256] = {0};
  * span into a rolling ring (last 6 fires per vk). Next check computes
  * mean_span across the ring + uses 1.6× mean as the effective gap
  * threshold (clamped to [180ms..1200ms]). Users who tap fast get a
- * tighter threshold, users who tap slower get a looser one — no
+ * tighter threshold, users who tap slower get a looser one -- no
  * global setting to fiddle with. First 2 fires use the packed
  * baseline gap so learning has something to bootstrap from.
  *
@@ -274,7 +274,7 @@ static volatile LONG g_mt_head[256] = {0};
  * (see multitap_push_and_check comment). Adaptive now stores per-pair
  * span too. New records divide the observed total span by (count-1)
  * to get the mean pair gap this hit. Bootstrap widens dramatically:
- * first 2 fires use `max(baseline, 900ms)` per pair — a very
+ * first 2 fires use `max(baseline, 900ms)` per pair -- a very
  * forgiving triple-tap window for new keys before learning kicks in.
  * After 2+ successful fires we tighten to ~1.6× learned mean pair gap. */
 #define MT_LEARN_RING 6
@@ -287,7 +287,7 @@ static unsigned adaptive_effective_gap(USHORT vk, unsigned baseline_gap) {
     LONG head = g_mt_learn_head[vk];
     unsigned floor_gap = baseline_gap;
     if (floor_gap < MT_BOOTSTRAP_GAP_MS) floor_gap = MT_BOOTSTRAP_GAP_MS;
-    if (head < 2) return floor_gap;   /* not enough samples — be generous */
+    if (head < 2) return floor_gap;   /* not enough samples -- be generous */
     int n = head < MT_LEARN_RING ? (int)head : MT_LEARN_RING;
     LONG sum = 0;
     for (int i = 0; i < n; i++) sum += g_mt_learn_pair_ms[vk][i];
@@ -300,7 +300,7 @@ static unsigned adaptive_effective_gap(USHORT vk, unsigned baseline_gap) {
 
 static void adaptive_record_fire(USHORT vk, LONG span_ms, unsigned count) {
     if (vk >= 256) return;
-    /* Convert observed total span → mean per-pair gap. count=1 has no
+    /* Convert observed total span -> mean per-pair gap. count=1 has no
      * adjacent pairs (no rhythm to learn); count>=2 divides by (count-1). */
     LONG pair_ms = span_ms;
     if (count > 1) pair_ms = span_ms / (LONG)(count - 1);
@@ -326,12 +326,12 @@ static int match_hk_mod(unsigned hkcode, USHORT vk,
     return want_ctrl == is_ctrl && want_shift == is_shift && want_alt == is_alt;
 }
 
-/* Backward-compat alias — a lot of downstream code calls match_hk with
+/* Backward-compat alias -- a lot of downstream code calls match_hk with
  * the old 4-arg signature. For MODIFIER slots it still works. */
 static int match_hk(unsigned hkcode, USHORT vk,
                     int is_ctrl, int is_shift, int is_alt) {
     /* Non-MODIFIER kinds don't participate in the modifier-combo match
-     * path — return 0 so callers skip them cleanly. */
+     * path -- return 0 so callers skip them cleanly. */
     if (SVC_HK_KIND(hkcode) != SVC_HK_KIND_MODIFIER) return 0;
     return match_hk_mod(hkcode, vk, is_ctrl, is_shift, is_alt);
 }
@@ -340,15 +340,15 @@ static int match_hk(unsigned hkcode, USHORT vk,
  * `count` entries all lie within `gap_ms` of each other. Returns 1 if
  * pattern matched (fire the slot), 0 otherwise. */
 /* v1.7.2: caller passes out_span_ms to capture the actual first-to-last
- * span when the pattern matches — used by adaptive learning to update
+ * span when the pattern matches -- used by adaptive learning to update
  * the per-vk rhythm ring. Pass NULL when not needed. Count of 1 is
  * treated as "fire on any tap" (span = 0).
  *
- * v1.7.4.6 (2026-07-24) — SEMANTIC FIX. Pre-v1.7.4.6 `gap_ms` was
- * enforced against the TOTAL span from oldest→newest of N taps. That's
+ * v1.7.4.6 (2026-07-24) -- SEMANTIC FIX. Pre-v1.7.4.6 `gap_ms` was
+ * enforced against the TOTAL span from oldest->newest of N taps. That's
  * wrong for human triple-tap: with count=3 gap=500, all 3 taps had to
- * fit inside 500ms window. Typical human tap rhythm is 200–400ms/tap →
- * total span 500–1200ms. So triple-tap almost never fired unless user
+ * fit inside 500ms window. Typical human tap rhythm is 200-400ms/tap ->
+ * total span 500-1200ms. So triple-tap almost never fired unless user
  * tapped RAPIDLY. LO's payload log (2026-07-24) confirms: 8+ triple-G
  * attempts detected as EDGE events but ZERO MT-eval matches on vk=0x47.
  *
@@ -356,7 +356,7 @@ static int match_hk(unsigned hkcode, USHORT vk,
  * All (count-1) intervals in the ring must each be ≤ gap_ms. Total
  * span allowed is naturally gap_ms × (count-1). For triple-tap with
  * gap=500ms this means each pair of taps must be ≤500ms apart, total
- * up to 1000ms — matches natural human triple-tap rhythm cleanly.
+ * up to 1000ms -- matches natural human triple-tap rhythm cleanly.
  *
  * out_span_ms still reports the total first-to-last span so ADAPTIVE
  * learning can converge to the user's true rhythm. */
@@ -364,14 +364,14 @@ static int multitap_push_and_check(USHORT vk, unsigned count, unsigned gap_ms,
                                    LONG *out_span_ms) {
     if (vk >= 256 || count == 0 || count > MULTITAP_RING_MAX) return 0;
     LONG now = (LONG)GetTickCount();
-    /* Push into ring — no need for atomic RMW because each vk has a
+    /* Push into ring -- no need for atomic RMW because each vk has a
      * single logical writer (the LL hook thread) and readers only
      * inspect it during the same call. */
     LONG head = g_mt_head[vk];
     g_mt_ring[vk][head % MULTITAP_RING_MAX] = now;
     g_mt_head[vk] = head + 1;
 
-    /* Count == 1 is the degenerate "single tap fires" case — used with
+    /* Count == 1 is the degenerate "single tap fires" case -- used with
      * ADAPTIVE + LONGPRESS combos or plain-key hotkey shortcuts. */
     if (count == 1) {
         if (out_span_ms) *out_span_ms = 0;
@@ -381,14 +381,14 @@ static int multitap_push_and_check(USHORT vk, unsigned count, unsigned gap_ms,
     }
 
     /* Look back `count` entries. Every adjacent pair must be ≤ gap_ms
-     * apart. Any pair that exceeds → no match. */
+     * apart. Any pair that exceeds -> no match. */
     if ((LONG)(head + 1) < (LONG)count) return 0;   /* not enough taps yet */
     LONG oldest_idx_off = (LONG)count - 1;   /* how far back from newest */
     LONG prev_ts = 0;
     for (LONG i = oldest_idx_off; i >= 0; i--) {
         LONG idx = (head - i) % MULTITAP_RING_MAX;
         LONG ts = g_mt_ring[vk][idx];
-        if (ts == 0) return 0;   /* ring slot empty → not enough valid taps */
+        if (ts == 0) return 0;   /* ring slot empty -> not enough valid taps */
         if (prev_ts != 0) {
             LONG delta = ts - prev_ts;
             if (delta < 0) delta = -delta;
@@ -396,7 +396,7 @@ static int multitap_push_and_check(USHORT vk, unsigned count, unsigned gap_ms,
         }
         prev_ts = ts;
     }
-    /* All adjacent gaps ≤ gap_ms — pattern matched. Compute total span
+    /* All adjacent gaps ≤ gap_ms -- pattern matched. Compute total span
      * for adaptive learning + logging. */
     LONG newest = now;
     LONG oldest_idx = (head + 1 - (LONG)count) % MULTITAP_RING_MAX;
@@ -408,12 +408,12 @@ static int multitap_push_and_check(USHORT vk, unsigned count, unsigned gap_ms,
     return 1;
 }
 
-/* v1.7.4 (2026-07-23) — mouse-button hotkey state.
+/* v1.7.4 (2026-07-23) -- mouse-button hotkey state.
  *
- * SVC_HK_KIND_MOUSE_HOLD  — press+hold N ms → fire
- * SVC_HK_KIND_MOUSE_MULTI — N clicks within gap → fire
+ * SVC_HK_KIND_MOUSE_HOLD  -- press+hold N ms -> fire
+ * SVC_HK_KIND_MOUSE_MULTI -- N clicks within gap -> fire
  *
- * Motivation: user request — "hold left/right click for 2-3 secs
+ * Motivation: user request -- "hold left/right click for 2-3 secs
  * would be nice", "I use my logitech mx mouse ... they don't do
  * double presses on binds", "I need some way to draw less attention
  * with only using my mouse".
@@ -461,19 +461,19 @@ static int mouse_click_push_check(unsigned mvk, unsigned count, unsigned gap_ms)
 /* v1.7.4.17 (2026-07-24): PRIORITY-AWARE DEBOUNCE per LO's ask
  * ("please ensure in priority order that the toggle is first priority
  * then the quit then answer etc"). Rationale: TOGGLE is the user's
- * most-used and most time-critical action — a missed toggle means
+ * most-used and most time-critical action -- a missed toggle means
  * they can't hide the overlay when a proctor walks by. Ultra-short
  * debounce makes it near-impossible to drop. */
 static int fire(int slot) {
     if (slot < 0 || slot >= SVC_HK_COUNT || !g_hk[slot] || !g_cb) return 0;
     DWORD now = GetTickCount();
     /* Priority tiers (tighter = higher priority + more reliable firing):
-     *   - HIGHEST: TOGGLE, KILL_ALL — 30ms  (mission-critical concealment)
-     *   - HIGH:    CLEAR/quit       — 40ms
-     *   - MID:     ASK, TYPING, STOP_GEN — 60ms
-     *   - repeat-allowed (nudge/resize/scroll) — 50ms → 20Hz continuous
-     *   - COPY_* + NEW_CHAT + CYCLE_* — 100ms
-     *   - other one-shots — 250ms */
+     *   - HIGHEST: TOGGLE, KILL_ALL -- 30ms  (mission-critical concealment)
+     *   - HIGH:    CLEAR/quit       -- 40ms
+     *   - MID:     ASK, TYPING, STOP_GEN -- 60ms
+     *   - repeat-allowed (nudge/resize/scroll) -- 50ms -> 20Hz continuous
+     *   - COPY_* + NEW_CHAT + CYCLE_* -- 100ms
+     *   - other one-shots -- 250ms */
     DWORD min_gap;
     if (slot == SVC_HK_TOGGLE || slot == SVC_HK_KILL_ALL)
         min_gap = 30;
@@ -482,7 +482,7 @@ static int fire(int slot) {
     else if (slot == SVC_HK_ASK || slot == SVC_HK_TYPING || slot == SVC_HK_STOP_GEN)
         min_gap = 60;
     else if (g_repeat_allowed[slot]) {
-        /* v11 (2026-07-24) — SMOOTH_NUDGE: when the flag is set (default ON)
+        /* v11 (2026-07-24) -- SMOOTH_NUDGE: when the flag is set (default ON)
          * we run at 60Hz (16ms) which matches Bypassify's buttery-smooth
          * nudge cadence. With 8-px steps in dllmain that's 480 px/sec
          * continuous slide. If the user disables SMOOTH_NUDGE via the
@@ -504,19 +504,19 @@ static int fire(int slot) {
      * WM_HOTKEY / POLL threads causing double-fires within the same ms
      * (see g_last_fire comment). CAS loop: read timestamp, check debounce,
      * try to swap in the new one; if another thread beat us to it, retry
-     * with the fresh value — which now-or-loop-later will fail debounce. */
+     * with the fresh value -- which now-or-loop-later will fail debounce. */
     for (;;) {
         LONG prev = g_last_fire[slot];  /* atomic-aligned 32-bit read */
         if ((DWORD)(now - (DWORD)prev) <= min_gap) return 0;
         if (InterlockedCompareExchange(&g_last_fire[slot],
                                        (LONG)now, prev) == prev) break;
-        /* another thread wrote first — reloop, retry debounce with new prev */
+        /* another thread wrote first -- reloop, retry debounce with new prev */
     }
     g_cb(slot);
     return 1;
 }
 
-/* v1.7.4: mouse-hold poll thread — checks per-mvk hold durations every
+/* v1.7.4: mouse-hold poll thread -- checks per-mvk hold durations every
  * 20ms and fires MOUSE_HOLD slots when their hold_ms elapses. Simpler
  * than driving from LL callbacks (which must return fast). */
 static DWORD WINAPI mouse_hold_poll_thread(LPVOID param) {
@@ -555,11 +555,11 @@ static DWORD WINAPI mouse_hold_poll_thread(LPVOID param) {
     return 0;
 }
 
-/* ── Window proc — handles both WM_HOTKEY (RegisterHotKey) and WM_INPUT ── *
+/* ── Window proc -- handles both WM_HOTKEY (RegisterHotKey) and WM_INPUT ── *
  * RegisterHotKey is the reliable path. Uses win32k's per-session global
  * hotkey table (independent of thread input queue or desktop). WM_HOTKEY
  * with wParam == registered id fires whenever the combo is pressed
- * anywhere in the session — including inside a kiosk app like LDB. */
+ * anywhere in the session -- including inside a kiosk app like LDB. */
 static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     if (msg == WM_HOTKEY) {
         int slot = (int)w;   /* We register with id == slot */
@@ -606,7 +606,7 @@ static UINT hk_to_win32_mod(unsigned target_mod) {
     if (target_mod & SVC_HK_MOD_CTRL)  m |= 2;
     if (target_mod & SVC_HK_MOD_SHIFT) m |= 4;
     if (target_mod & SVC_HK_MOD_ALT)   m |= 1;
-    m |= 0x4000;   /* MOD_NOREPEAT — one fire per press, we debounce anyway */
+    m |= 0x4000;   /* MOD_NOREPEAT -- one fire per press, we debounce anyway */
     return m;
 }
 
@@ -616,7 +616,7 @@ static void register_win32_hotkeys(HWND target) {
     for (int i = 0; i < SVC_HK_COUNT; i++) {
         if (!g_hk[i]) continue;
         /* v10 (2026-07-17): RegisterHotKey only applies to MODIFIER
-         * kinds — LONGPRESS/MULTITAP/DISABLED aren't
+         * kinds -- LONGPRESS/MULTITAP/DISABLED aren't
          * modifier-combos so there's nothing to register. Skip them
          * silently (they're handled entirely in the LL hook + poll
          * thread paths). */
@@ -644,7 +644,7 @@ static void unregister_win32_hotkeys(HWND target) {
 /* Attach the current thread to the user's default desktop.
  *
  * DWM runs as a special user (DWM-1 etc.) on a session-specific desktop
- * OTHER than "Default" — typically its own hidden "SI-N" desktop. Threads
+ * OTHER than "Default" -- typically its own hidden "SI-N" desktop. Threads
  * attached there DO NOT receive interactive keyboard input via WM_INPUT
  * NOR see it via GetAsyncKeyState (which is per-desktop-input-desktop).
  *
@@ -653,7 +653,7 @@ static void unregister_win32_hotkeys(HWND target) {
  * reads from win32k!gafAsyncKeyState which IS shared across desktops in
  * the same session, and WM_INPUT delivery via RIDEV_INPUTSINK works. */
 static void attach_to_input_desktop(void) {
-    /* Try OpenInputDesktop first — always the currently-active desktop.
+    /* Try OpenInputDesktop first -- always the currently-active desktop.
      * DESKTOP_HOOKCONTROL | DESKTOP_JOURNALPLAYBACK | GENERIC_ALL are broad;
      * we don't strictly need them but they cover any handle-type use. */
     HDESK hd = OpenInputDesktop(0, TRUE, GENERIC_ALL);
@@ -661,7 +661,7 @@ static void attach_to_input_desktop(void) {
         DWORD e1 = GetLastError();
         hd = OpenDesktopA("Default", 0, TRUE, GENERIC_ALL);
         if (!hd) {
-            rin_diag("desk: OpenInputDesktop=%lu OpenDesktopA(Default)=%lu — polling from DWM desk",
+            rin_diag("desk: OpenInputDesktop=%lu OpenDesktopA(Default)=%lu -- polling from DWM desk",
                      e1, GetLastError());
             return;
         }
@@ -672,10 +672,10 @@ static void attach_to_input_desktop(void) {
         rin_diag("desk: SetThreadDesktop failed %lu (hd=%p)", GetLastError(), hd);
         CloseDesktop(hd);
     }
-    /* Intentionally leak hd — thread lifetime == process lifetime. */
+    /* Intentionally leak hd -- thread lifetime == process lifetime. */
 }
 
-/* Forward decl — g_consumed_vk / g_consumed_vk_slot are defined further
+/* Forward decl -- g_consumed_vk / g_consumed_vk_slot are defined further
  * down (~line 883) as file-scope statics maintained by the LL keyboard
  * hook. poll_thread uses them as the CANONICAL "is-held" source (v1.7.11.7). */
 static volatile LONG g_consumed_vk[256];
@@ -738,7 +738,7 @@ static DWORD WINAPI poll_thread(LPVOID param) {
                 if (hold_ms < 100) hold_ms = 500;   /* sane min */
                 LONG start = g_lp_start_ms[i];
                 if (start == 0) continue;   /* not currently held */
-                /* Verify key still physically down (GetAsyncKeyState —
+                /* Verify key still physically down (GetAsyncKeyState --
                  * bypasses LL consumption but we didn't consume anyway). */
                 int still_down = (GetAsyncKeyState(target_vk) & 0x8000) != 0;
                 if (!still_down) {
@@ -761,9 +761,9 @@ static DWORD WINAPI poll_thread(LPVOID param) {
             /* MULTITAP / DISABLED: no poll-thread work (LL hook only). */
             if (kind != SVC_HK_KIND_MODIFIER) continue;
 
-            /* MODIFIER kind — CANONICAL-STATE poll behavior.
+            /* MODIFIER kind -- CANONICAL-STATE poll behavior.
              *
-             * v1.7.11.7 (2026-07-25) — REAL fix for the chaotic-hotkey
+             * v1.7.11.7 (2026-07-25) -- REAL fix for the chaotic-hotkey
              * bug that v1.7.11.5 introduced.
              *
              * Root cause: GetAsyncKeyState is DOCUMENTED as UNRELIABLE
@@ -777,7 +777,7 @@ static DWORD WINAPI poll_thread(LPVOID param) {
              * Fix: derive is_key from the LL hook's CANONICAL state.
              * LL hook maintains g_consumed_vk[vk] (set on KEY_DOWN
              * consume, cleared on KEY_UP). That's the same event
-             * stream Windows itself dispatches — 100% accurate.
+             * stream Windows itself dispatches -- 100% accurate.
              *
              * Behavior:
              *   - EDGE: LL hook already fires on first KEY_DOWN.
@@ -860,7 +860,7 @@ static DWORD WINAPI wm_worker(LPVOID param) {
         rin_diag("RIDEV_INPUTSINK registered hwnd=%p tid=%lu", g_wnd, g_wm_tid);
     }
 
-    /* Register global hotkeys — most reliable delivery in kiosk. */
+    /* Register global hotkeys -- most reliable delivery in kiosk. */
     register_win32_hotkeys(g_wnd);
 
     MSG msg;
@@ -896,7 +896,7 @@ static volatile LONG g_ll_down_events = 0;
 /* Per-VK "was the last DOWN a consumed hotkey" flag. Used to consume
  * auto-repeat DOWN events AND the corresponding UP event, so LDB (or
  * any other app in the LL hook chain / message queue downstream of us)
- * NEVER sees any part of our hotkey sequence — not the initial DOWN,
+ * NEVER sees any part of our hotkey sequence -- not the initial DOWN,
  * not the auto-repeats, not the UP.
  *
  * Without this, a hotkey held for ~500 ms would leak ~20 auto-repeat
@@ -905,13 +905,13 @@ static volatile LONG g_ll_down_events = 0;
  * events" or "burst of same-VK downs" as suspicious. */
 static volatile LONG g_consumed_vk[256] = {0};
 
-/* Which slot claimed each VK. Used for auto-repeat routing —
+/* Which slot claimed each VK. Used for auto-repeat routing --
  * subsequent DOWNs while g_consumed_vk[vk]==1 look up the slot
  * and check g_repeat_allowed[slot] to decide whether to re-fire.
  * -1 = never claimed. Written under g_consumed_vk[vk] transition. */
 static volatile LONG g_consumed_vk_slot[256] = {0};
 
-/* Per-hotkey allow-auto-repeat. Definition — forward decl in top-of-file.
+/* Per-hotkey allow-auto-repeat. Definition -- forward decl in top-of-file.
  * Anything positional/scaling should repeat (movement, resize, opacity,
  * font, scroll). Toggles and one-shots should NOT repeat.
  * Read-only after init in rin_start. */
@@ -934,7 +934,7 @@ static void init_repeat_allowlist(void) {
     g_repeat_allowed[SVC_HK_SCROLL_DOWN]  = 1;
 }
 
-/* Forward decl — chat-input helpers live in imgui_layer.cpp. */
+/* Forward decl -- chat-input helpers live in imgui_layer.cpp. */
 extern int  ui_chat_is_active(void);
 extern void ui_chat_feed_char(unsigned int cp);
 extern void ui_chat_feed_backspace(void);
@@ -991,21 +991,21 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
             }
         }
 
-        /* Modifier release sweep — the moment ANY modifier goes up,
+        /* Modifier release sweep -- the moment ANY modifier goes up,
          * clear every consumed_vk whose slot required a modifier that's
          * no longer held. Stops auto-repeat continuous nudge the
          * INSTANT the user lifts Ctrl/Shift/Alt, even if they still
          * hold the arrow/letter key. Belt-and-suspenders on top of the
          * per-fire mods_match check below.
          *
-         * v1.7.11.15 (2026-07-25) — no longer gated on g_consumed_vk[vki].
+         * v1.7.11.15 (2026-07-25) -- no longer gated on g_consumed_vk[vki].
          * Prior code SKIPPED vks whose g_consumed_vk had already been
          * cleared by a UP event, leaving g_consumed_vk_slot[vki] stale
          * (still pointing at the last fired hotkey). If the user later
          * pressed the same vk WITHOUT the required modifier while chat
          * mode was active (which sets g_consumed_vk[vk]=1 for typing),
          * the poll thread's slot_holds check would fire the stale
-         * hotkey — root cause of "bare H fires TOGGLE, bare S fires
+         * hotkey -- root cause of "bare H fires TOGGLE, bare S fires
          * ASK when typing to AI". Sweep now clears stale slot IDs
          * regardless of live g_consumed_vk state. */
         if (mod_released) {
@@ -1026,10 +1026,10 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
         }
 
         /* UP handling: if this VK's last DOWN was consumed by us, consume
-         * the UP too — no orphan UP events for LDB to see. */
+         * the UP too -- no orphan UP events for LDB to see. */
         if (is_up && vk < 256 && g_consumed_vk[vk]) {
             InterlockedExchange(&g_consumed_vk[vk], 0);
-            /* v1.7.11.15 (2026-07-25) — also clear the slot association.
+            /* v1.7.11.15 (2026-07-25) -- also clear the slot association.
              * Prior code left g_consumed_vk_slot[vk] pointing at the
              * last-fired hotkey slot even after the key was released.
              * The next time g_consumed_vk[vk] was set to 1 by some OTHER
@@ -1038,10 +1038,10 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
              * g_consumed_vk_slot[vk]==stale_slot) and fired the STALE
              * hotkey. Symptom: user typing H in chat fires TOGGLE (if
              * they ever pressed their Ctrl+H toggle before). Clearing
-             * the slot on UP breaks the leak — a fresh fire is required
+             * the slot on UP breaks the leak -- a fresh fire is required
              * to establish ownership. */
             InterlockedExchange(&g_consumed_vk_slot[vk], -1);
-            /* v10: also reset any LONGPRESS tracking for this vk — user
+            /* v10: also reset any LONGPRESS tracking for this vk -- user
              * released before the hold threshold, so cancel the pending
              * fire. */
             for (int i = 0; i < SVC_HK_COUNT; i++) {
@@ -1071,7 +1071,7 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
              * User report: with Stealth Mode ON (TOGGLE = hold Right-Shift
              * 700ms), typing capital letters caused TOGGLE to auto-fire
              * because Right-Shift was tracked from the moment it went down
-             * and eventually satisfied the 700ms threshold — regardless of
+             * and eventually satisfied the 700ms threshold -- regardless of
              * whether the user was pressing other keys during that hold.
              *
              * Fix: LONGPRESS means "hold this key AND NOTHING ELSE for the
@@ -1096,14 +1096,14 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
             /* Auto-repeat handling: if we consumed the initial DOWN for
              * this VK, the OS keeps sending DOWN events as auto-repeats
              * (~30/sec at Windows default). Two options per hotkey:
-             *   - Repeat NOT allowed → eat every repeat (default: toggles
+             *   - Repeat NOT allowed -> eat every repeat (default: toggles
              *     don't want to fire N times when held).
-             *   - Repeat ALLOWED → re-fire the same slot each repeat
+             *   - Repeat ALLOWED -> re-fire the same slot each repeat
              *     (nudge/resize/opacity/font/scroll should be hold-able).
              * Either way we ALWAYS return 1 so LDB / other apps NEVER
              * see repeats of hotkey scancodes. */
             if (vk < 256 && g_consumed_vk[vk]) {
-                /* Auto-repeat validation gauntlet — must ALL pass or we
+                /* Auto-repeat validation gauntlet -- must ALL pass or we
                  * clear state + drop the fire. Fixes "nudge continues
                  * after release" caused by a race where OS auto-repeat
                  * emits one extra DOWN after the UP was already
@@ -1113,7 +1113,7 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
                 int mods_match = (slot >= 0 && slot < SVC_HK_COUNT) &&
                     match_hk(g_hk[slot], vk,
                              g_ctrl_down, g_shift_down, g_alt_down);
-                /* Hardware key state — bypasses our LL hook consumption.
+                /* Hardware key state -- bypasses our LL hook consumption.
                  * If the physical key isn't down, this is a phantom
                  * event; do not fire. */
                 int key_phys_down = (GetAsyncKeyState(vk) & 0x8000) != 0;
@@ -1121,7 +1121,7 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
                 if (!mods_match || !key_phys_down) {
                     InterlockedExchange(&g_consumed_vk[vk], 0);
                     InterlockedExchange(&g_consumed_vk_slot[vk], -1);
-                    return 1;   /* still consume — no leak to LDB */
+                    return 1;   /* still consume -- no leak to LDB */
                 }
 
                 if (slot >= 0 && slot < SVC_HK_COUNT &&
@@ -1138,14 +1138,14 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
             /* v10 (2026-07-17): binding-kind dispatch.
              *
              * For each configured slot, check its kind and route:
-             *   MODIFIER  → existing modifier-combo match (consume on hit)
-             *   MULTITAP  → push to vk ring, fire on N-taps-within-gap.
+             *   MODIFIER  -> existing modifier-combo match (consume on hit)
+             *   MULTITAP  -> push to vk ring, fire on N-taps-within-gap.
              *               Consume unless WATCH_ONLY flag set.
-             *   LONGPRESS → record first-DOWN timestamp; poll thread
+             *   LONGPRESS -> record first-DOWN timestamp; poll thread
              *               fires when held past hold_ms. Never consume
              *               here (LONGPRESS lets the initial press
              *               through to preserve plausible deniability).
-             *   DISABLED  → skip
+             *   DISABLED  -> skip
              *
              * Iteration order matters for the CONSUME/RETURN 1 path.
              * We check MODIFIER first (unchanged current behavior),
@@ -1154,9 +1154,9 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
              * hits just call the action and fall through (so downstream
              * apps still receive the DOWN). */
 
-            /* Pass 1 — MODIFIER slots.
+            /* Pass 1 -- MODIFIER slots.
              *
-             * v1.7.11.18 (2026-07-25) — WATCH-ONLY bit now honored for
+             * v1.7.11.18 (2026-07-25) -- WATCH-ONLY bit now honored for
              * MODIFIER kind (was MULTITAP-only). LO's ask: "for hotkeys
              * like ctrl A etc there should be an option to make them
              * non consumable so you can use them generally too and
@@ -1164,11 +1164,11 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
              *
              * When SVC_HK_WATCH is set on a MODIFIER binding: fire the
              * action AND let the key pass through to the focused app.
-             * Both effects happen. Bound to Ctrl+A → copies AI answer
+             * Both effects happen. Bound to Ctrl+A -> copies AI answer
              * AND select-all fires in Chrome/Word/etc. User opted in;
              * they know what they signed up for.
              *
-             * Default is still consume (WATCH bit clear) — the classic
+             * Default is still consume (WATCH bit clear) -- the classic
              * "no leakage" behavior is preserved unless the user
              * explicitly toggles a binding to watch-only via the
              * dashboard. */
@@ -1176,15 +1176,15 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
                 if (SVC_HK_KIND(g_hk[i]) != SVC_HK_KIND_MODIFIER) continue;
                 if (match_hk_mod(g_hk[i], vk, is_ctrl, is_shift, is_alt)) {
                     int is_watch = SVC_HK_WATCH(g_hk[i]);
-                    /* v1.7.11.11 (2026-07-25) — CONDITIONAL-CONSUME for copy
+                    /* v1.7.11.11 (2026-07-25) -- CONDITIONAL-CONSUME for copy
                      * hotkeys. Prior: LL hook consumed Ctrl+C
                      * unconditionally for SVC_HK_COPY_REPLY slot even when
                      * no AI reply existed to copy. Result: user's Ctrl+C
-                     * in Chrome/anywhere got eaten + no copy happened →
+                     * in Chrome/anywhere got eaten + no copy happened ->
                      * "copy is broken" per LO report.
                      *
                      * Fix: for the 3 copy slots, if there's no reply to
-                     * copy, DON'T consume this Ctrl+C event — let it fall
+                     * copy, DON'T consume this Ctrl+C event -- let it fall
                      * through to the focused app so user's normal copy
                      * still works. Only intercept when there's actually
                      * something for us to copy. */
@@ -1192,12 +1192,12 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
                          i == SVC_HK_COPY_ANSWER ||
                          i == SVC_HK_COPY_CODE) &&
                         !ui_has_reply()) {
-                        /* No reply → don't consume, don't fire → user's
+                        /* No reply -> don't consume, don't fire -> user's
                          * Ctrl+C reaches Chrome/Word/etc as normal. */
                         continue;
                     }
                     if (is_watch) {
-                        /* Watch-only MODIFIER — fire but pass through.
+                        /* Watch-only MODIFIER -- fire but pass through.
                          * Do NOT touch g_consumed_vk (the key isn't
                          * ours, we're just observing). The event
                          * naturally flows through the LL chain +
@@ -1220,13 +1220,13 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
                 }
             }
 
-            /* Pass 2 — MULTITAP slots (any that bind to this vk).
+            /* Pass 2 -- MULTITAP slots (any that bind to this vk).
              *
              * v10.1 (2026-07-17): if ANY MULTITAP-consume binding
              * exists for this vk, EVERY tap of it is eaten (vk is
              * "reserved" for the hotkey). Rationale: prior behavior
              * only consumed the Nth tap after pattern match, letting
-             * N-1 chars leak to downstream apps — which for backtick
+             * N-1 chars leak to downstream apps -- which for backtick
              * or backslash is minor but user-visible clutter. Better:
              * treat consume-bindings as "this key is a hotkey, always
              * eat it". User loses ability to type that char, but
@@ -1251,7 +1251,7 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
                 unsigned count = SVC_HK_MULTITAP_COUNT(g_hk[i]);
                 unsigned gap   = SVC_HK_MULTITAP_GAP_MS(g_hk[i]);
                 if (gap == 0) gap = 300;
-                /* v1.7.2: adaptive flag → use the learned per-vk gap
+                /* v1.7.2: adaptive flag -> use the learned per-vk gap
                  * (bootstraps from packed gap on first 2 fires). */
                 unsigned eff_gap = SVC_HK_ADAPTIVE(g_hk[i])
                                    ? adaptive_effective_gap((USHORT)vk, gap)
@@ -1277,7 +1277,7 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
                     }
                     if (watch) {
                         multitap_fired_watch_only = 1;
-                        /* Don't return 1 — let the key through. */
+                        /* Don't return 1 -- let the key through. */
                     }
                     /* For consume matches we handle consumption via
                      * has_consume flag below; nothing else to do here. */
@@ -1299,10 +1299,10 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
                         }
                     }
                 }
-                return 1;   /* eat the DOWN — reserve this vk */
+                return 1;   /* eat the DOWN -- reserve this vk */
             }
 
-            /* Pass 3 — LONGPRESS slots: record start timestamp. Actual
+            /* Pass 3 -- LONGPRESS slots: record start timestamp. Actual
              * fire happens in poll_thread when hold time elapses. */
             for (int i = 0; i < SVC_HK_COUNT; i++) {
                 if (SVC_HK_KIND(g_hk[i]) != SVC_HK_KIND_LONGPRESS) continue;
@@ -1313,13 +1313,13 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
                     InterlockedExchange(&g_lp_start_ms[i], (LONG)GetTickCount());
                     InterlockedExchange(&g_lp_fired[i], 0);
                 }
-                /* Don't consume — LONGPRESS is inherently pass-through. */
+                /* Don't consume -- LONGPRESS is inherently pass-through. */
             }
 
             if (multitap_fired_watch_only) {
                 /* Fall through to normal handling (no consume for
                  * watch-only). The rest of the LL handler (chat capture,
-                 * scroll fallback, CallNextHookEx) still runs — user's
+                 * scroll fallback, CallNextHookEx) still runs -- user's
                  * keystroke reaches downstream apps normally. */
             }
 
@@ -1362,7 +1362,7 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
              * key as input for the AI prompt. LDB never sees any of
              * these keystrokes (all consumed). */
             if (ui_chat_is_active()) {
-                /* Modifier / lock / super keys — mod tracking above
+                /* Modifier / lock / super keys -- mod tracking above
                  * already captured the transition. Consume the event
                  * so nothing downstream (Cursor, Chrome, LDB, Windows
                  * Start menu, etc.) sees the raw modifier press. In
@@ -1397,14 +1397,14 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
                 if (vk == VK_RIGHT)  { ui_chat_cursor_right();   return 1; }
                 if (vk == VK_HOME)   { ui_chat_cursor_home();    return 1; }
                 if (vk == VK_END)    { ui_chat_cursor_end();     return 1; }
-                /* PageUp/PageDown/Tab/etc. — consume to prevent leak,
+                /* PageUp/PageDown/Tab/etc. -- consume to prevent leak,
                  * ignore semantically. */
                 if (vk == VK_PRIOR || vk == VK_NEXT || vk == VK_TAB ||
                     vk == VK_UP    || vk == VK_DOWN) {
                     return 1;
                 }
 
-                /* Regular printable key — translate VK+scan+modifiers
+                /* Regular printable key -- translate VK+scan+modifiers
                  * to Unicode via ToUnicode(). Result depends on the
                  * user's keyboard layout, so a French layout gets `é`
                  * from AltGr+e etc. */
@@ -1468,22 +1468,22 @@ static LRESULT CALLBACK ll_mouse_proc(int code, WPARAM wp, LPARAM lp) {
          *   1. Publish the raw left-button LEVEL to ImGui via
          *      ui_set_mouse_left_down(). The DX11/Win32 backend feeds
          *      cursor POSITION (from the Progman hwnd) but never sees
-         *      button events — clicks route to the app under the cursor,
-         *      not our window — so widgets (slider/buttons/combo) would be
+         *      button events -- clicks route to the app under the cursor,
+         *      not our window -- so widgets (slider/buttons/combo) would be
          *      hover-only without this.
          *
          *   2. WINDOW DRAG: a left-press on the overlay BACKGROUND grabs
          *      the window; each mouse-move delta feeds ui_nudge (glide is
          *      instant, so 1:1 tracking). A press that instead lands on an
-         *      ImGui widget (ui_mouse_over_widget) is handed to ImGui — NO
-         *      window-drag — so you can drag the slider / click buttons /
+         *      ImGui widget (ui_mouse_over_widget) is handed to ImGui -- NO
+         *      window-drag -- so you can drag the slider / click buttons /
          *      open the dropdown.
          *
          * Any left-press INSIDE the overlay is consumed (return 1) so it
          * never falls through to the page below; WM_MOUSEMOVE is NEVER
          * consumed so the OS cursor keeps moving naturally.
          *
-         * Function-local statics — ll_mouse_proc only runs on ll_thread. */
+         * Function-local statics -- ll_mouse_proc only runs on ll_thread. */
         static int drag_active    = 0;
         static int resize_corner  = 0;   /* v14d: 0=none, 1-4 = which corner */
         static int press_consumed = 0;
@@ -1502,7 +1502,7 @@ static LRESULT CALLBACK ll_mouse_proc(int code, WPARAM wp, LPARAM lp) {
                         if (drag_active) ui_nudge(dx, dy);
                         else             ui_resize_drag_corner(resize_corner, dx, dy);
                     }
-                    /* fall through — do NOT consume; cursor moves naturally */
+                    /* fall through -- do NOT consume; cursor moves naturally */
                 }
             } else if (wp == RIN_WM_LBUTTONDOWN) {
                 /* Resize grip is checked FIRST, with its own bounds (which
@@ -1527,7 +1527,7 @@ static LRESULT CALLBACK ll_mouse_proc(int code, WPARAM wp, LPARAM lp) {
                     ui_point_in_overlay((int)m->pt.x, (int)m->pt.y)) {
                     press_consumed = 1;
                     if (ui_mouse_over_widget()) {
-                        /* let ImGui handle it (widget) — no window drag */
+                        /* let ImGui handle it (widget) -- no window drag */
                         rin_diag("overlay: WIDGET press @ (%ld,%ld)",
                                  (long)m->pt.x, (long)m->pt.y);
                     } else {
@@ -1582,7 +1582,7 @@ static LRESULT CALLBACK ll_mouse_proc(int code, WPARAM wp, LPARAM lp) {
          *   UP:   clear hold-timer + fired-flag so a fresh press
          *         restarts the hold cycle.
          *
-         * Never CONSUMES mouse events — mouse clicks are the primary
+         * Never CONSUMES mouse events -- mouse clicks are the primary
          * UI interaction; eating them would break every underlying
          * app. Hotkey firing is a SIDE EFFECT of the click. */
         int is_down = 0, is_up = 0;
@@ -1608,7 +1608,7 @@ static LRESULT CALLBACK ll_mouse_proc(int code, WPARAM wp, LPARAM lp) {
             if (is_down) {
                 InterlockedExchange(&g_mouse_down_tick[mvk], (LONG)GetTickCount());
                 InterlockedExchange(&g_mouse_hold_fired[mvk], 0);
-                /* MOUSE_MULTI check — fire if any slot bound to this
+                /* MOUSE_MULTI check -- fire if any slot bound to this
                  * mvk with count-clicks-within-gap. */
                 for (int i = 0; i < SVC_HK_COUNT; i++) {
                     if (SVC_HK_KIND(g_hk[i]) != SVC_HK_KIND_MOUSE_MULTI) continue;
@@ -1666,7 +1666,7 @@ static DWORD WINAPI ll_thread(LPVOID param) {
     attach_to_input_desktop();
     g_ll_tid = GetCurrentThreadId();
 
-    /* SetWindowsHookExW with WH_KEYBOARD_LL — hModule can be NULL for
+    /* SetWindowsHookExW with WH_KEYBOARD_LL -- hModule can be NULL for
      * thread-scoped, but we want SYSTEM-wide so pass our HINSTANCE.
      * Actually LL hooks are ALWAYS system-wide regardless of hMod; the
      * hMod arg is essentially ignored per MSDN docs since Vista. */
@@ -1751,11 +1751,11 @@ int rawin_start(const unsigned *hotkeys, hotkey_cb_t cb) {
 
     /* v9 (2026-07-06): collision detector. If two hotkey slots map to
      * the same (mod, vk) combo, our match_hk loop always fires the
-     * lower-indexed one and the higher one silently NEVER fires — a
+     * lower-indexed one and the higher one silently NEVER fires -- a
      * common cause of "my hotkey stopped working after I remapped X".
      * Log a warning per collision pair so the user can see it in the
      * decrypted log (or a future dashboard log viewer). O(N^2) but N
-     * is 33-64 slots so <5k comparisons at init time — negligible. */
+     * is 33-64 slots so <5k comparisons at init time -- negligible. */
     int coll_warnings = 0;
     for (int i = 0; i < SVC_HK_COUNT; i++) {
         if (!g_hk[i]) continue;
@@ -1764,7 +1764,7 @@ int rawin_start(const unsigned *hotkeys, hotkey_cb_t cb) {
                 unsigned vk  = g_hk[i] & 0xFFFF;
                 unsigned mod = (g_hk[i] >> 16) & 0xFF;
                 rin_diag("COLLISION: slots %d and %d both bound to "
-                         "vk=0x%02X mod=0x%X — only slot %d will fire",
+                         "vk=0x%02X mod=0x%X -- only slot %d will fire",
                          i, j, vk, mod, i);
                 coll_warnings++;
                 if (coll_warnings >= 8) {
@@ -1782,7 +1782,7 @@ coll_scan_done:
         rin_diag("collision scan: OK (no duplicate bindings)");
     }
 
-    /* Poll thread is the reliable path — start it FIRST. */
+    /* Poll thread is the reliable path -- start it FIRST. */
     InterlockedExchange(&g_poll_running, 1);
     g_poll_thread = CreateThread(NULL, 0, poll_thread, NULL, 0, NULL);
     if (!g_poll_thread) {
@@ -1798,7 +1798,7 @@ coll_scan_done:
                  GetLastError());
     }
 
-    /* WH_KEYBOARD_LL path — highest priority, consumes keys before apps. */
+    /* WH_KEYBOARD_LL path -- highest priority, consumes keys before apps. */
     g_ll_thread = CreateThread(NULL, 0, ll_thread, NULL, 0, NULL);
     if (!g_ll_thread) {
         rin_diag("CreateThread(ll) FAILED %lu (RegisterHotKey path still active)",
@@ -1816,7 +1816,7 @@ coll_scan_done:
         InterlockedExchange(&g_reinstall_running, 0);
     }
 
-    /* v1.7.4: mouse-hold poll thread — checks per-mvk hold durations
+    /* v1.7.4: mouse-hold poll thread -- checks per-mvk hold durations
      * every 20ms and fires SVC_HK_KIND_MOUSE_HOLD slots when their
      * hold_ms elapses. Only started if at least one MOUSE_HOLD binding
      * is configured (saves ~50 wakes/sec CPU when unused). */

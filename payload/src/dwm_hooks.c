@@ -1,5 +1,5 @@
 /* ================================================================== *
- * dwm_hooks.c — dwmcore hook implementation.                          *
+ * dwm_hooks.c -- dwmcore hook implementation.                          *
  *                                                                    *
  * Ported 1:1 from Bypassify v1.3.0 payload (RE'd 2026-07-04, see     *
  * docs/BYPASSIFY_v1.3_DWM_RE_DEEP.md) plus the production            *
@@ -10,7 +10,7 @@
  * unconditionally while our overlay is "wake-active". This forces    *
  * DWM to composite every vsync tick, so state changes in our overlay *
  * (hotkey toggles, nudges, opacity bumps) are visible on the very    *
- * next frame with ZERO user interaction — solving the exact bug the  *
+ * next frame with ZERO user interaction -- solving the exact bug the  *
  * user reported: "if i press ctrl alt g it wont work but if i press  *
  * it then interact with the ui bam its gone".                        *
  * ================================================================== */
@@ -29,20 +29,20 @@
 /* ── Detour signatures ── */
 /* Present: 7-arg __fastcall.
  *
- * v1.7.11.4 (2026-07-25) — CRITICAL FIX. Prior signature had only 6 args
+ * v1.7.11.4 (2026-07-25) -- CRITICAL FIX. Prior signature had only 6 args
  * which meant our call to orig Present passed uninitialized STACK GARBAGE
  * as the 7th arg (bool disableMPO). When garbage happened to be non-zero
  * DWM disabled MPO (fine, similar to our IsOverlayPrevented hack); when
- * garbage was 0 DWM re-enabled MPO → Chrome's DirectComposition swapped
- * to hardware overlay planes → our overlay pixels wrote to the software
- * composite path but Chrome's pixels went through hardware plane path →
- * DWM couldn't reliably dirty-track our layer → SHADOW TRAILS.
+ * garbage was 0 DWM re-enabled MPO -> Chrome's DirectComposition swapped
+ * to hardware overlay planes -> our overlay pixels wrote to the software
+ * composite path but Chrome's pixels went through hardware plane path ->
+ * DWM couldn't reliably dirty-track our layer -> SHADOW TRAILS.
  *
  * Sources for 7-arg signature:
  *   1. chaosium43/dwm-overlay client/dwmcore.cpp (Win11 25H2, working
- *      reference implementation) — HookPresent declared with 7 args
+ *      reference implementation) -- HookPresent declared with 7 args
  *      including trailing `bool disableMPO`.
- *   2. Bypassify v1.3.0 Ghidra decomp (bp_decomp.c line 542) —
+ *   2. Bypassify v1.3.0 Ghidra decomp (bp_decomp.c line 542) --
  *      Detour_Present has 7 params, last is `undefined1 param_7`.
  *   3. Our earlier BP RE at 0x180003470 disassembly showed reads from
  *      [rsp+0x88] confirming 7th arg present in Present's caller. */
@@ -54,7 +54,7 @@ typedef LONG (__fastcall *pfnCOverlayPresent_t)(
 typedef BOOL (__fastcall *pfnPresentNeeded_t)(void *pThis);
 
 /* ForceFullDirtyRendering: no args, no return. DANGEROUS to call from
- * arbitrary threads (crashed DWM in our earlier attempt — see git log).
+ * arbitrary threads (crashed DWM in our earlier attempt -- see git log).
  * Kept as a resolved pointer for future experimentation, never called. */
 typedef void (__cdecl *pfnForceFullDirty_t)(void);
 
@@ -69,13 +69,13 @@ typedef void (__cdecl *pfnForceFullDirty_t)(void);
  *
  * WHY WE CALL THIS: DWM's compositor only re-samples layer regions that
  * are marked "dirty". Without this call, DWM's dirty tracking is driven
- * by user input events (mouse move → tiny dirty rect at cursor). Our
- * overlay pixels outside that dirty rect never get sampled → user sees
+ * by user input events (mouse move -> tiny dirty rect at cursor). Our
+ * overlay pixels outside that dirty rect never get sampled -> user sees
  * partial ("quadrant") updates. Calling AddDirtyRect with a fullscreen
  * rect on every PN fire ensures DWM always samples the ENTIRE layer. */
 typedef void (__fastcall *pfnAddDirtyRect_t)(void *this_ptr, const float *rect);
 
-/* ScheduleCompositionPass: `void (int arg0, int arg1)` — RE'd 2026-07-05
+/* ScheduleCompositionPass: `void (int arg0, int arg1)` -- RE'd 2026-07-05
  * from dwmcore.dll @ RVA 0x12be7c. Global (non-member) function that
  * requests DWM's compositor to schedule the next composition pass.
  * Args verified from disasm:
@@ -95,19 +95,19 @@ typedef void (__fastcall *pfnAddDirtyRect_t)(void *this_ptr, const float *rect);
  *     mov edx, 0xffffffff              ; edx = -1
  *     xor ecx, ecx                     ; rcx = 0
  *     call qword ptr [dwmcore+0x10e3fc]
- *   That's `ScheduleCompositionPass(arg0=0, arg1=-1)` — RE-CONFIRMED.
+ *   That's `ScheduleCompositionPass(arg0=0, arg1=-1)` -- RE-CONFIRMED.
  *   Bypassify's slot [7] @ 0x10e3fc on their build = ScheduleCompositionPass.
  *
- * Effect: every PN fire schedules the NEXT composition immediately →
- * DWM never enters idle → composition stays at native vsync rate.
+ * Effect: every PN fire schedules the NEXT composition immediately ->
+ * DWM never enters idle -> composition stays at native vsync rate.
  * This is the missing piece that keeps DWM at 60Hz continuously. */
 typedef void (__stdcall *pfnScheduleCompositionPass_t)(int arg0, int arg1);
 
-/* Extern from imgui_layer.cpp — used by the PN detours + keepalive
+/* Extern from imgui_layer.cpp -- used by the PN detours + keepalive
  * to gate SCP/ghost activity on overlay visibility (v6.3 flicker fix). */
 extern int ui_is_visible(void);
 
-/* v1.7.10.5 (2026-07-24) — DIRECTCOMPOSITION APP COMPOSE-GRACE.
+/* v1.7.10.5 (2026-07-24) -- DIRECTCOMPOSITION APP COMPOSE-GRACE.
  *
  * LO report: closing LDB + opening Chrome triggers shadow trails on
  * nudge + "kid eating cookie" chunk-by-chunk hide. Root cause: Chrome
@@ -155,7 +155,7 @@ static pfnScheduleCompositionPass_t g_schedule_composition = NULL;  /* the KEY w
 static pfnAddDirtyRect_t    g_add_dirty_display = NULL;   /* CDDisplayRenderTarget::AddDirtyRect */
 static pfnAddDirtyRect_t    g_add_dirty_legacy  = NULL;   /* CLegacyRenderTarget::AddDirtyRect  */
 
-/* Hook TARGET addresses (what we passed to MH_CreateHook) — cached at
+/* Hook TARGET addresses (what we passed to MH_CreateHook) -- cached at
  * install time so per-detour SEH __except blocks can pass them into
  * hook_crash_bump() for the 3-strike auto-disable. NULL if that hook
  * wasn't installed. */
@@ -166,14 +166,14 @@ static void *g_ht_present_display = NULL;
 static void *g_ht_present_legacy  = NULL;
 static void *g_ht_rc_window       = NULL;
 static void *g_ht_rc_visual       = NULL;
-/* g_ht_adr_display / g_ht_adr_legacy REMOVED 2026-07-06 v4.2 —
+/* g_ht_adr_display / g_ht_adr_legacy REMOVED 2026-07-06 v4.2 --
  * ADR[Display] + ADR[Legacy] hooks were passive RE-mode loggers that
  * observed AddDirtyRect calls without doing functional work. Now
- * uninstalled entirely (9 → 7 hooks, smaller registry footprint,
+ * uninstalled entirely (9 -> 7 hooks, smaller registry footprint,
  * fewer entries the hook integrity monitor needs to keep alive).
  * The trampoline pointers g_add_dirty_{display,legacy} are still
  * resolved (below) because they're a documented no-op fallback for
- * the quadrant fix — leaving them keeps the offsets.blob layout
+ * the quadrant fix -- leaving them keeps the offsets.blob layout
  * stable without touching the resolver. */
 
 /* Present1/2: hooked to capture the TRUE `this` from DWM's own context.
@@ -184,7 +184,7 @@ typedef LONG (__fastcall *pfnRTPresent_t)(void *pThis);
 static pfnRTPresent_t       g_orig_present_display = NULL;
 static pfnRTPresent_t       g_orig_present_legacy  = NULL;
 
-/* RenderContent hooks — CROWN JEWEL from hooksdll (dwm_payload.c line 2524):
+/* RenderContent hooks -- CROWN JEWEL from hooksdll (dwm_payload.c line 2524):
  *   CWindowNode::RenderContent(this, pDrawCtx, pResult) is called for each
  *   window's node during composition. pDrawCtx has a field at +0x30 that's
  *   NULL when this render is targeting a CAPTURE buffer (LDB Monitor
@@ -192,7 +192,7 @@ static pfnRTPresent_t       g_orig_present_legacy  = NULL;
  *
  * Using this detection, we set g_in_capture_render while a capture-context
  * RenderContent is in progress. Our Detour_COverlayContextPresent checks
- * this flag and SKIPS drawing our overlay for capture renders — the
+ * this flag and SKIPS drawing our overlay for capture renders -- the
  * overlay stays visible on the user's actual monitor but is INVISIBLE in
  * any capture LDB uploads to their server. */
 typedef LONG (__fastcall *pfnRenderContent_t)(void *pThis, void *pDrawCtx, BOOL *pResult);
@@ -201,12 +201,12 @@ static pfnRenderContent_t   g_orig_rc_visual  = NULL;   /* CVisual::RenderConten
 
 /* Offset inside CDrawingContext where the "screen render target" pointer
  * lives. If [pDrawCtx + 0x30] == NULL, this render is a CAPTURE pass
- * (verified via hooksdll RE — dwm_payload.c line 2508). */
+ * (verified via hooksdll RE -- dwm_payload.c line 2508). */
 #define DRAWCTX_CAPTURE_FLAG_OFFSET 0x30
 
-/* Capture-stealth latch — set every time a RenderContent detour observes
+/* Capture-stealth latch -- set every time a RenderContent detour observes
  * a capture-context draw. Present detour (fires AFTER RenderContent in
- * the same compose cycle — sometimes SIGNIFICANTLY after) checks if the
+ * the same compose cycle -- sometimes SIGNIFICANTLY after) checks if the
  * timestamp is within CAPTURE_LATCH_MS and skips draw if so.
  *
  * v1.7.4.6 (2026-07-24): CAPTURE_LATCH_MS was 15ms. LO's decrypted
@@ -217,22 +217,22 @@ static pfnRenderContent_t   g_orig_rc_visual  = NULL;   /* CVisual::RenderConten
  * render paths (window minimize animations, taskbar thumbnails,
  * task view previews, alt-tab peek, etc). With a 15ms latch, ONE
  * false-positive kept the overlay hidden for 15ms; a burst of them
- * kept overlay PERMANENTLY hidden → "overlay hides/shows on mouse
+ * kept overlay PERMANENTLY hidden -> "overlay hides/shows on mouse
  * move" flicker LO reported.
  *
  * FIX (LATCH REMOVED): rely entirely on the live counter g_in_capture_render.
  * The RC detour increments before orig, decrements after orig, so any
  * Present that fires DURING an RC call correctly sees > 0. Any Present
- * firing AFTER the RC decremented (even 100µs later) sees 0 → overlay
+ * firing AFTER the RC decremented (even 100µs later) sees 0 -> overlay
  * draws. The 15ms latch was covering an edge case (Present fires ~ms
  * after RC returns) that basically never happens with the SEH-wrapped
- * increment/decrement pair — and the false-positive damage from a
+ * increment/decrement pair -- and the false-positive damage from a
  * 300-events/sec burst FAR outweighed the correctness gain.
  *
  * Additionally: added `svcldb_capture_seen_screen[]` whitelist. Any
  * pDrawCtx we've EVER observed with non-NULL +0x30 (proving it's a
  * real screen-render context) is remembered. False-positive checks
- * against a whitelisted pDrawCtx are ignored — legitimate screen
+ * against a whitelisted pDrawCtx are ignored -- legitimate screen
  * pixels flow. Only NEW (never-seen-as-screen) contexts with
  * NULL +0x30 count as capture. This preserves LDB Monitor stealth
  * (its capture pDrawCtx is genuinely never a screen context) while
@@ -248,7 +248,7 @@ static volatile LONG      g_capture_false_positives = 0;
 static volatile ULONG_PTR g_ctx_whitelist[CAPTURE_CTX_WHITELIST_SIZE] = {0};
 static volatile LONG      g_ctx_whitelist_head    = 0;
 
-/* Hook target registry — cached in hooks_install so the integrity
+/* Hook target registry -- cached in hooks_install so the integrity
  * monitor can verify each hook is still armed. Max 16 (we currently
  * install 9). */
 #define HOOK_INTEGRITY_MAX 16
@@ -299,7 +299,7 @@ static int hook_registry_index(void *key) {
     return -1;
 }
 
-/* Forward decl — hook_diag is defined further down; hook_crash_bump
+/* Forward decl -- hook_diag is defined further down; hook_crash_bump
  * below emits diag on threshold trip. */
 static void hook_diag(const char *fmt, ...);
 
@@ -313,7 +313,7 @@ static void hook_crash_bump(void *target, const char *label) {
     int idx = hook_registry_index(target);
     if (idx < 0) return;
     hook_reg_t *r = &g_hook_registry[idx];
-    if (r->auto_disabled) return;   /* already disabled — nothing to do */
+    if (r->auto_disabled) return;   /* already disabled -- nothing to do */
     ULONGLONG now = GetTickCount64();
     /* Roll window if oldest counted crash is stale. */
     ULONGLONG first = r->first_crash_ms;
@@ -326,7 +326,7 @@ static void hook_crash_bump(void *target, const char *label) {
     LONG c = InterlockedIncrement(&r->crash_count);
     if (c >= HOOK_CRASH_THRESHOLD) {
         /* Trip: attempt to disable this specific hook. Race-safe via
-         * auto_disabled compare-and-set — only ONE thread should call
+         * auto_disabled compare-and-set -- only ONE thread should call
          * MH_DisableHook. */
         if (InterlockedCompareExchange(&r->auto_disabled, 1, 0) == 0) {
             MH_STATUS s = MH_DisableHook(target);
@@ -338,7 +338,7 @@ static void hook_crash_bump(void *target, const char *label) {
     }
 }
 
-/* Early forward decl — hook_diag is defined further down (its body
+/* Early forward decl -- hook_diag is defined further down (its body
  * writes to encrypted slog) but hook_integrity_thread below calls it. */
 static void hook_diag(const char *fmt, ...);
 
@@ -348,10 +348,10 @@ static void hook_diag(const char *fmt, ...);
  * likely restored the original bytes to detect / disable us. Attempt
  * to re-enable via MinHook (MH_EnableHook is idempotent-safe).
  *
- * Never crashes DWM — memcmp is wrapped in SEH, MH_EnableHook is
+ * Never crashes DWM -- memcmp is wrapped in SEH, MH_EnableHook is
  * checked for success. Tamper hits logged for post-mortem analysis.
  *
- * CRITICAL — INTERRUPTIBLE SLEEP:
+ * CRITICAL -- INTERRUPTIBLE SLEEP:
  *   The old code used `Sleep(10000)` which is NOT cancellable. When
  *   the payload's shutdown_watcher fired hooks_uninstall (which sets
  *   g_integrity_running=0 + waits 500ms for this thread), the wait
@@ -359,7 +359,7 @@ static void hook_diag(const char *fmt, ...);
  *   without us actually exiting, shutdown_watcher then called
  *   FreeLibraryAndExitThread, launcher's next inject-cycle sweep
  *   VirtualFreeEx'd the payload's code memory. When our Sleep
- *   returned, the CPU tried to execute the next instruction —
+ *   returned, the CPU tried to execute the next instruction --
  *   which was in decommitted memory. HARD DWM CRASH.
  *
  *   Verified live 2026-07-06 13:10-13:17 EDT: multiple back-to-back
@@ -369,7 +369,7 @@ static void hook_diag(const char *fmt, ...);
  *   Fix: chunk the 10s wait into 50ms Sleeps that re-check the flag
  *   on each iteration. Total wall-clock is still ~10s under normal
  *   operation, but shutdown drains within 50ms max. Cost is 200
- *   syscalls per 10s cycle — negligible. No new globals/handles
+ *   syscalls per 10s cycle -- negligible. No new globals/handles
  *   required, works in a purely user-mode/manual-mapped context. */
 static DWORD WINAPI hook_integrity_thread(LPVOID param) {
     (void)param;
@@ -391,12 +391,12 @@ static DWORD WINAPI hook_integrity_thread(LPVOID param) {
                 continue;
             }
             /* MinHook installs an E9 rel32 JMP for x64 hooks whose
-             * target isn't within +/-2GB of the detour (rare) —
+             * target isn't within +/-2GB of the detour (rare) --
              * otherwise E9 rel32. On x64 with large VA space it can
              * also use FF25 (JMP [rip+0]) trampolines. Accept both. */
             if (first != 0xE9 && first != 0xFF) {
                 InterlockedIncrement(&g_integrity_tamper_hits);
-                hook_diag("integrity TAMPER on %s target=%p first=0x%02X — re-enabling",
+                hook_diag("integrity TAMPER on %s target=%p first=0x%02X -- re-enabling",
                           r->name ? r->name : "?", r->target, first);
                 MH_STATUS s = MH_EnableHook(r->target);
                 hook_diag("integrity re-enable %s -> %d", r->name ? r->name : "?", (int)s);
@@ -408,7 +408,7 @@ static DWORD WINAPI hook_integrity_thread(LPVOID param) {
 
 static present_cb_t         g_present_cb      = NULL;
 
-/* Volatile refs — captured by PN detours on first invocation. Used by
+/* Volatile refs -- captured by PN detours on first invocation. Used by
  * hooks_force_wake() to directly trigger a compose pass without waiting. */
 static volatile void *g_display_rt = NULL;
 static volatile void *g_legacy_rt  = NULL;
@@ -418,19 +418,19 @@ static volatile void *g_legacy_rt  = NULL;
  * Two-flag state machine because we have two DIFFERENT shutdown
  * phases and each needs different detour behavior:
  *
- * Phase A — RUNNING (g_active=1, g_stop_draw=0):
+ * Phase A -- RUNNING (g_active=1, g_stop_draw=0):
  *   Present: draws overlay + calls orig
  *   PN:      returns TRUE  (force continuous compose)
  *
- * Phase B — DRAINING (g_active=1, g_stop_draw=1):
+ * Phase B -- DRAINING (g_active=1, g_stop_draw=1):
  *   Present: SKIPS drawing overlay + calls orig
  *            (orig writes clean pixels to layer texture)
  *   PN:      returns TRUE  (force DWM to actually composite those
- *            clean frames within the 200ms drain window — critical!
+ *            clean frames within the 200ms drain window -- critical!
  *            If PN returned FALSE here, DWM would go lazy and our
  *            old overlay pixels would stay on screen indefinitely.)
  *
- * Phase C — DISABLED (g_active=0, hooks about to be unhooked):
+ * Phase C -- DISABLED (g_active=0, hooks about to be unhooked):
  *   Present: SKIPS drawing (g_stop_draw still 1)
  *   PN:      returns orig  (let DWM's normal lazy-compose take over)
  *   Then MH_DisableHook removes the detours entirely. */
@@ -438,7 +438,7 @@ static volatile LONG g_active     = 0;   /* 1 while payload is alive (RUNNING + 
 static volatile LONG g_stop_draw  = 0;   /* 1 = Present skips our draw callback */
 
 /* Legacy name for compatibility with hooks_bump_wake / hooks_force_wake
- * — set to 1 alongside g_stop_draw so those helpers become no-ops
+ * -- set to 1 alongside g_stop_draw so those helpers become no-ops
  * during shutdown. */
 #define g_shutdown_flag g_stop_draw
 
@@ -447,7 +447,7 @@ static volatile LONG g_stop_draw  = 0;   /* 1 = Present skips our draw callback 
 static volatile LONG g_wake_frames    = 0;
 
 /* Burst-wake worker state. g_burst_end_ms is the TickCount when the
- * current burst expires — updated atomically to extend the burst if
+ * current burst expires -- updated atomically to extend the burst if
  * new hotkey events arrive. g_burst_running ensures only ONE worker
  * thread runs at a time (multiple hotkey presses in a row = O(1)). */
 static volatile ULONG g_burst_end_ms  = 0;
@@ -455,7 +455,7 @@ static volatile LONG  g_burst_running = 0;
 static volatile LONG  g_burst_interval_ms = 16;
 static volatile LONG  g_burst_frames_per_pump = 30;
 
-/* IsOverlayPrevented byte-patch bookkeeping — so we can revert on
+/* IsOverlayPrevented byte-patch bookkeeping -- so we can revert on
  * hooks_uninstall (belt-and-suspenders; Bypassify doesn't revert but
  * we do because a graceful uninstall in the same DWM instance benefits
  * from a clean restore). */
@@ -463,30 +463,30 @@ static BYTE  g_iop_saved_bytes[6] = {0};
 static void *g_iop_patch_addr     = NULL;
 static BOOL  g_iop_patched        = FALSE;
 
-/* v1.7.4.14 (2026-07-24) — ForceFullDirtyRendering-adjacent byte-patch
+/* v1.7.4.14 (2026-07-24) -- ForceFullDirtyRendering-adjacent byte-patch
  * to force dwmcore into "always full-dirty compose" mode. BP does
  * this at init (per docs/BYPASSIFY_v1.3_DWM_RE_DEEP.md OffsetTable
  * slot [11] = 0x3fd7b9 = ForceFullDirtyRendering RVA - 0x60).
  *
  * Without this patch, DWM's compositor uses dirty-region tracking:
  * only re-renders regions that changed. When our overlay moves via
- * nudge, DWM DOESN'T re-render the old-position region → old
- * overlay pixels linger in the layer texture → user sees a trailing
+ * nudge, DWM DOESN'T re-render the old-position region -> old
+ * overlay pixels linger in the layer texture -> user sees a trailing
  * "shadow" of the overlay along the movement path. */
 static BYTE  g_ffd_saved_byte     = 0;
 static void *g_ffd_patch_addr     = NULL;
 static BOOL  g_ffd_patched        = FALSE;
 
-/* Present-depth reentrancy guard — DWM sometimes re-enters Present
- * indirectly. Process-global counter (NOT __declspec(thread) — TLS is
+/* Present-depth reentrancy guard -- DWM sometimes re-enters Present
+ * indirectly. Process-global counter (NOT __declspec(thread) -- TLS is
  * broken under manual map). Worst case one dropped frame, no crash. */
 static volatile LONG g_present_depth  = 0;
 static volatile LONG g_present_calls  = 0;
 
-/* Forward decl — hook_diag body defined below alongside its raw helper. */
+/* Forward decl -- hook_diag body defined below alongside its raw helper. */
 static void hook_diag(const char *fmt, ...);
 
-/* Diagnostic — same landmark cadence, routed through hook_diag (which
+/* Diagnostic -- same landmark cadence, routed through hook_diag (which
  * writes to encrypted slog by default, plaintext only when
  * DWM_EXT_TRACE=1). Prevents "Present fired" strings from
  * leaking on disk. */
@@ -502,7 +502,7 @@ static void present_diag(int n) {
  *
  * Anti-strings: previously payload_early.txt held signature strings
  * like "hooks: CWindowNode::RenderContent hooked (capture stealth
- * ARMED)" — an anti-cheat could grep the disk for "capture stealth
+ * ARMED)" -- an anti-cheat could grep the disk for "capture stealth
  * ARMED" and identify us. slog encrypts every line so on-disk bytes
  * are opaque without the per-install key. */
 static int g_plaintext_diag = -1;   /* lazy init: -1 unknown, 0 no, 1 yes */
@@ -534,7 +534,7 @@ static void hook_diag_raw(const char *msg) {
         CloseHandle(h);
     }
 }
-/* Forward decl — svcldb_capture_active is defined further down (after
+/* Forward decl -- svcldb_capture_active is defined further down (after
  * the RenderContent detours) but is called from Detour_COverlayContextPresent
  * which lives above them. */
 static BOOL svcldb_capture_active(void);
@@ -551,14 +551,14 @@ static void hook_diag(const char *fmt, ...) {
 
 /* ── The 3 detours (Bypassify pattern) ── */
 
-/* v1.7.11.9 (2026-07-25) — PRIMARY-MONITOR FILTER.
+/* v1.7.11.9 (2026-07-25) -- PRIMARY-MONITOR FILTER.
  *
  * chaosium43/dwm-overlay (Win11 25H2 working reference) filters compose
  * passes: only renders if the current COverlayContext's monitor target
  * IsPrimaryMonitor()==TRUE. Skips non-primary compose passes (secondary
  * monitor, virtual displays, aeropeek thumbnails, task view compose).
  *
- * We render into EVERY COverlayContext DWM presents — creating render
+ * We render into EVERY COverlayContext DWM presents -- creating render
  * conflicts on HiDPI laptops (LO 2880x1800) which have multiple compose
  * surfaces per vsync. Chrome-specific shadow trails likely come from
  * DWM's per-monitor dirty tracking seeing writes across surfaces.
@@ -569,7 +569,7 @@ static void hook_diag(const char *fmt, ...) {
  * target offset. Cache. Filter subsequent Presents.
  *
  * Chaosium43 does this at deploy-time via PDB (dumper.cpp:167-183). We
- * scan at runtime — no PDB access needed on client machines. */
+ * scan at runtime -- no PDB access needed on client machines. */
 typedef BOOL (__fastcall *pfnIsPrimaryMonitor_t)(void *pMonitorTarget);
 static pfnIsPrimaryMonitor_t g_is_primary_monitor = NULL;
 static volatile LONG g_monitor_target_offset = -1;   /* -1 = not resolved */
@@ -588,7 +588,7 @@ static void discover_monitor_target_offset(void *pCtx) {
     if (g_monitor_target_offset >= 0) return;
     if (!pCtx || !g_is_primary_monitor) return;
 
-    /* One-shot latch — only first thread to reach here does the scan. */
+    /* One-shot latch -- only first thread to reach here does the scan. */
     if (InterlockedCompareExchange(&g_mto_scan_started, 1, 0) != 0) return;
 
     /* Scan first 512 bytes (64 pointer slots) of COverlayContext for a
@@ -600,7 +600,7 @@ static void discover_monitor_target_offset(void *pCtx) {
         void *candidate = *field;
         if (!candidate) continue;
         if (!is_ptr_readable_dwm(candidate, 8)) continue;
-        /* Check candidate has a plausible vtable — first qword should
+        /* Check candidate has a plausible vtable -- first qword should
          * point into dwmcore's .text. */
         void *vtable = *(void **)candidate;
         /* Vtable pointer should be in a MEM_IMAGE region (loaded module).
@@ -620,16 +620,16 @@ static void discover_monitor_target_offset(void *pCtx) {
                       slot * 8, slot, result);
             return;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
-            /* Not this slot — continue. */
+            /* Not this slot -- continue. */
             continue;
         }
     }
-    hook_diag("Monitor-target offset scan: NO valid slot found in first 512 bytes — filter disabled");
+    hook_diag("Monitor-target offset scan: NO valid slot found in first 512 bytes -- filter disabled");
     g_monitor_target_offset = -2;  /* sentinel: scan complete, no offset */
 }
 
 /* Returns 1 if pCtx's monitor is primary (should render) OR if we can't
- * determine (scan in progress / failed / no fn) — defensive: false
+ * determine (scan in progress / failed / no fn) -- defensive: false
  * positives OK, false negatives break rendering entirely. */
 static int should_render_this_context(void *pCtx) {
     if (!pCtx || !g_is_primary_monitor) return 1;  /* no filter possible */
@@ -646,13 +646,13 @@ static int should_render_this_context(void *pCtx) {
     }
 }
 
-/* Detour_COverlayContextPresent — main frame hook.
+/* Detour_COverlayContextPresent -- main frame hook.
  * Draws overlay into layer texture BEFORE orig, so orig samples the
  * texture with our pixels already composited in.
  *
  * When g_shutdown_flag is set, SKIP the draw (lets orig composite
  * with the underlying app's clean pixels for ~200ms before MinHook
- * gets disabled — that's what naturally clears our overlay off the
+ * gets disabled -- that's what naturally clears our overlay off the
  * screen when the payload uninstalls). */
 static LONG __fastcall Detour_COverlayContextPresent(
     void *pCtx, void *pLayer, UINT flags, void *a3, DWORD a4, void *a5,
@@ -662,7 +662,7 @@ static LONG __fastcall Detour_COverlayContextPresent(
     int n = InterlockedIncrement(&g_present_calls);
     present_diag(n);
 
-    /* NOTE: g_wake_frames is no longer decremented here — we now match
+    /* NOTE: g_wake_frames is no longer decremented here -- we now match
      * Bypassify exactly by having PN detours ALWAYS return TRUE (see
      * Detour_DisplayPresentNeeded). The wake counter is legacy but the
      * hooks_bump_wake / hooks_force_wake / hooks_burst_wake APIs are
@@ -676,11 +676,11 @@ static LONG __fastcall Detour_COverlayContextPresent(
     }
 
     __try {
-        /* Draw BEFORE orig — Bypassify's proven ordering.
+        /* Draw BEFORE orig -- Bypassify's proven ordering.
          *
          * SKIP CONDITIONS:
          *  1. g_stop_draw (shutdown drain phase)
-         *  2. svcldb_capture_active() — checks both live counter AND
+         *  2. svcldb_capture_active() -- checks both live counter AND
          *     tick-based latch (CAPTURE_LATCH_MS after last capture RC).
          *     Latch covers cases where Present fires AFTER RenderContent
          *     returns in the same capture cycle, since Present's args
@@ -688,19 +688,19 @@ static LONG __fastcall Detour_COverlayContextPresent(
          *
          * OVERRIDE: if svcldb_debug_capture_wants_overlay() is true, we
          * are running an internal debug capture (Ctrl+Shift+Alt+S) that
-         * wants overlay pixels IN the shot — do NOT skip overlay draw. */
+         * wants overlay pixels IN the shot -- do NOT skip overlay draw. */
         extern int svcldb_debug_capture_wants_overlay(void);
         int is_capture   = svcldb_capture_active();
         int want_overlay = svcldb_debug_capture_wants_overlay();
         int skip_draw    = is_capture && !want_overlay;
-        /* v1.7.11.12 (2026-07-25) — v1.7.11.9 monitor filter DISABLED.
+        /* v1.7.11.12 (2026-07-25) -- v1.7.11.9 monitor filter DISABLED.
          *
          * The runtime-scan discovery for OverlayMonitorTarget struct
          * offset was too loose (accepts any pointer whose vtable is in
          * MEM_IMAGE, no dwmcore-specific validation). It sometimes
-         * false-matched a wrong field → IsPrimaryMonitor returned wrong
-         * → we skipped rendering on TRUE primary passes → overlay
-         * flickers off for a frame → LO reported "jerks back".
+         * false-matched a wrong field -> IsPrimaryMonitor returned wrong
+         * -> we skipped rendering on TRUE primary passes -> overlay
+         * flickers off for a frame -> LO reported "jerks back".
          *
          * Reverting to always-render (old behavior). If we want proper
          * primary-monitor filter, we need PDB-based struct offset
@@ -725,7 +725,7 @@ static LONG __fastcall Detour_COverlayContextPresent(
         }
         if (g_orig_present) ret = g_orig_present(pCtx, pLayer, flags, a3, a4, a5, disableMPO);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        /* Silently swallow — DWM crash = user desktop dies. */
+        /* Silently swallow -- DWM crash = user desktop dies. */
         hook_diag("Detour_Present: caught exception in body");
         hook_crash_bump(g_ht_present, "Present body");
     }
@@ -734,7 +734,7 @@ static LONG __fastcall Detour_COverlayContextPresent(
     return ret;
 }
 
-/* Detour_CDDisplayRenderTarget_PresentNeeded — Bypassify's core wake trick.
+/* Detour_CDDisplayRenderTarget_PresentNeeded -- Bypassify's core wake trick.
  *
  * EXACT byte-verified Bypassify RE (0x180003520, 41 bytes):
  *   sub rsp, 0x28
@@ -758,7 +758,7 @@ static LONG __fastcall Detour_COverlayContextPresent(
  * time DWM asks. Result: DWM composites at native vsync rate (60/120/144
  * Hz) continuously while payload is loaded. No lazy compose, ever. Any
  * state change we make (hotkey, mouse) is visible on the very next
- * vsync tick with ZERO extra work — DWM was already going to composite.
+ * vsync tick with ZERO extra work -- DWM was already going to composite.
  *
  * This burns ~2-5% GPU continuously. Bypassify accepts this tradeoff
  * for zero-latency responsiveness. We do the same. */
@@ -773,7 +773,7 @@ static BOOL __fastcall Detour_DisplayPresentNeeded(void *pThis) {
     __try {
         if (g_orig_pn1) orig_result = g_orig_pn1(pThis);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        hook_diag("PN1: exception in orig — passing through FALSE");
+        hook_diag("PN1: exception in orig -- passing through FALSE");
         hook_crash_bump(g_ht_pn1, "PN1 orig");
         return FALSE;
     }
@@ -804,21 +804,21 @@ static BOOL __fastcall Detour_DisplayPresentNeeded(void *pThis) {
      * (hide overlay, switch, show overlay) now made automatic. */
     /* v1.7.10.5: DirectComposition app compose-grace.
      * If we're within the post-change grace window, KEEP forcing
-     * PN=TRUE + SCP even when hidden — this holds DWM in composite
+     * PN=TRUE + SCP even when hidden -- this holds DWM in composite
      * mode long enough to clear stale tiles in Chrome/Slack/Cursor/
      * etc that would otherwise "chunk-eat" our old overlay pixels
      * as they direct-flip. Grace is set by hooks_bump_compose_grace
      * from ui_toggle_visible / ui_nudge / ui_resize / etc. */
     if (!ui_is_visible() && !in_compose_grace_window()) return orig_result;
 
-    /* Overlay visible OR within compose grace — fire SCP + return TRUE (BP pattern). */
+    /* Overlay visible OR within compose grace -- fire SCP + return TRUE (BP pattern). */
     __try {
         if (g_schedule_composition) g_schedule_composition(0, -1);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         hook_crash_bump(g_ht_pn1, "PN1 SCP");
     }
 
-    /* AddDirtyRect DISABLED — CRASHED DWM in test 2026-07-05.
+    /* AddDirtyRect DISABLED -- CRASHED DWM in test 2026-07-05.
      * Root cause not fully understood: probably the pThis captured from
      * PresentNeeded is a virtual-base-adjusted `this` that doesn't match
      * what AddDirtyRect's trampoline+impl expects. Need to find safer
@@ -826,7 +826,7 @@ static BOOL __fastcall Detour_DisplayPresentNeeded(void *pThis) {
     return TRUE;
 }
 
-/* Detour_CLegacyRenderTarget_PresentNeeded — identical to PN1 but for
+/* Detour_CLegacyRenderTarget_PresentNeeded -- identical to PN1 but for
  * CLegacyRenderTarget (this is the RT that fires on most systems). */
 static BOOL __fastcall Detour_LegacyPresentNeeded(void *pThis) {
     if (!g_legacy_rt && pThis) {
@@ -838,7 +838,7 @@ static BOOL __fastcall Detour_LegacyPresentNeeded(void *pThis) {
     __try {
         if (g_orig_pn2) orig_result = g_orig_pn2(pThis);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        hook_diag("PN2: exception in orig — passing through FALSE");
+        hook_diag("PN2: exception in orig -- passing through FALSE");
         hook_crash_bump(g_ht_pn2, "PN2 orig");
         return FALSE;
     }
@@ -855,7 +855,7 @@ static BOOL __fastcall Detour_LegacyPresentNeeded(void *pThis) {
         hook_crash_bump(g_ht_pn2, "PN2 SCP");
     }
 
-    /* AddDirtyRect DISABLED — see PN1 detour comment above. */
+    /* AddDirtyRect DISABLED -- see PN1 detour comment above. */
     return TRUE;
 }
 
@@ -865,9 +865,9 @@ static DWORD WINAPI ghost_wnd_thread(LPVOID param);
 static volatile HWND g_ghost_wnd;
 static volatile LONG g_ghost_spawned;
 
-/* Detour_CDDisplayRenderTarget_Present — hooks the ACTUAL Present call
+/* Detour_CDDisplayRenderTarget_Present -- hooks the ACTUAL Present call
  * that DWM's compositor makes when it's about to composite an RT.
- * BEFORE calling orig, mark the entire RT as dirty via AddDirtyRect —
+ * BEFORE calling orig, mark the entire RT as dirty via AddDirtyRect --
  * this is the ONE context where `this` is guaranteed to be the correct
  * top-level object, so AddDirtyRect is safe to call.
  *
@@ -875,7 +875,7 @@ static volatile LONG g_ghost_spawned;
  * entire layer (not just the small region user just interacted with).
  * Fixes the "quadrant" bug end-to-end. */
 static LONG __fastcall Detour_DisplayPresent(void *pThis) {
-    /* SEH-wrap orig — any fault inside dwmcore's Present would bugcheck
+    /* SEH-wrap orig -- any fault inside dwmcore's Present would bugcheck
      * the entire desktop. Rare but not impossible under GPU driver
      * resets or malformed layer state. Swallow + return 0 so composition
      * skips one frame instead of killing DWM. */
@@ -898,7 +898,7 @@ static LONG __fastcall Detour_LegacyPresent(void *pThis) {
     }
 }
 
-/* IsCaptureRender — hooksdll's proven heuristic (dwm_payload.c line 2503).
+/* IsCaptureRender -- hooksdll's proven heuristic (dwm_payload.c line 2503).
  * `[pDrawCtx + DRAWCTX_CAPTURE_FLAG_OFFSET (0x30)] == NULL` means
  * this render is targeting a capture buffer, not the screen.
  *
@@ -908,7 +908,7 @@ static LONG __fastcall Detour_LegacyPresent(void *pThis) {
  * target. For NORMAL screen composition, this pointer references the
  * primary display's render target.
  *
- * v1.7.4.6 (2026-07-24) — WHITELIST-AWARE. The +0x30 check
+ * v1.7.4.6 (2026-07-24) -- WHITELIST-AWARE. The +0x30 check
  * false-positives on Windows 11 26100.8115+ for internal-only render
  * paths (window minimize animations, taskbar thumbnails, task-view
  * previews, alt-tab peek). Fix: any pDrawCtx we've EVER observed with
@@ -940,7 +940,7 @@ static BOOL svcldb_ctx_is_whitelisted(void *pDrawCtx) {
     return FALSE;
 }
 
-/* Rate-limit state — if RC[+0x30]==NULL fires > CAPTURE_RATE_LIMIT_PER_SEC
+/* Rate-limit state -- if RC[+0x30]==NULL fires > CAPTURE_RATE_LIMIT_PER_SEC
  * in a rolling window, treat subsequent hits as "definitely false-positive".
  * Real captures (LDB Monitor / OBS / Snip) fire ~1-5/sec. DWM internal
  * false-positives fire 300-1000/sec. This crisply separates them. */
@@ -948,10 +948,10 @@ static BOOL svcldb_ctx_is_whitelisted(void *pDrawCtx) {
 static volatile LONG      g_capture_bucket_count  = 0;
 static volatile ULONGLONG g_capture_bucket_start  = 0;
 
-/* Forward decl — ldb_detect exports this. */
+/* Forward decl -- ldb_detect exports this. */
 extern int ldb_detect_active(void);
 
-/* v1.7.4.12 (2026-07-24) — CAPTURE DETECTION FULLY DISABLED.
+/* v1.7.4.12 (2026-07-24) -- CAPTURE DETECTION FULLY DISABLED.
  *
  * Bypassify has NO RC[Window]/RC[Visual] hooks and NO capture-active
  * flag. Their overlay pixels appear in captures. They accept that
@@ -976,7 +976,7 @@ static BOOL svcldb_is_capture_render(void *pDrawCtx) {
     __try {
         void *screen_rt = *(void **)((BYTE *)pDrawCtx + DRAWCTX_CAPTURE_FLAG_OFFSET);
         if (screen_rt != NULL) {
-            /* Legit screen render — memoize this pDrawCtx as trusted. */
+            /* Legit screen render -- memoize this pDrawCtx as trusted. */
             svcldb_whitelist_ctx(pDrawCtx);
             return FALSE;
         }
@@ -987,12 +987,12 @@ static BOOL svcldb_is_capture_render(void *pDrawCtx) {
             InterlockedIncrement(&g_capture_false_positives);
             return FALSE;   /* known-good context, don't skip Present */
         }
-        /* v1.7.4.7 (2026-07-24) — RATE LIMIT the "possible capture"
+        /* v1.7.4.7 (2026-07-24) -- RATE LIMIT the "possible capture"
          * verdict. Some pDrawCtx pointers NEVER appear in screen-render
          * mode so the whitelist can't learn them (e.g. a per-thumbnail
          * cache DrawingContext that always renders offscreen). We saw
          * 5500 RC[Window] hits with pThis=0x27719ABA5B0 in 40s = 137/sec
-         * on LO's box — every one bypassed the whitelist because the
+         * on LO's box -- every one bypassed the whitelist because the
          * ctx literally never fired with non-NULL +0x30.
          *
          * Real capture pipelines (LDB Monitor, OBS, Snip) sample at
@@ -1002,14 +1002,14 @@ static BOOL svcldb_is_capture_render(void *pDrawCtx) {
         ULONGLONG now = GetTickCount64();
         ULONGLONG bucket_start = (ULONGLONG)g_capture_bucket_start;
         if (bucket_start == 0 || (now - bucket_start) >= 1000) {
-            /* Bucket rollover — reset. */
+            /* Bucket rollover -- reset. */
             InterlockedExchange64((volatile LONG64 *)&g_capture_bucket_start, (LONG64)now);
             InterlockedExchange(&g_capture_bucket_count, 1);
-            return TRUE;   /* first of a new second — trust it */
+            return TRUE;   /* first of a new second -- trust it */
         }
         LONG c = InterlockedIncrement(&g_capture_bucket_count);
         if (c > CAPTURE_RATE_LIMIT_PER_SEC) {
-            /* Over budget → false-positive, don't count as capture. */
+            /* Over budget -> false-positive, don't count as capture. */
             LONG fp = InterlockedIncrement(&g_capture_false_positives);
             if (fp == 1 || (fp % 200) == 0) {
                 hook_diag("RC: rate-limit FILTERED event #%ld (bucket_count=%ld now=%llu bucket_start=%llu)",
@@ -1023,16 +1023,16 @@ static BOOL svcldb_is_capture_render(void *pDrawCtx) {
     }
 }
 
-/* Detour_CWindowNode_RenderContent — sets g_in_capture_render for the
+/* Detour_CWindowNode_RenderContent -- sets g_in_capture_render for the
  * duration of the orig call when we detect a capture-context render.
  * The Present detour (called AFTER this returns during a full compose
  * cycle) checks the counter and skips our overlay draw if > 0.
  *
- * We also count "cycle skipped" — after RenderContent returns, the
+ * We also count "cycle skipped" -- after RenderContent returns, the
  * counter goes back to 0. Present may fire AFTER RenderContent for the
  * same cycle so we keep the flag set for slightly longer via a delay.
  * Actually simplest: increment on entry, decrement on exit. Present hook
- * checks value at time of firing — during capture composition it'll be
+ * checks value at time of firing -- during capture composition it'll be
  * non-zero. */
 static LONG __fastcall Detour_CWindowNode_RenderContent(
     void *pThis, void *pDrawCtx, BOOL *pResult)
@@ -1041,7 +1041,7 @@ static LONG __fastcall Detour_CWindowNode_RenderContent(
     __try {
         if (svcldb_is_capture_render(pDrawCtx)) {
             InterlockedIncrement(&g_in_capture_render);
-            /* Latch the tick — Present may fire after this returns */
+            /* Latch the tick -- Present may fire after this returns */
             InterlockedExchange64((volatile LONG64 *)&g_capture_seen_tick,
                                   (LONG64)GetTickCount64());
             captured_this_call = 1;
@@ -1064,7 +1064,7 @@ static LONG __fastcall Detour_CWindowNode_RenderContent(
 
     if (captured_this_call) {
         InterlockedDecrement(&g_in_capture_render);
-        /* Re-stamp AFTER the orig call too — some capture paths do
+        /* Re-stamp AFTER the orig call too -- some capture paths do
          * meaningful work in the orig that overruns the pre-stamp. */
         InterlockedExchange64((volatile LONG64 *)&g_capture_seen_tick,
                               (LONG64)GetTickCount64());
@@ -1072,7 +1072,7 @@ static LONG __fastcall Detour_CWindowNode_RenderContent(
     return ret;
 }
 
-/* Detour_CVisual_RenderContent — same as WindowNode variant but hooks
+/* Detour_CVisual_RenderContent -- same as WindowNode variant but hooks
  * the base class. Some DWM code paths call CVisual::RenderContent
  * instead of the CWindowNode override. Hooking both catches both. */
 static LONG __fastcall Detour_CVisual_RenderContent(
@@ -1104,7 +1104,7 @@ static LONG __fastcall Detour_CVisual_RenderContent(
     return ret;
 }
 
-/* svcldb_capture_active — check if we're within a capture render call.
+/* svcldb_capture_active -- check if we're within a capture render call.
  * Called from Present detour. v1.7.4.6: latch fully removed; relies
  * only on the live counter g_in_capture_render (RC detour's SEH-wrapped
  * increment/decrement guarantees any Present firing DURING an orig RC
@@ -1125,13 +1125,13 @@ static BOOL svcldb_capture_active(void) {
  * AddDirtyRect invocation during RE work. They served their purpose
  * (confirmed DWM does NOT call AddDirtyRect during our overlay toggles)
  * and are no longer needed. Removing them:
- *   - Drops us from 9 → 7 dwmcore hooks (smaller detectable surface).
+ *   - Drops us from 9 -> 7 dwmcore hooks (smaller detectable surface).
  *   - Removes 2 entries from the hook_registry (less for the integrity
  *     monitor to keep alive).
- *   - Zero functional impact — the detours never modified behaviour;
+ *   - Zero functional impact -- the detours never modified behaviour;
  *     they just logged and forwarded.
  *
- * If we ever need this observability back, git log the file — the
+ * If we ever need this observability back, git log the file -- the
  * Detour_AddDirtyRect_* bodies are preserved in the pre-removal commit. */
 
 /* ── Public API ── */
@@ -1217,19 +1217,19 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
         slog_write("payload.log", "hooks: no legacyPresentNeeded in blob");
     }
 
-    /* ── 4. ForceFullDirtyRendering — RESOLVE ONLY (DO NOT CALL) ──
+    /* ── 4. ForceFullDirtyRendering -- RESOLVE ONLY (DO NOT CALL) ──
      * Confirmed 2026-07-05: calling this from any thread crashes DWM.
      * Kept resolved for future experimentation only.
      *
-     * v1.7.4.14 (2026-07-24) — BUT patch the STATIC BYTE 0x60 before
+     * v1.7.4.14 (2026-07-24) -- BUT patch the STATIC BYTE 0x60 before
      * it. Per BP RE (docs/BYPASSIFY_v1.3_DWM_RE_DEEP.md) they patch
      * a byte at RVA 0x3fd7b9 to 1 at init, which is ForceFullDirty
      * RVA (0x3fd819) minus 0x60. This byte is a static bool that
-     * dwmcore reads inside its compose logic — when 1, dwmcore takes
-     * "always full-dirty" render paths → every compose re-renders
-     * the whole layer texture → old-position overlay pixels get
-     * overwritten by natural compose → NO TRAILING/SHADOW BUG. */
-    /* v1.7.9 (2026-07-24) — FORCE-FULL-DIRTY PATCH REMOVED.
+     * dwmcore reads inside its compose logic -- when 1, dwmcore takes
+     * "always full-dirty" render paths -> every compose re-renders
+     * the whole layer texture -> old-position overlay pixels get
+     * overwritten by natural compose -> NO TRAILING/SHADOW BUG. */
+    /* v1.7.9 (2026-07-24) -- FORCE-FULL-DIRTY PATCH REMOVED.
      * Ghidra RE'd Bypassify's full DwmInit: they hook 4 functions total
      * (Present, PN1, PN2, IsOverlayPrevented). They do NOT touch the
      * ForceFullDirty byte AT ALL. Our patch adds compose overhead
@@ -1237,14 +1237,14 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
      * consistency. Trail-clearing is handled by our RedrawWindow
      * cascade in imgui_layer.cpp instead. */
     if (off->forceFullDirty) {
-        /* v1.7.11.14 (2026-07-25) — WPT-TRACE-DRIVEN FIX.
+        /* v1.7.11.14 (2026-07-25) -- WPT-TRACE-DRIVEN FIX.
          *
          * WPT trace comparison of BP vs svcldb (2026-07-25) shows BP
          * triggers ~42,500 Dwm-Core `ETWGUID_VISUAL_RENDERCONTENT`
          * (event 115) + `Dx_Flip_Consumed` (event 182) events per 13
          * seconds = ~3269/sec = ~55 per vsync. We trigger ~0. That is
          * DWM's "render all visuals every frame" full-dirty compose
-         * mode — the exact mechanism BP uses to eliminate Chrome
+         * mode -- the exact mechanism BP uses to eliminate Chrome
          * trails.
          *
          * Prior v1.7.11.4 patched at `forceFullDirty - 0x60` (copied
@@ -1253,11 +1253,11 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
          * shows the CORRECT resolution is `SymFromName(dwmcore!Force
          * FullDirtyRendering)` returns the FLAG BYTE ADDRESS DIRECTLY.
          * On current Windows, our PDB-resolved `off->forceFullDirty`
-         * IS the flag byte — no -0x60 needed.
+         * IS the flag byte -- no -0x60 needed.
          *
          * Patch at the DIRECT address. If this is the correct flag on
-         * current Windows, DWM enters full-dirty compose mode → all
-         * visuals re-render every frame → Chrome trails vanish. */
+         * current Windows, DWM enters full-dirty compose mode -> all
+         * visuals re-render every frame -> Chrome trails vanish. */
         BYTE *ffd_flag = (BYTE *)dwmcore + off->forceFullDirty;
         DWORD old_prot = 0;
         if (VirtualProtect(ffd_flag, 1, PAGE_EXECUTE_READWRITE, &old_prot)) {
@@ -1270,7 +1270,7 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
             g_ffd_patched = TRUE;
             slog_writef("payload.log",
                 "ForceFullDirty flag @ %p patched DIRECT: 0x%02X -> 0x01 "
-                "(WPT-trace-driven — chaosium43 dumper.cpp:341 pattern, forces "
+                "(WPT-trace-driven -- chaosium43 dumper.cpp:341 pattern, forces "
                 "DWM full-dirty compose mode = expect 3000+/sec RENDERCONTENT events)",
                 ffd_flag, g_ffd_saved_byte);
         } else {
@@ -1280,11 +1280,11 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
         }
     }
 
-    /* ── 5. ScheduleCompositionPass — THE MISSING PIECE (Bypassify slot [7]) ──
+    /* ── 5. ScheduleCompositionPass -- THE MISSING PIECE (Bypassify slot [7]) ──
      * Global void(int, int) that requests DWM to schedule next composition
-     * immediately. Called from PN detours after orig — matches Bypassify
-     * exactly. Effect: DWM never enters idle → compositor runs at native
-     * vsync rate continuously → state changes visible on next frame.
+     * immediately. Called from PN detours after orig -- matches Bypassify
+     * exactly. Effect: DWM never enters idle -> compositor runs at native
+     * vsync rate continuously -> state changes visible on next frame.
      *
      * Confirmed via RE (dwmcore.dll RVA 0x12be7c on Win11 26100):
      *   - Global function, not member
@@ -1299,10 +1299,10 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
                     (void *)g_schedule_composition);
     } else {
         slog_write("payload.log", "ScheduleCompositionPass NOT in blob "
-                                  "(DWM may enter idle → half-render on toggle)");
+                                  "(DWM may enter idle -> half-render on toggle)");
     }
 
-    /* v1.7.11.9 (2026-07-25) — IsPrimaryMonitor for chaosium43-parity
+    /* v1.7.11.9 (2026-07-25) -- IsPrimaryMonitor for chaosium43-parity
      * primary-monitor filter. Enables discover_monitor_target_offset() +
      * should_render_this_context() in Present detour. Without this fn,
      * filter is disabled + we render every compose pass (old behavior). */
@@ -1312,17 +1312,17 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
         slog_writef("payload.log", "IsPrimaryMonitor resolved @ %p (primary-monitor filter armed)",
                     (void *)g_is_primary_monitor);
     } else {
-        slog_write("payload.log", "IsPrimaryMonitor NOT in blob — primary-monitor filter DISABLED");
+        slog_write("payload.log", "IsPrimaryMonitor NOT in blob -- primary-monitor filter DISABLED");
     }
 
     /* ── 5b. AddDirtyRect trampolines (both RT classes) ── *
      *
      * Solves the "quadrant" bug: without a fullscreen dirty rect, DWM
-     * only re-composites the small region the user just clicked → our
+     * only re-composites the small region the user just clicked -> our
      * overlay only updates in that region. Calling AddDirtyRect with
      * fullscreen (0, 0, 8192, 8192) on every PN fire forces DWM to
-     * mark the whole layer dirty → next composite samples entire
-     * texture → our overlay pixels always up to date across the
+     * mark the whole layer dirty -> next composite samples entire
+     * texture -> our overlay pixels always up to date across the
      * whole screen.
      *
      * We resolve BOTH the CDDisplayRenderTarget and CLegacyRenderTarget
@@ -1343,7 +1343,7 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
     }
     if (!off->addDirtyRectDisplay && !off->addDirtyRectLegacy) {
         slog_write("payload.log", "AddDirtyRect NOT in blob "
-                                  "(quadrant bug will persist — need to re-run resolver)");
+                                  "(quadrant bug will persist -- need to re-run resolver)");
     }
 
     /* ── 5c. Hook CDDisplayRenderTarget::Present + CLegacyRenderTarget::Present ── *
@@ -1352,13 +1352,13 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
      * (crashes AddDirtyRect). But Present's `this` is the top-level
      * object. Hooking Present gives us the correct `this` to safely
      * call AddDirtyRect from DWM's own compositor context, marking
-     * the full RT dirty right before it composits — which forces
+     * the full RT dirty right before it composits -- which forces
      * fullscreen re-composition every tick and fixes the "quadrant" bug. */
-    /* v1.7.9 (2026-07-24) — DisplayRT::Present + LegacyRT::Present
+    /* v1.7.9 (2026-07-24) -- DisplayRT::Present + LegacyRT::Present
      * HOOKS REMOVED. Ghidra RE proved Bypassify does NOT hook these.
      * Our detours were pass-throughs (call orig + SEH) with an old
      * comment claiming AddDirtyRect purpose that was never coded.
-     * Pure overhead — every dwmcore Present cycle went through 2
+     * Pure overhead -- every dwmcore Present cycle went through 2
      * extra detours doing nothing. Removing = fewer per-frame stack
      * frames + better frame-time consistency. Detour functions kept
      * in this file (unused) for reference / future re-enable. */
@@ -1379,13 +1379,13 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
      *
      * Result: overlay is INVISIBLE to LDB Monitor's continuous exam
      * screenshots that get uploaded to their server. */
-    /* v11.2.2 (2026-07-24) — RC[Window] + RC[Visual] hooks REMOVED.
+    /* v11.2.2 (2026-07-24) -- RC[Window] + RC[Visual] hooks REMOVED.
      *
      * Bypassify does not hook CWindowNode::RenderContent or
      * CVisual::RenderContent. They only have 4 hooks total (Present,
      * PN1, PN2, IsOverlayPrevented). RC hooks were our capture-stealth
      * mechanism BUT svcldb_is_capture_render() returns FALSE always
-     * (was disabled in v1.7.4.12 to fix flicker) — so RC hooks fire
+     * (was disabled in v1.7.4.12 to fix flicker) -- so RC hooks fire
      * for EVERY DWM render pass, take our __try/__except path, and
      * return, adding zero functional value AND per-frame overhead.
      *
@@ -1406,25 +1406,25 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
     /* ── 5d. AddDirtyRect passive-logging hooks REMOVED 2026-07-06 v4.2.
      * See the block-comment above `hooks_install`'s definition for context. */
 
-    /* ── 6. IsOverlayPrevented byte-patch — CRITICAL FIX v1.7.4.11 ──
+    /* ── 6. IsOverlayPrevented byte-patch -- CRITICAL FIX v1.7.4.11 ──
      *
      * Save original 6 bytes so hooks_uninstall can revert cleanly.
      *
-     * v1.7.4.11 (2026-07-24) — SEMANTIC INVERSION. Pre-v1.7.4.11 we
+     * v1.7.4.11 (2026-07-24) -- SEMANTIC INVERSION. Pre-v1.7.4.11 we
      * patched to `xor eax,eax; ret` = returns FALSE. Comment claimed
      * "return FALSE = allow overlay". That read the function name
      * BACKWARD. `IsOverlayPrevented` asks: "is HARDWARE OVERLAY
      * (Multiplane Overlay) prevented?" Return semantics:
-     *   TRUE  = "yes, hardware overlay is prevented" → DWM MUST use
-     *           software compositor path → every app's pixels flow
-     *           through the shared composited surface → our injected
+     *   TRUE  = "yes, hardware overlay is prevented" -> DWM MUST use
+     *           software compositor path -> every app's pixels flow
+     *           through the shared composited surface -> our injected
      *           pixels (drawn LAST via Present hook) end up on TOP
      *           of every app in that surface.
-     *   FALSE = "no, hardware overlay is NOT prevented" → DWM is
+     *   FALSE = "no, hardware overlay is NOT prevented" -> DWM is
      *           free to give DirectComposition apps (Chrome, Cursor,
      *           terminal, Slack, Discord, Electron in general) their
      *           OWN hardware overlay plane, composited by the GPU
-     *           bypassing our injected surface entirely → our overlay
+     *           bypassing our injected surface entirely -> our overlay
      *           ends up BEHIND those apps.
      *
      * LO's screenshot from 2026-07-24 showed BP's overlay literally
@@ -1433,7 +1433,7 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
      * confirmed they return TRUE while their shutdown_flag is 0. We
      * were returning the OPPOSITE. This one-bit-flip is why their
      * overlay stayed above and ours dropped behind. Same reason ours
-     * flickered on mouse move — the RC[Window] capture-detection
+     * flickered on mouse move -- the RC[Window] capture-detection
      * false-positives only surface when DirectComposition apps are
      * getting hardware plane placement (which our FALSE patch was
      * enabling).
@@ -1464,7 +1464,7 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
             FlushInstructionCache(GetCurrentProcess(), iop, 8);
             g_iop_patched = TRUE;
             slog_writef("payload.log",
-                        "IsOverlayPrevented patched @ %p — RETURNS TRUE (forces DWM out of "
+                        "IsOverlayPrevented patched @ %p -- RETURNS TRUE (forces DWM out of "
                         "hardware overlay plane path so our pixels composite ON TOP of "
                         "DirectComposition apps). Original 6 bytes: %02x %02x %02x %02x %02x %02x",
                         iop, g_iop_saved_bytes[0], g_iop_saved_bytes[1], g_iop_saved_bytes[2],
@@ -1474,17 +1474,17 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
                         GetLastError());
         }
     } else {
-        slog_write("payload.log", "IsOverlayPrevented not in blob — skipping patch");
+        slog_write("payload.log", "IsOverlayPrevented not in blob -- skipping patch");
     }
 
     /* Ensure clean state (in case a previous install/uninstall left
-     * stale flags — defensive; unlikely with FreeLibraryAndExitThread). */
+     * stale flags -- defensive; unlikely with FreeLibraryAndExitThread). */
     InterlockedExchange(&g_stop_draw, 0);
     InterlockedExchange(&g_wake_frames, 0);   /* no longer used; keep 0 */
 
-    /* Set g_active LAST — from now, PN detours return TRUE unconditionally,
+    /* Set g_active LAST -- from now, PN detours return TRUE unconditionally,
      * DWM composites at native vsync, our Detour_Present's draw callback
-     * fires every frame → overlay appears within ~16ms of installation. */
+     * fires every frame -> overlay appears within ~16ms of installation. */
     InterlockedExchange(&g_active, 1);
 
     /* Spawn keep-alive thread: safety net that fires SCP(0,-1) every 50ms.
@@ -1496,7 +1496,7 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
         if (ka) CloseHandle(ka);
     }
 
-    /* Ghost window pre-spawn — gated OFF by default (max stealth).
+    /* Ghost window pre-spawn -- gated OFF by default (max stealth).
      * When DWM_EXT_GHOST=1, we spawn a fullscreen invisible
      * TOPMOST HWND used for forcing DWM re-composite on hotkey. When
      * unset (default), no ghost = no enumerable window from us. */
@@ -1527,15 +1527,15 @@ void hooks_uninstall(void) {
     if (InterlockedExchange(&g_stop_draw, 1) != 0) return;
     if (!g_active) return;   /* never installed, nothing to do */
 
-    hook_diag("hooks_uninstall: entering — g_stop_draw set (Phase B: DRAINING)");
+    hook_diag("hooks_uninstall: entering -- g_stop_draw set (Phase B: DRAINING)");
 
     /* Stop hook-integrity monitor before we start disabling hooks (else
      * it'd see them being torn down and try to re-install mid-shutdown).
      *
-     * WAIT MUST SUCCEED — see hook_integrity_thread docstring. The old
+     * WAIT MUST SUCCEED -- see hook_integrity_thread docstring. The old
      * 500ms wait was not enough (thread could be mid-`Sleep(10000)`
      * and hooks_uninstall would time out + proceed while the thread
-     * was still alive in soon-to-be-freed code → DWM crash on next
+     * was still alive in soon-to-be-freed code -> DWM crash on next
      * inject cycle's sweep. Fixed in v-next by chunking the thread's
      * sleep into 50ms slices; wait budget bumped to 2s for headroom
      * against slow SEH-wrapped `first = *(unsigned char*)r->target`
@@ -1545,7 +1545,7 @@ void hooks_uninstall(void) {
         DWORD wr = WaitForSingleObject(g_integrity_thread, 2000);
         if (wr != WAIT_OBJECT_0) {
             hook_diag("hooks_uninstall: integrity thread wait FAILED "
-                      "(wr=%lu) — DWM crash likely on next inject", wr);
+                      "(wr=%lu) -- DWM crash likely on next inject", wr);
         }
         CloseHandle(g_integrity_thread);
         g_integrity_thread = NULL;
@@ -1554,20 +1554,20 @@ void hooks_uninstall(void) {
     /* Step 1 (Bypassify pattern): the shutdown flag is now set.
      * IMMEDIATELY:
      *   - Detour_Present stops calling our g_present_cb (draw is
-     *     skipped — layer texture will be composited clean by orig).
-     * BUT: PN detours STILL RETURN TRUE — we need DWM to keep
+     *     skipped -- layer texture will be composited clean by orig).
+     * BUT: PN detours STILL RETURN TRUE -- we need DWM to keep
      * composing during the drain window so orig Present has a chance
      * to overwrite our old pixels. */
 
     /* Step 2 (Bypassify pattern): give DWM ~12 frames at 60Hz to
      * composite CLEAN pixels from the underlying app. Because PN
      * still returns TRUE, DWM composites every vsync during this
-     * 200ms — orig Present runs each time (via Detour_Present),
+     * 200ms -- orig Present runs each time (via Detour_Present),
      * layer texture gets clean pixels from the owning app, DWM's
      * compositor backbuffer naturally clears our overlay off-screen.
      *
      * This is what solves "overlay stays on screen after killing the
-     * payload" — WITHOUT this sleep, MH_DisableHook cuts off hooks
+     * payload" -- WITHOUT this sleep, MH_DisableHook cuts off hooks
      * MID-FRAME and the last drawn overlay pixels persist. */
     hook_diag("hooks_uninstall: sleeping 200ms for clean-frame drain "
               "(PN still returns TRUE to force compose)");
@@ -1589,7 +1589,7 @@ void hooks_uninstall(void) {
     g_orig_pn2             = NULL;
     g_orig_present_display = NULL;
     g_orig_present_legacy  = NULL;
-    /* (Removed 2026-07-06 v4.2) — g_orig_adr_display / g_orig_adr_legacy
+    /* (Removed 2026-07-06 v4.2) -- g_orig_adr_display / g_orig_adr_legacy
      * static state is gone alongside the ADR hooks themselves. */
     g_orig_rc_window       = NULL;
     g_orig_rc_visual       = NULL;
@@ -1604,7 +1604,7 @@ void hooks_uninstall(void) {
 
     /* Step 4 (belt-and-suspenders): revert the IsOverlayPrevented
      * byte-patch. Bypassify skips this (they rely on DWM restart),
-     * but we do it for cleanliness — enables reinstall in the same
+     * but we do it for cleanliness -- enables reinstall in the same
      * DWM instance without stale state.
      *
      * v1.7.4.11: patch is now 6 bytes (mov eax,1; ret) instead of 3
@@ -1641,17 +1641,17 @@ void hooks_uninstall(void) {
     hook_diag("hooks_uninstall: DONE");
 }
 
-/* v1.7.4.12 (2026-07-24) — WAKE APIs NEUTERED.
+/* v1.7.4.12 (2026-07-24) -- WAKE APIs NEUTERED.
  *
  * Bypassify has ZERO code calling anything like hooks_bump_wake,
  * hooks_force_wake, hooks_burst_wake. Their PN detour returns TRUE
- * every time DWM asks → DWM composes every vsync → their draw fires
+ * every time DWM asks -> DWM composes every vsync -> their draw fires
  * on Present with fresh state. No external nudges needed.
  *
  * Our wake APIs were belt-and-suspenders from the era when we
  * didn't fully understand PN=TRUE. They've caused every flicker
  * report since. Kept as no-ops so callers don't need to be edited
- * out one-by-one — they just do nothing. */
+ * out one-by-one -- they just do nothing. */
 void hooks_bump_wake(int frames) { (void)frames; }
 void hooks_force_wake(void)      { }
 
@@ -1661,18 +1661,18 @@ void hooks_force_wake(void)      { }
  * thread. This is a SAFETY NET against the "DWM enters deep idle"
  * failure mode:
  *
- * Normal case: DWM calls PN → PN detour calls SCP → DWM stays awake.
+ * Normal case: DWM calls PN -> PN detour calls SCP -> DWM stays awake.
  *   Loop self-sustaining. This thread's work is redundant, cheap.
  *
  * Failure case: DWM enters deep idle for some reason and STOPS calling
- *   PN entirely. Without external stimulus, PN → SCP loop never
+ *   PN entirely. Without external stimulus, PN -> SCP loop never
  *   restarts and DWM composites at ~0 fps until user input. THIS
  *   thread breaks that cycle: even if DWM stops PN, we periodically
  *   call SCP externally, which triggers DWM to schedule composition,
  *   which eventually calls PN, which then calls SCP again.
  *
  * Cost: 20 calls/sec to a fast-path dwmcore function. Negligible. */
-/* WinEvent hook callback — fires whenever the foreground window changes.
+/* WinEvent hook callback -- fires whenever the foreground window changes.
  *
  * v6 FLICKER FIX (2026-07-06): the old code SetWindowPos'd the ghost
  * with full (x,y,w,h) on EVERY foreground change including every
@@ -1721,18 +1721,18 @@ static DWORD WINAPI keepalive_thread(LPVOID param) {
     (void)param;
     hook_diag("keepalive: thread started");
 
-    /* Install EVENT_SYSTEM_FOREGROUND hook — reacts INSTANTLY to any
+    /* Install EVENT_SYSTEM_FOREGROUND hook -- reacts INSTANTLY to any
      * app becoming foreground (Alt+Tab, click, etc.). Requires our
      * thread to have a message pump, so we PeekMessage in the loop below.
      * WINEVENT_OUTOFCONTEXT means the callback fires on OUR thread,
-     * not injected into the target process — safer + LDB never sees us. */
+     * not injected into the target process -- safer + LDB never sees us. */
     HWINEVENTHOOK fg_hook = SetWinEventHook(
         EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
         NULL, ghost_fg_change_cb,
         0, 0,
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     if (fg_hook) hook_diag("keepalive: EVENT_SYSTEM_FOREGROUND hook installed");
-    else         hook_diag("keepalive: SetWinEventHook FAILED — periodic z-order still active");
+    else         hook_diag("keepalive: SetWinEventHook FAILED -- periodic z-order still active");
 
     int last_overlay_visible = -1;   /* -1 forces initial sync */
     while (g_active && !g_stop_draw) {
@@ -1771,7 +1771,7 @@ static DWORD WINAPI keepalive_thread(LPVOID param) {
                      * WS_VISIBLE state before calling ShowWindow. Prior
                      * unconditional call raced with hooks_ghost_wake's own
                      * ShowWindow when a hotkey (Ctrl+Alt+G) fired within
-                     * 50ms — DOUBLE ShowWindow on a fullscreen layered
+                     * 50ms -- DOUBLE ShowWindow on a fullscreen layered
                      * window = double DWM invalidate = visible flash on
                      * toggle-show. Now: only call if state actually
                      * differs from Windows' view of the window. */
@@ -1790,7 +1790,7 @@ static DWORD WINAPI keepalive_thread(LPVOID param) {
                       cur_visible ? "visible" : "hidden");
         }
 
-        /* v1.7.4.12 (2026-07-24) — SCP KILLED.
+        /* v1.7.4.12 (2026-07-24) -- SCP KILLED.
          *
          * Bypassify has NO independent SCP-firing thread. They rely
          * PURELY on PN=TRUE in the PresentNeeded detour to keep DWM
@@ -1804,7 +1804,7 @@ static DWORD WINAPI keepalive_thread(LPVOID param) {
          * v1.7.4.12, so the thread mostly no-ops).
          *
          * If DWM ever truly idles with our hook armed, the PN detour
-         * fires TRUE on next PN call → DWM composes → we draw. No
+         * fires TRUE on next PN call -> DWM composes -> we draw. No
          * external SCP needed. */
 
         Sleep(cur_visible ? 500 : 1000);   /* very-low-freq idle */
@@ -1815,7 +1815,7 @@ static DWORD WINAPI keepalive_thread(LPVOID param) {
     return 0;
 }
 
-/* ── Burst-wake worker (legacy — mostly no-op now that PN always fires SCP) ── */
+/* ── Burst-wake worker (legacy -- mostly no-op now that PN always fires SCP) ── */
 
 static DWORD WINAPI burst_wake_thread(LPVOID param) {
     (void)param;
@@ -1828,7 +1828,7 @@ static DWORD WINAPI burst_wake_thread(LPVOID param) {
         hooks_bump_wake(g_burst_frames_per_pump);
         hooks_force_wake();
 
-        /* Sleep interval — clamped to sane values. */
+        /* Sleep interval -- clamped to sane values. */
         LONG iv = g_burst_interval_ms;
         if (iv < 8)   iv = 8;
         if (iv > 100) iv = 100;
@@ -1841,7 +1841,7 @@ static DWORD WINAPI burst_wake_thread(LPVOID param) {
 
 void hooks_burst_wake(int frames_per_pump, int duration_ms, int interval_ms) {
     /* v1.7.4.12: NO-OP. See hooks_bump_wake comment.
-     * PN=TRUE alone drives DWM compose every vsync — no burst needed. */
+     * PN=TRUE alone drives DWM compose every vsync -- no burst needed. */
     (void)frames_per_pump; (void)duration_ms; (void)interval_ms;
     return;
     /* --- dead code below preserved so callers still link cleanly --- */
@@ -1878,9 +1878,9 @@ void hooks_burst_wake(int frames_per_pump, int duration_ms, int interval_ms) {
         if (h) {
             CloseHandle(h);
         } else {
-            /* Thread create failed — undo the running flag so next call
+            /* Thread create failed -- undo the running flag so next call
              * can retry. The immediate hooks_force_wake above still fired,
-             * so this isn't fatal — just no burst extension. */
+             * so this isn't fatal -- just no burst extension. */
             InterlockedExchange(&g_burst_running, 0);
             hook_diag("burst_wake: CreateThread FAILED (falling back to single-shot)");
         }
@@ -1891,7 +1891,7 @@ int hooks_is_active(void) {
     return (g_active && !g_shutdown_flag) ? 1 : 0;
 }
 
-/* ── LDB-safe ghost window wake — g_ghost_wnd/g_ghost_spawned forward-declared above ── */
+/* ── LDB-safe ghost window wake -- g_ghost_wnd/g_ghost_spawned forward-declared above ── */
 
 static LRESULT CALLBACK ghost_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, msg, w, l);
@@ -1899,32 +1899,32 @@ static LRESULT CALLBACK ghost_wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
 
 /* Per-install pool of top-level window class names. A signature scanner
  * that looks for one hard-coded class name (as prior single-string builds
- * of svcldb were vulnerable to — see git log for the flip from a fixed
+ * of svcldb were vulnerable to -- see git log for the flip from a fixed
  * `MSCTFIME UI$`) has to know ALL of these to catch us, AND has to hit
  * the right one for the current machine. Rotation is deterministic per
  * install (see `cu_installsalt_index`) so behavior stays predictable
  * for the same user across every arm / reinject / DWM restart.
  *
  * Every name below is a real Windows-known class:
- *   [0] MSCTFIME UI$   — IME dispatcher (trailing $ so it never collides
+ *   [0] MSCTFIME UI$   -- IME dispatcher (trailing $ so it never collides
  *                        with the real `MSCTFIME UI` some GUI processes
  *                        register on startup); always registerable.
- *   [1] IME            — actual IME child-window class. Real Windows GUI
+ *   [1] IME            -- actual IME child-window class. Real Windows GUI
  *                        processes may or may not have this registered;
  *                        RegisterClassExW returns ERROR_CLASS_ALREADY_EXISTS
  *                        in the collision case and we fall through.
- *   [2] MSTaskListWClass — explorer.exe's taskbar-button class. Never
- *                        pre-registered inside dwm.exe → always available.
- *   [3] TrayNotifyWnd  — explorer.exe's tray-notification-area class.
+ *   [2] MSTaskListWClass -- explorer.exe's taskbar-button class. Never
+ *                        pre-registered inside dwm.exe -> always available.
+ *   [3] TrayNotifyWnd  -- explorer.exe's tray-notification-area class.
  *                        Never pre-registered inside dwm.exe.
- *   [4] WorkerW        — explorer.exe's desktop-worker class. Some DWM
+ *   [4] WorkerW        -- explorer.exe's desktop-worker class. Some DWM
  *                        builds may pre-register this internally; on
  *                        collision the fallback loop picks the next.
  *
  * IMPORTANT: If you ADD entries here, keep them at the tail so the same
  * install keeps picking the same primary. If you REMOVE an entry every
  * install that previously landed on it will silently roll to a different
- * name — that's cosmetically weird but functionally harmless (nothing
+ * name -- that's cosmetically weird but functionally harmless (nothing
  * outside DWM depends on this class name being stable). */
 static const wchar_t *k_ghost_class_pool[] = {
     L"MSCTFIME UI$",
@@ -1943,7 +1943,7 @@ static DWORD WINAPI ghost_wnd_thread(LPVOID param) {
     if (d) SetThreadDesktop(d);
 
     /* Register a class with a name that blends in. Bypassify uses a
-     * single hard-coded MS-adjacent name (`MSDiagEventSink`) — one
+     * single hard-coded MS-adjacent name (`MSDiagEventSink`) -- one
      * signature scanner regex catches every install of theirs. We
      * pick per-install from a 5-name pool (see comment above), so a
      * signature scanner has to know every entry AND match the right
@@ -1954,7 +1954,7 @@ static DWORD WINAPI ghost_wnd_thread(LPVOID param) {
     wc.lpfnWndProc = ghost_wnd_proc;
     wc.hInstance   = GetModuleHandleW(NULL);
 
-    /* Salt string is opaque on purpose — any strings dump sees a short
+    /* Salt string is opaque on purpose -- any strings dump sees a short
      * ID, not our product name. Rotating this string changes every
      * install's picked pool entry (which is a cosmetic-only change
      * post-ship, so don't unless we're rotating everything). */
@@ -1978,7 +1978,7 @@ static DWORD WINAPI ghost_wnd_thread(LPVOID param) {
         if (err != ERROR_CLASS_ALREADY_EXISTS) {
             hook_diag("ghost_wnd: RegisterClassExW idx=%u err=%lu (non-collision)",
                       idx, err);
-            /* Non-collision failure → still try next pool entry. Rare;
+            /* Non-collision failure -> still try next pool entry. Rare;
              * could be low-memory / invalid module handle. Log then
              * fall through. */
         }
@@ -2000,7 +2000,7 @@ static DWORD WINAPI ghost_wnd_thread(LPVOID param) {
      *   WS_EX_TRANSPARENT mouse events pass through to windows below
      *   WS_EX_NOACTIVATE  clicking doesn't activate it
      *   WS_EX_TOOLWINDOW  hides from taskbar + Alt+Tab
-     *   WS_EX_TOPMOST     ALWAYS above all other windows — the killer fix
+     *   WS_EX_TOPMOST     ALWAYS above all other windows -- the killer fix
      *
      * User confirmed 2026-07-05: "we know LDB specifically whitelists DWM
      * so anything that happens in DWM it doesn't care about and we can
@@ -2008,9 +2008,9 @@ static DWORD WINAPI ghost_wnd_thread(LPVOID param) {
      * topmost windows because DWM legitimately does this for cursor,
      * tooltips, IME candidate windows, etc.
      *
-     * With WS_EX_TOPMOST: no z-order fight when user Alt+Tabs — our
-     * ghost stays above everything → nudging it ALWAYS forces fullscreen
-     * DWM re-composite → toggle is instant regardless of context. */
+     * With WS_EX_TOPMOST: no z-order fight when user Alt+Tabs -- our
+     * ghost stays above everything -> nudging it ALWAYS forces fullscreen
+     * DWM re-composite -> toggle is instant regardless of context. */
     HWND h = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE |
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
@@ -2024,14 +2024,14 @@ static DWORD WINAPI ghost_wnd_thread(LPVOID param) {
         return 1;
     }
 
-    /* Alpha=1 (0.4% opacity) — DWM's compositor optimizes fully-transparent
+    /* Alpha=1 (0.4% opacity) -- DWM's compositor optimizes fully-transparent
      * layered windows OUT of composition entirely (alpha=0 test failed for
-     * this reason). With alpha=1, DWM MUST include this window → moving it
+     * this reason). With alpha=1, DWM MUST include this window -> moving it
      * forces DWM to re-composite the covered region. 1/255 = 0.4% opacity
      * of black is imperceptible. */
     SetLayeredWindowAttributes(h, 0, 1, LWA_ALPHA);
 
-    /* Hide from screenshot/capture APIs — belt-and-suspenders even though
+    /* Hide from screenshot/capture APIs -- belt-and-suspenders even though
      * LDB whitelists DWM's compositor output. Any capture tool that reads
      * pixels directly (BitBlt/DXGI screencap) sees black transparent. */
     #ifndef WDA_EXCLUDEFROMCAPTURE
@@ -2075,7 +2075,7 @@ static DWORD WINAPI ghost_wnd_thread(LPVOID param) {
  * When we made ghost opt-in for "max stealth", we lost the SetWindowPos
  * fullscreen-dirty push that DWM needs to re-composite the WHOLE screen
  * on hotkey. PN=TRUE + SCP loop keeps DWM out of idle but doesn't force
- * the "everything must repaint NOW" signal — result was:
+ * the "everything must repaint NOW" signal -- result was:
  *   - hotkey response felt slow (quadrant/partial re-composition)
  *   - 3-finger swipe / task view caused visible flicker
  *   - overlay disappeared during virtual desktop transitions
@@ -2087,7 +2087,7 @@ static DWORD WINAPI ghost_wnd_thread(LPVOID param) {
  * STEALTH TRADE-OFF: ghost is one enumerable top-level HWND. LDB
  * whitelists dwm.exe entirely so LDB doesn't care about our windows
  * inside DWM. Other anti-cheats that enumerate top-level windows
- * across all processes CAN see it — but its class name is picked
+ * across all processes CAN see it -- but its class name is picked
  * per-install from `k_ghost_class_pool[]` (5 real Windows class names
  * hashed by MachineGuid + hostname) so a single-signature scanner
  * cannot match it across every install. The window also has
@@ -2101,11 +2101,11 @@ static int ghost_is_enabled(void) {
         char buf[8];
         DWORD n = GetEnvironmentVariableA("DWM_EXT_GHOST",
                                           buf, sizeof(buf));
-        /* v1.7.4.12 (2026-07-24) — GHOST OFF by default, again.
+        /* v1.7.4.12 (2026-07-24) -- GHOST OFF by default, again.
          *
          * v1.7.4.8 flipped ghost ON to fix z-order (overlay dropping
          * behind DirectComposition apps). BUT: v1.7.4.11 fixed the
-         * REAL cause of that bug — IsOverlayPrevented was patched to
+         * REAL cause of that bug -- IsOverlayPrevented was patched to
          * return FALSE instead of TRUE. With IsOverlayPrevented=TRUE
          * we're in software compositor path and our pixels are
          * naturally on top. Ghost is no longer needed for z-order.
@@ -2155,7 +2155,7 @@ void hooks_ghost_wake(void) {
      * wake_dwm_composition is called from ~30 different sites (every
      * hotkey, every chat activity, every AI stream chunk). If several
      * fire within one frame (e.g., user types fast in chat), we'd
-     * ShowWindow + RedrawWindow N times per frame → visible strobing.
+     * ShowWindow + RedrawWindow N times per frame -> visible strobing.
      * 100ms throttle = at most 10 wakes/sec, plenty for perceived
      * responsiveness, none of the strobe. */
     static volatile LONG64 s_last_wake_tick = 0;
@@ -2176,7 +2176,7 @@ void hooks_ghost_wake(void) {
          * The 1-pixel move nudge on a FULLSCREEN alpha=1 layered window
          * forces DWM to invalidate + recomposite the ENTIRE desktop.
          * On a Ctrl+Alt+G toggle-show, that visible screen invalidation
-         * appears as a brief flash BEFORE the overlay pixels land — the
+         * appears as a brief flash BEFORE the overlay pixels land -- the
          * "flickers then shows" bug LO reported 2026-07-17.
          *
          * Fix: replace the position-nudge with RedrawWindow(RDW_INVALIDATE |
@@ -2189,7 +2189,7 @@ void hooks_ghost_wake(void) {
          * keeps DWM out of idle for 300ms, so if the RedrawWindow alone
          * misses a compose cycle, the next SCP fires within 16ms and the
          * overlay lands cleanly. */
-        /* Only call ShowWindow if actually needed — avoids second
+        /* Only call ShowWindow if actually needed -- avoids second
          * fullscreen invalidate when keepalive already synced ghost. */
         LONG st = GetWindowLongPtrW(h, GWL_STYLE);
         if (!(st & WS_VISIBLE)) ShowWindow(h, SW_SHOWNA);
@@ -2202,29 +2202,29 @@ void hooks_ghost_wake(void) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { }
 }
 
-/* v1.7.4.2 (2026-07-23) — SAFE fullscreen-dirty notifier.
+/* v1.7.4.2 (2026-07-23) -- SAFE fullscreen-dirty notifier.
  *
  * Fires AddDirtyRect on the DisplayRT + LegacyRT trampolines with a
  * fullscreen rect. DWM's compositor invalidates that region and
- * re-samples app pixels for the next composition pass — old overlay
+ * re-samples app pixels for the next composition pass -- old overlay
  * pixels get naturally overwritten by DWM's own re-render.
  *
  * SEH-wrapped for defence: an older v1.6 note said "AddDirtyRect
  * CRASHED DWM in test 2026-07-05" when called from arbitrary threads.
  * That was in the PN detour context (where pThis might be adjusted).
  * Here we call from the Present detour context via the CAPTURED PN
- * pThis pointers — same virtual-base-adjusted object that PN itself
+ * pThis pointers -- same virtual-base-adjusted object that PN itself
  * hands us. Empirically safer.
  *
  * Rect: fullscreen virtual-screen bounds. DWM's AddDirtyRect impl at
- * dwmcore!0xbed84 UNIONs the new rect with existing tracked dirty —
+ * dwmcore!0xbed84 UNIONs the new rect with existing tracked dirty --
  * passing fullscreen guarantees the whole layer is marked dirty.
  * Trampolines pre-resolved in hooks_install; if either is NULL we
  * silently skip that one. */
 int hooks_add_dirty_full(void) {
     if (!g_active || g_shutdown_flag) return 0;
     int fired = 0;
-    /* Full virtual screen — every pixel gets marked dirty. */
+    /* Full virtual screen -- every pixel gets marked dirty. */
     int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
     int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
     int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
@@ -2242,7 +2242,7 @@ int hooks_add_dirty_full(void) {
         /* If display trampoline crashes, cache-out so we don't
          * repeatedly try + risk destabilizing DWM. */
         g_add_dirty_display = NULL;
-        hook_diag("add_dirty_full: display trampoline crashed — disabled");
+        hook_diag("add_dirty_full: display trampoline crashed -- disabled");
     }
     __try {
         if (g_add_dirty_legacy && g_legacy_rt) {
@@ -2251,7 +2251,7 @@ int hooks_add_dirty_full(void) {
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         g_add_dirty_legacy = NULL;
-        hook_diag("add_dirty_full: legacy trampoline crashed — disabled");
+        hook_diag("add_dirty_full: legacy trampoline crashed -- disabled");
     }
     return fired;
 }

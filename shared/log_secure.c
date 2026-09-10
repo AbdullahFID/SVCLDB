@@ -1,5 +1,5 @@
 /* ================================================================== *
- * log_secure.c — AES-256-GCM support-log writer.                      *
+ * log_secure.c -- AES-256-GCM support-log writer.                      *
  *                                                                    *
  * Derived from hooksdll/src/log_secure.c. Adapted to svcldb install  *
  * dir + own SVCLDB_LOG_KEY. Kept identical wire format so a single   *
@@ -59,7 +59,7 @@ static CRITICAL_SECTION  g_lock;
 static volatile LONG     g_lock_init = 0;
 
 /* Per-thread reentry guard.
- * NOTE: We CANNOT use __declspec(thread) here — this code runs under a
+ * NOTE: We CANNOT use __declspec(thread) here -- this code runs under a
  * manual-mapped DLL where the OS loader is unaware of us, so the
  * __tls_index / TLS callbacks are never wired up. Reading a TLS variable
  * dereferences a garbage TIB slot and either returns junk or crashes.
@@ -73,7 +73,7 @@ static volatile DWORD g_reentry_tids[REENTRY_SLOTS] = {0};
 
 static int reentry_enter(void) {
     DWORD me = GetCurrentThreadId();
-    /* Scan for our TID first — if already present, we're re-entering. */
+    /* Scan for our TID first -- if already present, we're re-entering. */
     for (int i = 0; i < REENTRY_SLOTS; i++) {
         if (g_reentry_tids[i] == me) return 0;
     }
@@ -84,7 +84,7 @@ static int reentry_enter(void) {
             return 1;
         }
     }
-    return 0;   /* table full — skip this write */
+    return 0;   /* table full -- skip this write */
 }
 
 static void reentry_exit(void) {
@@ -106,13 +106,13 @@ static void ensure_lock(void) {
     }
 }
 
-/* Master material — 2 halves + salt, defined in log_key.c. Working
+/* Master material -- 2 halves + salt, defined in log_key.c. Working
  * key derived at init: SHA256((MA XOR MB) || SALT). This means:
  *  (1) The 32-byte AES-256 key never appears as a contiguous byte
- *      run in the binary — bytesearch tools have to find A + B + salt
+ *      run in the binary -- bytesearch tools have to find A + B + salt
  *      separately and then reproduce the derivation.
  *  (2) Rotating either material or the salt invalidates all prior
- *      logs — full-forward-secrecy on rebuild.
+ *      logs -- full-forward-secrecy on rebuild.
  *  (3) An attacker needs the compiled binary AND to reverse this
  *      code to get the working key.
  * The derived hex is written to `.log_master_key.hex` (gitignored)
@@ -124,7 +124,7 @@ extern const uint8_t SVCLDB_KEY_SALT[32];
  * log_key.c as writable storage; populated here at slog_init. */
 
 static BOOL derive_working_key(uint8_t out_key[32]) {
-    /* seed = (A XOR B) || SALT — 64 bytes. */
+    /* seed = (A XOR B) || SALT -- 64 bytes. */
     uint8_t seed[64];
     for (int i = 0; i < 32; i++) {
         seed[i] = SVCLDB_KEY_MATERIAL_A[i] ^ SVCLDB_KEY_MATERIAL_B[i];
@@ -213,8 +213,20 @@ void slog_write(const char *filename, const char *message) {
     info.pbTag   = tag; info.cbTag   = sizeof(tag);
 
     ULONG written = 0;
+    /* v2.0 (2026-09-10) -- Serialize BCryptEncrypt on the single global
+     * g_key handle. MSDN: "Applications should not use a single algorithm
+     * handle or key handle for multiple cipher operations simultaneously."
+     * The payload runs 7+ concurrent long-lived threads (hook_integrity,
+     * sub_check, ghost_wnd, keepalive, WH_KEYBOARD_LL, shutdown_watcher,
+     * ask_ai_thread(s)) all funneling through slog_writef. Pre-fix,
+     * concurrent GCM ops with one key produced corrupted ciphertext at
+     * best and could raise an SEH inside ntdll -> dwm.exe crash at worst.
+     * Scoping just the BCryptEncrypt call (not the encode/file write)
+     * keeps contention minimal. */
+    EnterCriticalSection(&g_lock);
     NTSTATUS enc = BCryptEncrypt(g_key, (PUCHAR)plaintext, (ULONG)n, &info,
                                  NULL, 0, ct, sizeof(ct), &written, 0);
+    LeaveCriticalSection(&g_lock);
     if (!NT_SUCCESS(enc) || written == 0) goto out;
 
     uint8_t blob[12 + 16 + sizeof(ct)];

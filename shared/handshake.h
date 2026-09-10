@@ -1,5 +1,5 @@
 /* ================================================================== *
- * handshake.h — Electron<->launcher<->payload handshake token.        *
+ * handshake.h -- Electron<->launcher<->payload handshake token.        *
  *                                                                    *
  * Purpose: prevent bypass of the Electron login flow. Only a caller  *
  * that holds a REAL Supabase access token AND runs on the same       *
@@ -21,10 +21,10 @@
  *   2. Crafting a fake token: requires the access_token, which is    *
  *      only issued after a real Google OAuth via Supabase.           *
  *   3. Replaying a stale token: valid for at most 48 hours (today +  *
- *      yesterday grace) — after that user must re-authenticate.      *
+ *      yesterday grace) -- after that user must re-authenticate.      *
  *                                                                    *
  * NOT a replacement for network verification (subscription check     *
- * still runs against Supabase on every login) — but it stops all     *
+ * still runs against Supabase on every login) -- but it stops all     *
  * offline CLI paths from injecting without an active session.        *
  * ================================================================== */
 #ifndef SVCLDB_HANDSHAKE_H
@@ -37,7 +37,7 @@
 extern "C" {
 #endif
 
-/* Wire-format constants — MUST match the JS implementation in
+/* Wire-format constants -- MUST match the JS implementation in
  * ui/src/license/handshake.js. Change either side and the payload
  * will reject every token until both sides are rebuilt. */
 #define SVCLDB_HANDSHAKE_TOKEN_LEN   32
@@ -62,7 +62,7 @@ int handshake_compute(const char *access_token,
  * match either day.
  *
  * This is what the payload calls in init_thread. Do NOT log the token
- * on failure — a hostile debugger reading the log could correlate. */
+ * on failure -- a hostile debugger reading the log could correlate. */
 int handshake_verify(const char *access_token,
                      const char *hwid,
                      const uint8_t token[SVCLDB_HANDSHAKE_TOKEN_LEN]);

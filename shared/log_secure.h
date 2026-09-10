@@ -1,12 +1,12 @@
 /* ================================================================== *
- * log_secure.h — AES-256-GCM support-log writer.                      *
+ * log_secure.h -- AES-256-GCM support-log writer.                      *
  *                                                                    *
  * Per-line self-contained format:                                    *
  *   v1.<base64( iv[12] || tag[16] || ciphertext )>\n                 *
  *                                                                    *
  * The master key is generated at build time (see gen_key.py) and     *
  * baked into log_key.c as SVCLDB_LOG_KEY[32]. Different from the main *
- * CloakGPT app's key — logs from one project cannot be decrypted by  *
+ * CloakGPT app's key -- logs from one project cannot be decrypted by  *
  * the other's key.                                                   *
  * ================================================================== */
 #ifndef SVCLDB_LOG_SECURE_H
@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-/* v3: derived at slog_init from A/B/salt material — no longer const.
+/* v3: derived at slog_init from A/B/salt material -- no longer const.
  * See shared/log_key.c for the material + shared/log_secure.c
  * derive_working_key() for the SHA256((A XOR B) || SALT) derivation. */
 extern uint8_t SVCLDB_LOG_KEY[32];
@@ -34,7 +34,7 @@ void slog_write(const char *filename, const char *message);
 void slog_writef(const char *filename, const char *fmt, ...);
 
 /* Convenience shortcuts for the well-known files (all writes have per-file
- * newline, no lockfile — GCM per-line + OS append-atomic semantics suffice.) */
+ * newline, no lockfile -- GCM per-line + OS append-atomic semantics suffice.) */
 static inline void slog_launcher(const char *m) { slog_write("launcher.log",  m); }
 static inline void slog_payload (const char *m) { slog_write("payload.log",   m); }
 static inline void slog_resolver(const char *m) { slog_write("resolver.log",  m); }

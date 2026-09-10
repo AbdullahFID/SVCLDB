@@ -1,5 +1,5 @@
 /* ================================================================== *
- * config_types.h — Shared struct definition for the config file.      *
+ * config_types.h -- Shared struct definition for the config file.      *
  *                                                                    *
  * Written by launcher, read by payload. Encrypted at rest via         *
  * cu_wrap_encrypt (machine-bound AES-256-GCM).                        *
@@ -27,7 +27,7 @@ typedef enum {
 } svc_provider_t;
 
 /* Model tiers per provider (except OpenRouter which is user-picked).
- * ai_provider.c holds tier→model lookup tables. User cycles via
+ * ai_provider.c holds tier->model lookup tables. User cycles via
  * Ctrl+Alt+M hotkey (SVC_HK_CYCLE_TIER). */
 typedef enum {
     SVC_TIER_STRONG = 0,   /* max quality / most expensive */
@@ -44,9 +44,9 @@ typedef enum {
  *
  * Bump SVC_CONFIG_SCHEMA_VERSION on any layout change (add-only). Old
  * configs cleanly fail via cu_wrap_decrypt's plen != sizeof(svc_config_t)
- * check when a field is added — this magic is defence-in-depth. */
+ * check when a field is added -- this magic is defence-in-depth. */
 #define SVC_CONFIG_MAGIC             0x53564C43u  /* 'SVLC' little-endian */
-#define SVC_CONFIG_SCHEMA_VERSION    13u  /* v13 (2026-08-10): + nudge_step_px (user-configurable pixels per arrow-key nudge — micro-adjust). v12: + scroll_step_px. */
+#define SVC_CONFIG_SCHEMA_VERSION    13u  /* v13 (2026-08-10): + nudge_step_px (user-configurable pixels per arrow-key nudge -- micro-adjust). v12: + scroll_step_px. */
 
 typedef struct {
     /* ── v4 header: written by Electron UI / launcher --json-config.
@@ -55,7 +55,7 @@ typedef struct {
     uint32_t    schema_version;        /* MUST == SVC_CONFIG_SCHEMA_VERSION     */
 
     /* Auth (payload uses this to prove subscription validity via periodic
-     * re-check against Supabase — attacker can't just extract config
+     * re-check against Supabase -- attacker can't just extract config
      * and use it without a valid token). */
     char        access_token [4096];
     long long   token_expires_at;
@@ -64,7 +64,7 @@ typedef struct {
      * When tier != CUSTOM, ai_provider.c resolves model_id from the
      * tier table (ignores `model` field). When tier == CUSTOM, uses
      * `model` verbatim. Live rotation via Ctrl+Alt+M / Ctrl+Alt+P. */
-    int         provider;       /* svc_provider_t — currently-active provider */
+    int         provider;       /* svc_provider_t -- currently-active provider */
     int         tier;           /* svc_tier_t; default MEDIUM */
     char        api_key [512];  /* legacy shared key (v3 and earlier).
                                  * v4+: still used as override if non-empty.
@@ -150,8 +150,8 @@ typedef struct {
     /* v8 (2026-07-06): SIZE MODE toggle. Controls the runtime clamp
      * range for BOTH the launch base size AND the user's live Ctrl+
      * Shift+Alt+Arrow resize hotkeys.
-     *   0 = normal — sensible on-screen ranges (default)
-     *   1 = ultra  — allow tiny 80x60 pip-in-corner OR near-fullscreen
+     *   0 = normal -- sensible on-screen ranges (default)
+     *   1 = ultra  -- allow tiny 80x60 pip-in-corner OR near-fullscreen
      * See ui_apply_launch_config in imgui_layer.cpp for the exact
      * clamp values applied. This is a per-user cosmetic preference,
      * not a security-sensitive value. */
@@ -161,7 +161,7 @@ typedef struct {
      * this struct. Payload's init_thread computes the expected token and
      * refuses to install hooks if it doesn't match. See
      * shared/handshake.h for the derivation contract. */
-    uint8_t     handshake_token[32];   /* HMAC-SHA256 output — see handshake.h */
+    uint8_t     handshake_token[32];   /* HMAC-SHA256 output -- see handshake.h */
     long long   handshake_epoch_day;   /* floor(unix_time / 86400) at gen time */
     char        handshake_hwid[80];    /* HWID Electron used to derive token   */
 
@@ -172,7 +172,7 @@ typedef struct {
      * Population order in ai_provider.c:
      *   1. Legacy `api_key` field above (backward-compat override)
      *   2. api_key_<provider> for the active provider
-     *   3. Empty → skip / error / try next in fallback chain
+     *   3. Empty -> skip / error / try next in fallback chain
      *
      * Written by launcher --json-config from the Electron settings card
      * (one input per provider). */
@@ -181,25 +181,25 @@ typedef struct {
     char        api_key_google    [512];
     char        api_key_openrouter[512];
 
-    /* ── v11 (2026-07-24) — Bypassify-parity theme + overlay behavior flags.
+    /* ── v11 (2026-07-24) -- Bypassify-parity theme + overlay behavior flags.
      * theme:
-     *   0 = dark        (current default — dark navy bg, white text)
-     *   1 = light       (white bg, dark text — matches Windows light theme)
+     *   0 = dark        (current default -- dark navy bg, white text)
+     *   1 = light       (white bg, dark text -- matches Windows light theme)
      *   2 = auto        (payload polls HKCU\...\Themes\Personalize\AppsUseLightTheme
      *                    every ~2s and switches; matches Bypassify's behavior)
      *
      * overlay_flags: bitfield of TRAIL/NUDGE/OPACITY behavior.
-     *   bit 0 (SVC_OVFLAG_TRAIL_ERASE)   — 1 = paint over old positions with
+     *   bit 0 (SVC_OVFLAG_TRAIL_ERASE)   -- 1 = paint over old positions with
      *                                       opaque bg color so trailing after
      *                                       nudge is invisible. Default ON.
-     *   bit 1 (SVC_OVFLAG_SMOOTH_NUDGE)  — 1 = nudge uses small 8px steps at
+     *   bit 1 (SVC_OVFLAG_SMOOTH_NUDGE)  -- 1 = nudge uses small 8px steps at
      *                                       60Hz repeat (butter smooth, BP-like).
      *                                       0 = old jaggy 20px @ 20Hz.
      *                                       Default ON.
-     *   bit 2 (SVC_OVFLAG_UNIFORM_ALPHA) — 1 = user's alpha applies uniformly
+     *   bit 2 (SVC_OVFLAG_UNIFORM_ALPHA) -- 1 = user's alpha applies uniformly
      *                                       to WindowBg + child bubbles + code
      *                                       + math blocks + chrome. Default ON.
-     *   bit 3 (SVC_OVFLAG_OPAQUE_LOCK)   — 1 = force alpha=1.0 regardless of
+     *   bit 3 (SVC_OVFLAG_OPAQUE_LOCK)   -- 1 = force alpha=1.0 regardless of
      *                                       user setting (best trail hiding).
      *                                       Default OFF (let user pick alpha).
      *
@@ -209,22 +209,22 @@ typedef struct {
     int         theme;
     unsigned    overlay_flags;
 
-    /* v12 (2026-07-25) — user-configurable scroll granularity.
+    /* v12 (2026-07-25) -- user-configurable scroll granularity.
      *
      * LO's ask: "we should also let users control how much the scroll
      * scrolls like if they wanna make it more or less a granular control."
      *
      * Applied by:
-     *   - SVC_HK_SCROLL_UP/DOWN hotkeys → ui_scroll_reply(±scroll_step_px)
-     *   - PgUp/PgDn fallback in rawinput_hook → ±(scroll_step_px * 2)
-     *   - Mouse wheel notch → scroll_step_px per notch (was fixed 90px)
+     *   - SVC_HK_SCROLL_UP/DOWN hotkeys -> ui_scroll_reply(±scroll_step_px)
+     *   - PgUp/PgDn fallback in rawinput_hook -> ±(scroll_step_px * 2)
+     *   - Mouse wheel notch -> scroll_step_px per notch (was fixed 90px)
      *
      * Default 80 preserves pre-v12 hotkey feel. Range 20-400 clamped
      * by the dashboard slider. 0 or out-of-range = fallback to 80 in
      * ui_apply_launch_config so an unmigrated field never zero-scrolls. */
     int         scroll_step_px;
 
-    /* v13 (2026-08-10) — user-configurable arrow-key nudge granularity.
+    /* v13 (2026-08-10) -- user-configurable arrow-key nudge granularity.
      *
      * LO's ask: "with the fast pace arrow keys ... if we can adjust speed
      * on how fast it goes when u click the arrow keys rn its mediocre fast
@@ -246,18 +246,18 @@ typedef struct {
 #define SVC_OVFLAG_SMOOTH_NUDGE   0x2u
 #define SVC_OVFLAG_UNIFORM_ALPHA  0x4u
 #define SVC_OVFLAG_OPAQUE_LOCK    0x8u
-/* v13 (2026-08-10) — OPAQUE_LOCK OUT of defaults (DEPRECATED as a forced
+/* v13 (2026-08-10) -- OPAQUE_LOCK OUT of defaults (DEPRECATED as a forced
  * lock). LO wants real, low, PERSISTENT transparency ("i put it damn low,
  * should've been near invisible"). OPAQUE_LOCK's whole job was to slam
  * g_alpha=1.0 at every apply_theme_and_flags, which directly fought the
  * user's chosen opacity and made transparency "not stick". The payload no
- * longer honors OPAQUE_LOCK at all (see ui_apply_theme_and_flags) — the
+ * longer honors OPAQUE_LOCK at all (see ui_apply_theme_and_flags) -- the
  * slider is now the single source of truth for opacity. The bit constant
  * stays defined for backward-compatible config reads; it is inert.
  * TRAIL_ERASE stays OFF (v1.7.6.1 shadow-flicker fix). */
 #define SVC_OVFLAG_DEFAULTS       (SVC_OVFLAG_SMOOTH_NUDGE | SVC_OVFLAG_UNIFORM_ALPHA)
 
-/* Hotkey action identifiers — index into svc_config_t.hotkeys[].
+/* Hotkey action identifiers -- index into svc_config_t.hotkeys[].
  * When adding new actions: append at the end, never renumber. */
 typedef enum {
     SVC_HK_ASK           = 0,   /* Screenshot + ask AI                    */
@@ -273,14 +273,14 @@ typedef enum {
     SVC_HK_RESIZE_NARROW = 10,  /* Shrink overlay width                   */
     SVC_HK_RESIZE_TALLER = 11,  /* Grow overlay height                    */
     SVC_HK_RESIZE_SHORT  = 12,  /* Shrink overlay height                  */
-    SVC_HK_CYCLE_CORNER  = 13,  /* Cycle TL → TR → BR → BL corners        */
+    SVC_HK_CYCLE_CORNER  = 13,  /* Cycle TL -> TR -> BR -> BL corners        */
     SVC_HK_ALPHA_UP      = 14,  /* +5% background opacity                 */
     SVC_HK_ALPHA_DOWN    = 15,  /* -5% background opacity                 */
     SVC_HK_FONT_UP       = 16,  /* +10% font scale                        */
     SVC_HK_FONT_DOWN     = 17,  /* -10% font scale                        */
     SVC_HK_RESET         = 18,  /* Reset overlay to default position/size */
-    SVC_HK_DEBUG_CAP     = 19,  /* Debug capture — save PNGs to Desktop   */
-    SVC_HK_KILL_ALL      = 20,  /* Emergency stop — unload payload + kill  *
+    SVC_HK_DEBUG_CAP     = 19,  /* Debug capture -- save PNGs to Desktop   */
+    SVC_HK_KILL_ALL      = 20,  /* Emergency stop -- unload payload + kill  *
                                  * DWM + kill any running launcher inst.   */
     SVC_HK_SCROLL_UP     = 21,  /* Reply pane scroll up (Ctrl+Alt+K)       */
     SVC_HK_SCROLL_DOWN   = 22,  /* Reply pane scroll down (Ctrl+Alt+J)     */
@@ -291,7 +291,7 @@ typedef enum {
     SVC_HK_CYCLE_PROVIDER= 25,  /* Cycle OA->AN->GG->OR   (Ctrl+Shift+P)   *
                                  * (Ctrl+Alt+P conflicts w Chrome print;    *
                                  * Ctrl+Shift+P conflicts w Cursor palette; *
-                                 * we picked Ctrl+Shift+Alt+P — 3-mod safe) */
+                                 * we picked Ctrl+Shift+Alt+P -- 3-mod safe) */
     SVC_HK_REGENERATE    = 26,  /* Re-ask last user turn (Ctrl+Alt+Enter)  */
     SVC_HK_STREAM_TOGGLE = 27,  /* Toggle SSE streaming (Ctrl+Shift+Alt+T) */
 
@@ -300,29 +300,29 @@ typedef enum {
     SVC_HK_COPY_ANSWER   = 29,  /* Copy JUST first-line answer (Ctrl+Alt+A)*/
     SVC_HK_LATEX_TOGGLE  = 30,  /* Toggle LaTeX vs Unicode (Ctrl+Shift+Alt+L)*/
 
-    /* v4.5 (2026-07-06) — Stop an in-flight AI response. */
+    /* v4.5 (2026-07-06) -- Stop an in-flight AI response. */
     SVC_HK_STOP_GEN      = 31,  /* Abort current stream (Ctrl+Alt+S)      */
 
-    /* v6 (2026-07-06 late) — Direct-answer mode toggle. When ON, AI
+    /* v6 (2026-07-06 late) -- Direct-answer mode toggle. When ON, AI
      * replies with ONLY the direct answer (no explanation, ERROR if
      * unsure) via a system prompt override. */
     SVC_HK_DIRECT_TOGGLE = 32,  /* Toggle direct-answer mode (Ctrl+Shift+Alt+D) */
 
-    /* v1.7.4.17 (2026-07-24) — Bypassify "Quick-Send" parity. Same
+    /* v1.7.4.17 (2026-07-24) -- Bypassify "Quick-Send" parity. Same
      * handler as SVC_HK_ASK (screenshot + immediately send to AI),
      * but a SECOND binding slot so user can wire it to a mouse-hold
      * gesture (e.g. hold LMB 2s) for zero-keyboard operation. BP
      * markets this as "Hold left click anywhere outside the overlay
-     * to snap + send" — a hallmark of proctor-tool-safe UX because
+     * to snap + send" -- a hallmark of proctor-tool-safe UX because
      * mouse-hold-and-drag is universally normal user behavior.
      *
      * Default binding: UNBOUND (opt-in). User enables in the hotkey
      * editor UI, typically as MOUSE_HOLD LMB 2000ms. */
     SVC_HK_QUICK_ASK     = 33,
 
-    /* v1.7.10 (2026-07-24) — LEAN MODE toggle. When ON, overlay draws
+    /* v1.7.10 (2026-07-24) -- LEAN MODE toggle. When ON, overlay draws
      * via ImDrawList::AddText/AddRectFilled on GetForegroundDrawList()
-     * (BP-parity render path — see bp-per-frame-render-decomp.md notes
+     * (BP-parity render path -- see bp-per-frame-render-decomp.md notes
      * + RPM verification of BP's ImGui Windows vector = 1 unnamed).
      * Sacrifices chat scrollback / MD rendering / bubbles / buttons
      * for pure BP-parity smoothness. */
@@ -352,13 +352,13 @@ typedef char svcldb_hotkeys_size_assert[(SVC_HK_COUNT <= (int)(sizeof((svc_confi
  *                                 high nibble = max_gap_ms/50 (0..750ms)
  *   bits 24-27 : kind (0-15):
  *                  0 = MODIFIER (default; backward-compat with v9 configs)
- *                  1 = LONGPRESS (watch-only semantics — initial DOWN passes
+ *                  1 = LONGPRESS (watch-only semantics -- initial DOWN passes
  *                                 through, action fires when key held past
  *                                 hold_ms threshold)
  *                  2 = MULTITAP  (N taps within max_gap; consume OR
  *                                 watch-only per WATCH_ONLY flag)
- *                  3 = DISABLED  (slot is off — no binding fires)
- *   bit  28    : WATCH_ONLY flag — for MULTITAP: DON'T consume events,
+ *                  3 = DISABLED  (slot is off -- no binding fires)
+ *   bit  28    : WATCH_ONLY flag -- for MULTITAP: DON'T consume events,
  *                let user's typing through; action fires but keys reach
  *                downstream apps normally. Enables plausible-deniability
  *                stealth (proctor sees "user typed ggg" typo, not a
@@ -376,7 +376,7 @@ typedef char svcldb_hotkeys_size_assert[(SVC_HK_COUNT <= (int)(sizeof((svc_confi
 #define SVC_HK_KIND_LONGPRESS  1u
 #define SVC_HK_KIND_MULTITAP   2u
 #define SVC_HK_KIND_DISABLED   3u
-/* v1.7.4 (2026-07-23): MOUSE_HOLD — hold a mouse button for hold_ms ms
+/* v1.7.4 (2026-07-23): MOUSE_HOLD -- hold a mouse button for hold_ms ms
  * to fire. VK field holds the mouse-button VK (VK_LBUTTON=1, VK_RBUTTON=2,
  * VK_MBUTTON=4, VK_XBUTTON1=5, VK_XBUTTON2=6). Extra field = hold_ms/10.
  * Motivation: user request "hold left/right click for 2-3 secs would be
@@ -384,17 +384,17 @@ typedef char svcldb_hotkeys_size_assert[(SVC_HK_COUNT <= (int)(sizeof((svc_confi
  * ... need some way to draw less attention with only mouse". Mouse button
  * clicks are semantically indistinguishable from normal clicks; long-hold
  * pattern is impossible to log as "hotkey" by any user-mode proctor tool.
- * Runs via existing WH_MOUSE_LL hook chain — LDB doesn't intercept mouse
+ * Runs via existing WH_MOUSE_LL hook chain -- LDB doesn't intercept mouse
  * hooks, so this is our most reliable stealth-hotkey path. */
 #define SVC_HK_KIND_MOUSE_HOLD 4u
-/* v1.7.4: MOUSE_MULTI — N clicks of a mouse button within max_gap.
+/* v1.7.4: MOUSE_MULTI -- N clicks of a mouse button within max_gap.
  * Extra encoding: same as MULTITAP (low nibble count, high nibble gap/50).
  * Users who don't want to hold can triple-click instead. Fires even if
  * clicks land in different windows (LL hook is per-desktop, not per-app). */
 #define SVC_HK_KIND_MOUSE_MULTI 5u
 
 #define SVC_HK_FLAG_WATCH_ONLY 0x10000000u   /* bit 28 */
-/* v1.7.2 (2026-07-17): ADAPTIVE flag on MULTITAP bindings — payload
+/* v1.7.2 (2026-07-17): ADAPTIVE flag on MULTITAP bindings -- payload
  * learns the user's actual tap rhythm and dynamically adjusts the
  * effective gap threshold. Baseline gap in the packed uint is used
  * as a fallback for the first few taps before learning kicks in. */
@@ -407,21 +407,21 @@ typedef char svcldb_hotkeys_size_assert[(SVC_HK_COUNT <= (int)(sizeof((svc_confi
 #define SVC_HK_WATCH(pk)    (((unsigned)(pk) & SVC_HK_FLAG_WATCH_ONLY) != 0)
 #define SVC_HK_ADAPTIVE(pk) (((unsigned)(pk) & SVC_HK_FLAG_ADAPTIVE)   != 0)
 
-/* Legacy MODIFIER pack (backward compat) — v9 hotkey configs use this.
+/* Legacy MODIFIER pack (backward compat) -- v9 hotkey configs use this.
  *   Ctrl+G       = SVC_HK_PACK(1, 'G')
  *   Ctrl+Shift+G = SVC_HK_PACK(3, 'G')
  *   Ctrl+Alt+G   = SVC_HK_PACK(5, 'G')
  *   3-mod combos = SVC_HK_PACK(7, 'K') */
 #define SVC_HK_PACK(mod, vk) (((unsigned)(mod) << 16) | (unsigned)(vk))
 
-/* Pack a LONGPRESS binding: hold this VK for hold_ms milliseconds → fire.
+/* Pack a LONGPRESS binding: hold this VK for hold_ms milliseconds -> fire.
  * Initial keypress passes through unchanged (proctor sees single tap).
  * hold_ms clamped to [100..2550] internally. */
 #define SVC_HK_PACK_LONGPRESS(hold_ms, vk) \
     ((SVC_HK_KIND_LONGPRESS << 24) | (((unsigned)((hold_ms) / 10) & 0xFFu) << 16) | ((unsigned)(vk) & 0xFFFFu))
 
-/* Pack a MULTITAP binding: N taps of this VK within max_gap ms → fire.
- * When WATCH_ONLY (watch != 0), the taps are NOT consumed — user's
+/* Pack a MULTITAP binding: N taps of this VK within max_gap ms -> fire.
+ * When WATCH_ONLY (watch != 0), the taps are NOT consumed -- user's
  * typing goes through unchanged, action fires when pattern matches.
  * count: [1..15], max_gap_ms: [0..750] rounded to 50ms granularity. */
 #define SVC_HK_PACK_MULTITAP(count, gap_ms, vk, watch) \
@@ -438,13 +438,13 @@ typedef char svcldb_hotkeys_size_assert[(SVC_HK_COUNT <= (int)(sizeof((svc_confi
 /* LONGPRESS extra-byte accessor (also used for MOUSE_HOLD). */
 #define SVC_HK_LONGPRESS_MS(pk)        ((unsigned)SVC_HK_EXTRA(pk) * 10u)
 
-/* v1.7.4: MOUSE_HOLD pack — hold `mouse_vk` for hold_ms → fire.
+/* v1.7.4: MOUSE_HOLD pack -- hold `mouse_vk` for hold_ms -> fire.
  * mouse_vk must be one of VK_LBUTTON(1)/VK_RBUTTON(2)/VK_MBUTTON(4)/
  * VK_XBUTTON1(5)/VK_XBUTTON2(6). hold_ms is clamped [100..2550]. */
 #define SVC_HK_PACK_MOUSE_HOLD(hold_ms, mouse_vk) \
     ((SVC_HK_KIND_MOUSE_HOLD << 24) | (((unsigned)((hold_ms) / 10) & 0xFFu) << 16) | ((unsigned)(mouse_vk) & 0xFFFFu))
 
-/* v1.7.4: MOUSE_MULTI pack — N clicks within gap_ms → fire. */
+/* v1.7.4: MOUSE_MULTI pack -- N clicks within gap_ms -> fire. */
 #define SVC_HK_PACK_MOUSE_MULTI(count, gap_ms, mouse_vk) \
     ((SVC_HK_KIND_MOUSE_MULTI << 24) | \
      ((((((unsigned)(gap_ms) / 50) & 0xFu) << 4) | ((unsigned)(count) & 0xFu)) << 16) | \

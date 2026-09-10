@@ -30,6 +30,17 @@ const JITTER_PCT               = 0.20;              // ±20 % randomness
 const TOKEN_REFRESH_BUFFER_S   = 15 * 60;           // refresh if <15 min left
 const MAX_CONSECUTIVE_FAILURES = 3;                 // 3 fails before lockout
 
+// v1.9.2 (2026-09-09) — Bug 2 fix. Supabase JWTs live ~1 hour. The old
+// scheduler polled on the BASE_INTERVAL (~1h ± 20%), so the refresh tick
+// routinely landed AT or AFTER the token had already expired (jitter could
+// push it to ~72 min). By then the payload's sub_check had 401'd on the
+// stale token and self-unloaded → "session died at ~1 hour". We now cap the
+// next wakeup to (exp − REFRESH_WAKE_LEAD_S) so a refresh ALWAYS runs while
+// the token is still valid, then pushes the fresh JWT into the payload.
+// 12 min < TOKEN_REFRESH_BUFFER_S (15 min), so at wake `exp - now` is inside
+// the buffer and the refresh branch fires, with the token still live.
+const REFRESH_WAKE_LEAD_S      = 12 * 60;
+
 let timerId             = null;
 let consecutiveFailures = 0;
 let stopped             = true;
@@ -38,6 +49,26 @@ let stopped             = true;
 function nextIntervalMs() {
   const jitter = 1 + ((Math.random() * 2 - 1) * JITTER_PCT);
   return Math.floor(BASE_INTERVAL_MS * jitter);
+}
+
+/**
+ * v1.9.2: choose the next wakeup. Normally the jittered ~1h subscription
+ * poll, but NEVER later than REFRESH_WAKE_LEAD_S before the current token's
+ * expiry — so we always refresh + push a fresh JWT to the payload before it
+ * goes stale. Floors at 30s so a near/just-expired token can't busy-spin.
+ */
+function nextDelayMs(getSession) {
+  let ms = nextIntervalMs();
+  try {
+    const s = getSession && getSession();
+    if (s && s.expires_at && s.refresh_token) {
+      const now = Math.floor(Date.now() / 1000);
+      const untilRefreshMs = (s.expires_at - REFRESH_WAKE_LEAD_S - now) * 1000;
+      if (untilRefreshMs < ms) ms = untilRefreshMs;
+    }
+  } catch { /* fall back to jittered base */ }
+  if (ms < 30_000) ms = 30_000;
+  return ms;
 }
 
 /**
@@ -170,14 +201,17 @@ function start(deps) {
       }
     } finally {
       if (!stopped) {
-        // Schedule next tick with fresh jitter.
-        timerId = setTimeout(() => tick(false), nextIntervalMs());
+        // v1.9.2: schedule next tick — jittered ~1h base, but capped so we
+        // always wake to refresh the JWT before it expires (see nextDelayMs).
+        const delay = nextDelayMs(getSession);
+        console.log(`[revalidation] next tick in ${Math.round(delay / 1000)}s`);
+        timerId = setTimeout(() => tick(false), delay);
       }
     }
   };
 
   // First tick 30s after start (not immediate — let the app settle after
-  // signin/inject). Then every jittered interval.
+  // signin/inject). Then capped-jittered intervals (nextDelayMs).
   timerId = setTimeout(() => tick(true), 30_000);
 }
 
@@ -196,5 +230,7 @@ function isRunning() {
 
 module.exports = {
   start, stop, isRunning,
+  nextDelayMs,   // v1.9.2: exported for timing tests
   BASE_INTERVAL_MS, TOKEN_REFRESH_BUFFER_S, MAX_CONSECUTIVE_FAILURES, JITTER_PCT,
+  REFRESH_WAKE_LEAD_S,
 };

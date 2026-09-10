@@ -74,9 +74,9 @@ const svc_config_t *cfg_get(void) {
     return g_loaded == 2 ? &g_cfg : NULL;
 }
 
-/* v14 (2026-08-24) — Update ONLY the access_token field in the cached
+/* v14 (2026-08-24) -- Update ONLY the access_token field in the cached
  * config. Called by token_refresh_server.c's pipe handler when Electron
- * pushes a refreshed Supabase JWT. All other fields untouched — this
+ * pushes a refreshed Supabase JWT. All other fields untouched -- this
  * is intentionally scoped to the token so we don't stomp mid-session
  * user mutations to `tier`, `provider`, etc. (see on_hotkey's mutable
  * cast pattern in dllmain.c).
@@ -107,6 +107,26 @@ int cfg_update_access_token(const char *new_token, size_t new_len) {
     }
     LeaveCriticalSection(&g_cs);
     return 1;
+}
+
+/* v2.0.1 (2026-09-10) -- see header comment. Symmetric with
+ * cfg_update_access_token -- reads under the same CS so a concurrent
+ * update can't hand us a torn JWT. */
+size_t cfg_copy_access_token(char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return 0;
+    ensure_cs();
+    EnterCriticalSection(&g_cs);
+    size_t r = 0;
+    if (g_loaded == 2) {
+        size_t need = strnlen(g_cfg.access_token, sizeof(g_cfg.access_token));
+        if (need > 0 && need + 1 <= out_sz) {
+            memcpy(out, g_cfg.access_token, need);
+            out[need] = 0;
+            r = need;
+        }
+    }
+    LeaveCriticalSection(&g_cs);
+    return r;
 }
 
 void cfg_cleanup(void) {

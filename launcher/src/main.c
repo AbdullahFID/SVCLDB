@@ -1,11 +1,11 @@
 /* ================================================================== *
- * main.c — Launcher entry point.                                     *
+ * main.c -- Launcher entry point.                                     *
  *                                                                    *
  * Flow:                                                              *
  *   1. Elevation check + SeDebugPrivilege                            *
  *   2. OAuth login (or reload valid session)                         *
  *   3. Subscription check                                            *
- *   4. Settings UI (config editor — placeholder for MVP)             *
+ *   4. Settings UI (config editor -- placeholder for MVP)             *
  *   5. On "Arm":                                                     *
  *        - Write encrypted config file                               *
  *        - Run resolver to produce offsets.blob                      *
@@ -64,7 +64,7 @@ static PFN_OpenProcessML g_pOpenProcessML = NULL;
  * verify_svchelper_parent() reads the InheritedFromUniqueProcessId
  * field of our own PROCESS_BASIC_INFORMATION via NtQueryInformationProcess,
  * opens the parent with PROCESS_QUERY_LIMITED_INFORMATION (least
- * privilege — works even if parent is high-integrity), reads the
+ * privilege -- works even if parent is high-integrity), reads the
  * parent's full image path via QueryFullProcessImageNameW, and verifies
  * the basename is svchelper.exe.
  *
@@ -72,15 +72,15 @@ static PFN_OpenProcessML g_pOpenProcessML = NULL;
  *   - Parent PID CAN be spoofed via PROC_THREAD_ATTRIBUTE_PARENT_PROCESS
  *     by an attacker with SeAssignPrimaryTokenPrivilege (typically
  *     admin). Combining with SVC_STR_DIR path-prefix check makes this
- *     harder — attacker needs their spoofed parent to sit in our
+ *     harder -- attacker needs their spoofed parent to sit in our
  *     install directory too. Still not cryptographic.
  *   - For a real cryptographic bind (attacker-with-admin threat model),
  *     add an HMAC launch-token via registry + env var. Deferred to a
- *     future revision — parent-check + install-path-check covers the
+ *     future revision -- parent-check + install-path-check covers the
  *     casual-lift attack we care about today.
  *
  * Returns 1 if parent is svchelper.exe from our install dir, 0 otherwise.
- * On probe failure (dbghelp missing / OpenProcess denied), returns 0 —
+ * On probe failure (dbghelp missing / OpenProcess denied), returns 0 --
  * fail closed. */
 typedef LONG (NTAPI *pfnNtQueryInformationProcess)(
     HANDLE ProcessHandle, ULONG ProcessInformationClass,
@@ -196,7 +196,7 @@ static int stamp_handshake_and_magic(svc_config_t *cfg,
     memset(cfg->handshake_token, 0, sizeof(cfg->handshake_token));
     if (!access_token || !access_token[0] || !hwid || !hwid[0]) {
         slog_writef("launcher.log",
-                    "handshake stamp: skipped — missing access_token or hwid "
+                    "handshake stamp: skipped -- missing access_token or hwid "
                     "(len at=%zu hwid=%zu)",
                     access_token ? strlen(access_token) : 0,
                     hwid ? strlen(hwid) : 0);
@@ -292,14 +292,14 @@ static int assemble_config_from_json(const char *json,
     cfg->handshake_epoch_day = (long long)n;
     if (json_get_num(json, "token_expires_at", &n)) cfg->token_expires_at = (long long)n;
 
-    /* v5 per-provider keys — populated by Electron from the 4-input
+    /* v5 per-provider keys -- populated by Electron from the 4-input
      * settings card. At least ONE must be non-empty; the legacy
      * cfg->api_key (single-key backward compat) is optional. */
     json_get_str(json, "api_key_openai",     cfg->api_key_openai,     sizeof(cfg->api_key_openai));
     json_get_str(json, "api_key_anthropic",  cfg->api_key_anthropic,  sizeof(cfg->api_key_anthropic));
     json_get_str(json, "api_key_google",     cfg->api_key_google,     sizeof(cfg->api_key_google));
     json_get_str(json, "api_key_openrouter", cfg->api_key_openrouter, sizeof(cfg->api_key_openrouter));
-    /* Legacy shared field — if UI sends it, prefer it. Otherwise fall
+    /* Legacy shared field -- if UI sends it, prefer it. Otherwise fall
      * through to per-provider keys inside ai_provider.c. */
     json_get_str(json, "api_key", cfg->api_key, sizeof(cfg->api_key));
 
@@ -308,12 +308,12 @@ static int assemble_config_from_json(const char *json,
         /* No BYO key is OK: the payload routes solves through the metered
          * CloakGPT-credits worker (svcldb-solve) using cfg->access_token
          * (validated present above). Only reject if there is ALSO no
-         * session token — then there is neither a credits path nor a key. */
+         * session token -- then there is neither a credits path nor a key. */
         if (!cfg->access_token[0]) {
             _snprintf(err, err_sz - 1, "no api key and no session token");
             return 0;
         }
-        /* else: credits mode — allow injection with no BYO key. */
+        /* else: credits mode -- allow injection with no BYO key. */
     }
     if (json_get_num(json, "provider", &n)) cfg->provider = (int)n;
     if (json_get_num(json, "tier",     &n)) cfg->tier     = (int)n;
@@ -334,7 +334,7 @@ static int assemble_config_from_json(const char *json,
      *   - anything else    -> user's text verbatim (power user override) */
     json_get_str(json, "system_prompt", cfg->system_prompt, sizeof(cfg->system_prompt));
 
-    /* overlay geometry (all optional — sensible defaults for missing fields) */
+    /* overlay geometry (all optional -- sensible defaults for missing fields) */
     if (json_get_num(json, "overlay_x",     &n)) cfg->overlay_x = (int)n; else cfg->overlay_x = 40;
     if (json_get_num(json, "overlay_y",     &n)) cfg->overlay_y = (int)n; else cfg->overlay_y = 40;
     if (json_get_num(json, "overlay_w",     &n)) cfg->overlay_w = (int)n; else cfg->overlay_w = 560;
@@ -347,20 +347,20 @@ static int assemble_config_from_json(const char *json,
     if (json_get_num(json, "theme",         &n)) cfg->theme = (int)n; else cfg->theme = 2;
     /* v11: overlay behavior flags. Default: TRAIL_ERASE + SMOOTH_NUDGE + UNIFORM_ALPHA on. */
     if (json_get_num(json, "overlay_flags", &n)) cfg->overlay_flags = (unsigned)n; else cfg->overlay_flags = SVC_OVFLAG_DEFAULTS;
-    /* v12 (2026-07-25): scroll_step_px — user-configurable pixels per scroll
+    /* v12 (2026-07-25): scroll_step_px -- user-configurable pixels per scroll
      * hotkey / mouse wheel notch. Default 80 mirrors pre-v12 hardcoded value. */
     if (json_get_num(json, "scroll_step_px", &n)) cfg->scroll_step_px = (int)n; else cfg->scroll_step_px = 80;
     if (cfg->scroll_step_px < 20 || cfg->scroll_step_px > 400) cfg->scroll_step_px = 80;
-    /* v13 (2026-08-10): nudge_step_px — user-configurable pixels per arrow-key
+    /* v13 (2026-08-10): nudge_step_px -- user-configurable pixels per arrow-key
      * nudge (micro-adjust). Default 48 mirrors the pre-v13 hardcoded value. */
     if (json_get_num(json, "nudge_step_px", &n)) cfg->nudge_step_px = (int)n; else cfg->nudge_step_px = 48;
     if (cfg->nudge_step_px < 1 || cfg->nudge_step_px > 200) cfg->nudge_step_px = 48;
 
-    /* Hotkeys: CSV of packed uints. Missing / short → zeroed slots.
+    /* Hotkeys: CSV of packed uints. Missing / short -> zeroed slots.
      *
      * v9 (2026-07-06): loop now iterates the FULL array capacity
      * (previously hardcoded 32, cutting off SVC_HK_DIRECT_TOGGLE = 32
-     * and any future slots — see the OOB bug notes in config_types.h).
+     * and any future slots -- see the OOB bug notes in config_types.h).
      * Using the sizeof-derived cap keeps this in sync with any future
      * array-size bumps automatically. */
     const int hk_cap = (int)(sizeof(cfg->hotkeys) / sizeof(cfg->hotkeys[0]));
@@ -376,7 +376,7 @@ static int assemble_config_from_json(const char *json,
         }
     }
 
-    /* Header + handshake sanity — MUST verify against the token we
+    /* Header + handshake sanity -- MUST verify against the token we
      * just decoded before we hand this to config_write. */
     cfg->magic          = SVC_CONFIG_MAGIC;
     cfg->schema_version = SVC_CONFIG_SCHEMA_VERSION;
@@ -404,7 +404,7 @@ static int detect_provider_from_key(const char *api_key) {
 }
 
 /* ── MVP settings flow: prompt via MessageBox / simple InputBox ─── *
- * Replaced by native ImGui settings in v2 — for now, use environment
+ * Replaced by native ImGui settings in v2 -- for now, use environment
  * variables + default config so we can prove the pipeline works.
  * User exports SVCLDB_API_KEY + SVCLDB_PROVIDER before running.
  */
@@ -413,7 +413,7 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
     strncpy(cfg->access_token, sess->access_token, sizeof(cfg->access_token) - 1);
     cfg->token_expires_at = sess->expires_at;
 
-    /* Provider select — env var wins if set. */
+    /* Provider select -- env var wins if set. */
     char provider[32] = {0};
     GetEnvironmentVariableA("SVCLDB_PROVIDER", provider, sizeof(provider));
 
@@ -437,7 +437,7 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
 
     /* Leave system_prompt empty (or literally "DEFAULT") so ai_ask()
      * uses the built-in SVCLDB_DEFAULT_SYSTEM_PROMPT in
-     * payload/src/ai/ai_provider.c — ~10 KB of subject-matter rules
+     * payload/src/ai/ai_provider.c -- ~10 KB of subject-matter rules
      * ported from hooksdll/lumio/src/autosolver.js (math/physics/chem/
      * bio/eng/CS/nursing/humanities/business + verify loop + common
      * pitfalls + response humanization).
@@ -446,7 +446,7 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
      * if they want to override. */
     cfg->system_prompt[0] = 0;
 
-    /* Hotkey defaults — chosen to survive LL-hook interception by other apps.
+    /* Hotkey defaults -- chosen to survive LL-hook interception by other apps.
      * Empirically 2026-07-05: Ctrl+G / Ctrl+Shift+G / Ctrl+P are consumed by
      * Cursor IDE's LL keyboard hook (Find/CommandPalette). Ctrl+Alt+* combos
      * are almost never intercepted since no common app uses them by default.
@@ -459,7 +459,7 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
     #define MOD_CA   (SVC_HK_MOD_CTRL | SVC_HK_MOD_ALT)
     #define MOD_CSA  (SVC_HK_MOD_CTRL | SVC_HK_MOD_SHIFT | SVC_HK_MOD_ALT)
     memset(cfg->hotkeys, 0, sizeof(cfg->hotkeys));
-    /* v1.7.5.1 (2026-07-24) — Bypassify-1:1 PARITY defaults in the launcher
+    /* v1.7.5.1 (2026-07-24) -- Bypassify-1:1 PARITY defaults in the launcher
      * fallback path (mirror of ui/src/injector/injector.js DEFAULT_HOTKEYS).
      * The launcher's env-var --quiet fallback used to install the old
      * multitap-triple-tap map for every slot; that made "Ctrl+Left nudge"
@@ -471,7 +471,7 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
     cfg->hotkeys[SVC_HK_ASK]           = SVC_HK_PACK(MOD_C,   'U');       /*  0 Ctrl+U   Take Screenshot     */
     cfg->hotkeys[SVC_HK_TOGGLE]        = SVC_HK_PACK(MOD_C,   'B');       /*  1 Ctrl+B   Hide/Show Overlay   */
     cfg->hotkeys[SVC_HK_TYPING]        = SVC_HK_PACK(MOD_C,   'T');       /*  2 Ctrl+T   Text Input Mode     */
-    cfg->hotkeys[SVC_HK_COPY_REPLY]    = SVC_HK_PACK(MOD_C,   'C');       /*  3 Ctrl+C   (LO ask 2026-07-25 — user prefers Ctrl+C binding; clipboard-write bug is separate) */
+    cfg->hotkeys[SVC_HK_COPY_REPLY]    = SVC_HK_PACK(MOD_C,   'C');       /*  3 Ctrl+C   (LO ask 2026-07-25 -- user prefers Ctrl+C binding; clipboard-write bug is separate) */
     cfg->hotkeys[SVC_HK_CLEAR]         = SVC_HK_PACK(MOD_C,   'Q');       /*  4 Ctrl+Q   Quit                */
     cfg->hotkeys[SVC_HK_MOVE_LEFT]     = SVC_HK_PACK(MOD_C,   0x25);      /*  5 Ctrl+Left                    */
     cfg->hotkeys[SVC_HK_MOVE_RIGHT]    = SVC_HK_PACK(MOD_C,   0x27);      /*  6 Ctrl+Right                   */
@@ -501,24 +501,24 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
     cfg->hotkeys[SVC_HK_LATEX_TOGGLE]  = SVC_HK_PACK(MOD_CS,  'L');       /* 30 Ctrl+Shift+L                 */
     cfg->hotkeys[SVC_HK_STOP_GEN]      = SVC_HK_PACK(MOD_CS,  'S');       /* 31 Ctrl+Shift+S  Settings       */
     cfg->hotkeys[SVC_HK_DIRECT_TOGGLE] = SVC_HK_PACK(MOD_CS,  'D');       /* 32 Ctrl+Shift+D                 */
-    /* 33 SVC_HK_QUICK_ASK left UNBOUND — user opt-in via editor as
+    /* 33 SVC_HK_QUICK_ASK left UNBOUND -- user opt-in via editor as
      * MOUSE_HOLD LMB 2000ms for Bypassify-parity Quick-Send UX. */
     cfg->hotkeys[SVC_HK_LEAN_TOGGLE]   = SVC_HK_PACK(MOD_CSA, 'M');       /* 34 Ctrl+Shift+Alt+M  Lean mode  */
 
     cfg->overlay_x = 40; cfg->overlay_y = 40;
     cfg->overlay_w = 560; cfg->overlay_h = 420;
-    cfg->overlay_alpha = 1.00f;   /* v11: OPAQUE default — Bypassify-parity, zero trailing */
+    cfg->overlay_alpha = 1.00f;   /* v11: OPAQUE default -- Bypassify-parity, zero trailing */
     cfg->size_mode = 0;   /* v8: normal size clamps by default */
-    cfg->theme = 2;                            /* v11: AUTO — follow Windows theme */
+    cfg->theme = 2;                            /* v11: AUTO -- follow Windows theme */
     cfg->overlay_flags = SVC_OVFLAG_DEFAULTS;  /* v11: smooth-nudge + uniform-alpha ON (v13: OPAQUE_LOCK dropped) */
     cfg->scroll_step_px = 80;                  /* v12: default scroll granularity */
     cfg->nudge_step_px = 48;                   /* v13: default arrow-key nudge step */
 
     /* Defaults for the AI-config fields.
-     *   tier=MEDIUM — balanced default; user rotates live via Ctrl+Alt+M
-     *   reasoning_effort=high — best answers at cost of ~2x tokens
-     *   streaming_enabled=1 — live-typing feel
-     *   latex_disabled=0 — LaTeX ON by default (readable + copyable) */
+     *   tier=MEDIUM -- balanced default; user rotates live via Ctrl+Alt+M
+     *   reasoning_effort=high -- best answers at cost of ~2x tokens
+     *   streaming_enabled=1 -- live-typing feel
+     *   latex_disabled=0 -- LaTeX ON by default (readable + copyable) */
     if (cfg->tier == 0 && cfg->model[0] == 0) {
         cfg->tier = 1;   /* SVC_TIER_MEDIUM */
     }
@@ -595,7 +595,7 @@ int main(int argc, char *argv[]) {
     int status_mode = 0;     /* read-only "is payload injected?" probe */
     const char *json_config_path = NULL;
 #if SVCLDB_DEV_BYPASS_AUTH
-    /* v1.7.4.10 (2026-07-24): --custom-dll <path> — dev-only. Manual-
+    /* v1.7.4.10 (2026-07-24): --custom-dll <path> -- dev-only. Manual-
      * maps an ARBITRARY DLL from disk into dwm.exe using our existing
      * inject path. For RE observation of third-party payloads
      * (e.g. Bypassify's dumper.dll) without going through their
@@ -618,7 +618,7 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--status") == 0) {
             /* Read-only injected-state probe for the Electron status poll.
              * Handled EARLY (below), before the elevation gate and before
-             * any arm path — pure OpenEvent, zero side effects. */
+             * any arm path -- pure OpenEvent, zero side effects. */
             status_mode = 1;
             quiet_mode = 1;
 #if SVCLDB_DEV_BYPASS_AUTH
@@ -632,8 +632,8 @@ int main(int argc, char *argv[]) {
                    strcmp(argv[i], "-r") == 0) {
             /* Fast re-injection using the existing config.dat + offsets.blob.
              * Skips OAuth, subscription check, api_key.txt, resolver, config
-             * regen. Just: verify config.dat exists → inject payload from
-             * embedded resource → done. Used after --kill-all or DWM crash
+             * regen. Just: verify config.dat exists -> inject payload from
+             * embedded resource -> done. Used after --kill-all or DWM crash
              * when the user wants to arm again without going through the
              * full 3-minute cold-start. */
             reinject_mode = 1;
@@ -670,7 +670,7 @@ int main(int argc, char *argv[]) {
      * Exit 0 == loaded, 3 == not loaded. Handled here, BEFORE the elevation
      * gate, the production launch-lockdown gate, and every arm path, so a
      * status poll can NEVER trigger OAuth / subscription-check / inject and
-     * needs no elevation — it is a pure OpenEvent(SYNCHRONIZE). This is the
+     * needs no elevation -- it is a pure OpenEvent(SYNCHRONIZE). This is the
      * robust, PowerShell-free probe the Electron injector prefers; see
      * ui/src/injector/injector.js probePayload(). */
     if (status_mode) {
@@ -690,37 +690,37 @@ int main(int argc, char *argv[]) {
     }
 
 #if !SVCLDB_DEV_BYPASS_AUTH
-    /* ── v1.6.5 (2026-07-17) LAUNCH LOCKDOWN — production only ──
+    /* ── v1.6.5 (2026-07-17) LAUNCH LOCKDOWN -- production only ──
      *
      * sihost.exe is an internal helper spawned by svchelper.exe. Any
      * direct-launch attempt (attacker with admin drops crafted args)
      * gets rejected here. Only exceptions: --unload / --kill / --kill-all
-     * (destructive-only, safe to allow from anywhere — worst case an
+     * (destructive-only, safe to allow from anywhere -- worst case an
      * attacker disables their own overlay).
      *
      * Two-layer gate:
      *   1. Legacy CLI-arm modes (--quiet or bare no-args) are DEAD in
      *      production. They existed as pre-Electron dev iteration paths;
      *      Electron's --json-config supersedes them. Attacker who drops
-     *      api_key.txt + runs `sihost.exe` no longer arms — hard exit.
+     *      api_key.txt + runs `sihost.exe` no longer arms -- hard exit.
      *
      *   2. --json-config and --reinject (the two Electron-driven arm
      *      paths) require our parent process to be svchelper.exe from
      *      the install directory. Blocks attacker from crafting their
      *      own JSON handoff and spawning sihost with it.
      *
-     * Dev-bypass build (SVCLDB_DEV_AUTH=1) skips BOTH — iterating via
+     * Dev-bypass build (SVCLDB_DEV_AUTH=1) skips BOTH -- iterating via
      * `sihost --quiet` or `sihost --reinject` works as always. */
     if (quiet_mode && !unload_mode && !kill_mode && !kill_all_mode &&
         !reinject_mode && !json_config_mode && !ocr_daemon_mode) {
-        /* Encrypted log line only — no user-facing hint about internal
+        /* Encrypted log line only -- no user-facing hint about internal
          * layout, no plaintext MessageBox that ships strings to
          * attackers. Silent non-zero exit. */
         slog_writef("launcher.log", "REJECT: unsupported CLI mode");
         ExitProcess(22);
     }
     if (argc == 1) {
-        /* Bare `sihost.exe` with no args — same silent reject. */
+        /* Bare `sihost.exe` with no args -- same silent reject. */
         slog_writef("launcher.log", "REJECT: bare launch");
         ExitProcess(22);
     }
@@ -728,9 +728,9 @@ int main(int argc, char *argv[]) {
         char verify_err[512] = {0};
         if (!verify_svchelper_parent(verify_err, sizeof(verify_err))) {
             slog_writef("launcher.log",
-                        "REJECT: parent-verify failed (%s) — not spawned by "
+                        "REJECT: parent-verify failed (%s) -- not spawned by "
                         "svchelper.exe", verify_err);
-            /* Silent exit — don't tip off attacker with a MessageBox. */
+            /* Silent exit -- don't tip off attacker with a MessageBox. */
             ExitProcess(23);
         }
     }
@@ -738,7 +738,7 @@ int main(int argc, char *argv[]) {
 
     /* ── --unload: cooperative unload ── *
      * Signal the named event; payload's shutdown_watcher wakes,
-     * calls hooks_uninstall() → sleeps 200ms → MinHook down.
+     * calls hooks_uninstall() -> sleeps 200ms -> MinHook down.
      * We wait ~500ms then exit so the caller sees a synchronous "done".
      * If the payload is NOT loaded, signal fails silently and we exit 0. */
     if (unload_mode) {
@@ -749,7 +749,7 @@ int main(int argc, char *argv[]) {
              * MinHook disable + safety margin. */
             Sleep(500);
 
-            /* CLEAN-SHUTDOWN SENTINEL — write a marker file so the NEXT
+            /* CLEAN-SHUTDOWN SENTINEL -- write a marker file so the NEXT
              * launch knows the prior session shut down cleanly. Absence
              * on next launch = prior session was killed (crash, taskmgr,
              * force-close). Support can grep launcher.log for
@@ -765,7 +765,7 @@ int main(int argc, char *argv[]) {
 
             /* Verify: if the payload actually unloaded, dwm.exe should
              * no longer have dwmapiext.dll loaded. Not fatal if still
-             * loaded (some AV/perf plugins can slow FreeLibrary) — just
+             * loaded (some AV/perf plugins can slow FreeLibrary) -- just
              * a diagnostic. */
             if (inject_is_loaded()) {
                 slog_writef("launcher.log", "--unload: payload still loaded after 500ms");
@@ -801,7 +801,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* ── --kill-all: emergency stop ── *
-     * The nuclear "stop everything" option — user-triggered via
+     * The nuclear "stop everything" option -- user-triggered via
      * Ctrl+Shift+Alt+K hotkey (payload spawns launcher --kill-all) OR
      * via CLI directly. Sequence:
      *   1. Signal cooperative unload (payload has ~200ms to drain).
@@ -820,7 +820,7 @@ int main(int argc, char *argv[]) {
         Sleep(300);
 
         /* 2. Force-kill DWM UNCONDITIONALLY. User invoked emergency stop
-         * because they want EVERYTHING clean — even if cooperative unload
+         * because they want EVERYTHING clean -- even if cooperative unload
          * succeeded, we nuke DWM to guarantee no stale hook/state/texture
          * lingers into next session. Windows respawns dwm.exe in ~2s. */
         unsigned long dwmpid = inject_find_dwm_pid();
@@ -845,7 +845,7 @@ int main(int argc, char *argv[]) {
                 do {
                     if (pe.th32ProcessID == self_pid) continue;
                     if (_stricmp(pe.szExeFile, "sihost.exe") != 0) continue;
-                    /* Filter to OUR sihost.exe only — check the .exe path
+                    /* Filter to OUR sihost.exe only -- check the .exe path
                      * starts with SVC_INSTALL_DIR. Prevents killing the
                      * legitimate Windows sihost.exe in System32 (which
                      * would break shell integration + push notifications). */
@@ -870,10 +870,10 @@ int main(int argc, char *argv[]) {
             slog_writef("launcher.log", "--kill-all: sibling sihost swept, killed=%d", killed);
         }
 
-        /* 4. Force sentinel to DIRTY — user invoked emergency kill, this
+        /* 4. Force sentinel to DIRTY -- user invoked emergency kill, this
          * was NOT a clean shutdown. Also write .dwm_user_panic so
          * Electron's respawn watchdog knows this was user-intended and
-         * disarms instead of auto-reinjecting. Bug fix 2026-08-24 —
+         * disarms instead of auto-reinjecting. Bug fix 2026-08-24 --
          * without the panic sentinel the watchdog re-injected within 5s
          * of a panic press, silently defeating the whole point of the
          * emergency stop button. Both files are checked in
@@ -905,7 +905,7 @@ int main(int argc, char *argv[]) {
     /* ── --custom-dll: RE observation path (dev-only) ── *
      * Manual-map an arbitrary DLL from disk into dwm.exe using our
      * existing inject infrastructure. No handshake, no config, no
-     * resolver — just read bytes + inject. For observing third-party
+     * resolver -- just read bytes + inject. For observing third-party
      * payloads' runtime behavior. */
     if (custom_dll_mode) {
         slog_writef("launcher.log", "--custom-dll: %s", custom_dll_path);
@@ -923,7 +923,7 @@ int main(int argc, char *argv[]) {
     /* ── --json-config: Electron UI handoff ── *
      * Electron already authenticated the user + verified subscription +
      * gathered API key + computed the handshake token. It wrote a temp
-     * JSON to the path we received. We: (1) parse JSON → svc_config_t,
+     * JSON to the path we received. We: (1) parse JSON -> svc_config_t,
      * (2) verify handshake, (3) write encrypted config.dat, (4) run
      * resolver, (5) inject payload from embedded resource, (6) delete
      * the temp JSON so the plaintext secrets don't linger on disk. */
@@ -940,7 +940,7 @@ int main(int argc, char *argv[]) {
         char perr[256] = {0};
         int ok = assemble_config_from_json(json_body, &cfg, perr, sizeof(perr));
         /* Zeroise + delete the plaintext JSON as soon as we've parsed it.
-         * Even on failure — never leak the access_token on disk. */
+         * Even on failure -- never leak the access_token on disk. */
         svc_secure_zero(json_body, json_sz);
         free(json_body);
         DeleteFileA(json_config_path);
@@ -954,10 +954,10 @@ int main(int argc, char *argv[]) {
             slog_writef("launcher.log", "--json-config: config_write failed");
             ExitProcess(12);
         }
-        /* Wipe from stack — cfg.access_token + api_key are highly sensitive. */
+        /* Wipe from stack -- cfg.access_token + api_key are highly sensitive. */
         svc_secure_zero(&cfg, sizeof(cfg));
 
-        /* Resolver — best effort (payload has sig-scan fallback). */
+        /* Resolver -- best effort (payload has sig-scan fallback). */
         char rerr[512] = {0};
         if (!run_resolver(rerr, sizeof(rerr))) {
             slog_writef("launcher.log", "--json-config: resolver warn: %s", rerr);
@@ -981,6 +981,24 @@ int main(int argc, char *argv[]) {
             slog_writef("launcher.log", "--json-config: inject FAILED (%s)", ierr);
             ExitProcess(13);
         }
+        /* v1.9.2 (2026-09-09) -- Bug 3/4: wait for the payload to PUBLISH its
+         * Global\...ShutdownRelease event before reporting success. The DLL is
+         * mapped + its init thread spawned by now, but init_thread creates the
+         * event LATE (after offsets load + hooks_install + PE wipe + section
+         * downgrade). If we exit 0 in that gap, Electron's status probe reads
+         * "not loaded" -> dashboard falsely shows "Payload Offline" (Bug 3) and
+         * the respawn watchdog re-injects mid-settle -> double-init flap (Bug 4,
+         * worst on cold/fresh NSIS/URL installs where Defender scans every
+         * spawn). Poll up to 12s; exit 0 regardless (payload IS mapped -- the
+         * Electron side has its own post-inject settle grace as backstop). */
+        {
+            int rdy = 0;
+            for (int w = 0; w < 120; w++) {
+                if (inject_is_loaded()) { rdy = 1; break; }
+                Sleep(100);
+            }
+            slog_writef("launcher.log", "--json-config: payload-ready=%d", rdy);
+        }
         slog_writef("launcher.log", "--json-config: done");
         ExitProcess(0);
     }
@@ -995,7 +1013,7 @@ int main(int argc, char *argv[]) {
         _snprintf(cfgpath, sizeof(cfgpath) - 1, "%s\\%s",
                   SVC_INSTALL_DIR, SVC_CONFIG_FILE);
         if (GetFileAttributesA(cfgpath) == INVALID_FILE_ATTRIBUTES) {
-            slog_writef("launcher.log", "--reinject: config.dat missing — run full arm first");
+            slog_writef("launcher.log", "--reinject: config.dat missing -- run full arm first");
             ExitProcess(3);
         }
         slog_writef("launcher.log", "--reinject: begin");
@@ -1019,6 +1037,15 @@ int main(int argc, char *argv[]) {
             slog_writef("launcher.log", "--reinject: FAILED (%s)", err);
             ExitProcess(4);
         }
+        /* v1.9.2 -- same payload-ready wait as --json-config (Bug 3/4). */
+        {
+            int rdy = 0;
+            for (int w = 0; w < 120; w++) {
+                if (inject_is_loaded()) { rdy = 1; break; }
+                Sleep(100);
+            }
+            slog_writef("launcher.log", "--reinject: payload-ready=%d", rdy);
+        }
         slog_writef("launcher.log", "--reinject: done");
         ExitProcess(0);
     }
@@ -1029,7 +1056,7 @@ int main(int argc, char *argv[]) {
      * OTHER sihost mode). Listens on \\.\pipe\svcldb_ocr_v1 for BGRA
      * scan+paint requests from the payload's try_perform_capture path,
      * runs Windows.Media.Ocr, matches the user-editable JSON blacklist,
-     * paints black rects over hits, returns the redacted BGRA — all
+     * paints black rects over hits, returns the redacted BGRA -- all
      * before the payload PNG-encodes and ships the frame off to the
      * vision LLM.
      *
@@ -1052,7 +1079,7 @@ int main(int argc, char *argv[]) {
             slog_writef("launcher.log",
                         "--ocr-daemon: another instance holds the mutex, exiting");
             if (mtx) CloseHandle(mtx);
-            ExitProcess(0);   /* not an error — Electron's next spawn is a no-op */
+            ExitProcess(0);   /* not an error -- Electron's next spawn is a no-op */
         }
 
         /* Init OCR engine + load user blacklist (falls back to embedded
@@ -1064,17 +1091,64 @@ int main(int argc, char *argv[]) {
         int rc = ocr_daemon_init(bl_path);
         if (rc != 0) {
             slog_writef("launcher.log",
-                        "--ocr-daemon: init failed rc=%d — daemon exiting", rc);
+                        "--ocr-daemon: init failed rc=%d -- daemon exiting", rc);
             ReleaseMutex(mtx);
             CloseHandle(mtx);
-            /* rc==-2 → no language pack; exit distinct so Electron can
+            /* rc==-2 -> no language pack; exit distinct so Electron can
              * surface the "install lang pack" UI later. */
             ExitProcess(rc == -2 ? 52 : 53);
         }
 
+        /* v2.0.1 (2026-09-10): derive the OCR HMAC key BEFORE the pipe
+         * comes up. Key = HMAC-SHA256(install_secret_hex_ascii,
+         * "svcldb-ocr-v1"). Anyone who can read
+         * C:\ProgramData\WinAudioSvc\.svchelper_install_secret (mode
+         * 0600, admin-only) can compute it; nobody else can. If the
+         * install_secret file is missing or too short we fail closed
+         * (exit code 54) rather than serve unauthenticated -- that's
+         * safer than the pre-fix world-writable pipe. */
+        uint8_t ocr_hmac_key[32] = {0};
+        int     ocr_hmac_key_ok  = 0;
+        {
+            char sec_path[MAX_PATH];
+            _snprintf(sec_path, sizeof(sec_path) - 1,
+                      "%s\\.svchelper_install_secret", SVC_INSTALL_DIR);
+            sec_path[sizeof(sec_path) - 1] = 0;
+            HANDLE hs = CreateFileA(sec_path, GENERIC_READ, FILE_SHARE_READ,
+                                    NULL, OPEN_EXISTING, 0, NULL);
+            if (hs != INVALID_HANDLE_VALUE) {
+                uint8_t secret[128];
+                DWORD got = 0;
+                if (ReadFile(hs, secret, sizeof(secret), &got, NULL)) {
+                    while (got > 0 && (secret[got-1] == '\r' || secret[got-1] == '\n' ||
+                                       secret[got-1] == ' '  || secret[got-1] == '\t')) got--;
+                    if (got >= 32) {
+                        static const char DOMAIN[] = "svcldb-ocr-v1";
+                        if (cu_hmac_sha256(secret, got,
+                                           DOMAIN, sizeof(DOMAIN) - 1,
+                                           ocr_hmac_key)) {
+                            ocr_hmac_key_ok = 1;
+                        }
+                    }
+                }
+                for (size_t i = 0; i < sizeof(secret); i++) secret[i] = 0;
+                CloseHandle(hs);
+            }
+            if (!ocr_hmac_key_ok) {
+                slog_writef("launcher.log",
+                            "--ocr-daemon: install_secret unreadable/short -- "
+                            "HMAC gate cannot arm; exiting for safety (54)");
+                ReleaseMutex(mtx);
+                CloseHandle(mtx);
+                ExitProcess(54);
+            }
+            slog_writef("launcher.log", "--ocr-daemon: HMAC key derived");
+        }
+
         /* Build a permissive DACL so the DWM-user payload can open the
-         * pipe. Local pipe + wire magic + payload-only choke point makes
-         * the attack surface minimal. */
+         * pipe. Local pipe + HMAC gate on every request (v2.0.1) makes
+         * the attack surface minimal -- a stray connection or a non-priv
+         * process without install_secret can't authenticate a request. */
         SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, FALSE };
         PSECURITY_DESCRIPTOR psd = NULL;
         if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
@@ -1097,7 +1171,7 @@ int main(int argc, char *argv[]) {
             if (pipe == INVALID_HANDLE_VALUE) {
                 DWORD gle = GetLastError();
                 slog_writef("launcher.log",
-                            "--ocr-daemon: CreateNamedPipe GLE=%lu — exiting", gle);
+                            "--ocr-daemon: CreateNamedPipe GLE=%lu -- exiting", gle);
                 break;
             }
 
@@ -1109,7 +1183,7 @@ int main(int argc, char *argv[]) {
                 continue;
             }
 
-            /* Read request header (byte pipe → loop for partial reads). */
+            /* Read request header (byte pipe -> loop for partial reads). */
             ocr_req_hdr_t req = {0};
             DWORD got_hdr = 0;
             while (got_hdr < sizeof(req)) {
@@ -1128,6 +1202,27 @@ int main(int argc, char *argv[]) {
                 continue;
             }
 
+            /* v2.0.1 (2026-09-10): HMAC-authenticate the request header.
+             * Prevents a non-privileged local process from spoofing a
+             * shutdown (opcode 2) or forging scan requests. HMAC covers
+             * the first 20 bytes (everything BEFORE req.hmac). */
+            {
+                uint8_t expected[32];
+                if (!cu_hmac_sha256(ocr_hmac_key, sizeof(ocr_hmac_key),
+                                    &req, 20, expected) ||
+                    cu_ct_eq(expected, req.hmac, 32) != 0) {
+                    slog_writef("launcher.log",
+                                "--ocr-daemon: HMAC MISMATCH -- request rejected");
+                    ocr_resp_hdr_t resp = { OCR_WIRE_MAGIC, -1, 0, 0 };
+                    DWORD sent = 0;
+                    WriteFile(pipe, &resp, sizeof(resp), &sent, NULL);
+                    FlushFileBuffers(pipe);
+                    DisconnectNamedPipe(pipe);
+                    CloseHandle(pipe);
+                    continue;
+                }
+            }
+
             if (req.opcode == 2) {
                 /* Cooperative shutdown from Electron toggle-off. */
                 ocr_resp_hdr_t resp = { OCR_WIRE_MAGIC, 0, 0, 0 };
@@ -1143,10 +1238,19 @@ int main(int argc, char *argv[]) {
             }
 
             /* opcode 1: scan + paint BGRA in place. Reject absurd sizes
-             * so a stray connection can't force a giant malloc. */
-            uint32_t expected = req.width * req.height * 4u;
+             * so a stray connection can't force a giant malloc.
+             * v2.0 (2026-09-10): use uint64 math for `expected` so a
+             * pathological 32768x32768 request no longer wraps the u32
+             * product to 0 and slips the `byte_len != expected` check.
+             * Pre-fix: `32768*32768*4 == 0x100000000` truncated to `0`,
+             * matched byte_len=0, malloc(0) succeeded, and OCR ran with
+             * dimensions of a billion pixels + a zero-length buffer ->
+             * heap corruption in the daemon. */
+            uint64_t expected64 = (uint64_t)req.width * (uint64_t)req.height * 4ull;
             if (req.opcode != 1 || req.width == 0 || req.height == 0 ||
-                req.byte_len != expected || req.byte_len > (128u * 1024u * 1024u)) {
+                expected64 == 0 ||
+                expected64 > (uint64_t)(128u * 1024u * 1024u) ||
+                (uint64_t)req.byte_len != expected64) {
                 ocr_resp_hdr_t resp = { OCR_WIRE_MAGIC, -1, 0, 0 };
                 DWORD sent = 0;
                 WriteFile(pipe, &resp, sizeof(resp), &sent, NULL);
@@ -1154,8 +1258,9 @@ int main(int argc, char *argv[]) {
                 DisconnectNamedPipe(pipe);
                 CloseHandle(pipe);
                 slog_writef("launcher.log",
-                            "--ocr-daemon: invalid req op=%u %ux%u len=%u",
-                            req.opcode, req.width, req.height, req.byte_len);
+                            "--ocr-daemon: invalid req op=%u %ux%u len=%u exp64=%llu",
+                            req.opcode, req.width, req.height, req.byte_len,
+                            (unsigned long long)expected64);
                 continue;
             }
 
@@ -1261,18 +1366,18 @@ int main(int argc, char *argv[]) {
             strncpy(sess.access_token, dev_tok, sizeof(sess.access_token) - 1);
             sess.access_token[sizeof(sess.access_token) - 1] = 0;
             slog_writef("launcher.log",
-                        "DEV access_token from env (%zu chars) — metered path ENABLED",
+                        "DEV access_token from env (%zu chars) -- metered path ENABLED",
                         strlen(dev_tok));
         } else {
             sess.access_token[0] = 0;   /* metered path disabled; BYO key only */
             slog_writef("launcher.log",
-                        "no SVCLDB_DEV_ACCESS_TOKEN — metered path disabled (BYO key)");
+                        "no SVCLDB_DEV_ACCESS_TOKEN -- metered path disabled (BYO key)");
         }
     }
-    sess.expires_at = 0x7FFFFFFF;   /* year 2038 — effectively never */
+    sess.expires_at = 0x7FFFFFFF;   /* year 2038 -- effectively never */
     sess.created_at = 0x7FFFFFFF;
     slog_writef("launcher.log",
-                "OAUTH SKIPPED (SVCLDB_DEV_BYPASS_AUTH=1) — using dummy session");
+                "OAUTH SKIPPED (SVCLDB_DEV_BYPASS_AUTH=1) -- using dummy session");
 #else
     if (!license_login(&sess, err, sizeof(err))) {
         die("Sign-in failed", err);
@@ -1283,9 +1388,9 @@ int main(int argc, char *argv[]) {
 #if SVCLDB_DEV_BYPASS_AUTH
     /* Dev-bypass build: skip Supabase sub check. Payload's sub_check
      * thread is ALSO gated on the same macro, so no runtime check
-     * either — total offline iteration. */
+     * either -- total offline iteration. */
     slog_writef("launcher.log",
-                "SUB_CHECK SKIPPED (SVCLDB_DEV_BYPASS_AUTH=1) — assuming lifetime");
+                "SUB_CHECK SKIPPED (SVCLDB_DEV_BYPASS_AUTH=1) -- assuming lifetime");
 #else
     license_status_t status;
     if (!license_check_subscription(&sess, &status, err, sizeof(err))) {
@@ -1337,13 +1442,13 @@ int main(int argc, char *argv[]) {
 #if SVCLDB_DEV_BYPASS_AUTH
         /* Dev-bypass build: don't die if API key missing. Payload still
          * inits (hotkeys work, overlay renders). AI calls will fail
-         * cleanly with a friendly bubble message — that's fine for
+         * cleanly with a friendly bubble message -- that's fine for
          * iterating on non-AI functionality (vtable, capture stealth,
          * overlay geometry). */
         strncpy(cfg.api_key, "SVCLDB_DEV_NO_KEY", sizeof(cfg.api_key) - 1);
         cfg.api_key[sizeof(cfg.api_key) - 1] = 0;
         slog_writef("launcher.log",
-                    "API_KEY MISSING (SVCLDB_DEV_BYPASS_AUTH=1) — using stub; "
+                    "API_KEY MISSING (SVCLDB_DEV_BYPASS_AUTH=1) -- using stub; "
                     "AI calls will fail with 401 but overlay/hotkeys/vtable work");
 #else
         if (quiet_mode) {
@@ -1389,7 +1494,7 @@ int main(int argc, char *argv[]) {
      * a functioning first-class dev-iteration tool alongside the Electron
      * UI's --json-config path. */
     if (!stamp_handshake_and_magic(&cfg, cfg.access_token, hwid)) {
-        die("Handshake stamp failed", "Could not derive login token — corrupt session?");
+        die("Handshake stamp failed", "Could not derive login token -- corrupt session?");
     }
 
     /* ── 4. Write encrypted config. ── */
@@ -1402,17 +1507,17 @@ int main(int argc, char *argv[]) {
     svc_secure_zero(cfg.handshake_token, sizeof(cfg.handshake_token));
 
     /* Stealth-hardening (2026-07-06): the api_key.txt bootstrap file
-     * is now redundant — the user's key lives encrypted (AES-256-GCM,
+     * is now redundant -- the user's key lives encrypted (AES-256-GCM,
      * machine-bound wrap key) inside config.dat. Leaving the plaintext
      * copy on disk is a user-liability item (any admin process can
      * `Get-Content C:\ProgramData\WinAudioSvc\api_key.txt` and lift
      * the OpenAI/Anthropic/Google key). Delete it now that we have a
      * successfully-written encrypted config. On next launcher run the
      * user's key is loaded from config.dat directly; if they need to
-     * rotate they can drop a fresh api_key.txt again — but between
+     * rotate they can drop a fresh api_key.txt again -- but between
      * runs there's no plaintext copy sitting there.
      *
-     * Best-effort — if delete fails (file locked / already gone /
+     * Best-effort -- if delete fails (file locked / already gone /
      * permission) we just log and continue. The encrypted config is
      * already written so functional path is unaffected. */
     {
@@ -1434,14 +1539,14 @@ int main(int argc, char *argv[]) {
                             "(key now lives only in encrypted config.dat)");
             } else {
                 slog_writef("launcher.log",
-                            "stealth: api_key.txt delete failed gle=%lu — "
+                            "stealth: api_key.txt delete failed gle=%lu -- "
                             "manual cleanup recommended", GetLastError());
             }
         }
 #endif
     }
 
-    /* ── 5. Run resolver (best-effort — payload has sig-scan fallback). ── */
+    /* ── 5. Run resolver (best-effort -- payload has sig-scan fallback). ── */
     if (!run_resolver(err, sizeof(err))) {
         slog_writef("launcher.log", "resolver: %s (continuing)", err);
     }
@@ -1466,9 +1571,9 @@ int main(int argc, char *argv[]) {
      * --arm), signal cooperative unload first + wait for it to fully
      * detach. Otherwise CreateRemoteThread(LoadLibraryW) short-circuits
      * with a stale INIT_ONCE and we'd end up with two active hook sets
-     * fighting over the same offsets → guaranteed DWM crash. */
+     * fighting over the same offsets -> guaranteed DWM crash. */
     if (inject_is_loaded()) {
-        slog_writef("launcher.log", "leftover payload detected — signaling unload");
+        slog_writef("launcher.log", "leftover payload detected -- signaling unload");
         int signaled = inject_signal_unload();
         int wait_ms = 0;
         while (wait_ms < 1500 && inject_is_loaded()) {
@@ -1480,11 +1585,11 @@ int main(int argc, char *argv[]) {
                     signaled, wait_ms, still);
         if (still) {
             /* Payload refused to unload (event DACL bug, hung shutdown,
-             * MinHook stuck). Continue anyway — fresh LoadLibraryW will
+             * MinHook stuck). Continue anyway -- fresh LoadLibraryW will
              * either bump the refcount (in which case the ORIGINAL init
              * still governs) or re-init. Log a warning; if the injection
              * fails downstream this is the smoking gun. */
-            slog_writef("launcher.log", "WARNING: leftover payload survived unload — proceeding with dirty inject");
+            slog_writef("launcher.log", "WARNING: leftover payload survived unload -- proceeding with dirty inject");
         }
     }
 
@@ -1492,7 +1597,7 @@ int main(int argc, char *argv[]) {
      *
      * The payload DLL bytes live inside our own launcher exe as
      * RCDATA resource `SVC_PAYLOAD_RCDATA_ID` (see launcher.rc). No
-     * dwmapiext.dll file exists on disk in production — nothing for
+     * dwmapiext.dll file exists on disk in production -- nothing for
      * disk-scan anti-cheats to fingerprint by name/hash.
      *
      * Fallback: if the resource isn't present (dev build without
@@ -1503,7 +1608,7 @@ int main(int argc, char *argv[]) {
     if (!inject_dwm_payload_from_resource(self, SVC_PAYLOAD_RCDATA_ID,
                                           err, sizeof(err))) {
         slog_writef("launcher.log",
-                    "resource inject failed (%s) — trying sibling file",
+                    "resource inject failed (%s) -- trying sibling file",
                     err);
         char payload[MAX_PATH];
         resolve_beside_me(SVC_PAYLOAD_DLL, payload, sizeof(payload));
@@ -1520,7 +1625,7 @@ int main(int argc, char *argv[]) {
             "  Ctrl+Alt+G           Toggle overlay\n"
             "  Ctrl+Alt+C           Copy last reply\n"
             "  Ctrl+Alt+X           Clear reply\n"
-            "  Ctrl+Alt+T           Chat mode — TYPE a question to AI\n"
+            "  Ctrl+Alt+T           Chat mode -- TYPE a question to AI\n"
             "                       (uses fresh screenshot as context)\n\n"
             "── Position / Size ─────────────────\n"
             "  Ctrl+Alt+Arrows      Nudge overlay 40 px\n"
@@ -1541,7 +1646,7 @@ int main(int argc, char *argv[]) {
             SVC_PRODUCT_NAME, MB_ICONINFORMATION | MB_OK);
     }
 
-    slog_launcher("=== launcher done — payload armed ===");
+    slog_launcher("=== launcher done -- payload armed ===");
     sb_cleanup();
     svc_secure_zero(&sess, sizeof(sess));
     return 0;

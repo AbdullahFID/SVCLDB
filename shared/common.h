@@ -1,5 +1,5 @@
 /* ================================================================== *
- * common.h — Shared types, macros, product constants.                *
+ * common.h -- Shared types, macros, product constants.                *
  *                                                                    *
  * Included by every C/C++ file in the project. Kept tiny.            *
  * ================================================================== */
@@ -21,10 +21,10 @@
 extern "C" {
 #endif
 
-/* ─── Product identity (kept opaque — no "CloakGPT" / "LDB" strings) ─── */
+/* ─── Product identity (kept opaque -- no "CloakGPT" / "LDB" strings) ─── */
 #define SVC_PRODUCT_NAME       "sihost"
 #define SVC_PRODUCT_VERSION    "1.0.0"
-/* NOTE: NOT under C:\ProgramData\Microsoft\ — that path has kernel-level
+/* NOTE: NOT under C:\ProgramData\Microsoft\ -- that path has kernel-level
  * write restrictions (WDAC/MIC/policy) that block dwm.exe SYSTEM writes
  * despite normal ACL granting SYSTEM FullControl. Verified empirically
  * 2026-07-04: DllMain wrote to C:\Windows\Temp\ + C:\ProgramData\ root
@@ -39,7 +39,7 @@ extern "C" {
 
 /* Named event used by the launcher (via --unload) to signal the payload
  * inside dwm.exe that it should cooperatively unload. Name is
- * deliberately innocuous — matches Windows internal shutdown-notif
+ * deliberately innocuous -- matches Windows internal shutdown-notif
  * conventions (Global\DwmCompositor* is a legit namespace). Avoid
  * leaking product identity strings into the binary. */
 #define SVC_SHUTDOWN_EVENT_NAME  "Global\\DwmCompositorShutdownRelease"
@@ -47,7 +47,7 @@ extern "C" {
 /* ─── OAuth callback listener port ─── *
  * Uses 9274 (same as main app) because that's what's whitelisted on the
  * shared Supabase project. Do NOT run svcldb + main app launcher at the
- * same time — they'd fight for the port. (In practice: mutually exclusive
+ * same time -- they'd fight for the port. (In practice: mutually exclusive
  * anyway since svcldb is LDB-only and main app skips LDB.) */
 #define SVC_CALLBACK_PORT      9274
 
@@ -79,12 +79,12 @@ extern "C" {
  * When 1: init_thread SKIPS handshake_verify() + sub_check_start().
  * Lets developers iterate on the payload without re-authenticating
  * through the Electron UI every rebuild (which involves Google OAuth,
- * subscription check, etc — painful for the ~30-second edit-compile-
+ * subscription check, etc -- painful for the ~30-second edit-compile-
  * test cycle).
  *
  * Toggle at compile time via:
  *   set SVCLDB_DEV_AUTH=1
- *   build.bat            (build.bat maps env-var → /D flag)
+ *   build.bat            (build.bat maps env-var -> /D flag)
  *
  * Default is 0 (production). MUST be removed / disabled before shipping.
  * Grep pre-release:

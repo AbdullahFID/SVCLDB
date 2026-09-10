@@ -13,7 +13,7 @@ int pl_offsets_load(pl_offsets_t *out) {
     /* v1.6.2: zero-init so partial reads (legacy blob without the new
      * slot-target RVAs) leave those fields at 0. Payload's get_backbuffer_
      * texture treats 0 RVA as "no dynamic hint" and falls back to
-     * hardcoded slot indices — same behavior as pre-v1.6.2. */
+     * hardcoded slot indices -- same behavior as pre-v1.6.2. */
     memset(out, 0, sizeof(*out));
 
     HANDLE h = CreateFileA(BLOB_PATH, GENERIC_READ, FILE_SHARE_READ, NULL,

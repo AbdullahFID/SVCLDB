@@ -1,4 +1,4 @@
-/* base64 encode/decode — standard alphabet + URL-safe variant. */
+/* base64 encode/decode -- standard alphabet + URL-safe variant. */
 #ifndef SVCLDB_BASE64_H
 #define SVCLDB_BASE64_H
 

@@ -1,7 +1,7 @@
 /* ================================================================== *
- * resolver — DWM symbol resolver for the payload.                     *
+ * resolver -- DWM symbol resolver for the payload.                     *
  *                                                                    *
- * DIRECTLY MODELED on hooksdll/dwm/dwm_resolver.c — same 17-slot     *
+ * DIRECTLY MODELED on hooksdll/dwm/dwm_resolver.c -- same 17-slot     *
  * blob format so we can reuse the production vtable-walk code from   *
  * the main app's dwm_payload.c verbatim, without offset drift.       *
  * ================================================================== */
@@ -15,7 +15,7 @@
 
 #pragma comment(lib, "user32.lib")
 
-/* ── Offsets blob layout — must match payload's pl_offsets_t exactly */
+/* ── Offsets blob layout -- must match payload's pl_offsets_t exactly */
 typedef struct {
     uint64_t renderContent;
     uint64_t isNormal;
@@ -39,7 +39,7 @@ typedef struct {
     uint64_t addDirtyRectLegacy;
     uint64_t presentDisplay;
     uint64_t presentLegacy;
-    /* --- v1.6.2 — vtable-slot target RVAs (payload matches these
+    /* --- v1.6.2 -- vtable-slot target RVAs (payload matches these
      * against the live vtable at first Present() to discover the
      * correct slot indices dynamically, replacing hardcoded 5/24/19). */
     uint64_t getPhysicalBackBufferRva;
@@ -99,7 +99,7 @@ static void log_line(const char *fmt, ...) {
     printf("%s\n", buf); fflush(stdout);
 }
 
-/* Wildcard resolver — captures first match. Fallback when SymFromName misses
+/* Wildcard resolver -- captures first match. Fallback when SymFromName misses
  * because the class name differs across Windows builds. */
 typedef struct { uint64_t rva; char name[512]; int count; } WildCtx;
 static BOOL CALLBACK WildCb(SYMINFO *pSym, ULONG size, PVOID ctx) {
@@ -176,7 +176,7 @@ int main(void) {
     if (pSymSetOptions) pSymSetOptions(0x80800002);   /* DEBUG|UNDNAME|FAVOR_COMPRESSED */
 
     log_line("SymInitialize (%s)", SYM_SERVER);
-    log_line("NOTE: first run downloads PDB — 30-90s");
+    log_line("NOTE: first run downloads PDB -- 30-90s");
     if (!pSymInitialize(g_hProc, SYM_SERVER, FALSE)) {
         log_line("FATAL: SymInitialize %lu", GetLastError()); return 1;
     }
@@ -237,19 +237,19 @@ int main(void) {
      * trick that solves the "quadrant" bug where DWM only re-composites
      * the region the user just clicked in. Calling these with a
      * fullscreen RECTF on every PN detour fire forces DWM to mark the
-     * whole layer dirty each frame → next composite samples entire
-     * texture → our overlay pixels are always up to date. */
+     * whole layer dirty each frame -> next composite samples entire
+     * texture -> our overlay pixels are always up to date. */
     b.addDirtyRectDisplay = resolve("dwmcore!CDDisplayRenderTarget::AddDirtyRect");
     b.addDirtyRectLegacy  = resolve("dwmcore!CLegacyRenderTarget::AddDirtyRect");
 
-    /* Present RVAs — hooked to capture the REAL `this` pointer DWM uses
+    /* Present RVAs -- hooked to capture the REAL `this` pointer DWM uses
      * for the render target. PN's `this` might be virtual-base-adjusted
      * (crashed AddDirtyRect when used directly); Present's `this` is
      * the top-level object with the complete layout. */
     b.presentDisplay = resolve("dwmcore!CDDisplayRenderTarget::Present");
     b.presentLegacy  = resolve("dwmcore!CLegacyRenderTarget::Present");
 
-    /* v1.6.2 — vtable-slot target RVAs. Payload walks pLayer's vtable
+    /* v1.6.2 -- vtable-slot target RVAs. Payload walks pLayer's vtable
      * at first Present() call and matches these against the live function
      * pointers to discover the correct slot index for each method,
      * replacing hardcoded GPB_SLOT=5 / GD3D_SLOT=24 / ACC3_SLOT=19.
@@ -257,11 +257,11 @@ int main(void) {
      * The hardcoded values came from Bypassify's original RE and work
      * for ~800+ Bypassify users, but Windows patch levels can re-order
      * internal vtables (verified on user jay.perkerson@gmail.com's box,
-     * 2026-07-15 — DWM crashed within 1s of inject). Dynamic discovery
+     * 2026-07-15 -- DWM crashed within 1s of inject). Dynamic discovery
      * closes that failure mode.
      *
      * If PDB doesn't expose these symbol names (which happens on some
-     * Windows editions), the RVA stays 0 → payload falls back to
+     * Windows editions), the RVA stays 0 -> payload falls back to
      * hardcoded slots, same behavior as pre-v1.6.2. */
     /* Try known class variants (Windows 10/11 pre-24H2, 24H2, 25H2+).
      * The class that owns GetPhysicalBackBuffer / GetD3D11Resource has
@@ -270,7 +270,7 @@ int main(void) {
      *   - Windows 11 24H2+:    CDDisplaySwapChain (buffer class:
      *                           CDDisplaySwapChainBuffer)
      * We resolve BOTH so payload's dynamic scan has more RVA candidates
-     * to match against — increases coverage when pLayer's actual vtable
+     * to match against -- increases coverage when pLayer's actual vtable
      * slot dispatches to whichever variant is live. */
     b.getPhysicalBackBufferRva = resolve("dwmcore!CDDisplaySwapChain::GetPhysicalBackBuffer");
     if (!b.getPhysicalBackBufferRva)
@@ -292,7 +292,7 @@ int main(void) {
     if (!b.getD3D11ResourceRva)
         b.getD3D11ResourceRva = resolve_wild("dwmcore!*GetD3D11Resource*");
 
-    /* Accessor method — its exact name is class-dependent (defined on
+    /* Accessor method -- its exact name is class-dependent (defined on
      * whatever D3D11 resource wrapper GetD3D11Resource returns). Try
      * common patterns; if none hit, payload uses hardcoded slot 19. */
     b.accessorRva = resolve("dwmcore!CDeviceTextureTarget::GetTexture2D");

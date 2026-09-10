@@ -1,5 +1,5 @@
 /* ================================================================== *
- * log_key.c — Master key MATERIAL (dual-half + salt) for slog.        *
+ * log_key.c -- Master key MATERIAL (dual-half + salt) for slog.        *
  *                                                                    *
  * v3 (2026-07-05): rotated from the flat-32-byte scheme. The actual  *
  * working AES-256-GCM key is DERIVED at runtime by log_secure.c as:  *
@@ -10,7 +10,7 @@
  *                                                                    *
  * Rationale:                                                         *
  *  - The two halves + salt sit in different .rodata regions of the   *
- *    binary — a bytesearch for "the key" doesn't identify it in one  *
+ *    binary -- a bytesearch for "the key" doesn't identify it in one  *
  *    contiguous 32-byte run.                                         *
  *  - An attacker with the binary must reverse-engineer log_secure.c  *
  *    to reproduce the XOR + SHA256 derivation before decrypting.     *
@@ -21,7 +21,7 @@
  * (gitignored) at build time so the standalone decrypt tool          *
  * (`lumio/tools/decrypt-logs.js --key <hex>`) can consume it.        *
  *                                                                    *
- * ROTATED 2026-07-05 v3 — prior key (7a9e...9d48) invalidated.       *
+ * ROTATED 2026-07-05 v3 -- prior key (7a9e...9d48) invalidated.       *
  * ================================================================== */
 
 #include <stdint.h>
@@ -48,6 +48,6 @@ const uint8_t SVCLDB_KEY_SALT[32] = {
 };
 
 /* Backward-compat alias. log_secure.c currently references
- * SVCLDB_LOG_KEY directly — we keep this defined but populated
+ * SVCLDB_LOG_KEY directly -- we keep this defined but populated
  * on-demand from derive_working_key(). See log_secure.c. */
 uint8_t SVCLDB_LOG_KEY[32] = {0};   /* filled at slog_init() */

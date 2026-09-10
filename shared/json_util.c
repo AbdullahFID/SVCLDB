@@ -1,5 +1,5 @@
 /* ================================================================== *
- * json_util.c — Minimal JSON parse + build.                           *
+ * json_util.c -- Minimal JSON parse + build.                           *
  * ================================================================== */
 
 #include "json_util.h"
@@ -48,7 +48,7 @@ static const char *skip_value(const char *p) {
         }
         return depth == 0 ? p : NULL;
     }
-    /* Number / true / false / null — consume until delimiter. */
+    /* Number / true / false / null -- consume until delimiter. */
     while (*p && *p != ',' && *p != '}' && *p != ']' &&
            *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') p++;
     return p;
@@ -115,7 +115,7 @@ static int copy_str(const char *p, char *out, size_t outsize) {
                 case 'b':  emit = '\b'; break;
                 case 'f':  emit = '\f'; break;
                 case 'u': {
-                    /* \uXXXX — decode BMP char. Skip surrogate pairs (rare in
+                    /* \uXXXX -- decode BMP char. Skip surrogate pairs (rare in
                      * our use case). Encode as UTF-8 into emitbuf. */
                     if (!p[2] || !p[3] || !p[4] || !p[5]) return 0;
                     unsigned int cp;
@@ -158,6 +158,46 @@ int json_get_str(const char *json, const char *key, char *out, size_t outsize) {
     if (!v) return 0;
     if (*v != '"') return 0;
     return copy_str(v, out, outsize);
+}
+
+/* v2.0.1 (2026-09-10) -- Length probe mirror of copy_str: walks the
+ * same escape rules but only counts unescaped UTF-8 output bytes; no
+ * writes. Returns 0 on unterminated/malformed strings so callers can
+ * distinguish that from "empty string but valid". */
+static size_t count_str(const char *p) {
+    if (*p != '"') return 0;
+    p++;
+    size_t o = 0;
+    while (*p) {
+        if (*p == '"') return o;
+        if (*p == '\\' && p[1]) {
+            char c = p[1];
+            if (c == 'u') {
+                if (!p[2] || !p[3] || !p[4] || !p[5]) return 0;
+                unsigned int cp;
+                char hexb[5] = { p[2], p[3], p[4], p[5], 0 };
+                if (sscanf(hexb, "%04x", &cp) != 1) return 0;
+                if      (cp < 0x80)  o += 1;
+                else if (cp < 0x800) o += 2;
+                else                 o += 3;
+                p += 6;
+                continue;
+            }
+            /* All other single-char escapes emit exactly 1 byte. */
+            o++;
+            p += 2;
+            continue;
+        }
+        o++;
+        p++;
+    }
+    return 0;   /* unterminated string */
+}
+
+size_t json_get_str_len(const char *json, const char *key) {
+    const char *v = find_key(json, key);
+    if (!v || *v != '"') return 0;
+    return count_str(v);
 }
 
 int json_get_num(const char *json, const char *key, double *out) {

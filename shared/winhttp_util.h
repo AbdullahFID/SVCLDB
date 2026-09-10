@@ -1,5 +1,5 @@
 /* ================================================================== *
- * winhttp_util.h — HTTPS request wrapper (WinHTTP).                   *
+ * winhttp_util.h -- HTTPS request wrapper (WinHTTP).                   *
  *                                                                    *
  * Simple synchronous request layer used by:                          *
  *  - OAuth token exchange                                            *
@@ -63,7 +63,7 @@ int whreq_post_stream(const char *url, const char **headers,
  * can go long minutes between SSE tokens (o3, gpt-5.5-pro, opus, gemini-3.1-pro).
  *
  * receive_timeout_ms is passed to WinHttpSetTimeouts's dwReceiveTimeout
- * parameter which applies PER WinHttpReadData call — i.e. "no data for
+ * parameter which applies PER WinHttpReadData call -- i.e. "no data for
  * this long between chunks kills the stream". Pass 0 to inherit the
  * default (20_000 ms). Recommended: 900_000 (15 min) for reasoning models,
  * 60_000 (1 min) for fast models.
@@ -79,7 +79,7 @@ int whreq_post_stream_ex(const char *url, const char **headers,
                          char **out_headers,
                          char *out_err, size_t err_size);
 
-/* Same idea for non-streaming POST/GET — receive_timeout_ms overrides
+/* Same idea for non-streaming POST/GET -- receive_timeout_ms overrides
  * dwReceiveTimeout. out_headers same contract as above. */
 int whreq_post_ex(const char *url, const char **headers,
                   const void *body, size_t body_len,

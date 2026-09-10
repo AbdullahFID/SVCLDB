@@ -5,13 +5,13 @@
  *   payload/src/ui/imgui_layer.cpp  (production render path)         *
  *   payload/test/latex_test.c       (unit test harness)              *
  *                                                                    *
- * Single source of truth â€” do NOT keep a second copy anywhere. Any   *
+ * Single source of truth â€" do NOT keep a second copy anywhere. Any   *
  * regressions caught by latex_test guarantee the payload is fixed    *
  * too because they compile the same file.                            *
  *                                                                    *
  * Header-only C99: every symbol has file-scope static linkage so   *
  * each translation unit that includes this header gets its own copy  *
- * (which the linker is happy with â€” no ODR issue). Tests can be a    *
+ * (which the linker is happy with â€" no ODR issue). Tests can be a    *
  * .c file, payload .cpp file, both OK.                               *
  *                                                                    *
  * Public API:                                                        *
@@ -31,30 +31,30 @@
 #  define SVCLDB_LTX_SNPRINTF snprintf
 #endif
 
-/* NB: no `extern "C"` wrapper — every symbol below has file-scope `static`
+/* NB: no `extern "C"` wrapper -- every symbol below has file-scope `static`
  * linkage which is unaffected by name mangling. Wrapping in `extern "C"`
  * would conflict with C++'s treatment of `static`-linkage function decls
  * in the including .cpp. */
 /* ── LaTeX-to-Unicode simplifier ─────────────────────────────────
  *
  * Renders LaTeX-style math as readable Unicode text. The overlay
- * doesn't have a full math typesetter — it's a lightweight ImGui
- * pane — so we convert common LaTeX commands to Unicode equivalents
+ * doesn't have a full math typesetter -- it's a lightweight ImGui
+ * pane -- so we convert common LaTeX commands to Unicode equivalents
  * at RENDER TIME. The chat_msg text still holds the ORIGINAL LaTeX
  * so copy hotkeys give you raw LaTeX (paste into Overleaf / ChatGPT /
  * paper); DISPLAY gets the readable Unicode form.
  *
  * Coverage:
- *   Delimiters:  $..$  \(..\)   → stripped, content inline
- *   Fractions:   \frac{a}{b}    → (a)/(b) if either side has ops, else a/b
- *   Roots:       \sqrt{x}       → √(x) if x has ops, else √x
- *   Superscript: ^2/^3/^n       → ² ³ n (Unicode 2-3, keep n as-is)
- *                ^{...}         → keep ^ + strip braces
- *   Subscript:   _{...}         → strip braces (keep as _content)
- *   Symbols:     \pi \Delta \int \sum etc → π Δ ∫ Σ ...
- *   Relations:   \leq \geq \neq \pm etc → ≤ ≥ ≠ ± ...
- *   Functions:   \log \ln \sin \cos etc → log ln sin cos (drop \)
- *   Arrows:      \to \rightarrow etc → → ← ⇒ ⇐ ↔
+ *   Delimiters:  $..$  \(..\)   -> stripped, content inline
+ *   Fractions:   \frac{a}{b}    -> (a)/(b) if either side has ops, else a/b
+ *   Roots:       \sqrt{x}       -> √(x) if x has ops, else √x
+ *   Superscript: ^2/^3/^n       -> ² ³ n (Unicode 2-3, keep n as-is)
+ *                ^{...}         -> keep ^ + strip braces
+ *   Subscript:   _{...}         -> strip braces (keep as _content)
+ *   Symbols:     \pi \Delta \int \sum etc -> π Δ ∫ Σ ...
+ *   Relations:   \leq \geq \neq \pm etc -> ≤ ≥ ≠ ± ...
+ *   Functions:   \log \ln \sin \cos etc -> log ln sin cos (drop \)
+ *   Arrows:      \to \rightarrow etc -> -> <- ⇒ ⇐ ↔
  *
  * NOT converted (kept as-is because they're structural or too rare):
  *   \begin{...} \end{...}  \left \right   \\ (newline)   \text{...}
@@ -64,7 +64,7 @@
  *
  * Returns bytes written to `dst`. `dst` must have room for AT LEAST
  * `src_len + 32` bytes as a safety margin (most conversions are
- * shorter than the source; some like \pi → π are same or shorter
+ * shorter than the source; some like \pi -> π are same or shorter
  * length in UTF-8). */
 struct latex_map_entry {
     const char *tex;
@@ -84,7 +84,7 @@ struct latex_map_entry {
  * out of order. Verified 2026-07-05: `\int` before `\infty` would
  * make `\infty` never match. */
 static const struct latex_map_entry LATEX_MAP[] = {
-    /* ── Sizing / spacing (all EMPTY — they don't render literally) ──
+    /* ── Sizing / spacing (all EMPTY -- they don't render literally) ──
      * These control delimiter size, style, or whitespace in real LaTeX;
      * in plain-text render they're pure noise and get dropped. */
     { "\\Biggl",              ""    },
@@ -115,7 +115,7 @@ static const struct latex_map_entry LATEX_MAP[] = {
     { "\\noexpand",           ""    },
     { "\\expandafter",        ""    },
     { "\\!",                  ""    },
-    { "\\,",                  ""    },  /* thin space — collapse */
+    { "\\,",                  ""    },  /* thin space -- collapse */
     { "\\;",                  ""    },
     { "\\:",                  ""    },
     { "\\>",                  ""    },  /* medium space */
@@ -134,9 +134,9 @@ static const struct latex_map_entry LATEX_MAP[] = {
     { "\\newline",            "\n"  },
     /* \\ in display math = newline. Handled specially by the walker
      * (adjacent double-backslash) so a real backslash-in-content
-     * (like Windows path in a code fence — but we don't run this on
+     * (like Windows path in a code fence -- but we don't run this on
      * code) isn't mistranslated. */
-    /* ── Escaped punctuation — LaTeX escapes these to render literally ── */
+    /* ── Escaped punctuation -- LaTeX escapes these to render literally ── */
     { "\\%",          "%"              },
     { "\\$",          "$"              },
     { "\\&",          "&"              },
@@ -151,8 +151,8 @@ static const struct latex_map_entry LATEX_MAP[] = {
     { "\\KaTeX",      "KaTeX"          },
     { "\\LaTeX",      "LaTeX"          },
     { "\\TeX",        "TeX"            },
-    /* ── Function names — drop the leading backslash so `\log n` renders as `log n`.
-     * Multi-char variants (arcsin) come BEFORE their prefix (arc, sin) — the
+    /* ── Function names -- drop the leading backslash so `\log n` renders as `log n`.
+     * Multi-char variants (arcsin) come BEFORE their prefix (arc, sin) -- the
      * word-boundary check + longest-match walker rely on this ordering. */
     { "\\arcsin",     "arcsin" },
     { "\\arccos",     "arccos" },
@@ -263,8 +263,8 @@ static const struct latex_map_entry LATEX_MAP[] = {
     { "\\downharpoonright",   "\xE2\x87\x82" },   /* ⇂ */
     { "\\downharpoonleft",    "\xE2\x87\x83" },   /* ⇃ */
     { "\\restriction",        "\xE2\x86\xBE" },   /* ↾ */
-    { "\\rightarrow",         "\xE2\x86\x92" },   /* → */
-    { "\\leftarrow",          "\xE2\x86\x90" },   /* ← */
+    { "\\rightarrow",         "\xE2\x86\x92" },   /* -> */
+    { "\\leftarrow",          "\xE2\x86\x90" },   /* <- */
     { "\\nrightarrow",        "\xE2\x86\x9B" },   /* ↛ */
     { "\\nleftarrow",         "\xE2\x86\x9A" },   /* ↚ */
     { "\\Uparrow",            "\xE2\x87\x91" },   /* ⇑ */
@@ -282,18 +282,18 @@ static const struct latex_map_entry LATEX_MAP[] = {
     { "\\Lsh",                "\xE2\x86\xB0" },   /* ↰ */
     { "\\Rsh",                "\xE2\x86\xB1" },   /* ↱ */
     { "\\mapsto",             "\xE2\x86\xA6" },   /* ↦ */
-    { "\\to",                 "\xE2\x86\x92" },   /* → */
-    { "\\gets",               "\xE2\x86\x90" },   /* ← */
+    { "\\to",                 "\xE2\x86\x92" },   /* -> */
+    { "\\gets",               "\xE2\x86\x90" },   /* <- */
     /* Short-form arrow aliases per KaTeX (\Darr, \Uarr, etc.). */
     { "\\Harr",               "\xE2\x87\x94" },   /* ⇔ */
     { "\\hArr",               "\xE2\x87\x94" },   /* ⇔ */
     { "\\harr",               "\xE2\x86\x94" },   /* ↔ */
     { "\\Larr",               "\xE2\x87\x90" },   /* ⇐ */
     { "\\lArr",               "\xE2\x87\x90" },   /* ⇐ */
-    { "\\larr",               "\xE2\x86\x90" },   /* ← */
+    { "\\larr",               "\xE2\x86\x90" },   /* <- */
     { "\\Rarr",               "\xE2\x87\x92" },   /* ⇒ */
     { "\\rArr",               "\xE2\x87\x92" },   /* ⇒ */
-    { "\\rarr",               "\xE2\x86\x92" },   /* → */
+    { "\\rarr",               "\xE2\x86\x92" },   /* -> */
     { "\\Uarr",               "\xE2\x87\x91" },   /* ⇑ */
     { "\\uArr",               "\xE2\x87\x91" },   /* ⇑ */
     { "\\uarr",               "\xE2\x86\x91" },   /* ↑ */
@@ -602,7 +602,7 @@ static const struct latex_map_entry LATEX_MAP[] = {
     { "\\varrho",     "\xCF\xB1" },       /* ϱ (U+03F1) */
     { "\\varpi",      "\xCF\x96" },       /* ϖ */
     { "\\varkappa",   "\xCF\xB0" },       /* ϰ (U+03F0) */
-    { "\\varDelta",   "\xF0\x9D\x9B\xA5" },  /* 𝛥 U+1D6E5 — 4-byte UTF-8; falls back if font missing */
+    { "\\varDelta",   "\xF0\x9D\x9B\xA5" },  /* 𝛥 U+1D6E5 -- 4-byte UTF-8; falls back if font missing */
     { "\\varGamma",   "\xF0\x9D\x9B\xA4" },  /* 𝛤 */
     { "\\varLambda",  "\xF0\x9D\x9B\xAC" },  /* 𝛬 */
     { "\\varOmega",   "\xF0\x9D\x9B\xBA" },  /* 𝛺 */
@@ -728,21 +728,21 @@ static const struct latex_map_entry LATEX_MAP[] = {
     { "\\Vert",             "\xE2\x80\x96" },   /* ‖ */
     { "\\lVert",            "\xE2\x80\x96" },   /* ‖ */
     { "\\rVert",            "\xE2\x80\x96" },   /* ‖ */
-    /* ── Ellipses (all forms — KaTeX has 6 variants) ── */
+    /* ── Ellipses (all forms -- KaTeX has 6 variants) ── */
     { "\\dotsb",            "\xE2\x8B\xAF" },   /* ⋯ (bin/rel context) */
-    { "\\dotsc",            "\xE2\x80\xA6" },   /* … (comma context) */
+    { "\\dotsc",            "\xE2\x80\xA6" },   /* ... (comma context) */
     { "\\dotsi",            "\xE2\x8B\xAF" },   /* ⋯ (integral context) */
     { "\\dotsm",            "\xE2\x8B\xAF" },   /* ⋯ (multiplication) */
-    { "\\dotso",            "\xE2\x80\xA6" },   /* … (other) */
-    { "\\dots",             "\xE2\x80\xA6" },   /* … */
-    { "\\ldots",            "\xE2\x80\xA6" },   /* … */
+    { "\\dotso",            "\xE2\x80\xA6" },   /* ... (other) */
+    { "\\dots",             "\xE2\x80\xA6" },   /* ... */
+    { "\\ldots",            "\xE2\x80\xA6" },   /* ... */
     { "\\cdots",            "\xE2\x8B\xAF" },   /* ⋯ */
     { "\\vdots",            "\xE2\x8B\xAE" },   /* ⋮ */
     { "\\ddots",            "\xE2\x8B\xB1" },   /* ⋱ */
-    { "\\mathellipsis",     "\xE2\x80\xA6" },   /* … */
-    /* ── Number sets (blackboard bold) — single-letter shortcuts +
+    { "\\mathellipsis",     "\xE2\x80\xA6" },   /* ... */
+    /* ── Number sets (blackboard bold) -- single-letter shortcuts +
      * long names. \mathbb{R} is handled by the text-wrapper fallback
-     * which drops the wrapper and keeps 'R' — so `\mathbb{R}` renders
+     * which drops the wrapper and keeps 'R' -- so `\mathbb{R}` renders
      * as literal 'R'. These single-letter shortcuts render as the
      * actual double-struck Unicode which looks much nicer. ── */
     { "\\R",                "\xE2\x84\x9D" },   /* ℝ */
@@ -761,7 +761,7 @@ static const struct latex_map_entry LATEX_MAP[] = {
     /* ── Misc scalars / constants ── */
     { "\\degree",           "\xC2\xB0" },       /* ° */
     { "\\textdegree",       "\xC2\xB0" },       /* ° */
-    { "\\prime",            "\xE2\x80\xB2" },   /* ′ */
+    { "\\prime",            "\xE2\x80\xB2" },   /* ' */
     { "\\hbar",             "\xC4\xA7" },       /* ħ */
     { "\\hslash",           "\xE2\x84\x8F" },   /* ℏ */
     { "\\ell",              "\xE2\x84\x93" },   /* ℓ */
@@ -828,10 +828,10 @@ static const struct latex_map_entry LATEX_MAP[] = {
  * commands still work). Listed here for O(N) linear check per unknown
  * `\word{...}` occurrence.
  *
- * IMPORTANT: entries must match with WORD-BOUNDARY semantics — i.e.
+ * IMPORTANT: entries must match with WORD-BOUNDARY semantics -- i.e.
  * `\mathbf` followed by `{` matches, but `\mathbfriend` doesn't. */
 static const char *LATEX_TEXT_WRAPPERS[] = {
-    /* Text/math font-style wrappers — drop the command, keep the content. */
+    /* Text/math font-style wrappers -- drop the command, keep the content. */
     "text", "textbf", "textit", "textrm", "textsf", "texttt",
     "textnormal", "textup", "textsl", "textsc", "textmd", "textbrace",
     "mathbf", "mathrm", "mathbb", "mathcal", "mathfrak", "mathit",
@@ -854,7 +854,7 @@ static const char *LATEX_TEXT_WRAPPERS[] = {
     "overbrace", "underbrace",
     "overbracket", "underbracket", "overgroup", "undergroup",
     /* Substack: multi-line subscript. Content includes `\\` which we
-     * convert to `\n` — inside a `_{}` context the multi-byte result
+     * convert to `\n` -- inside a `_{}` context the multi-byte result
      * won't map to Unicode subscript so falls back to `_{...}` literal
      * form, which shows the multi-line content readably. */
     "substack",
@@ -862,21 +862,21 @@ static const char *LATEX_TEXT_WRAPPERS[] = {
      * In a text render, showing the raw value is more informative than
      * hiding it (which is what real strikethrough would do in TeX). */
     "cancel", "bcancel", "xcancel", "sout", "cancelto",
-    /* Frame / box wrappers — the box art doesn't survive text mode. */
+    /* Frame / box wrappers -- the box art doesn't survive text mode. */
     "boxed", "fbox",
-    /* Enclose / phase / raisebox — extract inner text only. */
+    /* Enclose / phase / raisebox -- extract inner text only. */
     "enclose", "phase", "raisebox",
-    /* Row/column tags in equation envs — usually invisible; content stays. */
+    /* Row/column tags in equation envs -- usually invisible; content stays. */
     "tag", "notag", "label", "nonumber",
-    /* URL wrapper — `\url{URL}` — best-effort: show URL as text. */
+    /* URL wrapper -- `\url{URL}` -- best-effort: show URL as text. */
     "url",
     /* Character formatting that doesn't affect rendering. */
     "widecheck",
     NULL
 };
 
-/* Accent commands — emit inner content + Unicode combining mark
- * appended AFTER each character. E.g. `\vec{v}` → `v⃗` (v + U+20D7). */
+/* Accent commands -- emit inner content + Unicode combining mark
+ * appended AFTER each character. E.g. `\vec{v}` -> `v⃗` (v + U+20D7). */
 struct latex_accent_entry {
     const char *cmd;      /* command name (no backslash) */
     const char *combining; /* UTF-8 combining mark (usually 2-3 bytes) */
@@ -887,7 +887,7 @@ static const struct latex_accent_entry LATEX_ACCENTS[] = {
     { "underrightarrow",  "\xE2\x83\x97" },   /* combining right arrow below not in BMP, use above as approx */
     { "overleftarrow",    "\xE2\x83\x96" },   /* ⃖ combining left arrow (U+20D6) */
     { "underleftarrow",   "\xE2\x83\x96" },
-    { "Overrightarrow",   "\xE2\x83\x9C" },   /* ⃜ (approx double-arrow — combining) — actually use ⇒ approach */
+    { "Overrightarrow",   "\xE2\x83\x9C" },   /* ⃜ (approx double-arrow -- combining) -- actually use ⇒ approach */
     { "overleftrightarrow","\xE2\x83\x94" },  /* combining left-right arrow (U+20D4 or similar); we use ↔-style */
     { "underleftrightarrow","\xE2\x83\x94" },
     { "overrightharpoon", "\xE2\x83\x91" },   /* ⃑ combining right harpoon (U+20D1) */
@@ -913,13 +913,13 @@ static const struct latex_accent_entry LATEX_ACCENTS[] = {
     { NULL, NULL }
 };
 
-/* Superscript digit lookup for ^0..^9 → Unicode superscript. */
+/* Superscript digit lookup for ^0..^9 -> Unicode superscript. */
 static const char *SUP_DIGITS[10] = {
     "\xE2\x81\xB0", "\xC2\xB9",     "\xC2\xB2",     "\xC2\xB3",
     "\xE2\x81\xB4", "\xE2\x81\xB5", "\xE2\x81\xB6", "\xE2\x81\xB7",
     "\xE2\x81\xB8", "\xE2\x81\xB9"
 };
-/* Subscript digit lookup for _0.._9 → Unicode subscript. */
+/* Subscript digit lookup for _0.._9 -> Unicode subscript. */
 static const char *SUB_DIGITS[10] = {
     "\xE2\x82\x80", "\xE2\x82\x81", "\xE2\x82\x82", "\xE2\x82\x83",
     "\xE2\x82\x84", "\xE2\x82\x85", "\xE2\x82\x86", "\xE2\x82\x87",
@@ -927,7 +927,7 @@ static const char *SUB_DIGITS[10] = {
 };
 
 /* Match a LaTeX command at src[pos]. Returns entry index or -1.
- * Uses longest-match — we walk the table in order and pick the first
+ * Uses longest-match -- we walk the table in order and pick the first
  * where the source starts with entry->tex AND the char after
  * entry->tex is NOT an ASCII letter (so `\pi` doesn't match `\pion`). */
 static int latex_match_at(const char *src, size_t src_len, size_t pos) {
@@ -938,7 +938,7 @@ static int latex_match_at(const char *src, size_t src_len, size_t pos) {
         /* Boundary check: next char must not be [a-zA-Z] so we don't
          * partial-match longer commands. `\pi` is fine before space
          * or digit or `\`, but not before `on` (which would make it
-         * `\pion` — not a real command but we shouldn't confuse).
+         * `\pion` -- not a real command but we shouldn't confuse).
          *
          * EXCEPTION: entries whose command name ENDS in a non-alpha
          * (like `\!`, `\,`, `\;`, `\ `, `\%`, `\{`) are self-
@@ -986,7 +986,7 @@ static size_t latex_wrapper_at(const char *src, size_t src_len, size_t pos) {
     return 0;
 }
 
-/* Same for accent commands — returns entry index or -1. */
+/* Same for accent commands -- returns entry index or -1. */
 static int latex_accent_at(const char *src, size_t src_len, size_t pos) {
     if (pos >= src_len || src[pos] != '\\') return -1;
     size_t start = pos + 1;
@@ -1109,7 +1109,7 @@ static size_t utf8_advance(const char *s, size_t pos, size_t end) {
 /* ── Unicode super/subscript helpers ─────────────────────────────
  *
  * Full alphabetic coverage isn't 1:1 in Unicode (some letters have no
- * subscript form) — we fall back to caret/underscore for those.
+ * subscript form) -- we fall back to caret/underscore for those.
  * See U+2070..209F block + Latin-1 sups + Spacing Modifier Letters. */
 
 /* Convert an ASCII char to its Unicode SUPERSCRIPT UTF-8 string.
@@ -1208,13 +1208,13 @@ static int try_render_sup_sub(const char *s, size_t n, int is_super,
                               char *dst, size_t *dp, size_t dst_cap) {
     for (size_t i = 0; i < n; i++) {
         const char *u = is_super ? sup_of(s[i]) : sub_of(s[i]);
-        if (!u) return 0;   /* no clean mapping — abort */
+        if (!u) return 0;   /* no clean mapping -- abort */
         ltx_puts(dst, dp, dst_cap, u);
     }
     return 1;
 }
 
-/* Unicode vulgar-fraction chars for common `\frac{a}{b}` forms — much
+/* Unicode vulgar-fraction chars for common `\frac{a}{b}` forms -- much
  * more readable than `1/2` inline. */
 struct vulgar_frac_entry { const char *num; const char *den; const char *uni; };
 static const struct vulgar_frac_entry VULGAR_FRACS[] = {
@@ -1239,7 +1239,7 @@ static const struct vulgar_frac_entry VULGAR_FRACS[] = {
     { NULL, NULL, NULL }
 };
 
-/* ── Helper functions (previously C++ lambdas — converted to file-static
+/* ── Helper functions (previously C++ lambdas -- converted to file-static
  * for C compatibility so the same source can be shared with test/tools). ─── */
 
 /* Read ONE LaTeX-arg starting at `pos`. Supports:
@@ -1314,20 +1314,20 @@ static int latex_is_ambiguous_den(const char *s, size_t len) {
  *
  * Renders a `\begin{env}...\end{env}` body as text art:
  *
- *   pmatrix   →   ⎛ 1 2 ⎞      (Unicode brackets)
+ *   pmatrix   ->   ⎛ 1 2 ⎞      (Unicode brackets)
  *                 ⎝ 3 4 ⎠
- *   bmatrix   →   ⎡ 1 2 ⎤
+ *   bmatrix   ->   ⎡ 1 2 ⎤
  *                 ⎣ 3 4 ⎦
- *   cases     →   ⎧ x  if x>0   (open brace, no close)
+ *   cases     ->   ⎧ x  if x>0   (open brace, no close)
  *                 ⎩ -x otherwise
- *   align/aligned → each `&` becomes space, `\\` becomes newline
+ *   align/aligned -> each `&` becomes space, `\\` becomes newline
  *
  * All row separators (`\\`) become `\n`. Column separators (`&`) become
- * a single space (best-effort — ImGui isn't a real math typesetter).
+ * a single space (best-effort -- ImGui isn't a real math typesetter).
  *
  * Body is recursively latex_to_unicode'd cell-by-cell so nested \frac,
  * \sqrt, etc. work. Row alignment is preserved by padding each cell to
- * the widest cell in that column (based on byte length — approximate). */
+ * the widest cell in that column (based on byte length -- approximate). */
 static size_t latex_render_env(const char *env, size_t env_len,
                                 const char *body, size_t body_len,
                                 char *dst, size_t dst_cap);
@@ -1335,19 +1335,19 @@ static size_t latex_render_env(const char *env, size_t env_len,
 /* Convert LaTeX to Unicode. Returns bytes written to dst (NOT NUL-
  * terminated; caller adds if needed).
  *
- * 2026-07-05 late-night rewrite — much more comprehensive:
+ * 2026-07-05 late-night rewrite -- much more comprehensive:
  *   - $ / \( / \) / \[ / \] delimiters stripped
- *   - \\ in display math → newline
- *   - \frac{a}{b} → Unicode vulgar frac (½ ⅓ …) if applicable, else a/b
- *   - \sqrt{x} → √(x) — always wrapped for readability
- *   - ^{...} / _{...} → Unicode super/subscript when all chars mappable
- *   - Bare ^N / _N (single digit) → Unicode super/sub
- *   - \text{...} / \mathbf{...} / \mathrm{...} etc. → strip wrapper, keep content
- *   - \vec{x} / \hat{x} / \bar{x} etc. → x + Unicode combining mark
- *   - \begin{matrix}...\end{matrix} → text-art rendering (via latex_render_env)
+ *   - \\ in display math -> newline
+ *   - \frac{a}{b} -> Unicode vulgar frac (½ ⅓ ...) if applicable, else a/b
+ *   - \sqrt{x} -> √(x) -- always wrapped for readability
+ *   - ^{...} / _{...} -> Unicode super/subscript when all chars mappable
+ *   - Bare ^N / _N (single digit) -> Unicode super/sub
+ *   - \text{...} / \mathbf{...} / \mathrm{...} etc. -> strip wrapper, keep content
+ *   - \vec{x} / \hat{x} / \bar{x} etc. -> x + Unicode combining mark
+ *   - \begin{matrix}...\end{matrix} -> text-art rendering (via latex_render_env)
  *   - Full LATEX_MAP lookup (~200 symbols, longest-match-first)
- *   - Unknown \command{content} → recursively emit content (drop cmd)
- *   - Unknown \command (no braces) → preserve as literal for user diag
+ *   - Unknown \command{content} -> recursively emit content (drop cmd)
+ *   - Unknown \command (no braces) -> preserve as literal for user diag
  *   - Stray { } stripped (they're LaTeX grouping)
  *   - $ ` * and ** stay as-is (paragraph accumulator handles md-strip) */
 static size_t latex_to_unicode(const char *src, size_t src_len,
@@ -1389,7 +1389,7 @@ static size_t latex_to_unicode(const char *src, size_t src_len,
             continue;
         }
 
-        /* \begin{env}...\end{env} — dispatch to environment renderer. */
+        /* \begin{env}...\end{env} -- dispatch to environment renderer. */
         if (c == '\\' && sp + 7 <= src_len &&
             memcmp(src + sp, "\\begin{", 7) == 0) {
             const char *env_name = NULL;
@@ -1417,14 +1417,14 @@ static size_t latex_to_unicode(const char *src, size_t src_len,
             }
         }
 
-        /* \not X prefix — negation. Emits the negated Unicode form:
-         *   \not=       -> ≠   (specific — same as \neq)
+        /* \not X prefix -- negation. Emits the negated Unicode form:
+         *   \not=       -> ≠   (specific -- same as \neq)
          *   \not<       -> ≮
          *   \not>       -> ≯
-         *   \not\in     -> ∉   (specific — same as \notin)
+         *   \not\in     -> ∉   (specific -- same as \notin)
          *   \not\equiv  -> ≢
          *   \not\subset -> ⊄
-         *   \not\prec   -> ⊀   (specific — same as \nprec)
+         *   \not\prec   -> ⊀   (specific -- same as \nprec)
          *   ... more via NEGATION_MAP below
          * For unknown targets: emit the target's rendered form + a
          * combining long-solidus-overlay (U+0338) which visually strikes
@@ -1442,7 +1442,7 @@ static size_t latex_to_unicode(const char *src, size_t src_len,
             /* Absorb whitespace between \not and target. */
             while (p < src_len && src[p] == ' ') p++;
             if (p >= src_len) {
-                /* orphan \not — emit literal for diagnostic */
+                /* orphan \not -- emit literal for diagnostic */
                 ltx_puts(dst, &dp, dst_cap, "\\not");
                 sp = p;
                 continue;
@@ -1520,9 +1520,9 @@ static size_t latex_to_unicode(const char *src, size_t src_len,
             }
         }
 
-        /* \pmod{a} → " (mod a)" — parenthesized modular arithmetic
+        /* \pmod{a} -> " (mod a)" -- parenthesized modular arithmetic
          * marker. Standard LaTeX renders \pmod with parens which our
-         * bare \pmod → "mod" mapping doesn't do; catch it here so we
+         * bare \pmod -> "mod" mapping doesn't do; catch it here so we
          * emit the parens explicitly. */
         if (c == '\\' && sp + 6 <= src_len &&
             memcmp(src + sp, "\\pmod", 5) == 0 && src[sp + 5] == '{') {
@@ -1535,8 +1535,8 @@ static size_t latex_to_unicode(const char *src, size_t src_len,
                                           inner_end - inner_start,
                                           inner_buf, sizeof(inner_buf) - 1);
             inner_buf[il] = 0;
-            /* No leading space — the source usually has one already
-             * ("$a \equiv b \pmod{7}$" → "a ≡ b (mod 7)"). Emitting a
+            /* No leading space -- the source usually has one already
+             * ("$a \equiv b \pmod{7}$" -> "a ≡ b (mod 7)"). Emitting a
              * leading space here would double it. */
             ltx_puts(dst, &dp, dst_cap, "(mod ");
             ltx_put(dst, &dp, dst_cap, inner_buf, il);
@@ -1545,7 +1545,7 @@ static size_t latex_to_unicode(const char *src, size_t src_len,
             continue;
         }
 
-        /* \ang{degrees} → "degrees°" (KaTeX \ang extension). */
+        /* \ang{degrees} -> "degrees°" (KaTeX \ang extension). */
         if (c == '\\' && sp + 5 <= src_len &&
             memcmp(src + sp, "\\ang", 4) == 0 && src[sp + 4] == '{') {
             size_t p = sp + 4;
@@ -1563,11 +1563,11 @@ static size_t latex_to_unicode(const char *src, size_t src_len,
             continue;
         }
 
-        /* \ket{X} → |X⟩   quantum ket notation
-         * \bra{X} → ⟨X|   bra notation
-         * \Ket, \Bra — same (tall delimiter variants render identically in text mode)
-         * \braket{ϕ|ψ} → ⟨ϕ|ψ⟩   inner-product bracket
-         * \Braket — same
+        /* \ket{X} -> |X⟩   quantum ket notation
+         * \bra{X} -> ⟨X|   bra notation
+         * \Ket, \Bra -- same (tall delimiter variants render identically in text mode)
+         * \braket{ϕ|ψ} -> ⟨ϕ|ψ⟩   inner-product bracket
+         * \Braket -- same
          * \bra & \ket must match BEFORE \braket because they're prefixes.
          * Order in the string check: check longer prefix first. */
         if (c == '\\' && sp + 8 <= src_len &&
@@ -1628,9 +1628,9 @@ static size_t latex_to_unicode(const char *src, size_t src_len,
             continue;
         }
 
-        /* \overset{above}{base} → "base" + "^{above}" recursion
-         * \underset{below}{base} → "base" + "_{below}"
-         * \stackrel{above}{base} → same as \overset (deprecated alias)
+        /* \overset{above}{base} -> "base" + "^{above}" recursion
+         * \underset{below}{base} -> "base" + "_{below}"
+         * \stackrel{above}{base} -> same as \overset (deprecated alias)
          * The best text rendering is to emit `base` first, then let the
          * sup/sub handler render `above`/`below`. */
         if (c == '\\' && sp + 9 <= src_len) {
@@ -1677,7 +1677,7 @@ static size_t latex_to_unicode(const char *src, size_t src_len,
         }
 
         /* \hspace{X}, \hspace*{X}, \vspace{X}, \kern{X}, \mkern{X},
-         * \hskip{X}, \mskip{X} — drop command + drop {} arg, emit
+         * \hskip{X}, \mskip{X} -- drop command + drop {} arg, emit
          * one space (best-effort). Matches KaTeX behavior of visible
          * gap. */
         if (c == '\\' && sp + 7 <= src_len) {
@@ -1720,8 +1720,8 @@ static size_t latex_to_unicode(const char *src, size_t src_len,
             if (matched) continue;
         }
 
-        /* \href{url}{text} — extract text only (drop url).
-         * KaTeX renders as link — in text mode we just show label. */
+        /* \href{url}{text} -- extract text only (drop url).
+         * KaTeX renders as link -- in text mode we just show label. */
         if (c == '\\' && sp + 7 <= src_len &&
             memcmp(src + sp, "\\href", 5) == 0 && src[sp + 5] == '{') {
             size_t p = sp + 5;
@@ -1742,7 +1742,7 @@ static size_t latex_to_unicode(const char *src, size_t src_len,
         }
 
         /* \frac{a}{b} + synonyms \dfrac \tfrac \cfrac (display / text /
-         * continued) — all render the same in text mode. PLUS v6.1
+         * continued) -- all render the same in text mode. PLUS v6.1
          * shorthand for the single-token forms:
          *   \frac12       -> 1/2                  (two single-char args)
          *   \frac1{2x}    -> 1/(2x)               (single-char + braced)
@@ -1784,7 +1784,7 @@ static size_t latex_to_unicode(const char *src, size_t src_len,
                                                   den_end - den_start,
                                                   den_buf, sizeof(den_buf) - 1);
                     den_buf[dl] = 0;
-                    /* Try vulgar fraction lookup first — much prettier. */
+                    /* Try vulgar fraction lookup first -- much prettier. */
                     int vulgar_ok = 0;
                     for (int i = 0; VULGAR_FRACS[i].num; i++) {
                         if (strcmp(num_buf, VULGAR_FRACS[i].num) == 0 &&
@@ -1801,20 +1801,20 @@ static size_t latex_to_unicode(const char *src, size_t src_len,
                          *
                          * DEN: wrap if has op/space/paren OR if content
                          *   mixes DIGIT with LETTER/multibyte (e.g. `2a`,
-                         *   `2σ²` — `1/2a` reads as `(1/2)·a` OR `1/(2a)`
+                         *   `2σ²` -- `1/2a` reads as `(1/2)·a` OR `1/(2a)`
                          *   ambiguously without parens). Pure `a`, pure
                          *   `10`, pure `speed` etc. don't need wrap
                          *   (unambiguous atomic units).
                          *
                          * Yields (all real AI outputs):
-                         *   1/2         → ½ (vulgar path)
-                         *   a/b         → a/b
-                         *   dy/dx       → dy/dx (standard notation)
-                         *   distance/speed → distance/speed
-                         *   1/2a        → 1/(2a) (ambiguous → wrap)
-                         *   2/2σ²       → 2/(2σ²)
-                         *   (a+b)/(c-d) → wrap both
-                         *   1/(σ√(2π))  → den has `(` → wrap */
+                         *   1/2         -> ½ (vulgar path)
+                         *   a/b         -> a/b
+                         *   dy/dx       -> dy/dx (standard notation)
+                         *   distance/speed -> distance/speed
+                         *   1/2a        -> 1/(2a) (ambiguous -> wrap)
+                         *   2/2σ²       -> 2/(2σ²)
+                         *   (a+b)/(c-d) -> wrap both
+                         *   1/(σ√(2π))  -> den has `(` -> wrap */
                         int wrap_num = latex_has_op_chars(num_buf, nl);
                         int wrap_den = latex_has_op_chars(den_buf, dl) ||
                                        latex_is_ambiguous_den(den_buf, dl);
@@ -1832,7 +1832,7 @@ static size_t latex_to_unicode(const char *src, size_t src_len,
             }
         }
 
-        /* \binom{a}{b} → C(a,b) form. */
+        /* \binom{a}{b} -> C(a,b) form. */
         if (c == '\\' && sp + 6 <= src_len &&
             (memcmp(src + sp, "\\binom", 6) == 0 ||
              memcmp(src + sp, "\\tbinom", 7) == 0 ||
@@ -1883,7 +1883,7 @@ static size_t latex_to_unicode(const char *src, size_t src_len,
              (src[sp + 5] >= 'a' && src[sp + 5] <= 'z') ||
              (src[sp + 5] >= 'A' && src[sp + 5] <= 'Z'))) {
             size_t p = sp + 5;
-            /* Optional [n] index for nth root — emit as n√ prefix. */
+            /* Optional [n] index for nth root -- emit as n√ prefix. */
             if (p < src_len && src[p] == '[') {
                 p++;
                 size_t idx_start = p;
@@ -1914,9 +1914,9 @@ static size_t latex_to_unicode(const char *src, size_t src_len,
                                               inner_buf, sizeof(inner_buf) - 1);
                 inner_buf[il] = 0;
                 /* Wrap in parens for readability. Rules (in order):
-                 *   YES if inner has any op/space → √(a+b), √(a b)
+                 *   YES if inner has any op/space -> √(a+b), √(a b)
                  *   YES if inner has mixed content (digit+letter, digit
-                 *     + multibyte greek) → √(2π), √(2ac), √(2x)
+                 *     + multibyte greek) -> √(2π), √(2ac), √(2x)
                  *   NO for pure digits (√27, √100)
                  *   NO for pure letters (√x, √xy, √abc)
                  *   NO for single-char content
@@ -1982,7 +1982,7 @@ static size_t latex_to_unicode(const char *src, size_t src_len,
             }
         }
 
-        /* Accent commands: \vec{x} → x⃗ etc. */
+        /* Accent commands: \vec{x} -> x⃗ etc. */
         {
             int acc = latex_accent_at(src, src_len, sp);
             if (acc >= 0) {
@@ -2031,9 +2031,9 @@ static size_t latex_to_unicode(const char *src, size_t src_len,
         /* Superscript/subscript with braces: ^{...} / _{...}
          * Try full Unicode super/sub for all chars; fall back to
          * `^{inner}` / `_{inner}` literal on any un-mappable char.
-         * We KEEP the braces on fallback so scope is unambiguous —
-         * `\lim_{n \to \infty}` renders as `lim_{n → ∞}`, not
-         * `lim_n → ∞` which is unreadable. */
+         * We KEEP the braces on fallback so scope is unambiguous --
+         * `\lim_{n \to \infty}` renders as `lim_{n -> ∞}`, not
+         * `lim_n -> ∞` which is unreadable. */
         if ((c == '^' || c == '_') && sp + 1 < src_len && src[sp + 1] == '{') {
             char op = c;
             sp += 2;
@@ -2068,9 +2068,9 @@ static size_t latex_to_unicode(const char *src, size_t src_len,
 
         /* Bare ^X or _X handling.
          *
-         * SPECIAL CASE: ^\command — if the command is in LATEX_MAP,
+         * SPECIAL CASE: ^\command -- if the command is in LATEX_MAP,
          * emit its Unicode DIRECTLY (dropping the `^`). This makes
-         * `T=0^\circ\text{C}` render as `T=0°C` — the ° symbol is
+         * `T=0^\circ\text{C}` render as `T=0°C` -- the ° symbol is
          * already "superscript-like" so `^°` would be redundant. */
         if ((c == '^' || c == '_') && sp + 1 < src_len && src[sp + 1] == '\\') {
             int idx = latex_match_at(src, src_len, sp + 1);
@@ -2088,7 +2088,7 @@ static size_t latex_to_unicode(const char *src, size_t src_len,
          * Same chemistry-friendly rule as `_`: single-digit sup can be
          * followed by a letter (e.g. `x^2y` = `x²y`), which is standard
          * math notation. Only reject if it's followed by another digit
-         * (multi-digit sup — requires braces). */
+         * (multi-digit sup -- requires braces). */
         if (c == '^' && sp + 1 < src_len) {
             char nx = src[sp + 1];
             int is_digit = (nx >= '0' && nx <= '9');
@@ -2105,7 +2105,7 @@ static size_t latex_to_unicode(const char *src, size_t src_len,
                 continue;
             }
         }
-        /* Bare _X analogous — with a special case for chemistry:
+        /* Bare _X analogous -- with a special case for chemistry:
          * `H_2O` and `CO_2` are ubiquitous, so allow single-digit
          * subscript even when followed by another letter. `x_ab`
          * (unlikely in real math) still stays literal because
@@ -2146,10 +2146,10 @@ static size_t latex_to_unicode(const char *src, size_t src_len,
                 }
                 continue;
             }
-            /* Unknown \command — if followed by `{...}`, safest is to
+            /* Unknown \command -- if followed by `{...}`, safest is to
              * silently drop the command name and emit the content
              * (so `\weird{content}` becomes `content`). This handles
-             * long-tail LaTeX (`\mathbb{R}` → `R`) even without adding
+             * long-tail LaTeX (`\mathbb{R}` -> `R`) even without adding
              * every package's symbols to LATEX_MAP.
              *
              * If NOT followed by `{`, preserve as literal `\name` so
@@ -2176,14 +2176,14 @@ static size_t latex_to_unicode(const char *src, size_t src_len,
                 sp = after;
                 continue;
             }
-            /* No braces after — emit `\name` verbatim for diagnostic. */
+            /* No braces after -- emit `\name` verbatim for diagnostic. */
             ltx_putc(dst, &dp, dst_cap, '\\');
             sp = after_bs;
             while (sp < word_end) ltx_putc(dst, &dp, dst_cap, src[sp++]);
             continue;
         }
 
-        /* Strip stray { } (LaTeX grouping — no meaning in prose). */
+        /* Strip stray { } (LaTeX grouping -- no meaning in prose). */
         if (c == '{' || c == '}') {
             sp++;
             continue;
@@ -2213,7 +2213,7 @@ static size_t latex_to_unicode(const char *src, size_t src_len,
  *
  * Supported environments:
  *   matrix, pmatrix, bmatrix, Bmatrix, vmatrix, Vmatrix, smallmatrix
- *   array   (columns spec { }|c|c|| ignored — same as matrix)
+ *   array   (columns spec { }|c|c|| ignored -- same as matrix)
  *   cases   (open brace on left, right-aligned second col)
  *   align, aligned, gather, gathered, split, multline, eqnarray,
  *   subarray (all treat & as space + \\ as newline)
@@ -2268,7 +2268,7 @@ static size_t latex_render_env(const char *env, size_t env_len,
         while (bp < body_len && body[bp] != '}') bp++;
         if (bp < body_len) bp++;
     }
-    /* Skip a leading `{...}` alignment spec for align etc. — rare. */
+    /* Skip a leading `{...}` alignment spec for align etc. -- rare. */
 
     /* Skip leading whitespace/newlines. */
     while (bp < body_len && (body[bp] == ' ' || body[bp] == '\t' ||
@@ -2354,7 +2354,7 @@ static size_t latex_render_env(const char *env, size_t env_len,
             if (bracket_close[0] && !is_cases) {
                 /* Only close on the LAST row for matrices. We don't know
                  * ahead if this IS the last row, so close every row (visual
-                 * approximation — tall matrices show brackets on each
+                 * approximation -- tall matrices show brackets on each
                  * row, which is imperfect but readable). */
                 ltx_puts(dst, &dp, dst_cap, bracket_close);
             }

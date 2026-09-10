@@ -1,7 +1,7 @@
 /* ================================================================== *
- * hwid.c — HWID derivation with WMIC / registry / SHA256 fallback.    *
+ * hwid.c -- HWID derivation with WMIC / registry / SHA256 fallback.    *
  *                                                                    *
- * All native — no PowerShell, no child processes beyond wmic when   *
+ * All native -- no PowerShell, no child processes beyond wmic when   *
  * available. On Win11 24H2 where wmic is removed, we skip step 1    *
  * and fall through to MachineGuid. Same fallback chain as the JS    *
  * version so the resulting UUID matches across implementations.     *
@@ -35,7 +35,7 @@ static DWORD run_captured(const char *cmdline, char *buf, DWORD bufsize) {
     si.wShowWindow = SW_HIDE;
 
     PROCESS_INFORMATION pi = {0};
-    /* Non-const command line — CreateProcess mutates it. */
+    /* Non-const command line -- CreateProcess mutates it. */
     char cmd[512];
     _snprintf(cmd, sizeof(cmd) - 1, "%s", cmdline);
     cmd[sizeof(cmd) - 1] = '\0';
@@ -109,7 +109,7 @@ static int parse_wmic_uuid(const char *raw, char *out, unsigned outsize) {
     return 1;
 }
 
-/* SHA-256(computer_name || volume_serial || 'salt') → formatted as UUID. */
+/* SHA-256(computer_name || volume_serial || 'salt') -> formatted as UUID. */
 static int fallback_uuid(char *out, unsigned outsize) {
     if (outsize < 40) return 0;
     char name[256];

@@ -18,6 +18,12 @@ const EVENTS = new Set([
    * payload after DWM crashed + respawned. Renderer displays a small
    * toast so the user knows recovery happened. */
   'injector:respawn-recovered',
+  /* v2.0 (2026-09-10): user pressed Ctrl+Q inside the overlay (soft
+   * user_quit) OR Ctrl+Shift+Alt+K panic (user_panic). Watchdog reads
+   * either sentinel, disarms, and pushes this event so the renderer
+   * navigates home / shows the "emergency stop" toast. Was fired by
+   * main.js since v1.9.2 but silently dropped by preload's whitelist. */
+  'injector:user-quit',
 ]);
 
 contextBridge.exposeInMainWorld('svc', {

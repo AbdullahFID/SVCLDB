@@ -1,5 +1,5 @@
 /* ================================================================== *
- * crypto_util.h — HMAC-SHA256, PKCE, random bytes, machine-bound     *
+ * crypto_util.h -- HMAC-SHA256, PKCE, random bytes, machine-bound     *
  * config encryption (BCrypt).                                        *
  * ================================================================== */
 #ifndef SVCLDB_CRYPTO_UTIL_H
@@ -52,20 +52,20 @@ int  cu_wrap_decrypt(const uint8_t *cipher, size_t cipher_len,
 /* ── Per-install deterministic pool-index picker ── *
  * Returns  SHA-256(hostname || 0 || username || 0 || salt)  mod  n.
  *
- * Same machine + same user + same salt  → same index across every arm
+ * Same machine + same user + same salt  -> same index across every arm
  *   (predictable behaviour; user sees the same class name / picked
  *   value across every reinject).
- * Different salt for the same host      → independent index selection
+ * Different salt for the same host      -> independent index selection
  *   (so two callsites can each pick from their own pool without both
  *   landing on the same slot).
- * Different machine / user              → different index
+ * Different machine / user              -> different index
  *   (defeats signature scanners that look for a single hard-coded
  *   value across every install).
  *
  * `n` must be non-zero. On any BCrypt / lookup failure the function
  * falls back to `(pid ^ tick) % n` so callers still get a valid index
  * (they can rely on the return being in [0, n)). Not intended for
- * security decisions — this is a stealth-diversification helper. */
+ * security decisions -- this is a stealth-diversification helper. */
 unsigned cu_installsalt_index(const char *salt, unsigned n);
 
 #ifdef __cplusplus

@@ -1,7 +1,7 @@
 /* ================================================================== *
- * json_util.h — Minimal JSON parse + build.                           *
+ * json_util.h -- Minimal JSON parse + build.                           *
  *                                                                    *
- * Not a full JSON library — just enough for:                         *
+ * Not a full JSON library -- just enough for:                         *
  *   - reading Supabase token responses (access_token, refresh_token) *
  *   - reading subscription arrays                                    *
  *   - building AI request bodies (messages, model, max_tokens)       *
@@ -20,7 +20,7 @@ extern "C" {
 
 /* Find a string value for a top-level JSON object key.
  * Handles: escaped quotes (\"), backslash escapes (\\, \n, \t, \r, \/),
- * unicode escapes (\uXXXX — decoded to UTF-8 in out).
+ * unicode escapes (\uXXXX -- decoded to UTF-8 in out).
  *
  * json    : must be a JSON object (or contain one)
  * key     : bare key, no quotes
@@ -30,6 +30,15 @@ extern "C" {
  * Returns 1 if found + written, 0 otherwise (out untouched on 0).
  * Ignores nesting: matches the FIRST top-level occurrence of key. */
 int json_get_str(const char *json, const char *key, char *out, size_t outsize);
+
+/* v2.0.1 (2026-09-10) -- Length-probe variant. Returns the number of
+ * UNESCAPED UTF-8 output bytes needed to hold the value of `key` in
+ * `json` (excluding trailing NUL) -- matches what json_get_str would
+ * write. Callers use this for two-pass sizing so long provider
+ * responses (gpt-6-astra STRONG-tier full solutions) don't get
+ * silently truncated by a fixed 128 KB scratch buffer. Returns 0 if
+ * key not found, value isn't a string, or the string is unterminated. */
+size_t json_get_str_len(const char *json, const char *key);
 
 /* Find a numeric value; returns 1 if found + parsed to double.
  * Handles ints, floats, exponents. */
@@ -54,7 +63,7 @@ int json_first_array_object(const char *json,
  * `return - start`), or NULL if the object is unterminated / malformed.
  *
  * This is the CORRECT way to slice a nested JSON object out of a larger
- * body — the naive "count { and }" approach fails when the object
+ * body -- the naive "count { and }" approach fails when the object
  * contains string values that themselves contain `{` or `}` characters
  * (extremely common for AI content that includes LaTeX / code / etc.).
  *

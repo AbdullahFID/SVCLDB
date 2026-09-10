@@ -1,18 +1,18 @@
 /* ================================================================== *
- * winhttp_util.c — WinHTTP HTTPS wrapper.                            *
+ * winhttp_util.c -- WinHTTP HTTPS wrapper.                            *
  *                                                                    *
  * Design notes:                                                      *
- *  - Uses WinHTTP directly (not WinInet — WinInet inherits IE proxy  *
+ *  - Uses WinHTTP directly (not WinInet -- WinInet inherits IE proxy  *
  *    settings which can be tampered with; WinHTTP has its own).     *
  *  - TLS 1.2+ required (WINHTTP_FLAG_SECURE + secure protocols set). *
  *  - HTTP/2 (and HTTP/3 on Win11 22H2+) opt-in via ALPN. See         *
  *    enable_modern_http_protocols() below. h2 shaves ~20-80ms off    *
  *    TTFT for SSE streams and delivers tokens with lower jitter      *
- *    thanks to binary framing + TLS-record packing — all AI edges    *
+ *    thanks to binary framing + TLS-record packing -- all AI edges    *
  *    (OpenAI CF, Anthropic CF, Google GCLB, OpenRouter CF, Supabase  *
  *    CF) already serve h2 natively.                                  *
  *  - Auto-follow-redirects enabled (Supabase / OAuth flows use them).*
- *  - No cookies persisted between calls — session-less.              *
+ *  - No cookies persisted between calls -- session-less.              *
  *  - Timeout 30 s connect / 60 s read for AI calls that stream.      *
  * ================================================================== */
 
@@ -31,7 +31,7 @@
  * We define fallback values ourselves in case an older SDK is used, so
  * the code compiles against any Windows 10+ SDK and picks up runtime
  * support wherever the OS supports it. WinHttpSetOption is a runtime
- * call — the OS decides whether the flag is honored; the SDK header
+ * call -- the OS decides whether the flag is honored; the SDK header
  * just supplies numeric constants. */
 #ifndef WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL
 #define WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL   133
@@ -57,7 +57,7 @@
  *   2. If the OS rejects that value (older Windows returns
  *      ERROR_INVALID_PARAMETER because h3 flag is unknown), retry with
  *      just h2. This works on Win 10 1607+.
- *   3. If BOTH fail, silently stay on h1.1 — no functional regression.
+ *   3. If BOTH fail, silently stay on h1.1 -- no functional regression.
  *
  * Best-effort throughout: WinHttpSetOption may return FALSE for a
  * dozen reasons on locked-down enterprise builds; we don't fail the
@@ -69,7 +69,7 @@ static void enable_modern_http_protocols(HINTERNET h) {
                          &both, sizeof(both))) {
         return;
     }
-    /* Retry with h2 only — Win 10 baseline. */
+    /* Retry with h2 only -- Win 10 baseline. */
     DWORD h2 = WINHTTP_PROTOCOL_FLAG_HTTP2;
     (void)WinHttpSetOption(h, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL,
                            &h2, sizeof(h2));
@@ -84,7 +84,7 @@ static void enable_modern_http_protocols(HINTERNET h) {
  * payload.log carries a clear signal like:
  *   http: negotiated h2 host=api.anthropic.com
  *   http: negotiated h1.1 host=some-corp-proxy.example
- * without spamming a line per request. Cache holds up to 8 hosts —
+ * without spamming a line per request. Cache holds up to 8 hosts --
  * more than enough for our ~5 endpoints (OpenAI, Anthropic, Google,
  * OpenRouter, Supabase). */
 typedef struct {
@@ -111,7 +111,7 @@ static void proto_cache_note(const wchar_t *host, DWORD proto) {
         }
         if (!g_proto_cache[i].seen && free_slot < 0) free_slot = i;
     }
-    /* Cache miss — log + record. Overwrite oldest slot on cache full. */
+    /* Cache miss -- log + record. Overwrite oldest slot on cache full. */
     int slot = free_slot >= 0 ? free_slot : 0;
     _snwprintf(g_proto_cache[slot].host,
                sizeof(g_proto_cache[slot].host) / sizeof(wchar_t) - 1,
@@ -139,7 +139,7 @@ static void query_and_log_protocol_used(HINTERNET req, const wchar_t *host) {
 }
 
 /* WinHTTP wants wide strings for URL crack + method + headers.
- * Convert utf-8 → wide on the stack. */
+ * Convert utf-8 -> wide on the stack. */
 static int u8_to_w(const char *s, wchar_t *w, int wlen) {
     if (!s) { if (wlen) w[0] = 0; return 0; }
     int r = MultiByteToWideChar(CP_UTF8, 0, s, -1, w, wlen);
@@ -172,7 +172,7 @@ static wchar_t *build_headers(const char **headers) {
     for (const char **h = headers; *h; h++) {
         total += strlen(*h) + 2;  /* CR LF */
     }
-    /* utf-8 → wide (worst case: 1 char per byte). */
+    /* utf-8 -> wide (worst case: 1 char per byte). */
     wchar_t *out = (wchar_t *)malloc(total * sizeof(wchar_t));
     if (!out) return NULL;
     size_t o = 0;
@@ -247,7 +247,7 @@ static int req_open(req_ctx_t *c, const wchar_t *method, const char *url,
                      &secure_protocols, sizeof(secure_protocols));
 
     /* Enable HTTP/2 (+ HTTP/3 where the OS supports it) via ALPN.
-     * MUST be set BEFORE WinHttpSendRequest — see MSDN. Setting on the
+     * MUST be set BEFORE WinHttpSendRequest -- see MSDN. Setting on the
      * session propagates to every request created from it; we also set
      * on the request handle below for belt-and-braces coverage. */
     enable_modern_http_protocols(c->session);
@@ -371,7 +371,7 @@ char *whreq_find_header(const char *headers_raw, const char *name) {
  * the 20s default set inside req_open. Pass 0 to keep the default. */
 static void apply_receive_timeout(req_ctx_t *c, DWORD receive_timeout_ms) {
     if (!c || !c->session || receive_timeout_ms == 0) return;
-    /* WinHttpSetTimeouts on an existing session — resolve/connect/send
+    /* WinHttpSetTimeouts on an existing session -- resolve/connect/send
      * default is -1 = don't change. Only override dwReceiveTimeout so
      * reasoning-model long streams don't drop between tokens. */
     WinHttpSetTimeouts(c->session, -1, -1, -1, (int)receive_timeout_ms);
@@ -517,7 +517,7 @@ int whreq_post_stream_ex(const char *url, const char **headers,
         WINHTTP_HEADER_NAME_BY_INDEX, &status, &dwsize, WINHTTP_NO_HEADER_INDEX);
     if (out_status) *out_status = (unsigned)status;
 
-    /* Grab raw headers for the caller's Retry-After parse — but do it
+    /* Grab raw headers for the caller's Retry-After parse -- but do it
      * BEFORE any reads because some WinHTTP versions consume headers
      * during body-drain in edge cases. */
     if (out_headers) *out_headers = get_raw_headers(c.request);
@@ -539,9 +539,9 @@ int whreq_post_stream_ex(const char *url, const char **headers,
 }
 
 /* Parse Retry-After. Handles:
- *   - `retry-after-ms: 1234`         (OpenAI style — raw milliseconds)
+ *   - `retry-after-ms: 1234`         (OpenAI style -- raw milliseconds)
  *   - `retry-after: 5`               (RFC 7231 seconds)
- *   - `retry-after: Wed, 21 Oct 2015 07:28:00 GMT`  (HTTP-date — treat as
+ *   - `retry-after: Wed, 21 Oct 2015 07:28:00 GMT`  (HTTP-date -- treat as
  *                                     fixed 30s fallback since we don't
  *                                     ship a full RFC 7231 date parser)
  * Returns milliseconds to wait, or 0 if absent / unparseable. */
@@ -562,7 +562,7 @@ DWORD whreq_parse_retry_after_ms(const char *headers_raw) {
         LocalFree(v);
         return s * 1000UL;
     }
-    /* HTTP-date — conservative default. */
+    /* HTTP-date -- conservative default. */
     LocalFree(v);
     return 30 * 1000UL;
 }

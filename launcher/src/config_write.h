@@ -1,5 +1,5 @@
 /* ================================================================== *
- * config_write.h — Write encrypted config for payload to consume.     *
+ * config_write.h -- Write encrypted config for payload to consume.     *
  *                                                                    *
  * Payload reads C:\ProgramData\...\config.dat on load.               *
  * Contains: current session token, selected AI provider + API key,   *

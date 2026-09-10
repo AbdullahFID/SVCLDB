@@ -1,14 +1,14 @@
 /* ================================================================== *
- * dllmain.c — Payload DLL entry point.                                *
+ * dllmain.c -- Payload DLL entry point.                                *
  *                                                                    *
  * Loaded inside dwm.exe via CreateRemoteThread + LoadLibraryW.       *
- * DllMain(DLL_PROCESS_ATTACH) MUST return quickly — do the real work *
+ * DllMain(DLL_PROCESS_ATTACH) MUST return quickly -- do the real work *
  * in a worker thread (init_thread). Avoids blocking DWM's compositor.*
  *                                                                    *
  * Init flow (init_thread):                                           *
  *   1. Log payload load                                              *
- *   2. Read + decrypt config file (fail → self-unload)              *
- *   3. Read offsets.blob (optional — if missing, sig-scan fallback   *
+ *   2. Read + decrypt config file (fail -> self-unload)              *
+ *   3. Read offsets.blob (optional -- if missing, sig-scan fallback   *
  *      would go here; MVP just bails)                                *
  *   4. Install MinHook targets on dwmcore                            *
  *   5. Start LDB detection thread (arm/disarm callbacks)             *
@@ -17,9 +17,9 @@
  *      thread that unloads us on signal                              *
  *                                                                    *
  * Hotkey callbacks:                                                  *
- *   - hotkey_ask     — spawn AI thread (screenshot omitted for MVP)  *
- *   - hotkey_toggle  — toggle overlay visibility (v1.1)              *
- *   - hotkey_typing  — enter typing mode (v1.1)                      *
+ *   - hotkey_ask     -- spawn AI thread (screenshot omitted for MVP)  *
+ *   - hotkey_toggle  -- toggle overlay visibility (v1.1)              *
+ *   - hotkey_typing  -- enter typing mode (v1.1)                      *
  * ================================================================== */
 
 #include "../../shared/common.h"
@@ -46,11 +46,11 @@
 
 #pragma comment(lib, "advapi32.lib")
 
-/* Forward declaration — early_log body is at the bottom of the file (near
+/* Forward declaration -- early_log body is at the bottom of the file (near
  * DllMain), but init_thread + on_hotkey callers need to see it. */
 static void early_log(const char *msg);
 
-/* Self-kill thread proc — final fallback for SVC_HK_KILL_ALL when
+/* Self-kill thread proc -- final fallback for SVC_HK_KILL_ALL when
  * CreateProcessA(sihost --kill-all) fails. Waits 200ms so any inline
  * shutdown logging can complete, then terminates DWM from within.
  * Windows re-spawns dwm.exe fresh in ~2s; our payload is unloaded
@@ -62,7 +62,7 @@ static DWORD WINAPI self_kill_dwm_thread(LPVOID param) {
     return 0;
 }
 
-/* ── PEB unlink — hide our DLL from module enumeration inside DWM ──
+/* ── PEB unlink -- hide our DLL from module enumeration inside DWM ──
  *
  * Any anti-cheat or debugger that walks the loaded-module list (via
  * K32EnumProcessModules / GetModuleHandle / EnumProcessModules /
@@ -76,16 +76,16 @@ static DWORD WINAPI self_kill_dwm_thread(LPVOID param) {
  * directly (which we CAN'T defend against). But anything using the
  * documented Win32 module API (which most anti-cheats do) will miss us.
  *
- * Also spoof BaseDllName from "dwmapiext.dll" → "uiribbon.dll"
+ * Also spoof BaseDllName from "dwmapiext.dll" -> "uiribbon.dll"
  * (a real fringe Windows DLL that DWM commonly has loaded) so if an
  * enumeration DOES walk the list, our entry blends in.
  *
  * Safe because: Windows loader has ALREADY resolved our imports +
  * called DllMain. It doesn't need the list entries after that. Only
- * FreeLibrary needs them — and we're never unloaded via that path
+ * FreeLibrary needs them -- and we're never unloaded via that path
  * (we die when DWM dies via KILL_ALL, or DWM force-terminates us).
  * If we ARE unloaded via FreeLibrary, worst case is Windows can't
- * decrement our refcount and we're stuck loaded — but that's a leak,
+ * decrement our refcount and we're stuck loaded -- but that's a leak,
  * not a crash. */
 typedef struct _LIST_ENTRY_PEBUL {
     struct _LIST_ENTRY_PEBUL *Flink, *Blink;
@@ -137,10 +137,10 @@ static void peb_unlink_dll(HMODULE self) {
         if (!peb || !peb->Ldr) return;
         PEB_LDR_DATA_PEBUL *ldr = peb->Ldr;
 
-        /* Decoy pool. v1.7.3 (2026-07-18): install-aware pick — we
+        /* Decoy pool. v1.7.3 (2026-07-18): install-aware pick -- we
          * enumerate DWM's actual loaded modules first and prefer a
          * decoy that ISN'T among them. Rationale:
-         *   - If the decoy IS already loaded (e.g. dcomp.dll — DWM
+         *   - If the decoy IS already loaded (e.g. dcomp.dll -- DWM
          *     always has this), a "duplicate BaseDllName in LDR"
          *     correlator (Blackbone, pe-sieve, DetectMemoryHollowing)
          *     immediately flags us: two dcomp.dll entries at different
@@ -150,7 +150,7 @@ static void peb_unlink_dll(HMODULE self) {
          *     DWM is a much weaker signal than duplicate.
          * The pool is randomized per install (seed = pid ^ tick) so
          * repeat installs on the same box don't converge on the same
-         * decoy — makes fingerprinting across users harder. */
+         * decoy -- makes fingerprinting across users harder. */
         static WCHAR *pool_base[] = {
             L"uiribbon.dll",
             L"uiribbonres.dll",
@@ -174,9 +174,9 @@ static void peb_unlink_dll(HMODULE self) {
         BOOL pool_loaded[SVC_DECOY_POOL_SIZE] = {0};
 
         /* SINGLE walk of InLoadOrderModuleList:
-         *   1. Check every entry's BaseDllName against our pool → mark
+         *   1. Check every entry's BaseDllName against our pool -> mark
          *      pool_loaded[i] for any decoy that's already loaded.
-         *   2. Remember our entry pointer (delayed mutation — do the
+         *   2. Remember our entry pointer (delayed mutation -- do the
          *      unlink+spoof AFTER the walk completes so mid-walk pointer
          *      invalidation can't happen).
          * The walk is SEH-wrapped by the outer __try, so a race with
@@ -191,7 +191,7 @@ static void peb_unlink_dll(HMODULE self) {
             LIST_ENTRY_PEBUL *next = cur->Flink;
             scanned++;
 
-            /* Pool membership check — cheap prefix compare, case
+            /* Pool membership check -- cheap prefix compare, case
              * insensitive. Skip anything with implausible length so we
              * don't chase a corrupt LDR entry into the weeds. */
             if (ent->BaseDllName.Buffer &&
@@ -210,7 +210,7 @@ static void peb_unlink_dll(HMODULE self) {
 
             if (ent->DllBase == self) {
                 our_ent = ent;
-                /* Do NOT break — keep walking to complete the pool scan
+                /* Do NOT break -- keep walking to complete the pool scan
                  * (some pool DLLs may appear AFTER us in load order). */
             }
             cur = next;
@@ -218,14 +218,14 @@ static void peb_unlink_dll(HMODULE self) {
 
         if (!our_ent) {
             slog_writef("payload.log",
-                "peb_unlink: no LDR entry found for base=%p (scanned=%d) — "
+                "peb_unlink: no LDR entry found for base=%p (scanned=%d) -- "
                 "nothing to hide via PEB path (manual-map behavior)",
                 (void *)self, scanned);
             return;
         }
 
         /* Build a compact log of which decoys are loaded vs available.
-         * Encrypted at rest, but still keep it compact — noisy logs are
+         * Encrypted at rest, but still keep it compact -- noisy logs are
          * a bad habit. */
         int loaded_count = 0, avail_count = 0;
         char loaded_str[192] = {0}; int lo_off = 0;
@@ -256,7 +256,7 @@ static void peb_unlink_dll(HMODULE self) {
             scanned, loaded_str, avail_str);
 
         /* Now do the mutation on the remembered entry. Unlink from
-         * all three lists — same technique as pre-v1.7.3. */
+         * all three lists -- same technique as pre-v1.7.3. */
         LIST_ENTRY_PEBUL *l1 = &our_ent->InLoadOrderLinks;
         LIST_ENTRY_PEBUL *l2 = &our_ent->InMemoryOrderLinks;
         LIST_ENTRY_PEBUL *l3 = &our_ent->InInitializationOrderLinks;
@@ -278,7 +278,7 @@ static void peb_unlink_dll(HMODULE self) {
 
         /* Pick decoy from the NOT-loaded subset. If (implausibly) every
          * pool DLL is already loaded, fall back to uniform pick over
-         * the whole pool (accept the duplicate-name signal — no better
+         * the whole pool (accept the duplicate-name signal -- no better
          * option). Log the FALLBACK case explicitly for support. */
         unsigned seed = (unsigned)(GetCurrentProcessId() ^ GetTickCount());
         int pick = 0;
@@ -320,27 +320,35 @@ static void peb_unlink_dll(HMODULE self) {
                 fallback ? ", FALLBACK-duplicate-name" : "");
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        slog_write("payload.log", "peb_unlink: EXCEPTION — DLL remains visible");
+        slog_write("payload.log", "peb_unlink: EXCEPTION -- DLL remains visible");
     }
 }
 
-/* ── Permissive SECURITY_ATTRIBUTES for cross-integrity named objects ──
+/* ── SECURITY_ATTRIBUTES for the shutdown event named object ──
  *
- * DWM runs as SYSTEM. When we CreateEventA(NULL, ...), Windows gives the
- * event DWM's default DACL — SYSTEM owner + full access for SYSTEM only.
- * An elevated Admin process cannot OpenEventA(EVENT_MODIFY_STATE) on it
+ * DWM runs under Window Manager Group\DWM-N (a virtual account). When
+ * we CreateEventA(NULL, ...) the event gets DWM's default DACL, which
+ * an elevated Admin launcher CANNOT OpenEventA(EVENT_MODIFY_STATE) on
  * (GLE=5 ACCESS_DENIED). Documented in hooksdll CLAUDE.md V5.8.
  *
- * Fix: build a SECURITY_DESCRIPTOR from SDDL `D:(A;;GA;;;WD)` = "Allow
- * GenericAll for Everyone". Result: any process on the same session can
- * signal the event. This is the SAME approach hooksdll/dwm uses. */
-static void build_world_sa(SECURITY_ATTRIBUTES *sa, PSECURITY_DESCRIPTOR *out_sd) {
+ * v2.0 (2026-09-10) -- TIGHTENED from world-writable (`WD` Everyone) to
+ * Administrators + SYSTEM only (`BA` + `SY`). Prior world DACL let ANY
+ * local unprivileged process (including LDB / Respondus / other exam
+ * browser child processes running as the interactive user) OpenEvent +
+ * SetEvent to force the payload to cooperatively unload -- silently
+ * defeating the overlay. Elevated sihost.exe still opens the event
+ * with SYNCHRONIZE / EVENT_MODIFY_STATE because it runs as admin (BA),
+ * so --status / --unload / --kill-all + the injector.js status probe
+ * remain functional. The creating payload thread inside dwm.exe always
+ * has FULL access via ownership regardless of DACL, so its own
+ * shutdown_watcher WaitForSingleObject stays live. */
+static void build_shutdown_event_sa(SECURITY_ATTRIBUTES *sa, PSECURITY_DESCRIPTOR *out_sd) {
     *out_sd = NULL;
     sa->nLength = sizeof(*sa);
     sa->bInheritHandle = FALSE;
     sa->lpSecurityDescriptor = NULL;
     if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
-            "D:(A;;GA;;;WD)",   /* Allow GenericAll for Everyone */
+            "D:(A;;GA;;;BA)(A;;GA;;;SY)",   /* Admins + SYSTEM only */
             SDDL_REVISION_1,
             out_sd, NULL)) {
         sa->lpSecurityDescriptor = *out_sd;
@@ -351,10 +359,10 @@ static HMODULE g_self          = NULL;
 static HANDLE  g_init_thread   = NULL;
 static HANDLE  g_shutdown_ev   = NULL;
 static HANDLE  g_shutdown_thr  = NULL;
-static HANDLE  g_init_mutex    = NULL;   /* v14 (2026-08-24): double-init guard — see init_thread */
+static HANDLE  g_init_mutex    = NULL;   /* v14 (2026-08-24): double-init guard -- see init_thread */
 static volatile LONG g_running = 0;
 
-/* ── MZ header wipe — corrupt our PE signature so memory scanners
+/* ── MZ header wipe -- corrupt our PE signature so memory scanners
  * looking for "MZ" (0x5A4D) + "PE\0\0" (0x00004550) at ImageBase
  * miss us. Windows LDR already validated + loaded us; it never
  * re-reads MZ/PE headers after that. Preserves normal execution
@@ -371,7 +379,7 @@ static void wipe_pe_headers(HMODULE self) {
         DWORD e_lfanew = *(DWORD *)(base + 0x3C);
         DWORD old_prot = 0;
         if (VirtualProtect(base, 0x40, PAGE_READWRITE, &old_prot)) {
-            /* Overwrite MZ signature 'MZ' → 'XX' — no longer identifies
+            /* Overwrite MZ signature 'MZ' -> 'XX' -- no longer identifies
              * as a DOS/PE. Preserve e_lfanew so nothing that already
              * mapped headers gets a shifted pointer. */
             base[0] = 'X'; base[1] = 'X';
@@ -398,16 +406,16 @@ static void wipe_pe_headers(HMODULE self) {
  *
  * Backstory: the launcher's manual_map_from_bytes allocates our whole
  * image via VirtualAllocEx(PAGE_EXECUTE_READWRITE). After DllMain
- * finishes we no longer need the "W" bit on our .text section — but
+ * finishes we no longer need the "W" bit on our .text section -- but
  * the entire ~600KB region stays RWX by default. Every user-mode
  * memory scanner (Moneta, pe-sieve, MappedImagesDetector, faultline)
  * treats RWX + MEM_PRIVATE as a high-severity IOC.
  *
  * Post-init we walk our IMAGE_SECTION_HEADER table and VirtualProtect
  * each section to match what a loader-mapped image would look like:
- *   IMAGE_SCN_MEM_EXECUTE + !WRITE  → PAGE_EXECUTE_READ
- *   IMAGE_SCN_MEM_WRITE   + !EXECUTE → PAGE_READWRITE
- *   IMAGE_SCN_MEM_READ    + !WRITE   → PAGE_READONLY
+ *   IMAGE_SCN_MEM_EXECUTE + !WRITE  -> PAGE_EXECUTE_READ
+ *   IMAGE_SCN_MEM_WRITE   + !EXECUTE -> PAGE_READWRITE
+ *   IMAGE_SCN_MEM_READ    + !WRITE   -> PAGE_READONLY
  *
  * The memory Type field stays MEM_PRIVATE (only phantom-hollowing
  * would flip that to MEM_IMAGE, which itself has known detections).
@@ -416,7 +424,7 @@ static void wipe_pe_headers(HMODULE self) {
  *
  * SAFE ordering: called AFTER hooks_install (MinHook has already
  * placed trampolines and detour relays into its own separate memory
- * pool — its bytes aren't in our .text). Also after wipe_pe_headers
+ * pool -- its bytes aren't in our .text). Also after wipe_pe_headers
  * (which uses its own VirtualProtect toggling and doesn't care about
  * final state). Also after all writable-init globals have been
  * populated. */
@@ -424,7 +432,7 @@ static void downgrade_own_sections(HMODULE self) {
     if (!self) return;
     __try {
         BYTE *base = (BYTE *)self;
-        /* Read e_lfanew — safe because wipe_pe_headers only overwrote
+        /* Read e_lfanew -- safe because wipe_pe_headers only overwrote
          * the MZ signature at [0..1] and the PE\0\0 signature at
          * base+e_lfanew, NOT the DOS-stub e_lfanew field at [0x3C]
          * nor the IMAGE_FILE_HEADER / IMAGE_OPTIONAL_HEADER /
@@ -432,7 +440,7 @@ static void downgrade_own_sections(HMODULE self) {
         DWORD e_lfanew = *(DWORD *)(base + 0x3C);
         if (e_lfanew == 0 || e_lfanew >= 0x1000) {
             slog_writef("payload.log",
-                        "vp_downgrade: bad e_lfanew=%lu — skipping", e_lfanew);
+                        "vp_downgrade: bad e_lfanew=%lu -- skipping", e_lfanew);
             return;
         }
         IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)(base + e_lfanew);
@@ -458,7 +466,7 @@ static void downgrade_own_sections(HMODULE self) {
             } else if (chars & IMAGE_SCN_MEM_READ) {
                 want = PAGE_READONLY;
             } else {
-                /* No permissions set at all — leave as-is. */
+                /* No permissions set at all -- leave as-is. */
                 skipped++;
                 continue;
             }
@@ -471,7 +479,7 @@ static void downgrade_own_sections(HMODULE self) {
         }
         /* Also downgrade the PE-header page itself to R/O. Our whole-file
          * layout starts with the DOS + NT headers (SizeOfHeaders bytes,
-         * usually 0x400) — those don't need to be writable or executable
+         * usually 0x400) -- those don't need to be writable or executable
          * post-init. Belt-and-suspenders on top of the section walk. */
         DWORD hdr_sz = nt->OptionalHeader.SizeOfHeaders;
         if (hdr_sz > 0 && hdr_sz < 0x2000) {
@@ -483,11 +491,11 @@ static void downgrade_own_sections(HMODULE self) {
                     "(RWX MEM_PRIVATE fingerprint reduced)",
                     downgraded, (unsigned)nsec, skipped);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        slog_write("payload.log", "vp_downgrade: exception — leaving RWX");
+        slog_write("payload.log", "vp_downgrade: exception -- leaving RWX");
     }
 }
 
-/* ── Anti-debug — refuse to init if DWM is being debugged. DWM is
+/* ── Anti-debug -- refuse to init if DWM is being debugged. DWM is
  * normally NOT debugged (that'd require SYSTEM debug privileges +
  * explicit attach). Anyone debugging DWM is definitely investigating
  * us. Multi-vector so an attacker who NOPs any one path is still
@@ -498,7 +506,7 @@ static int anti_debug_check(void) {
 #else
     BYTE *peb = (BYTE *)__readfsdword(0x30);
 #endif
-    if (!peb) return 1;   /* uncertain — allow */
+    if (!peb) return 1;   /* uncertain -- allow */
 
     /* Vector 1: PEB->BeingDebugged at offset 0x02 (both x86/x64).
      * IsDebuggerPresent() reads exactly this byte. */
@@ -515,7 +523,7 @@ static int anti_debug_check(void) {
      * catches). */
 #ifdef _WIN64
     /* Native x64 PEB layout: NtGlobalFlag at 0xBC (v10.x) or 0x158
-     * (some older). Check the ULONG at 0xBC — safest position. */
+     * (some older). Check the ULONG at 0xBC -- safest position. */
     ULONG ntgf = *(ULONG *)(peb + 0xBC);
 #else
     ULONG ntgf = *(ULONG *)(peb + 0x68);
@@ -530,7 +538,7 @@ static int anti_debug_check(void) {
      * PEB->ProcessHeap (offset 0x30 x64, 0x18 x86) then heap flags at
      * +0x70 (Flags) and +0x74 (ForceFlags). Not-debugged process has
      * both = 0x00000002 (HEAP_GROWABLE); debug adds
-     * HEAP_TAIL_CHECKING_ENABLED (0x20) + friends → typically
+     * HEAP_TAIL_CHECKING_ENABLED (0x20) + friends -> typically
      * 0x40000060 or similar. */
     __try {
 #ifdef _WIN64
@@ -554,7 +562,7 @@ static int anti_debug_check(void) {
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         /* Heap layout is version-sensitive; if we can't read it
-         * safely, don't fail-closed — other vectors still cover. */
+         * safely, don't fail-closed -- other vectors still cover. */
     }
 
     /* Vector 4: hardware breakpoint scan on our own thread. If a
@@ -575,7 +583,7 @@ static int anti_debug_check(void) {
 
     /* Vector 5: RDTSC differential across a NOP-op. Single-stepping
      * debuggers show >>10000 cycles for what should be <500 cycles.
-     * Tolerant threshold — false positives on heavy load are worse
+     * Tolerant threshold -- false positives on heavy load are worse
      * than false negatives. Only trip on obvious step-through. */
     unsigned __int64 t0 = __rdtsc();
     /* A few cheap ops the compiler can't fold away. */
@@ -596,7 +604,7 @@ static int anti_debug_check(void) {
     return 1;
 }
 
-/* ── Present callback — routes to ImGui layer.
+/* ── Present callback -- routes to ImGui layer.
  * Called from Detour_COverlayContextPresent. pCtx = COverlayContext this-ptr,
  * pLayer = the second arg to Present (what the vtable walk needs). */
 static void on_present(void *pCtx, void *pLayer) {
@@ -608,7 +616,7 @@ static void on_ldb_arm(void) {
     slog_write("payload.log", "target detected");
     /* Bump alpha? Show a subtle indicator? For MVP, nothing.
      * The dwm hooks are already active; when LDB is present, our
-     * present hook fires as usual — nothing extra to do. */
+     * present hook fires as usual -- nothing extra to do. */
 }
 static void on_ldb_disarm(void) {
     slog_write("payload.log", "target gone");
@@ -622,10 +630,10 @@ static void on_ldb_disarm(void) {
  *                                                                  *
  * User pastes into their answer field via Ctrl+V. Simple + reliable*
  * even before ImGui overlay ships.                                 */
-/* ── Status badge helper — pushes current provider/tier/model to UI. */
+/* ── Status badge helper -- pushes current provider/tier/model to UI. */
 static void refresh_status_badge(const svc_config_t *cfg) {
     if (!cfg) return;
-    /* v16: credits mode has no per-provider model — the /solve worker
+    /* v16: credits mode has no per-provider model -- the /solve worker
      * picks server-side. Show it plainly so the overlay reflects it. */
     if (cfg->provider == SVC_PROVIDER_CREDITS) {
         ui_set_status("CloakGPT credits", ai_tier_name(cfg->tier),
@@ -679,6 +687,7 @@ static void ai_stream_done_handler(int ok, const char *full_reply, size_t reply_
             ui_chat_stream_append(ctx->msg_id, SUFFIX, sizeof(SUFFIX) - 1);
             ui_chat_finalize_pending(ctx->msg_id);
             slog_write("ai.log", "stream stopped by user hotkey");
+            free(ctx);   /* v2.0 (2026-09-10): don't leak ctx on abort */
             return;
         }
         if (strstr(e, "12175") || strstr(e, "SECURE_FAILURE")) {
@@ -744,7 +753,7 @@ static void ai_stream_done_handler(int ok, const char *full_reply, size_t reply_
 /* Thread param: NULL == "screenshot + preset prompt" (the SVC_HK_ASK
  * path); non-NULL == malloc'd UTF-8 string owned by the thread that
  * gets prepended before the preset instructions (the chat-submit
- * path — user's typed question + screenshot). */
+ * path -- user's typed question + screenshot). */
 static DWORD WINAPI ask_ai_thread(LPVOID param) {
     char *user_text = (char *)param;   /* owned; free after use */
     DWORD start = GetTickCount();
@@ -754,16 +763,16 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
 
     /* Append user message to chat FIRST so the user sees it in the flow
      * before the AI reply. For preset "solve this screenshot" (no
-     * user_text) we skip this — the screenshot IS the question. */
+     * user_text) we skip this -- the screenshot IS the question. */
     if (user_text && user_text[0]) {
         ui_chat_append_message(UI_MSG_USER, user_text);
     } else {
-        /* Preset ask — append a synthetic user message so history shows
+        /* Preset ask -- append a synthetic user message so history shows
          * what was asked. */
         ui_chat_append_message(UI_MSG_USER,
                                 "[screenshot] Solve the question on screen.");
     }
-    /* Now add a pending AI placeholder — the streaming callback will
+    /* Now add a pending AI placeholder -- the streaming callback will
      * fill it as chunks arrive. */
     int pending_id = ui_chat_append_pending();
 
@@ -795,7 +804,7 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
             "The screenshot below is what the user was looking at when "
             "they typed. Answer their question directly, per your "
             "system-prompt rules. Prefer concrete answers over hedged "
-            "ones — the user asked because they want an answer.",
+            "ones -- the user asked because they want an answer.",
             user_text);
         prompt_buf[sizeof(prompt_buf) - 1] = 0;
         prompt = prompt_buf;
@@ -836,7 +845,7 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
         }
         /* Credits was the chosen path. If the user has NO BYO key, surface
          * the metered message (friendly on no-credits/no-sub, transport
-         * error otherwise) — never fall through to a keyless BYO path. If
+         * error otherwise) -- never fall through to a keyless BYO path. If
          * they DO have a key, fall through so a backend blip still solves. */
         int has_byo = cfg->api_key[0] || cfg->api_key_openai[0] ||
                       cfg->api_key_anthropic[0] || cfg->api_key_google[0] ||
@@ -855,7 +864,7 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
         /* fall through to BYO-key providers below */
     }
 
-    /* STREAMING path when enabled — the on_done callback finalizes
+    /* STREAMING path when enabled -- the on_done callback finalizes
      * the pending message. NON-STREAMING path calls ai_ask and pushes
      * the full reply into the pending slot. */
     if (cfg->streaming_enabled) {
@@ -953,13 +962,13 @@ void chat_submit_typed_text(void) {
     if (t) {
         CloseHandle(t);
     } else {
-        /* Thread creation failure — clean up ownership. */
+        /* Thread creation failure -- clean up ownership. */
         free(text);
         ui_chat_append_message(UI_MSG_AI, "[error] could not spawn AI worker");
     }
 }
 
-/* Debug capture thread — invoked by Ctrl+Shift+Alt+S. Captures the
+/* Debug capture thread -- invoked by Ctrl+Shift+Alt+S. Captures the
  * screen via BOTH available paths and saves each PNG to Public Desktop
  * so the user can verify what each method actually captures. Sets a
  * reply message in the overlay too.
@@ -972,7 +981,7 @@ void chat_submit_typed_text(void) {
 static DWORD WINAPI debug_capture_thread(LPVOID param) {
     (void)param;
 
-    /* DWM.exe runs as "Window Manager\DWM-N" — NOT full SYSTEM. Cannot
+    /* DWM.exe runs as "Window Manager\DWM-N" -- NOT full SYSTEM. Cannot
      * write to C:\Users\Public\Desktop (GLE=5 ACCESS_DENIED). Write to
      * our install dir which DWM definitely has access to (we log there).
      * User can open the files from Explorer once we save them. */
@@ -1044,7 +1053,7 @@ static DWORD WINAPI debug_capture_thread(LPVOID param) {
         slog_writef("payload.log", "DBG_CAP: GDI capture FAILED");
     }
 
-    /* ── Path 3: DWM-direct BMP write (no WIC, no COM — hooksdll approach) ──
+    /* ── Path 3: DWM-direct BMP write (no WIC, no COM -- hooksdll approach) ──
      * The other paths use WIC PNG encoding which is failing silently in
      * DWM's process context. This bypass writes raw BMP bytes via WriteFile,
      * which is guaranteed to work regardless of COM state / apartment. */
@@ -1104,7 +1113,7 @@ static void on_hotkey(int action) {
             /* v1.7.4.17: SVC_HK_QUICK_ASK is a SECOND binding slot
              * that shares SVC_HK_ASK's handler. Lets the user wire a
              * mouse-hold gesture (e.g. hold LMB 2000ms) to screenshot+
-             * ask WITHOUT any keyboard footprint — matches Bypassify's
+             * ask WITHOUT any keyboard footprint -- matches Bypassify's
              * "quick-send" feature that markets zero-keyboard-signature
              * AI queries for maximum proctor-tool safety. */
             HANDLE t = CreateThread(NULL, 0, ask_ai_thread, NULL, 0, NULL);
@@ -1115,7 +1124,7 @@ static void on_hotkey(int action) {
             ui_toggle_visible();
             break;
         case SVC_HK_TYPING:
-            /* Chat input mode — toggles a typing field at the bottom of
+            /* Chat input mode -- toggles a typing field at the bottom of
              * the overlay. All non-hotkey keystrokes get diverted into
              * the buffer (invisible to LDB / any other app in the LL
              * hook chain). Enter submits with a fresh screenshot;
@@ -1128,8 +1137,8 @@ static void on_hotkey(int action) {
         case SVC_HK_CLEAR:
             /* Context-aware: if a reply is showing, CLEAR the reply
              * (back to home page). If we're on the home page, this
-             * hotkey becomes QUIT — signals our own shutdown event
-             * DIRECTLY (no launcher spawn — that fails with
+             * hotkey becomes QUIT -- signals our own shutdown event
+             * DIRECTLY (no launcher spawn -- that fails with
              * ERROR_ELEVATION_REQUIRED since sihost has an admin
              * manifest and DWM's SYSTEM context can't satisfy UAC). */
             if (ui_has_reply()) {
@@ -1138,7 +1147,7 @@ static void on_hotkey(int action) {
                 /* Inline soft-quit: signal our own shutdown event.
                  * The shutdown_watcher thread will call hooks_uninstall
                  * which drains ~200ms of clean frames + disables all
-                 * hooks + reverts byte patches — same as if user ran
+                 * hooks + reverts byte patches -- same as if user ran
                  * sihost --unload manually. Overlay disappears cleanly;
                  * DWM stays alive; user re-arms via launcher when
                  * ready. Sentinel gets written to indicate clean quit. */
@@ -1154,7 +1163,7 @@ static void on_hotkey(int action) {
                 slog_writef("payload.log", "hotkey QUIT: signalled inline shutdown");
             }
             break;
-        /* v13 (2026-08-10) — nudge step is USER-CONFIGURABLE via
+        /* v13 (2026-08-10) -- nudge step is USER-CONFIGURABLE via
          * cfg->nudge_step_px (dashboard "Nudge step" slider). LO: the arrow-
          * key move was "mediocre fast ... wanna be able to do micro
          * adjustments". A small value (2-4 px) gives precise per-tap micro-
@@ -1180,9 +1189,9 @@ static void on_hotkey(int action) {
         case SVC_HK_RESIZE_TALLER: ui_resize( 0,  30); break;
         case SVC_HK_RESIZE_SHORT:  ui_resize( 0, -30); break;
         case SVC_HK_CYCLE_CORNER:  ui_cycle_corner();  break;
-        case SVC_HK_ALPHA_UP:      ui_bump_alpha(+0.05f); break;  /* small step — held key repeats @20Hz */
+        case SVC_HK_ALPHA_UP:      ui_bump_alpha(+0.05f); break;  /* small step -- held key repeats @20Hz */
         case SVC_HK_ALPHA_DOWN:    ui_bump_alpha(-0.05f); break;
-        case SVC_HK_FONT_UP:       ui_bump_font(+0.10f);  break;  /* smaller step — held key repeats @20Hz */
+        case SVC_HK_FONT_UP:       ui_bump_font(+0.10f);  break;  /* smaller step -- held key repeats @20Hz */
         case SVC_HK_FONT_DOWN:     ui_bump_font(-0.10f);  break;
         case SVC_HK_RESET:         ui_reset_geometry();   break;
         case SVC_HK_SCROLL_UP: {
@@ -1273,15 +1282,15 @@ static void on_hotkey(int action) {
         }
         case SVC_HK_REGENERATE: {
             /* Re-ask the last user turn. If there's a pending AI msg,
-             * we'll still spawn a new ask — the new one appears below. */
+             * we'll still spawn a new ask -- the new one appears below. */
             char *last = ui_chat_last_user_text();
             if (!last) {
                 ui_chat_append_message(UI_MSG_AI,
-                    "[nothing to regenerate — no prior question]");
+                    "[nothing to regenerate -- no prior question]");
                 break;
             }
             /* Strip the "[screenshot] " prefix for preset asks so the
-             * regen doesn't look weird — call the preset path. */
+             * regen doesn't look weird -- call the preset path. */
             const char *user_prefix = "[screenshot] ";
             char *param = NULL;
             if (strncmp(last, user_prefix, strlen(user_prefix)) == 0) {
@@ -1315,7 +1324,7 @@ static void on_hotkey(int action) {
         }
         case SVC_HK_COPY_ANSWER: {
             /* Copy JUST the first-line "direct answer" (e.g. "x = 4"
-             * or "B) Photosynthesis") — per SYSTEM_PROMPT contract. */
+             * or "B) Photosynthesis") -- per SYSTEM_PROMPT contract. */
             ui_copy_last_ai_answer();
             break;
         }
@@ -1389,7 +1398,7 @@ static void on_hotkey(int action) {
             /* v1.7.10: toggle LEAN MODE. Overlay switches between full
              * ImGui Begin/End render (chat bubbles, MD, scrollback, buttons)
              * and BP-parity draw-list-only render (raw AddRectFilled +
-             * AddText on GetForegroundDrawList — much lighter per-frame
+             * AddText on GetForegroundDrawList -- much lighter per-frame
              * workload = smoother nudge feel). See ui_toggle_lean() in
              * imgui_layer.cpp for the exact implementation. */
             ui_toggle_lean();
@@ -1403,7 +1412,7 @@ static void on_hotkey(int action) {
                     "Smoother nudge feel. Toggle off: `Ctrl+Shift+Alt+M`.");
             } else {
                 _snprintf(msg, sizeof(msg) - 1,
-                    "[LEAN mode **OFF**] Full overlay restored — chat "
+                    "[LEAN mode **OFF**] Full overlay restored -- chat "
                     "scrollback, markdown, code blocks, buttons all back.");
             }
             msg[sizeof(msg) - 1] = 0;
@@ -1413,37 +1422,37 @@ static void on_hotkey(int action) {
             break;
         }
         case SVC_HK_KILL_ALL: {
-            /* Emergency stop — DIRECT self-kill of DWM from inside DWM.
+            /* Emergency stop -- DIRECT self-kill of DWM from inside DWM.
              *
              * The old design tried to spawn sihost.exe --kill-all from
              * DWM but sihost has a requireAdministrator manifest and
              * DWM's SYSTEM-in-user-session context returns
              * ERROR_ELEVATION_REQUIRED (740) on CreateProcess for such
-             * binaries — no interactive UAC to satisfy the manifest.
+             * binaries -- no interactive UAC to satisfy the manifest.
              *
              * Inline approach:
-             *   1. Write .dwm_user_panic sentinel — Electron's
+             *   1. Write .dwm_user_panic sentinel -- Electron's
              *      respawn watchdog checks BOTH .dwm_clean_shutdown
              *      (Ctrl+Q soft-quit) and .dwm_user_panic (this hotkey)
              *      and disarms on either. Without this, watchdog would
              *      auto-reinject seconds after panic (the whole point
-             *      of KILL_ALL was "GET OFF MY SCREEN NOW" — silently
+             *      of KILL_ALL was "GET OFF MY SCREEN NOW" -- silently
              *      re-injecting is a catastrophic UX regression). See
              *      ui/src/main.js respawnWatchdog::tick sentinel logic.
              *   2. Delete .dwm_clean_shutdown so launcher's cold-start
              *      dirty-detect logs prior=DIRTY (this was NOT a clean
-             *      hooks_uninstall — we're about to TerminateProcess).
+             *      hooks_uninstall -- we're about to TerminateProcess).
              *   3. TerminateProcess(GetCurrentProcess()) in a helper
              *      thread after a short delay. Windows respawns
              *      dwm.exe fresh in ~2s; our payload dies with it.
              *
-             * Bug fix 2026-08-24 (Sam's user report — teacher walking up
+             * Bug fix 2026-08-24 (Sam's user report -- teacher walking up
              * scenario): panic hotkey used to cause overlay to POP UP a
              * few seconds later because the watchdog had no way to
              * distinguish "user hit panic" from "DWM crashed". The new
              * sentinel is that signal.
              *
-             * We DON'T sweep sibling sihost.exe instances — launcher is
+             * We DON'T sweep sibling sihost.exe instances -- launcher is
              * a one-shot that exits after arming so there's normally
              * nothing to sweep. If the user has a stuck sihost they
              * can kill it via Task Manager. */
@@ -1457,12 +1466,12 @@ static void on_hotkey(int action) {
                     FlushFileBuffers(hpanic);
                     CloseHandle(hpanic);
                 } else {
-                    /* Best-effort — if sentinel write fails, watchdog
+                    /* Best-effort -- if sentinel write fails, watchdog
                      * MIGHT still re-inject. Rare (ProgramData is
                      * writable to SYSTEM). Logged so post-mortem can
                      * spot it. */
                     slog_writef("payload.log",
-                                "hotkey KILL_ALL: .dwm_user_panic write FAILED gle=%lu — "
+                                "hotkey KILL_ALL: .dwm_user_panic write FAILED gle=%lu -- "
                                 "watchdog may re-inject!", GetLastError());
                 }
             }
@@ -1500,6 +1509,23 @@ static DWORD WINAPI shutdown_watcher(LPVOID param) {
      * mid-teardown. token_refresh_stop closes the pending pipe handle
      * to unblock ConnectNamedPipe and waits up to 5s for the thread. */
     token_refresh_stop();
+    /* v2.0 (2026-09-10) -- CRITICAL: signal in-flight ask_ai_thread(s)
+     * to abort BEFORE hooks_uninstall + ui_shutdown. The threads are
+     * spawned fire-and-forget (HANDLE closed at spawn time; no join
+     * point). Their ai_stream_done_handler calls ui_chat_stream_append
+     * + ui_chat_set_reply_of_pending / ui_chat_finalize_pending -- all
+     * of which dereference the ImGui context that ui_shutdown() frees.
+     * Repro: user submits an AI query then Ctrl+Q's mid-response -> the
+     * still-running stream tries to write into freed ImGui state ->
+     * access violation inside dwm.exe -> desktop compositor crashes for
+     * ~2-3s. ai_request_abort() flips the abort flag stream_chunk_recv
+     * checks every chunk; the sleep gives the done_handler + free(ctx)
+     * path room to complete while ImGui is still alive. rawin_stop()
+     * above blocked any new hotkeys, so no NEW ask_ai_thread can start
+     * during this drain window. Bounded at 300ms -- negligible for the
+     * user, well within Electron's 20s uninject budget. */
+    ai_request_abort();
+    Sleep(300);
     hooks_uninstall();
     ui_shutdown();
     cfg_cleanup();
@@ -1518,10 +1544,10 @@ static DWORD WINAPI shutdown_watcher(LPVOID param) {
 }
 
 /* ── Init worker (runs off DllMain thread). ──────────────────────── */
-/* Log rotation — payload.log can grow unbounded over long sessions.
+/* Log rotation -- payload.log can grow unbounded over long sessions.
  * On each init, if it exceeds 2MB, truncate to zero and start fresh.
  * Loses old encrypted diag but prevents disk-fill DoS. Keeps 2MB
- * of history which is ~10K encrypted lines — plenty for post-mortem. */
+ * of history which is ~10K encrypted lines -- plenty for post-mortem. */
 static void rotate_payload_log(void) {
     const char *path = SVC_INSTALL_DIR "\\payload.log";
     WIN32_FILE_ATTRIBUTE_DATA fad;
@@ -1537,7 +1563,7 @@ static void rotate_payload_log(void) {
 }
 
 #if SVCLDB_DEV_BYPASS_AUTH
-/* v1.7.10.2 — Dev-only automated hotkey self-test. Programmatically
+/* v1.7.10.2 -- Dev-only automated hotkey self-test. Programmatically
  * fires each ui_* action after 5s startup delay. Logs pass/fail per
  * action so we can diagnose broken hotkeys without needing LO to
  * physically test each one. Only compiled into dev-bypass builds.
@@ -1588,7 +1614,7 @@ static DWORD WINAPI selftest_thread_dev(LPVOID param) {
     Sleep(150);
     ui_bump_font(-0.1f);
 
-    /* Scroll — MUST pump some visible chat first so we can tell if
+    /* Scroll -- MUST pump some visible chat first so we can tell if
      * the underlying scroll region is empty (nothing to scroll) vs
      * the scroll handler itself is buggy. Adds one fake AI msg with
      * enough text to overflow the chat area on any normal geometry. */
@@ -1639,7 +1665,7 @@ static DWORD WINAPI selftest_thread_dev(LPVOID param) {
 
     /* ── v1.7.11.15+ expanded coverage. ──────────────────────────── */
 
-    /* Copy variants — need the fake AI msg from [10] to still be there.
+    /* Copy variants -- need the fake AI msg from [10] to still be there.
      * These should silently succeed even if clipboard access is briefly
      * denied (5-retry OpenClipboard loop inside clip_set_utf8_bytes). */
     slog_write("payload.log", "selftest: [17/28] ui_copy_last_ai_answer");
@@ -1649,7 +1675,7 @@ static DWORD WINAPI selftest_thread_dev(LPVOID param) {
     ui_copy_last_ai_code();
     Sleep(150);
 
-    /* Config mutations — cycle tier / provider / stream / latex / direct. */
+    /* Config mutations -- cycle tier / provider / stream / latex / direct. */
     svc_config_t *mcfg = (svc_config_t *)cfg_get();
     if (mcfg) {
         int t0 = mcfg->tier;
@@ -1691,13 +1717,13 @@ static DWORD WINAPI selftest_thread_dev(LPVOID param) {
                     mcfg->scroll_step_px);
     }
 
-    /* Stop-gen abort — safe to call even with no in-flight request. */
+    /* Stop-gen abort -- safe to call even with no in-flight request. */
     slog_write("payload.log", "selftest: [25/28] ai_request_abort");
     ai_request_abort();
     Sleep(50);
     ai_clear_abort();  /* clean state for LO's real use */
 
-    /* v1.7.11.15 BURST HYSTERESIS TEST — fire ui_toggle_visible 5x in
+    /* v1.7.11.15 BURST HYSTERESIS TEST -- fire ui_toggle_visible 5x in
      * ~50ms. Should see exactly ONE "visible toggled -> N" line and
      * FOUR "visible toggle IGNORED (burst hysteresis:...)" lines. If
      * any consecutive toggles slip through, the hysteresis regressed. */
@@ -1709,7 +1735,7 @@ static DWORD WINAPI selftest_thread_dev(LPVOID param) {
     Sleep(400);   /* wait past hysteresis */
     ui_toggle_visible();   /* restore to original visible state (net 2 flips = 0 change if starting visible) */
 
-    /* Chat mode round-trip with a synthetic char — feeds through the
+    /* Chat mode round-trip with a synthetic char -- feeds through the
      * feed_char path so we exercise the buffer growth logic. */
     slog_write("payload.log", "selftest: [27/28] chat toggle + feed 'a' + backspace + cancel");
     ui_chat_toggle();
@@ -1739,7 +1765,7 @@ static DWORD WINAPI selftest_thread_dev(LPVOID param) {
 static DWORD WINAPI init_thread(LPVOID param) {
     (void)param;
     /* Decrypt the smoking-gun string blob BEFORE any logging code runs.
-     * Idempotent + thread-safe — safe to call at DllMain-thread start.
+     * Idempotent + thread-safe -- safe to call at DllMain-thread start.
      * After this, SS(SVC_STR_XXX) returns plaintext pointers to strings
      * that live encrypted-at-rest inside .rdata. See shared/str_enc.h. */
     svc_str_init();
@@ -1748,13 +1774,13 @@ static DWORD WINAPI init_thread(LPVOID param) {
     early_log("init_thread: entered");
     slog_write("payload.log", SS(SVC_STR_PAYLOAD_INIT));
 
-    /* v14 (2026-08-24) — Double-init guard. Manual-map does NOT go
-     * through the Windows loader → LoadLibrary's ref-count dedup that
+    /* v14 (2026-08-24) -- Double-init guard. Manual-map does NOT go
+     * through the Windows loader -> LoadLibrary's ref-count dedup that
      * would normally block a second load doesn't apply. If sihost
      * --reinject fires while the first payload is still alive (e.g.
      * respawnWatchdog racing a user's manual click, two sihost.exe
      * launched concurrently, or the launcher's leftover-heal path
-     * timing out) — both DllMain chains run init_thread, both call
+     * timing out) -- both DllMain chains run init_thread, both call
      * hooks_install() which RE-WRITES MinHook's byte patches.
      *
      * MinHook internally dedups by target but the second install
@@ -1762,34 +1788,34 @@ static DWORD WINAPI init_thread(LPVOID param) {
      * JMP-trampoline-B), silently invalidating the FIRST payload's
      * trampoline pointers. First payload's long-lived threads
      * (sub_check, keepalive, integrity monitor) then MH_CALL_ORIGINAL
-     * through stale trampolines → jump to garbage → __fastfail → DWM
-     * crash → screen goes black. This is a documented crasher
+     * through stale trampolines -> jump to garbage -> __fastfail -> DWM
+     * crash -> screen goes black. This is a documented crasher
      * (CLAUDE_REFERENCE_OLD.md:2664-2668, session 2026-07-06).
      *
      * Fix: named mutex scoped to this DWM session (Local\ namespace,
-     * one guard per user session — multi-user hosts don't false-
+     * one guard per user session -- multi-user hosts don't false-
      * conflict). First mapper wins + keeps the handle. Second mapper
-     * gets ERROR_ALREADY_EXISTS → bails BEFORE touching hooks.
+     * gets ERROR_ALREADY_EXISTS -> bails BEFORE touching hooks.
      * The second DLL image leaks ~850 KB in DWM's address space
-     * (can't FreeLibrary a manual-mapped copy — no LDR entry),
+     * (can't FreeLibrary a manual-mapped copy -- no LDR entry),
      * but that's a one-shot cost vs a DWM crash.
      *
      * Name blends with legit DWM object naming ("DwmCompositor*"
      * matches the existing SVC_SHUTDOWN_EVENT_NAME pattern). Not
-     * encrypted here — the string is innocuous + adding str_enc
+     * encrypted here -- the string is innocuous + adding str_enc
      * bloat for one guard call site isn't worth it. */
     g_init_mutex = CreateMutexA(NULL, FALSE, "Local\\DwmCompositorGuardRelease");
     DWORD init_mutex_gle = GetLastError();
     if (init_mutex_gle == ERROR_ALREADY_EXISTS) {
         slog_write("payload.log",
-                   "init_thread: DOUBLE-INIT DETECTED — another payload copy already "
+                   "init_thread: DOUBLE-INIT DETECTED -- another payload copy already "
                    "loaded in this DWM session. Bailing WITHOUT touching hooks to avoid "
                    "MinHook double-patch crash.");
         if (g_init_mutex) { CloseHandle(g_init_mutex); g_init_mutex = NULL; }
         return 42;   /* Leak our DLL image; safer than double-init crash. */
     }
     if (!g_init_mutex) {
-        /* Very unusual — CreateMutex failed for a reason other than
+        /* Very unusual -- CreateMutex failed for a reason other than
          * ALREADY_EXISTS (OOM, DACL denial, exhausted handle table).
          * Log + continue optimistically; this is a defense-in-depth
          * guard, not the primary flow. First-map behavior is still
@@ -1803,14 +1829,14 @@ static DWORD WINAPI init_thread(LPVOID param) {
 
     early_log("init_thread: past slog_write test");
 
-    /* Anti-debug — refuse to init if DWM is being debugged. Someone
+    /* Anti-debug -- refuse to init if DWM is being debugged. Someone
      * attached a debugger to SYSTEM's DWM = they're investigating us. */
     if (!anti_debug_check()) {
-        early_log("init_thread: debugged — aborting init");
+        early_log("init_thread: debugged -- aborting init");
         return 4;
     }
 
-    /* Read config — MUST succeed. If not, payload is inert (safe). */
+    /* Read config -- MUST succeed. If not, payload is inert (safe). */
     const svc_config_t *cfg = cfg_get();
     if (!cfg) {
         early_log("init_thread: config unavailable");
@@ -1827,7 +1853,7 @@ static DWORD WINAPI init_thread(LPVOID param) {
      * shared/handshake.h for the derivation contract.
      *
      * Dev bypass: `SVCLDB_DEV_BYPASS_AUTH=1` at compile time skips this
-     * gate for iteration convenience. See common.h — MUST be 0 before
+     * gate for iteration convenience. See common.h -- MUST be 0 before
      * shipping. */
 #if SVCLDB_DEV_BYPASS_AUTH
     early_log("init_thread: HANDSHAKE SKIPPED (SVCLDB_DEV_BYPASS_AUTH=1)");
@@ -1849,7 +1875,7 @@ static DWORD WINAPI init_thread(LPVOID param) {
     early_log(SS(SVC_STR_HANDSHAKE_OK));
 #endif
 
-    /* Read offsets.blob — try, fall back to signature scan later. */
+    /* Read offsets.blob -- try, fall back to signature scan later. */
     pl_offsets_t off = {0};
     if (!pl_offsets_load(&off)) {
         early_log("init_thread: offsets.blob missing");
@@ -1857,18 +1883,18 @@ static DWORD WINAPI init_thread(LPVOID param) {
     }
     early_log("init_thread: offsets loaded");
 
-    /* v1.6.5 (2026-07-16) — HINT SEMANTICS CORRECTED via PDB RE.
+    /* v1.6.5 (2026-07-16) -- HINT SEMANTICS CORRECTED via PDB RE.
      *
      * The three vtable slots and their ACTUAL method identities per
      * PDB verification (see tools/re_probe/dwmcore_dump.c output):
-     *   GPB_SLOT   =  5  on pLayer   → COverlaySwapChain::GetDevice
-     *   GD3D_SLOT  = 24  on pLayer   → CDDisplaySwapChain::GetPhysicalBackBuffer
-     *   ACC3_SLOT  = 19  on res_vtbl → CDDisplaySwapChainBuffer::GetD3D11Resource
+     *   GPB_SLOT   =  5  on pLayer   -> COverlaySwapChain::GetDevice
+     *   GD3D_SLOT  = 24  on pLayer   -> CDDisplaySwapChain::GetPhysicalBackBuffer
+     *   ACC3_SLOT  = 19  on res_vtbl -> CDDisplaySwapChainBuffer::GetD3D11Resource
      *
      * PRE-v1.6.5 BUG: hints were plumbed as
-     *   gpb_hint = getPhysicalBackBufferRva  (WRONG — slot 5 is GetDevice)
-     *   gd3d_hint = getD3D11ResourceRva      (WRONG — slot 24 is GetPhysicalBackBuffer)
-     *   acc_hint = accessorRva               (WRONG — slot 19 is GetD3D11Resource,
+     *   gpb_hint = getPhysicalBackBufferRva  (WRONG -- slot 5 is GetDevice)
+     *   gd3d_hint = getD3D11ResourceRva      (WRONG -- slot 24 is GetPhysicalBackBuffer)
+     *   acc_hint = accessorRva               (WRONG -- slot 19 is GetD3D11Resource,
      *                                         and accessorRva is GetTexture2D
      *                                         which is on a DIFFERENT class)
      *
@@ -1877,26 +1903,26 @@ static DWORD WINAPI init_thread(LPVOID param) {
      * layout the hardcoded slots happen to be correct. On user builds
      * where pLayer's cast lands on vtable[2..5]/6 (multi-inherit
      * subobjects), hardcoded slot 24 points at a completely different
-     * method → wrong chain → silent __fastfail via CFG/CET.
+     * method -> wrong chain -> silent __fastfail via CFG/CET.
      *
      * v1.6.5 fix: hint each slot with the RVA of what that slot ACTUALLY
      * invokes. Dynamic scan now MATCHES on typical builds (zero
      * regression) and DRIFTS to the correct slot on user builds where
      * the method has moved to slots 28/43/44/45 (still within the
      * v1.6.5 MAX_VTABLE_SCAN_SLOTS=256 window). */
-    ui_set_vtable_slot_hints(off.getDevice,                 /* slot 5 → GetDevice */
-                             off.getPhysicalBackBufferRva,  /* slot 24 → GetPhysicalBackBuffer */
-                             off.getD3D11ResourceRva);      /* slot 19 → GetD3D11Resource */
+    ui_set_vtable_slot_hints(off.getDevice,                 /* slot 5 -> GetDevice */
+                             off.getPhysicalBackBufferRva,  /* slot 24 -> GetPhysicalBackBuffer */
+                             off.getD3D11ResourceRva);      /* slot 19 -> GetD3D11Resource */
 
     /* v1.6.3: populate the known-RVA lookup table so the first-success
      * diag in get_backbuffer_texture can NAME which dwmcore method each
      * vtable slot actually invokes on this Windows build. Enables log
-     * lines like "slot=5 rva=0x1DD690 (== getDevice)" — support can
+     * lines like "slot=5 rva=0x1DD690 (== getDevice)" -- support can
      * identify by method name what each user's slot resolves to,
      * WITHOUT needing to run the resolver on their box. */
     {
         static ui_rva_symbol_t known[] = {
-            /* Populated in-place from `off` below — the pointers here
+            /* Populated in-place from `off` below -- the pointers here
              * are compile-time; the RVAs are runtime. */
             { 0, "cOverlayContextPresent"  },
             { 0, "isOverlayPrevented"      },
@@ -1963,7 +1989,7 @@ static DWORD WINAPI init_thread(LPVOID param) {
     early_log("init_thread: pe_wipe done");
 
     /* Downgrade our whole image from initial RWX to per-section image-
-     * like protections (.text→RX, .data→RW, .rdata→RO). Removes the
+     * like protections (.text->RX, .data->RW, .rdata->RO). Removes the
      * single strongest IOC used by user-mode memory scanners against
      * manually-mapped code. See downgrade_own_sections() docstring. */
     downgrade_own_sections(g_self);
@@ -1988,17 +2014,18 @@ static DWORD WINAPI init_thread(LPVOID param) {
      * are respected. */
     ui_apply_launch_config(cfg->overlay_w, cfg->overlay_h,
                            cfg->overlay_alpha, cfg->size_mode);
-    /* v11 (2026-07-24): theme + overlay behavior flags — Bypassify parity.
+    /* v11 (2026-07-24): theme + overlay behavior flags -- Bypassify parity.
      * Reads cfg->theme + cfg->overlay_flags from the config that svchelper
      * wrote. Stale v10 configs pass 0 for both which auto-migrates to
      * AUTO theme + SVC_OVFLAG_DEFAULTS. */
     ui_apply_theme_and_flags(cfg->theme, cfg->overlay_flags);
 
-    /* Shutdown watcher — event must be openable from elevated Admin
-     * launcher process, so we build a world-writable DACL via SDDL. */
+    /* Shutdown watcher -- event must be openable from elevated Admin
+     * launcher process. v2.0 (2026-09-10): DACL is now admin+SYSTEM only
+     * (see build_shutdown_event_sa) -- was world-writable. */
     SECURITY_ATTRIBUTES sa = {0};
     PSECURITY_DESCRIPTOR sd = NULL;
-    build_world_sa(&sa, &sd);
+    build_shutdown_event_sa(&sa, &sd);
     g_shutdown_ev = CreateEventA(sa.lpSecurityDescriptor ? &sa : NULL,
                                   TRUE, FALSE, SS(SVC_STR_SHUTDOWN_EVENT));
     if (sd) LocalFree(sd);   /* CreateEvent duplicates the descriptor */
@@ -2016,7 +2043,7 @@ static DWORD WINAPI init_thread(LPVOID param) {
      * shows in the overlay's top strip right on first frame. */
     refresh_status_badge(cfg);
 
-    /* Runtime subscription re-check. Independent of Electron UI —
+    /* Runtime subscription re-check. Independent of Electron UI --
      * self-unloads within ~30 min of the sub going inactive even if
      * the UI is closed. See payload/src/sub_check.h.
      *
@@ -2029,9 +2056,9 @@ static DWORD WINAPI init_thread(LPVOID param) {
     sub_check_start();
 #endif
 
-    /* v14 (2026-08-24) — Start the token-refresh pipe server so Electron
+    /* v14 (2026-08-24) -- Start the token-refresh pipe server so Electron
      * can push a refreshed JWT into cfg->access_token before sub_check's
-     * next tick. Fixes the "1 hour → overlay silently disappears" bug
+     * next tick. Fixes the "1 hour -> overlay silently disappears" bug
      * (Bug 2). Under dev-bypass this is a no-op cost (server thread
      * still runs but no client will ever connect since sub_check itself
      * is skipped). Cheap enough to always leave enabled. */
@@ -2042,7 +2069,7 @@ static DWORD WINAPI init_thread(LPVOID param) {
     slog_write("payload.log", SS(SVC_STR_PAYLOAD_READY));
 
 #if SVCLDB_DEV_BYPASS_AUTH
-    /* v1.7.10.2 (2026-07-24) — DEV-ONLY AUTO-SELFTEST.
+    /* v1.7.10.2 (2026-07-24) -- DEV-ONLY AUTO-SELFTEST.
      * Spawns a thread that waits 5s for init to settle, then
      * programmatically fires every hotkey action + logs pass/fail
      * per action. Result decodable via tools/dlog.ps1 grep of
@@ -2056,13 +2083,13 @@ static DWORD WINAPI init_thread(LPVOID param) {
     return 0;
 }
 
-/* ── EARLY plaintext diagnostic — no TLS, no BCrypt, no CRT.        *
+/* ── EARLY plaintext diagnostic -- no TLS, no BCrypt, no CRT.        *
  * When manual-mapped, __declspec(thread) TLS is broken (loader-only *
  * init step skipped). slog_write relies on TLS reentry guard, so a  *
  * crashing slog_write would silently swallow all logging.           *
- * This bypasses slog entirely — proves DllMain ran + gives us a    *
+ * This bypasses slog entirely -- proves DllMain ran + gives us a    *
  * bootstrap trace no matter what fails later. */
-/* early_log — routes through slog (encrypted) so feature-name signature
+/* early_log -- routes through slog (encrypted) so feature-name signature
  * strings ("init_thread: hooks installed" etc.) don't leak in plaintext
  * on disk. Falls back to payload_early.txt when DWM_EXT_TRACE=1
  * for iteration debug. See hook_diag_raw in dwm_hooks.c for the same
@@ -2081,7 +2108,7 @@ static void early_log(const char *msg) {
         g_early_plaintext = (n > 0 && buf[0] != '0') ? 1 : 0;
 #endif
     }
-    /* Encrypted path — always. */
+    /* Encrypted path -- always. */
     slog_writef("payload.log", "early: %s", msg);
     /* Plaintext fallback only when env var opts in. */
     if (g_early_plaintext) {
@@ -2106,7 +2133,7 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         early_log("DllMain: PROCESS_ATTACH entered");
         g_self = hInst;
-        /* NOTE: NOT calling DisableThreadLibraryCalls on manual-mapped DLLs —
+        /* NOTE: NOT calling DisableThreadLibraryCalls on manual-mapped DLLs --
          * loader doesn't know about us anyway, so THREAD_ATTACH doesn't fire. */
         HANDLE t = CreateThread(NULL, 0, init_thread, NULL, 0, NULL);
         if (t) {

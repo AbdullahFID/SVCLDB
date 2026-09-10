@@ -1,16 +1,16 @@
 /* ================================================================== *
- * str_enc.h — Runtime XOR-decryption of "smoking-gun" strings.        *
+ * str_enc.h -- Runtime XOR-decryption of "smoking-gun" strings.        *
  *                                                                    *
  * Motivation: even after Astral-PE metadata scrub, the .rdata        *
  * section of dwmapiext.dll leaks ~128 identifying strings that a     *
- * 30-second `strings` sweep reveals — product name, ProgramData      *
+ * 30-second `strings` sweep reveals -- product name, ProgramData      *
  * paths, named events, hook function names, model names, error       *
  * messages, etc. Analysts use these as the FIRST triage step.        *
  *                                                                    *
  * Fix: XOR-encrypt each smoking-gun string at build time and write   *
  * the encrypted blob into .rdata. At DllMain time, XOR back in-place  *
  * so runtime code sees plaintext. Analyst sees garbage in `strings`  *
- * but a memory dump of the running process still shows plaintext —   *
+ * but a memory dump of the running process still shows plaintext --   *
  * that's a tradeoff: static analysis becomes MUCH harder, dynamic    *
  * analysis is unaffected. Since this project's real threat is        *
  * static RE / theft (not runtime EDR), this is the right tradeoff.   *
@@ -26,7 +26,7 @@
  *      `const char *` to the decrypted string. Call `svc_str_init()`  *
  *      ONCE from DllMain (payload) or main() (launcher) before any    *
  *      logging code runs.                                             *
- *   4. Decryption happens IN-PLACE on the blob — after init the blob  *
+ *   4. Decryption happens IN-PLACE on the blob -- after init the blob  *
  *      contains plaintext. No allocation, no thread-local buffers.   *
  *                                                                    *
  * The generated file is committed to the repo (not built each time)  *
@@ -46,7 +46,7 @@ extern "C" {
  * str_enc_generated.h. */
 #include "str_enc_generated.h"
 
-/* Decrypt the entire blob in-place. Idempotent — safe to call multiple
+/* Decrypt the entire blob in-place. Idempotent -- safe to call multiple
  * times, subsequent calls become no-ops via an internal flag. */
 void svc_str_init(void);
 
@@ -55,7 +55,7 @@ void svc_str_init(void);
  * have to worry about init ordering during early boot). */
 const char *svc_str(int idx);
 
-/* Convenience macro — shorter at call sites. Equivalent to svc_str(x). */
+/* Convenience macro -- shorter at call sites. Equivalent to svc_str(x). */
 #define SS(x)  svc_str(x)
 
 #ifdef __cplusplus

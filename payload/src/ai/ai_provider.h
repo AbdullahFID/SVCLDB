@@ -1,5 +1,5 @@
 /* ================================================================== *
- * ai_provider.h — Unified interface over OpenAI / Anthropic /         *
+ * ai_provider.h -- Unified interface over OpenAI / Anthropic /         *
  * Google / OpenRouter.                                                *
  *                                                                    *
  * Supports:                                                          *
@@ -10,7 +10,7 @@
  *  - Automatic retry with exponential backoff                        *
  *                                                                    *
  * Every provider follows the "text before image" content-ordering    *
- * rule — Anthropic + OpenAI docs are both explicit that this yields  *
+ * rule -- Anthropic + OpenAI docs are both explicit that this yields  *
  * measurably better vision accuracy.                                 *
  * ================================================================== */
 #ifndef SVCLDB_AI_PROVIDER_H
@@ -25,7 +25,7 @@ extern "C" {
 /* ── Tier tables ──
  *
  * OpenAI, Anthropic, Google each expose 3 tiers we curate. OpenRouter
- * is user-picked — either "openrouter/free" (default, zero-cost auto-
+ * is user-picked -- either "openrouter/free" (default, zero-cost auto-
  * routing) or any specific slug like "meta-llama/llama-4-maverick:free".
  */
 typedef struct {
@@ -38,7 +38,7 @@ typedef struct {
 } svc_model_tier_t;
 
 /* Lookup model info for a (provider, tier) pair.
- * For OpenRouter, tier is ignored — always returns the entry pointing
+ * For OpenRouter, tier is ignored -- always returns the entry pointing
  * at "openrouter/free". Non-OpenRouter with tier=CUSTOM returns NULL
  * (caller must use cfg->model verbatim).
  * Returns NULL if the (provider, tier) combo isn't supported. */
@@ -61,12 +61,12 @@ int ai_ask(const svc_config_t *cfg,
            char *err, size_t err_sz);
 
 /* ── Metered path: route the solve through the svcldb-solve worker using
- * the user's Supabase JWT (cfg->access_token) — no per-provider API key
+ * the user's Supabase JWT (cfg->access_token) -- no per-provider API key
  * needed; the worker holds the funded key + meters credits server-side.
  *
  * Returns:
  *   1  = success; *out_reply is heap-alloc'd (free with ai_free_reply).
- *   0  = SOFT failure (no token / transport / 5xx / parse) — the caller
+ *   0  = SOFT failure (no token / transport / 5xx / parse) -- the caller
  *        should silently fall back to the BYO-key providers.
  *  -1  = DEFINITIVE (expired session / no active subscription / no credits);
  *        `err` holds a user-facing message. Caller should surface it when
@@ -80,11 +80,11 @@ int ai_ask_metered(const svc_config_t *cfg,
 /* ── Streaming query.
  *
  * on_chunk is called for every incremental token/word (may be called
- * many times per request). `chunk` is UTF-8 text (NOT null-terminated —
+ * many times per request). `chunk` is UTF-8 text (NOT null-terminated --
  * use `len`). Return 0 to keep streaming, non-zero to abort.
  *
  * on_done fires exactly once when the stream ends, with the full
- * response text (heap-alloc'd, caller owns via ai_free_reply) — or
+ * response text (heap-alloc'd, caller owns via ai_free_reply) -- or
  * NULL if the stream errored. `err` in on_done is populated only on
  * error.
  *
@@ -117,7 +117,7 @@ const char *ai_default_system_prompt(void);
  * but rate-limited, 5xx = provider-side issue). Fills out_latency_ms
  * with round-trip time when the roundtrip succeeded.
  *
- * Fast — 6s cap. Doesn't consume any tokens (models list is free).
+ * Fast -- 6s cap. Doesn't consume any tokens (models list is free).
  * Safe to call from a UI thread as a diagnostic check.
  *
  * Returns 1 iff the HTTP roundtrip completed (status may still be non-2xx),
@@ -146,14 +146,14 @@ int ai_is_reasoning_model(const char *model_id);
  *
  * Sets a process-wide flag that ai_ask_streaming's chunk callback
  * checks on every incoming SSE token. When set, the WinHTTP read loop
- * returns non-zero from the callback → WinHTTP tears down the request
- * cleanly → on_done fires with a friendly "stopped by user" message.
+ * returns non-zero from the callback -> WinHTTP tears down the request
+ * cleanly -> on_done fires with a friendly "stopped by user" message.
  *
  * The flag is auto-cleared at the START of every ai_ask / ai_ask_streaming
  * call so a stale abort from before doesn't poison a fresh request.
  *
  * Bound to Ctrl+Alt+S by default (SVC_HK_STOP_GEN). Safe to call from
- * any thread — uses InterlockedExchange. */
+ * any thread -- uses InterlockedExchange. */
 void ai_request_abort(void);
 
 /* Zero the abort flag. Called implicitly at the start of each request

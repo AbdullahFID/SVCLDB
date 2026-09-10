@@ -1,5 +1,5 @@
 /* ================================================================== *
- * handshake.c — Implementation of handshake token derivation and     *
+ * handshake.c -- Implementation of handshake token derivation and     *
  * verification. Linked into BOTH launcher and payload.               *
  * ================================================================== */
 
@@ -26,7 +26,7 @@ int handshake_compute(const char *access_token,
     size_t at_len = strnlen(access_token, HS_MAX_AT_LEN);
     if (at_len == 0 || at_len >= HS_MAX_AT_LEN) return 0;
 
-    /* sig_key = SHA-256(access_token || SALT) — 32 bytes.
+    /* sig_key = SHA-256(access_token || SALT) -- 32 bytes.
      * Stack-allocated buffer to avoid heap in payload context (where
      * malloc through the manual-mapped CRT works but is riskier than
      * a simple stack alloca). */

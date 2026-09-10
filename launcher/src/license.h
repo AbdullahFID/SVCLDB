@@ -1,5 +1,5 @@
 /* ================================================================== *
- * license.h — Subscription check (via Supabase REST) + storage.       *
+ * license.h -- Subscription check (via Supabase REST) + storage.       *
  *                                                                    *
  * Session is persisted to disk (machine-bound-encrypted) so re-launch*
  * doesn't force re-login unless session is stale / expired.          *

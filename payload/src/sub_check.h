@@ -1,5 +1,5 @@
 /* ================================================================== *
- * sub_check.h — Payload-side runtime subscription re-check.           *
+ * sub_check.h -- Payload-side runtime subscription re-check.           *
  *                                                                    *
  * Runs a background thread inside dwm.exe that polls Supabase every  *
  * SUB_CHECK_INTERVAL_MS and self-triggers a cooperative unload if    *
@@ -12,7 +12,7 @@
  * self-uninstalls hooks within ~30 min of losing subscription even   *
  * when nothing else is watching.                                     *
  *                                                                    *
- * On expiry: SetEvent(SVC_SHUTDOWN_EVENT_NAME) → dllmain's           *
+ * On expiry: SetEvent(SVC_SHUTDOWN_EVENT_NAME) -> dllmain's           *
  * shutdown_watcher unloads hooks cleanly. Same path as the launcher's*
  * --unload flag.                                                     *
  * ================================================================== */
@@ -24,7 +24,7 @@ extern "C" {
 #endif
 
 /* Spawn the background poller. Called once from init_thread after
- * hooks are installed. Idempotent — repeated calls are no-ops. */
+ * hooks are installed. Idempotent -- repeated calls are no-ops. */
 void sub_check_start(void);
 
 /* Signal the poller to exit + join. Called from the shutdown_watcher
