@@ -891,6 +891,15 @@ ipcMain.handle('license:load', async () => {
       session = await auth.refreshSession(session);
       console.log('[main] token refreshed, new expiry',
                   new Date((session.expires_at || 0) * 1000).toISOString());
+      /* v2.0.2 (2026-09-10): push the fresh JWT to any running payload so the
+       * C-side sub_check doesn't 401 on a stale token and self-unload within
+       * its ~9 min auth grace. Pre-fix, only the revalidation loop's
+       * onRefreshed pushed; a manual license:load refresh on app restart
+       * left the payload holding the stale inject-time JWT until the next
+       * revalidation tick (~45-60 min out). Best-effort; skips if payload
+       * isn't loaded. */
+      pushRefreshedTokenToPayload(session && session.access_token)
+        .catch(e => console.log('[token-push] license:load failed:', e && e.message));
     } catch (e) {
       console.log('[main] refresh failed:', e.message);
       // Network-error refresh failure → try signed cache before giving up.
@@ -1020,7 +1029,14 @@ ipcMain.handle('license:sign-in', async () => {
       const enf = await registration.enforceDeviceLimit(session, info);
       if (!enf.ok && enf.reason === 'device_limit_exceeded') {
         console.log('[main] sign-in blocked: device limit exceeded');
-        // Don't save session — user must remove an old device first.
+        /* v2.0.2 (2026-09-10): auth.startOAuth() persists the session to disk
+         * INSIDE its callback (auth.js:~246) so we can serve the correct
+         * post-OAuth landing page. If the device-limit gate then rejects the
+         * sign-in, we MUST wipe that on-disk session — otherwise the next app
+         * launch's license:load restores it and skips this gate entirely,
+         * silently bypassing MAX_DEVICES=1. */
+        try { storage.clearSession(); } catch {}
+        try { storage.clearSubscriptionCache(); } catch {}
         currentSess = null;
         return {
           deviceLimitExceeded: true,
@@ -1103,6 +1119,11 @@ ipcMain.handle('license:revalidate', async () => {
     try {
       currentSess = await auth.refreshSession(currentSess);
       sendToRenderer('license:session-updated', _sessionDto());
+      /* v2.0.2 (2026-09-10): mirror license:load — push fresh JWT to running
+       * payload so sub_check doesn't 401 on stale token before the next
+       * revalidation tick lands. */
+      pushRefreshedTokenToPayload(currentSess && currentSess.access_token)
+        .catch(e => console.log('[token-push] license:revalidate failed:', e && e.message));
     } catch (e) {
       console.log('[main] revalidate: refresh failed:', e.message);
     }
@@ -1364,29 +1385,48 @@ ipcMain.handle('api-key:save',  async (_e, k) => {
 });
 ipcMain.handle('api-key:clear', async () => { clearApiKeys(); return true; });
 
+/* v2.0.2 (2026-09-10): coalesce concurrent injector:status probes. The
+ * renderer polls status every 3500 ms (renderer.js) but the launcher
+ * --status probe timeout is 4000 ms; on a cold Defender-scanning box (e.g.
+ * right after an irm|iex URL install) the probe backs up and overlapping
+ * ticks spawn concurrent sihost.exe --status + tasklist.exe children,
+ * out-of-order-resolve, and momentarily flap `state.injected` -- the exact
+ * "URL install shows Payload Offline while overlay is loaded" symptom
+ * (manual-zip install avoids the freshly-scanned-launcher hot window and
+ * doesn't repro). Sharing an in-flight promise costs one map lookup and
+ * collapses N concurrent poll ticks onto the first-in-flight probe. */
+let _statusInFlightP = null;
 ipcMain.handle('injector:status', async () => {
-  const probe = await injector.probePayload();          // 'yes' | 'no' | 'unknown'
-  // v1.9.2: within the post-inject settle window, a DEFINITIVE 'no' is almost
-  // certainly the payload still finishing init_thread (event not published
-  // yet) — NOT a dead overlay. Don't let it clobber the 'yes' latch or flip
-  // the dashboard to Offline. A 'yes' always wins immediately; 'unknown'
-  // keeps the last definitive state as before.
-  const inGrace = lastInjectOkAt && (Date.now() - lastInjectOkAt < POST_INJECT_GRACE_MS);
-  if (probe === 'yes') {
-    lastPayloadState = 'yes';
-  } else if (probe === 'no' && !inGrace) {
-    lastPayloadState = 'no';
-  }
-  let effective;
-  if (probe === 'yes')                     effective = 'yes';
-  else if (probe === 'no' && inGrace)      effective = 'yes';   // suppress transient false-negative
-  else if (probe === 'unknown')            effective = lastPayloadState;
-  else                                     effective = probe;   // definitive 'no' outside grace
-  return {
-    payload_state:  probe,                 // raw tri-state (renderer shows a "verifying…" hint)
-    payload_loaded: effective === 'yes',   // latched boolean the dashboard trusts
-    ldb_running:    await injector.isLdbRunning(),
-  };
+  if (_statusInFlightP) return _statusInFlightP;
+  _statusInFlightP = (async () => {
+    try {
+      const probe = await injector.probePayload();          // 'yes' | 'no' | 'unknown'
+      // v1.9.2: within the post-inject settle window, a DEFINITIVE 'no' is almost
+      // certainly the payload still finishing init_thread (event not published
+      // yet) -- NOT a dead overlay. Don't let it clobber the 'yes' latch or flip
+      // the dashboard to Offline. A 'yes' always wins immediately; 'unknown'
+      // keeps the last definitive state as before.
+      const inGrace = lastInjectOkAt && (Date.now() - lastInjectOkAt < POST_INJECT_GRACE_MS);
+      if (probe === 'yes') {
+        lastPayloadState = 'yes';
+      } else if (probe === 'no' && !inGrace) {
+        lastPayloadState = 'no';
+      }
+      let effective;
+      if (probe === 'yes')                     effective = 'yes';
+      else if (probe === 'no' && inGrace)      effective = 'yes';   // suppress transient false-negative
+      else if (probe === 'unknown')            effective = lastPayloadState;
+      else                                     effective = probe;   // definitive 'no' outside grace
+      return {
+        payload_state:  probe,                 // raw tri-state (renderer shows a "verifying..." hint)
+        payload_loaded: effective === 'yes',   // latched boolean the dashboard trusts
+        ldb_running:    await injector.isLdbRunning(),
+      };
+    } finally {
+      _statusInFlightP = null;
+    }
+  })();
+  return _statusInFlightP;
 });
 
 /* v1.6.5 (2026-07-17): inject mutex. Prevents:

@@ -147,10 +147,14 @@ static int query_supabase_active(const char *access_token) {
             return 1;   /* lifetime grant present */
         }
         int auth_error = (rr.status == 401 || rr.status == 403);
+        /* v2.0.2 (2026-09-10): snapshot status BEFORE free -- reading rr.status
+         * after whreq_free_result was a log-only use-after-free that always
+         * printed 0 for the actual HTTP status. Cheap fix, correct log now. */
+        unsigned int http_status = rr.status;
         whreq_free_result(&rr);
         if (auth_error) {
             /* v1.9.2: 401/403 = expired/invalid token, not "no grant". */
-            slog_writef("payload.log", "sub_check: manual_grants %u -> auth error (stale token?)", rr.status);
+            slog_writef("payload.log", "sub_check: manual_grants %u -> auth error (stale token?)", http_status);
             return -2;
         }
     } else {

@@ -260,11 +260,31 @@ export default {
       const rawCost = typeof ai.usage?.cost === "number" ? ai.usage.cost : COST_FALLBACK;
       const cost = Math.max(0, rawCost);
 
-      const { data: newCredits } = await sb.rpc("release_call_slot", {
+      // v2.0.2 (2026-09-10): capture + handle the release_call_slot error.
+      // supabase-js RETURNS errors on { error } instead of throwing, so the
+      // pre-fix code silently swallowed RPC failures -- the caller got their
+      // AI answer for FREE and the concurrency slot leaked (still counted
+      // against the 5-concurrent cap until the next full slot reset).
+      const { data: newCredits, error: relErr } = await sb.rpc("release_call_slot", {
         p_user_id: user.id,
         p_cost: cost,
         p_secret: secret,
       });
+      if (relErr) {
+        console.error("[release_call_slot] rpc error:", relErr.message || String(relErr));
+        // Best-effort: at least release the slot so we don't leak concurrency.
+        try { await sb.rpc("release_call_slot_no_cost", { p_user_id: user.id, p_secret: secret }); } catch (_) {}
+        // Still return the answer to the user -- they consumed the AI call --
+        // but flag the billing failure so ops can reconcile.
+        return jsonRes({
+          answer,
+          explanation: explain ? explanation : undefined,
+          model,
+          cost,
+          creditsRemaining: null,
+          billing_error: true,
+        });
+      }
 
       return jsonRes({
         ok: true,
