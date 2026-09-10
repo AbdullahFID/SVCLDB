@@ -128,4 +128,19 @@ module.exports = {
   // Names of the C-side binaries we spawn.
   LAUNCHER_EXE:  'sihost.exe',
   PAYLOAD_DLL:   'dwmapiext.dll',
+
+  /* v2.0.2 (2026-09-10): canonical manifest of the C binaries Electron
+   * bundles into resources/ and mirrors to SVC_INSTALL_DIR. SINGLE SOURCE
+   * OF TRUTH shared by:
+   *   - main.js::ensureCBinariesInstalled   (startup deploy + upgrade detect)
+   *   - injector.js::ensureBinariesPresent  (on-demand self-repair when an
+   *     antivirus quarantine or the user removed one AFTER install)
+   * Order is intentional: sihost.exe first (the launcher the injector spawns;
+   * it embeds dwmapiext.dll as RCDATA — the on-disk dll is a backup). */
+  BUNDLED_BINS:  ['sihost.exe', 'dllhost32.exe', 'cgpt_dbghelp.dll', 'symsrv.dll', 'dwmapiext.dll'],
+
+  /* Non-executable runtime assets the payload reads by absolute path from
+   * SVC_INSTALL_DIR. Kept SEPARATE from BUNDLED_BINS so an asset refresh
+   * never trips the payload-uninject upgrade path in ensureCBinariesInstalled. */
+  BUNDLED_ASSETS: ['cg_icons.ttf'],
 };

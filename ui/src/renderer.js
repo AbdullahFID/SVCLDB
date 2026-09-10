@@ -1686,6 +1686,10 @@ document.getElementById('btn-inject').addEventListener('click', async () => {
       state.injected = true;
       toast(`Overlay armed with ${configured.length} provider${configured.length === 1 ? '' : 's'} — hotkeys are live.`, 'ok');
       _refreshStatus();
+    } else if (r.code === 'LAUNCHER_MISSING') {
+      /* v2.0.2: soft recovery instead of a dead red toast — the app is still
+       * fully open; only this Inject action needs the engine restored. */
+      await _handleLauncherMissing(bag, configured);
     } else {
       const msg = _explainInjectExit(r.exitCode, r.err);
       toast(`Inject failed: ${msg}`, 'err');
@@ -1739,6 +1743,58 @@ document.getElementById('btn-killall').addEventListener('click', async () => {
     toast(`Kill-all failed: ${e.message || e}`, 'err');
   }
 });
+
+/* v2.0.2 (2026-09-10): graceful recovery for a missing overlay engine
+ * (sihost.exe). The #1 real-world cause of "Inject failed: launcher missing"
+ * is antivirus quarantining the injector after install. Rather than a dead
+ * red toast, we explain the likely cause, offer one-click repair from the
+ * app's OWN bundled copy (no re-download), and retry the inject once if the
+ * repair sticks. The dashboard itself stays fully usable throughout — this
+ * only ever affects the Inject action, never opening the app. */
+async function _handleLauncherMissing(bag, configured) {
+  const go = confirm(
+    "CloakGPT can't find its overlay engine (sihost.exe).\n\n" +
+    "This is almost always your antivirus quarantining it. The file ships " +
+    "inside CloakGPT, so it can be restored without re-downloading anything.\n\n" +
+    "Repair now and try injecting again?"
+  );
+  if (!go) {
+    toast('Inject skipped — click Inject Now anytime to repair and retry.', 'err');
+    return;
+  }
+  showLoading('Repairing install…', 'Restoring the overlay engine and re-checking antivirus exclusions.');
+  let rep;
+  try {
+    rep = await window.svc.injector.repair();
+  } catch (e) {
+    hideLoading();
+    toast(`Repair failed: ${e.message || e}`, 'err');
+    return;
+  }
+  if (!rep || !rep.ok) {
+    hideLoading();
+    toast('Could not restore sihost.exe — your antivirus is likely blocking it. Add a CloakGPT exclusion, then click Inject Now.', 'err');
+    return;
+  }
+  // Repair stuck — retry the inject once with the same args.
+  showLoading('Injecting overlay…', 'Engine restored. Arming the overlay.');
+  try {
+    const r2 = await window.svc.injector.inject({ keys: bag, tier: state.chosen_tier });
+    hideLoading();
+    if (r2.ok) {
+      state.injected = true;
+      toast(`Repaired and armed with ${configured.length} provider${configured.length === 1 ? '' : 's'} — hotkeys are live.`, 'ok');
+      _refreshStatus();
+    } else if (r2.code === 'LAUNCHER_MISSING') {
+      toast('Antivirus re-removed sihost.exe immediately. Add a CloakGPT exclusion, then click Inject Now.', 'err');
+    } else {
+      toast(`Inject failed after repair: ${_explainInjectExit(r2.exitCode, r2.err)}`, 'err');
+    }
+  } catch (e) {
+    hideLoading();
+    toast(`Inject failed after repair: ${e.message || e}`, 'err');
+  }
+}
 
 function _explainInjectExit(code, err) {
   if (err) return err;

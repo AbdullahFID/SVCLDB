@@ -118,6 +118,11 @@ contextBridge.exposeInMainWorld('svc', {
     inject:        (opts)  => ipcRenderer.invoke('injector:inject', opts),
     uninject:      ()      => ipcRenderer.invoke('injector:uninject'),
     killAll:       ()      => ipcRenderer.invoke('injector:kill-all'),
+    /* v2.0.2 (2026-09-10): restore a quarantined/removed sihost.exe from the
+     * app's own bundled copy + re-assert AV exclusions. Backs the soft
+     * "Repair & retry" dialog shown on a LAUNCHER_MISSING inject failure.
+     * Returns { ok, launcherPresent, repaired:[...], source, reason? }. */
+    repair:        ()      => ipcRenderer.invoke('injector:repair'),
     /* v1.7.4 (2026-07-23): boolean-only payload-loaded probe. Used by
      * the preset auto-reinject flow to decide whether to fire an
      * inject after a preset click (only re-inject if payload is

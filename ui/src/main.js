@@ -35,7 +35,7 @@ const security     = require('./license/security');
 const mitm         = require('./license/mitm');
 const registration = require('./license/registration');
 const injector     = require('./injector/injector');
-const { SVC_INSTALL_DIR } = require('./license/config');
+const { SVC_INSTALL_DIR, BUNDLED_BINS, BUNDLED_ASSETS } = require('./license/config');
 
 // ─── First-run install ─────────────────────────────────────────
 // Copy the C binaries bundled as extraResources into SVC_INSTALL_DIR
@@ -48,13 +48,15 @@ const { SVC_INSTALL_DIR } = require('./license/config');
 // binaries inside `resources/` next to the exe; on first launch we
 // mirror them out to C:\ProgramData\WinAudioSvc\.
 function ensureCBinariesInstalled() {
-  const bins = [
-    'sihost.exe',        // launcher (embeds dwmapiext.dll as RCDATA)
-    'dllhost32.exe',     // resolver (fetches DWM PDB → offsets.blob)
-    'cgpt_dbghelp.dll',  // SDK dbghelp (symbol-server capable)
-    'symsrv.dll',        // Microsoft PDB fetcher
-    'dwmapiext.dll',     // payload — backup, sihost.exe usually reads from its own RCDATA
-  ];
+  /* v2.0.2: the bin + asset manifests now live in license/config.js as the
+   * SINGLE SOURCE OF TRUTH, shared with injector.js::ensureBinariesPresent
+   * so the on-demand self-repair path restores the exact same set (no drift).
+   *   sihost.exe       launcher (embeds dwmapiext.dll as RCDATA)
+   *   dllhost32.exe    resolver (fetches DWM PDB -> offsets.blob)
+   *   cgpt_dbghelp.dll SDK dbghelp (symbol-server capable)
+   *   symsrv.dll       Microsoft PDB fetcher
+   *   dwmapiext.dll    payload - backup, sihost usually reads its own RCDATA */
+  const bins = BUNDLED_BINS;
   try { if (!fs.existsSync(SVC_INSTALL_DIR)) fs.mkdirSync(SVC_INSTALL_DIR, { recursive: true }); }
   catch (e) { console.log('[install] mkdir SVC_INSTALL_DIR failed:', e.message); return; }
 
@@ -134,7 +136,7 @@ function ensureCBinariesInstalled() {
    *   Bundled as extraResources (from shared/fonts/lucide.ttf → cg_icons.ttf).
    *   Without this copy the overlay silently falls back to hand-drawn vector
    *   icons ("buns") — see docs/HANDOFF_2026-08-12_CREDITS_INJECT_BUG.md. */
-  const assets = ['cg_icons.ttf'];
+  const assets = BUNDLED_ASSETS;
   for (const a of assets) {
     const src = path.join(srcDir, a);
     if (!fs.existsSync(src)) continue;
@@ -1638,6 +1640,33 @@ ipcMain.handle('injector:kill-all', async () => {
   return injector.killAll();
 });
 
+/* v2.0.2 (2026-09-10) — user-triggered "Repair install". Backs the soft
+ * dialog the renderer shows when an inject hits LAUNCHER_MISSING (an AV
+ * quarantine of sihost.exe is the usual cause). We:
+ *   1. Restore any missing bundled binary from resources/ (no re-download).
+ *   2. Re-assert Defender exclusions so a Microsoft-Defender quarantine
+ *      doesn't immediately re-eat the file we just restored.
+ *   3. Re-check once more after the exclusion lands (covers the AV race).
+ * Returns { ok, launcherPresent, repaired[], source, reason? }. ok simply
+ * mirrors launcherPresent so the renderer can gate its inject retry on it. */
+ipcMain.handle('injector:repair', async () => {
+  let rep = { launcherPresent: false, repaired: [], source: 'none' };
+  try { rep = injector.ensureBinariesPresent(); } catch (e) { rep.reason = e && e.message; }
+  try { await ensureDefenderExclusions(); } catch { /* best-effort, never block */ }
+  if (!rep.launcherPresent) {
+    try { rep = injector.ensureBinariesPresent(); } catch (e) { rep.reason = e && e.message; }
+  }
+  console.log('[injector:repair] launcherPresent=%s repaired=%s source=%s',
+              rep.launcherPresent, (rep.repaired || []).join(',') || '-', rep.source);
+  return {
+    ok: !!rep.launcherPresent,
+    launcherPresent: !!rep.launcherPresent,
+    repaired: rep.repaired || [],
+    source: rep.source,
+    reason: rep.reason,
+  };
+});
+
 /* v1.7.4 (2026-07-23) — boolean is-loaded probe for the preset
  * auto-reinject flow. Returns true/false only (collapses 'unknown'
  * to false so the renderer's safe default is "not loaded → save
@@ -2596,7 +2625,15 @@ function startOcrDaemon() {
   if (ocrDaemonIsRunning()) return { ok: true, alreadyRunning: true };
   const exePath = path.join(SVC_INSTALL_DIR, 'sihost.exe');
   if (!fs.existsSync(exePath)) {
-    return { ok: false, err: `launcher missing: ${exePath}` };
+    /* v2.0.2: the OCR helper IS sihost.exe, so an AV quarantine that removed
+     * it can be undone from the bundled copy without a re-download. Try that
+     * before failing, and hand back a code the UI can turn into a soft
+     * "repair & retry" prompt instead of a dead "launcher missing". */
+    try { injector.ensureBinariesPresent(); } catch {}
+    if (!fs.existsSync(exePath)) {
+      return { ok: false, code: 'LAUNCHER_MISSING',
+               err: 'Screenshot redactor engine (sihost.exe) is missing - likely quarantined by antivirus. Add a CloakGPT exclusion and try again.' };
+    }
   }
   try {
     const child = spawn(exePath, ['--ocr-daemon'], {

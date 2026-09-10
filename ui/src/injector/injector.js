@@ -18,8 +18,90 @@ const { spawn, execFile } = require('child_process');
 
 const handshake = require('../license/handshake');
 const {
-  SVC_INSTALL_DIR, LAUNCHER_EXE, SVC_SHUTDOWN_EVENT,
+  SVC_INSTALL_DIR, LAUNCHER_EXE, SVC_SHUTDOWN_EVENT, BUNDLED_BINS,
 } = require('../license/config');
+
+// ─── On-demand self-repair ──────────────────────────────────────
+//
+// v2.0.2 (2026-09-10): the #1 real-world "Inject failed: launcher missing"
+// cause is antivirus quarantining sihost.exe AFTER install — it's an
+// unsigned binary that manual-maps a DLL into dwm.exe, about the most
+// AV-triggering thing a program can do. The deployed copy vanishes but the
+// running Electron app still carries its own copy inside resources/, so we
+// can restore it with ZERO re-download.
+//
+// ensureBinariesPresent() copies any MISSING bundled binary from
+// process.resourcesPath back into SVC_INSTALL_DIR. It is deliberately
+// missing-ONLY: it never overwrites a file that's already there (that's
+// main.js::ensureCBinariesInstalled's startup + upgrade job). Safe to call
+// on every inject — a no-op once the files are in place.
+//
+// Returns:
+//   { launcherPresent: bool,     // sihost.exe on disk after the attempt
+//     repaired: string[],        // names actually restored this call
+//     source: 'bundle'|'none',   // 'none' == dev build / bundle also lost it
+//     reason?: string }
+function ensureBinariesPresent() {
+  const exePath = path.join(SVC_INSTALL_DIR, LAUNCHER_EXE);
+  const repaired = [];
+
+  const srcDir = process.resourcesPath;
+  const haveBundle = !!(srcDir && fs.existsSync(path.join(srcDir, LAUNCHER_EXE)));
+  if (!haveBundle) {
+    // In `npm start` dev mode resourcesPath is Electron's own resources dir
+    // (no bundled C bins) — the dev deploys by hand. Also covers the rare
+    // case where the app's OWN bundled copy got quarantined too.
+    return {
+      launcherPresent: fs.existsSync(exePath),
+      repaired,
+      source: 'none',
+      reason: fs.existsSync(exePath) ? undefined : 'no bundled copy in resourcesPath (dev build or bundle quarantined)',
+    };
+  }
+
+  try { if (!fs.existsSync(SVC_INSTALL_DIR)) fs.mkdirSync(SVC_INSTALL_DIR, { recursive: true }); } catch {}
+
+  for (const b of BUNDLED_BINS) {
+    const src = path.join(srcDir, b);
+    const dst = path.join(SVC_INSTALL_DIR, b);
+    if (!fs.existsSync(src)) continue;     // not bundled → skip
+    if (fs.existsSync(dst))  continue;     // missing-ONLY → never clobber a present file
+    try {
+      fs.copyFileSync(src, dst);
+      if (fs.existsSync(dst)) repaired.push(b);  // verify it stuck (AV can re-eat instantly)
+    } catch { /* EPERM/EBUSY = AV lock or non-elevated; reflected in launcherPresent below */ }
+  }
+
+  return { launcherPresent: fs.existsSync(exePath), repaired, source: 'bundle' };
+}
+
+// Structured, user-friendly failure returned by inject/uninject/killAll when
+// the launcher is gone AND self-repair couldn't bring it back. `code` lets the
+// renderer show a soft "repair & retry" dialog instead of a scary red toast.
+function _launcherMissingResult() {
+  const srcDir = process.resourcesPath;
+  const haveBundle = !!(srcDir && fs.existsSync(path.join(srcDir, LAUNCHER_EXE)));
+  return {
+    ok: false,
+    exitCode: -1,
+    code: 'LAUNCHER_MISSING',
+    repairTried: haveBundle,
+    err: haveBundle
+      ? "Overlay engine (sihost.exe) was removed after install and couldn't be restored - almost always antivirus quarantining it. Add a CloakGPT antivirus exclusion, then retry."
+      : "Overlay engine (sihost.exe) is missing and there's no bundled copy to restore from (dev build or corrupted download). Reinstall CloakGPT.",
+  };
+}
+
+// Shared guard: ensure the launcher is present, self-repairing if needed.
+// Returns null when good-to-go (possibly after a silent restore), or a
+// _launcherMissingResult() object when it truly can't be recovered.
+function _guardLauncher() {
+  const exePath = path.join(SVC_INSTALL_DIR, LAUNCHER_EXE);
+  if (fs.existsSync(exePath)) return null;
+  try { ensureBinariesPresent(); } catch { /* fall through to the existence re-check */ }
+  if (fs.existsSync(exePath)) return null;   // self-heal worked → proceed silently
+  return _launcherMissingResult();
+}
 
 // ─── Injected-status probe ───────────────────────────────────────
 //
@@ -624,13 +706,24 @@ async function inject(opts) {
   if (!hasKey && !hasSession) {
     return { ok: false, exitCode: -3, err: 'Sign in to use CloakGPT credits, or add your own API key.' };
   }
+
+  /* v2.0.2: launcher self-repair BEFORE we write the plaintext handoff. If
+   * sihost.exe is gone (AV quarantine is the usual culprit) we restore it
+   * from the bundled resources/ copy and continue transparently; only if it
+   * truly can't be recovered do we bail with a graceful LAUNCHER_MISSING (and
+   * we never leave a plaintext token/keys tmp file behind). */
+  const guard = _guardLauncher();
+  if (guard) return guard;
+
   const tmp  = path.join(os.tmpdir(), `svchelper_${crypto.randomBytes(8).toString('hex')}.json`);
   fs.writeFileSync(tmp, JSON.stringify(json), { encoding: 'utf8', mode: 0o600 });
 
   const exePath = path.join(SVC_INSTALL_DIR, LAUNCHER_EXE);
   if (!fs.existsSync(exePath)) {
+    /* Race: AV re-ate it between the guard and here. Clean up the tmp and
+     * surface the same graceful result. */
     try { fs.unlinkSync(tmp); } catch {}
-    return { ok: false, exitCode: -1, err: `launcher missing: ${exePath}` };
+    return _launcherMissingResult();
   }
 
   return new Promise((resolve) => {
@@ -684,8 +777,9 @@ async function inject(opts) {
  * so it uninstalls MinHook detours cleanly. DWM stays alive.
  */
 async function uninject() {
+  const guard = _guardLauncher();   // v2.0.2: self-repair, then graceful fail
+  if (guard) return guard;
   const exePath = path.join(SVC_INSTALL_DIR, LAUNCHER_EXE);
-  if (!fs.existsSync(exePath)) return { ok: false, err: `launcher missing: ${exePath}` };
   return new Promise((resolve) => {
     const child = spawn(exePath, ['--unload'], {
       windowsHide: true, stdio: 'ignore', detached: false,
@@ -708,8 +802,9 @@ async function uninject() {
  * (Windows respawns fresh), sweeps every other sihost.exe instance.
  */
 async function killAll() {
+  const guard = _guardLauncher();   // v2.0.2: self-repair, then graceful fail
+  if (guard) return guard;
   const exePath = path.join(SVC_INSTALL_DIR, LAUNCHER_EXE);
-  if (!fs.existsSync(exePath)) return { ok: false, err: `launcher missing: ${exePath}` };
   return new Promise((resolve) => {
     const child = spawn(exePath, ['--kill-all'], {
       windowsHide: true, stdio: 'ignore', detached: false,
@@ -728,6 +823,7 @@ async function killAll() {
 
 module.exports = {
   buildJson, inject, uninject, killAll,
+  ensureBinariesPresent,          /* v2.0.2: on-demand launcher self-repair */
   isPayloadLoaded, probePayload, isLdbRunning,
   detectProvider, pickPrimaryProvider,
   PROVIDER,
