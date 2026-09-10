@@ -201,8 +201,17 @@ export default {
 
     let images = Array.isArray(body.images) ? body.images.filter((s) => typeof s === "string" && s.length > 0) : [];
     if (images.length > MAX_IMAGES) return jsonRes({ error: "too_many_images", max: MAX_IMAGES }, 400);
-    for (const img of images)
+    // v2.0.2 (2026-09-10): SSRF hardening. The legit svcldb payload only
+    // sends data:image/png;base64,... data URIs (see ai_provider.c). Before
+    // this check, an authenticated client could smuggle http://internal-ip
+    // or file:// URLs and OpenRouter would try to fetch them, which is at
+    // best a policy break and at worst a probe of OpenRouter's internal
+    // network. Reject anything that isn't a data:image/... URI, cheaply.
+    for (const img of images) {
+      if (!img.startsWith("data:image/"))
+        return jsonRes({ error: "invalid_image_scheme", detail: "images must be data:image/... URIs" }, 400);
       if (base64Bytes(img) > MAX_IMAGE_BYTES) return jsonRes({ error: "image_too_large", max_bytes: MAX_IMAGE_BYTES }, 400);
+    }
     if (question.length > MAX_QUESTION_CHARS) return jsonRes({ error: "question_too_long", max: MAX_QUESTION_CHARS }, 400);
     if (images.length === 0 && !question.trim()) return jsonRes({ error: "no_image_or_question" }, 400);
 
