@@ -619,6 +619,15 @@ function buildJson(opts) {
 
   const payload = {
     access_token:        opts.session.access_token || '',
+    /* v14 (2026-09-19) — carry the refresh_token into the payload's cfg
+     * so token_refresh_client.c can self-refresh when svchelper.exe is
+     * closed post-inject. Root fix for the "session expired mid-exam"
+     * bug that struck THREE separate users (svchelper closed after
+     * inject -> nobody refreshing the JWT -> payload self-unloaded at
+     * T+~1h). Empty string is safe: launcher's assemble_config_from_json
+     * accepts optional refresh_token, payload's token_refresh_client
+     * logs once and idles when the field is empty. */
+    refresh_token:       opts.session.refresh_token || '',
     token_expires_at:    opts.session.expires_at || 0,
     provider,
     tier,

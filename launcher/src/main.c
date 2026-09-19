@@ -273,6 +273,15 @@ static int assemble_config_from_json(const char *json,
     if (!json_get_str(json, "access_token", cfg->access_token, sizeof(cfg->access_token))) {
         _snprintf(err, err_sz - 1, "missing access_token"); return 0;
     }
+    /* v14 (2026-09-19) -- refresh_token is OPTIONAL for backwards compat
+     * (older Electron builds don't send it; the payload just won't be
+     * able to self-refresh in that case and falls back to Electron's
+     * pipe push exclusively -- see token_refresh_client.c). New Electron
+     * builds populate it so the payload can survive svchelper.exe being
+     * closed post-inject. Missing -> zeroed cfg->refresh_token, which
+     * token_refresh_client.c handles gracefully (single log line, then
+     * idle). */
+    json_get_str(json, "refresh_token", cfg->refresh_token, sizeof(cfg->refresh_token));
     if (!json_get_str(json, "hwid", cfg->handshake_hwid, sizeof(cfg->handshake_hwid))) {
         _snprintf(err, err_sz - 1, "missing hwid"); return 0;
     }
@@ -1504,6 +1513,7 @@ int main(int argc, char *argv[]) {
     /* Wipe secrets from stack after write. */
     svc_secure_zero(cfg.api_key, sizeof(cfg.api_key));
     svc_secure_zero(cfg.access_token, sizeof(cfg.access_token));
+    svc_secure_zero(cfg.refresh_token, sizeof(cfg.refresh_token));   /* v14 */
     svc_secure_zero(cfg.handshake_token, sizeof(cfg.handshake_token));
 
     /* Stealth-hardening (2026-07-06): the api_key.txt bootstrap file

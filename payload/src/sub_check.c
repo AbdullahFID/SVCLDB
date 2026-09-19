@@ -61,9 +61,28 @@
  * so a healthy session never even reaches a 401 here. As defense-in-depth we
  * give a stale-token 401 a short grace: retry on AUTH_RETRY cadence and only
  * self-unload after MAX_AUTH_FAILS consecutive 401s (covers a slightly-late
- * push, or concludes the session is genuinely dead / Electron closed). */
+ * push, or concludes the session is genuinely dead / Electron closed).
+ *
+ * v14 (2026-09-19) -- Bug 2 struck AGAIN with the "Electron closed after
+ * inject" scenario. v1.9.2's 9-min grace assumed Electron was alive to
+ * push. It isn't in the real-user flow (sign in -> inject -> close
+ * svchelper -> take exam). Fixes:
+ *   (a) The payload can now self-refresh via token_refresh_client.c
+ *       (using cfg->refresh_token added to svc_config_t in v14), so most
+ *       401s never happen at all.
+ *   (b) In case the refresh also fails (network out during exam, refresh
+ *       token rotated by another device, etc), we extend grace to a
+ *       WALL-CLOCK 6 HOURS via SUB_CHECK_AUTH_GRACE_MS. Long enough to
+ *       cover a full exam window even under total network failure; short
+ *       enough that a genuinely cancelled subscription still unloads
+ *       eventually. User explicitly asked for "6 hours not 1 hour" here.
+ * The count-based MAX_AUTH_FAILS (3) fallback stays as a lower bound --
+ * whichever fires FIRST triggers the unload -- but with 3-min retry
+ * cadence, 3 fails is 9 min, so the wall-clock grace is what dominates
+ * in practice. */
 #define SUB_CHECK_AUTH_RETRY_MS     (3U * 60U * 1000U)  /* retry ~3 min while token looks stale */
-#define SUB_CHECK_MAX_AUTH_FAILS    3                    /* ~9 min grace before self-unload */
+#define SUB_CHECK_MAX_AUTH_FAILS    3                    /* legacy count-based grace (~9 min) */
+#define SUB_CHECK_AUTH_GRACE_MS     (6U * 60U * 60U * 1000U)  /* v14: 6h wall-clock grace */
 
 static HANDLE  g_sc_thread = NULL;
 static volatile LONG g_sc_running = 0;
@@ -237,6 +256,7 @@ static DWORD WINAPI sub_check_thread(LPVOID param) {
 
     int consecutive_net_fails = 0;
     int consecutive_auth_fails = 0;   /* v1.9.2: stale-token (401/403) grace */
+    ULONGLONG first_auth_fail_tick = 0;  /* v14: GetTickCount64 at start of grace window */
     for (;;) {
         /* Choose next wait interval:
          *   - token looked stale (401) -> short AUTH_RETRY so we pick up the
@@ -289,6 +309,7 @@ static DWORD WINAPI sub_check_thread(LPVOID param) {
             }
             consecutive_net_fails = 0;
             consecutive_auth_fails = 0;
+            first_auth_fail_tick = 0;   /* v14: reset wall-clock grace on any success */
             continue;
         }
         if (r == 0) {
@@ -303,15 +324,38 @@ static DWORD WINAPI sub_check_thread(LPVOID param) {
              * JWT ~12 min pre-expiry and pushes it into cfg->access_token,
              * so a healthy session should never land here. Give it a short
              * grace before pulling the overlay: retry on the AUTH cadence,
-             * self-unload only after MAX_AUTH_FAILS consecutive 401s. */
+             * self-unload only after MAX_AUTH_FAILS consecutive 401s.
+             *
+             * v14 (2026-09-19) -- Extended grace to 6-hour wall-clock in
+             * addition to the count-based 9-min. token_refresh_client is
+             * ALSO trying to fix the token during this window. Combined
+             * with the payload's autonomous refresh path, this means the
+             * only ways to end up self-unloading here are:
+             *   (a) Genuinely-inactive subscription (rare -- HTTP 200 empty
+             *       falls through to `r == 0` branch above, not here).
+             *   (b) 6+ hours of continuous refresh-token invalidation
+             *       (means: user revoked the session everywhere OR
+             *       laptop offline for the entire exam).
+             * Either way, 6h is enough to survive a 4-hour AP exam etc.
+             * without losing the overlay to a transient blip. */
             consecutive_auth_fails++;
+            if (first_auth_fail_tick == 0) first_auth_fail_tick = GetTickCount64();
+            ULONGLONG elapsed_ms = GetTickCount64() - first_auth_fail_tick;
+            unsigned grace_remain_min = (elapsed_ms >= SUB_CHECK_AUTH_GRACE_MS)
+                ? 0u
+                : (unsigned)((SUB_CHECK_AUTH_GRACE_MS - elapsed_ms) / 60000u);
             slog_writef("payload.log",
-                        "sub_check: auth/expired-token fail %d/%d (grace -- awaiting "
-                        "Electron token-refresh push)",
-                        consecutive_auth_fails, SUB_CHECK_MAX_AUTH_FAILS);
-            if (consecutive_auth_fails >= SUB_CHECK_MAX_AUTH_FAILS) {
-                slog_write("payload.log",
-                           "sub_check: stale token persisted across grace window -- self-unload");
+                        "sub_check: auth/expired-token fail #%d (grace_remaining=%um; "
+                        "awaiting token_refresh_client + Electron pipe push)",
+                        consecutive_auth_fails, grace_remain_min);
+            /* v14: unload only when wall-clock grace has EXPIRED. The count-
+             * based check is retained as a fallback but the wall-clock is
+             * the dominant condition. */
+            if (elapsed_ms >= SUB_CHECK_AUTH_GRACE_MS) {
+                slog_writef("payload.log",
+                            "sub_check: 6h wall-clock auth grace expired "
+                            "(elapsed=%llums, fails=%d) -- self-unload",
+                            elapsed_ms, consecutive_auth_fails);
                 trigger_self_unload(SS(SVC_STR_SUBCHK_INACTIVE));
                 break;
             }

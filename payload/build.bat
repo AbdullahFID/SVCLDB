@@ -62,6 +62,7 @@ set C_SOURCES=^
  "%SRC%\ai\ai_provider.c" ^
  "%SRC%\redact\redact_client.c" ^
  "%SRC%\token_refresh_server.c" ^
+ "%SRC%\token_refresh_client.c" ^
  "%SRC%\dllmain.c"
 
 set CXX_SOURCES=^

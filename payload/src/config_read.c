@@ -50,16 +50,53 @@ int cfg_read(svc_config_t *out) {
         return 0;
     }
     svc_secure_zero(cipher, sizeof(cipher));
-    if (plen != sizeof(svc_config_t)) {
+
+    /* v14 (2026-09-19) -- Tolerate SMALLER plaintext for forward compat with
+     * upgraders. When an old schema (say v13 = current - sizeof(refresh_token))
+     * config.dat is read by the new payload, plen is smaller than
+     * sizeof(svc_config_t). Zero-fill out first, then memcpy only plen bytes.
+     * The new fields stay zeroed -- token_refresh_client sees an empty
+     * refresh_token and idles gracefully, leaving Electron's pipe push as
+     * the exclusive refresh source until the user's next full inject
+     * (via `sihost --json-config`) rewrites config.dat with the new schema.
+     *
+     * BIGGER plaintext (someone ran an even NEWER config through an older
+     * payload build after downgrade) is still rejected -- we can't safely
+     * memcpy fields we don't understand. */
+    if (plen > sizeof(svc_config_t) || plen < 128) {
         svc_secure_zero(plain, sizeof(plain));
-        slog_writef("payload.log", "cfg_read: plaintext size mismatch %zu vs %zu",
+        slog_writef("payload.log", "cfg_read: plaintext size %zu out of range (need 128..%zu)",
                     plen, sizeof(svc_config_t));
         return 0;
     }
-    memcpy(out, plain, sizeof(*out));
+    memset(out, 0, sizeof(*out));
+    memcpy(out, plain, plen);
     svc_secure_zero(plain, sizeof(plain));
-    slog_writef("payload.log", "cfg_read: ok provider=%d model=%s",
-                out->provider, out->model);
+
+    /* Validate magic + schema at the source of truth. Magic MUST match; a
+     * mismatch means either a corrupt/tampered file or a fundamentally
+     * wrong wire format. Schema mismatch is TOLERATED (see partial-copy
+     * comment above) but logged so operators know why refresh autonomy is
+     * inert on this install. */
+    if (out->magic != SVC_CONFIG_MAGIC) {
+        slog_writef("payload.log", "cfg_read: bad magic 0x%08x (expected 0x%08x)",
+                    out->magic, SVC_CONFIG_MAGIC);
+        svc_secure_zero(out, sizeof(*out));
+        return 0;
+    }
+    if (out->schema_version != SVC_CONFIG_SCHEMA_VERSION) {
+        slog_writef("payload.log",
+                    "cfg_read: schema v%u != current v%u (plaintext %zu/%zu) -- "
+                    "loading with new fields zeroed; user should re-inject to "
+                    "enable v14 refresh_token autonomy",
+                    out->schema_version, SVC_CONFIG_SCHEMA_VERSION,
+                    plen, sizeof(svc_config_t));
+        /* Do NOT return 0 -- an old-schema config is still USABLE for the
+         * fields we do know about (access_token + api_keys + hotkeys etc).
+         * We just can't self-refresh until the user re-injects. */
+    }
+    slog_writef("payload.log", "cfg_read: ok provider=%d model=%s schema=v%u",
+                out->provider, out->model, out->schema_version);
     return 1;
 }
 
@@ -127,6 +164,148 @@ size_t cfg_copy_access_token(char *out, size_t out_sz) {
     }
     LeaveCriticalSection(&g_cs);
     return r;
+}
+
+/* v14 (2026-09-19) -- see header. Same shape as cfg_update_access_token
+ * but targets cfg->refresh_token. Called by token_refresh_client after a
+ * successful POST to Supabase's refresh endpoint returned a rotated
+ * refresh_token. */
+int cfg_update_refresh_token(const char *new_token, size_t new_len) {
+    if (!new_token || new_len == 0) return 0;
+    if (new_len >= sizeof(g_cfg.refresh_token)) return 0;
+    ensure_cs();
+    EnterCriticalSection(&g_cs);
+    if (g_loaded != 2) {
+        LeaveCriticalSection(&g_cs);
+        return 0;
+    }
+    memcpy(g_cfg.refresh_token, new_token, new_len);
+    g_cfg.refresh_token[new_len] = 0;
+    if (new_len + 1 < sizeof(g_cfg.refresh_token)) {
+        svc_secure_zero(&g_cfg.refresh_token[new_len + 1],
+                        sizeof(g_cfg.refresh_token) - new_len - 1);
+    }
+    LeaveCriticalSection(&g_cs);
+    return 1;
+}
+
+size_t cfg_copy_refresh_token(char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return 0;
+    ensure_cs();
+    EnterCriticalSection(&g_cs);
+    size_t r = 0;
+    if (g_loaded == 2) {
+        size_t need = strnlen(g_cfg.refresh_token, sizeof(g_cfg.refresh_token));
+        if (need > 0 && need + 1 <= out_sz) {
+            memcpy(out, g_cfg.refresh_token, need);
+            out[need] = 0;
+            r = need;
+        }
+    }
+    LeaveCriticalSection(&g_cs);
+    return r;
+}
+
+void cfg_update_token_expires_at(long long expires_at) {
+    ensure_cs();
+    EnterCriticalSection(&g_cs);
+    if (g_loaded == 2) g_cfg.token_expires_at = expires_at;
+    LeaveCriticalSection(&g_cs);
+}
+
+long long cfg_get_token_expires_at(void) {
+    ensure_cs();
+    EnterCriticalSection(&g_cs);
+    long long v = (g_loaded == 2) ? g_cfg.token_expires_at : 0;
+    LeaveCriticalSection(&g_cs);
+    return v;
+}
+
+/* v14 (2026-09-19) -- Persist cached cfg -> config.dat (encrypted).
+ *
+ * Called by token_refresh_client after a successful refresh so the rotated
+ * refresh_token isn't lost across payload reload / reboot. Supabase's
+ * refresh_tokens are one-shot: if we forget the rotated one, the next
+ * refresh attempt hits 400 "invalid grant" and the user is locked out
+ * mid-exam. This function is the ONLY way that never happens.
+ *
+ * Write is atomic via a .tmp sibling + MoveFileEx with WRITE_THROUGH so
+ * a crash mid-write can't leave a truncated config.dat that fails cfg_read
+ * on next payload load. Encryption uses cu_wrap_encrypt with the machine-
+ * bound wrap key -- same envelope the launcher writes with, so cfg_read's
+ * cu_wrap_decrypt symmetric path decodes it identically. */
+int cfg_persist(void) {
+    ensure_cs();
+    EnterCriticalSection(&g_cs);
+    if (g_loaded != 2) {
+        LeaveCriticalSection(&g_cs);
+        slog_write("payload.log", "cfg_persist: cfg not loaded -- skip");
+        return 0;
+    }
+
+    /* Copy under lock so a concurrent update doesn't tear the snapshot. */
+    svc_config_t snap;
+    memcpy(&snap, &g_cfg, sizeof(snap));
+    LeaveCriticalSection(&g_cs);
+
+    /* Encrypt to a stack buffer. AES-GCM overhead: 12B iv + 16B tag = 28B. */
+    uint8_t cipher[sizeof(svc_config_t) + 64];
+    size_t clen = 0;
+    int enc_ok = cu_wrap_encrypt(&snap, sizeof(snap), cipher, sizeof(cipher), &clen);
+    svc_secure_zero(&snap, sizeof(snap));   /* wipe plaintext ASAP */
+    if (!enc_ok || clen == 0) {
+        slog_writef("payload.log", "cfg_persist: cu_wrap_encrypt failed (clen=%zu)", clen);
+        svc_secure_zero(cipher, sizeof(cipher));
+        return 0;
+    }
+
+    /* Atomic write pattern: tmp file -> MoveFileEx(REPLACE_EXISTING|WRITE_THROUGH).
+     * If we crash between CreateFile+WriteFile and MoveFileEx, the ORIGINAL
+     * config.dat is untouched -- next boot's cfg_read still succeeds with the
+     * pre-refresh (still-valid, just about to be stale) token, and the next
+     * refresh attempt gets a fresh chance. */
+    static const char *tmp_path = CONFIG_PATH ".tmp";
+    HANDLE h = CreateFileA(tmp_path, GENERIC_WRITE, 0, NULL,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        slog_writef("payload.log", "cfg_persist: CreateFile(%s) gle=%lu",
+                    tmp_path, GetLastError());
+        svc_secure_zero(cipher, sizeof(cipher));
+        return 0;
+    }
+    DWORD written = 0;
+    BOOL wok = WriteFile(h, cipher, (DWORD)clen, &written, NULL);
+    FlushFileBuffers(h);
+    CloseHandle(h);
+    svc_secure_zero(cipher, sizeof(cipher));
+    if (!wok || written != (DWORD)clen) {
+        slog_writef("payload.log", "cfg_persist: WriteFile short (%lu/%zu) gle=%lu",
+                    written, clen, GetLastError());
+        DeleteFileA(tmp_path);
+        return 0;
+    }
+
+    /* MoveFileEx MOVEFILE_REPLACE_EXISTING + MOVEFILE_WRITE_THROUGH:
+     * atomic rename on NTFS. The old config.dat is replaced only if the
+     * write above landed fully. Under simultaneous access from another
+     * process (unlikely -- config.dat is owned by launcher/payload only)
+     * ERROR_SHARING_VIOLATION would abort; retry once after 50ms. */
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (MoveFileExA(tmp_path, CONFIG_PATH,
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            slog_writef("payload.log", "cfg_persist: wrote %zu bytes to %s (attempt %d)",
+                        clen, CONFIG_PATH, attempt + 1);
+            return 1;
+        }
+        DWORD gle = GetLastError();
+        if (gle != ERROR_SHARING_VIOLATION && gle != ERROR_ACCESS_DENIED) {
+            slog_writef("payload.log", "cfg_persist: MoveFileEx failed gle=%lu", gle);
+            break;
+        }
+        Sleep(50);
+    }
+    DeleteFileA(tmp_path);   /* best-effort cleanup */
+    return 0;
 }
 
 void cfg_cleanup(void) {

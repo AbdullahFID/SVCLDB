@@ -46,7 +46,7 @@ typedef enum {
  * configs cleanly fail via cu_wrap_decrypt's plen != sizeof(svc_config_t)
  * check when a field is added -- this magic is defence-in-depth. */
 #define SVC_CONFIG_MAGIC             0x53564C43u  /* 'SVLC' little-endian */
-#define SVC_CONFIG_SCHEMA_VERSION    13u  /* v13 (2026-08-10): + nudge_step_px (user-configurable pixels per arrow-key nudge -- micro-adjust). v12: + scroll_step_px. */
+#define SVC_CONFIG_SCHEMA_VERSION    14u  /* v14 (2026-09-19): + refresh_token (payload-side JWT refresh so overlay survives with Electron closed -- see docs/HANDOFF_2026-09-19_PAYLOAD_JWT_AUTONOMY.md). v13 (2026-08-10): + nudge_step_px. v12: + scroll_step_px. */
 
 typedef struct {
     /* ── v4 header: written by Electron UI / launcher --json-config.
@@ -239,6 +239,32 @@ typedef struct {
      * clamped by the dashboard slider. 0 or out-of-range = fallback to 48
      * in the dllmain hotkey handler so an unmigrated field never zero-moves. */
     int         nudge_step_px;
+
+    /* v14 (2026-09-19) -- Payload-side JWT refresh.
+     *
+     * Root problem: pre-v14 the payload cached `access_token` at inject
+     * time and depended ENTIRELY on Electron (`ui/src/license/revalidation.js`
+     * + `token_refresh_server.c` pipe push) to swap in a fresh JWT before
+     * Supabase's ~1h TTL expired. When svchelper.exe was closed after a
+     * successful inject (real user flow: sign in -> inject -> close Electron
+     * to keep only sihost.exe running during an exam), no one refreshed the
+     * JWT, `sub_check.c` hit 401 at T+~1h, and after the 9-min grace the
+     * payload self-unloaded mid-exam. Sam reported this THREE times before
+     * we finally added payload autonomy. See
+     * docs/HANDOFF_2026-09-19_PAYLOAD_JWT_AUTONOMY.md.
+     *
+     * v14 fix: Electron writes the current `refresh_token` into config.dat
+     * (encrypted at rest by cu_wrap_encrypt like every other secret). The
+     * payload's new `token_refresh_client.c` background thread wakes ~15
+     * min before `token_expires_at`, POSTs to
+     *   `POST {SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`
+     *   header:  apikey: <anon>
+     *   body:    {"refresh_token":"<rt>"}
+     * and on success writes the rotated `{access_token, refresh_token,
+     * expires_in}` back into this struct + persists to disk (cfg_persist).
+     * Bounded at 4096 to match Supabase's refresh-token size (~40 chars
+     * typical but budget for envelope + safety). NUL-terminated. */
+    char        refresh_token[4096];
 } svc_config_t;
 
 /* v11 overlay_flags bit constants. */

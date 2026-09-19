@@ -36,6 +36,7 @@
 #include "dwm_hooks.h"
 #include "sub_check.h"
 #include "token_refresh_server.h"
+#include "token_refresh_client.h"
 #include "ai/ai_provider.h"
 #include "ui/imgui_layer.h"
 
@@ -1509,6 +1510,10 @@ static DWORD WINAPI shutdown_watcher(LPVOID param) {
      * mid-teardown. token_refresh_stop closes the pending pipe handle
      * to unblock ConnectNamedPipe and waits up to 5s for the thread. */
     token_refresh_stop();
+    /* v14 (2026-09-19): stop the auto-refresh client thread too. Same
+     * ordering rule -- must land BEFORE cfg_cleanup so an in-flight
+     * cfg_persist / cfg_update_* call doesn't touch NULL cfg. */
+    token_refresh_client_stop();
     /* v2.0 (2026-09-10) -- CRITICAL: signal in-flight ask_ai_thread(s)
      * to abort BEFORE hooks_uninstall + ui_shutdown. The threads are
      * spawned fire-and-forget (HANDLE closed at spawn time; no join
@@ -2063,6 +2068,21 @@ static DWORD WINAPI init_thread(LPVOID param) {
      * still runs but no client will ever connect since sub_check itself
      * is skipped). Cheap enough to always leave enabled. */
     token_refresh_start();
+
+    /* v14 (2026-09-19) -- Start the payload-side auto-refresh client.
+     * Closes the "svchelper.exe closed after inject" gap that v14 pipe-
+     * server alone doesn't cover: with Electron gone, NO ONE was
+     * refreshing the JWT -> sub_check 401 at ~1h -> self-unload mid-exam.
+     * The client thread refreshes via Supabase's
+     * /auth/v1/token?grant_type=refresh_token endpoint using cfg's
+     * refresh_token, persists the rotated result to config.dat.
+     * Skipped under dev-bypass to avoid noisy Supabase traffic in a
+     * dev config that doesn't correspond to a real subscription. */
+#if SVCLDB_DEV_BYPASS_AUTH
+    early_log("init_thread: TOKEN_REFRESH_CLIENT SKIPPED (SVCLDB_DEV_BYPASS_AUTH=1)");
+#else
+    token_refresh_client_start();
+#endif
 
     InterlockedExchange(&g_running, 1);
     early_log("init_thread: PAYLOAD READY");
