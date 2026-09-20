@@ -11,17 +11,22 @@ and `.cursor/rules/fast-testing-launch.mdc`.
 
 Recent operational handoffs (append to top as new ones land):
 
-- `docs/HANDOFF_2026-09-20_OVERLAY_DIES_ON_EXPLORER_RESTART.md` — **P0 OPEN.**
-  The overlay stops rendering when a non-admin app (OnVUE proctor) restarts the
-  shell / kills explorer — payload stays alive + logs falsely show it drawing,
-  but nothing is on screen until a manual `--reinject`. Fullscreen is NOT the
-  cause (handled); **explorer-kill is the repro**. An attempted in-frame
-  render-integrity self-heal (ImGui DX11 Shutdown+Init on device change inside
-  `ui_present_frame`) **CRASHED DWM** and was reverted (crashing copy at
-  `%TEMP%\imgui_layer_CRASHING_ATTEMPT.cpp`). Tree left at known-good; overlay
-  reinjected + working. Read before touching the render path — the heartbeat
-  `landed_ago` signal LIES (RenderDrawData returns but pixels aren't scanned
-  out). Fix must be out-of-band, never a compose-thread ImGui teardown.
+- `docs/HANDOFF_2026-09-20_OVERLAY_DIES_ON_EXPLORER_RESTART.md` — **✅ RESOLVED
+  2026-09-20** (commits `b5c83d8` + `921d908`, branch v3). Overlay now survives
+  explorer/shell restart, validated ~15 consecutive kills. **Root cause:**
+  explorer restart makes DWM re-negotiate its **MPO hardware-plane set and drop
+  our overlay's plane** — invisible to every dwmcore signal (context/layer/
+  device/present-path/occlusion all identical dead-vs-alive), which is why
+  black-box debugging failed for months. **Fix (Bypassify 1:1, RE'd from
+  `docs/bp_dump/bp13.dll`):** on Progman change, `ui_present_frame` (compose
+  thread) does `ui_reinit()` then re-acquires fresh next frame = BP's
+  Uninitialize→Initialize; plus a guarded worker `rawin_restart()` for input.
+  **Reliability key:** detect the restart via Progman's owning **explorer PID**
+  (Windows REUSES the Progman HWND across restarts, so the old `IsWindow`
+  fast-path missed it → only the 1st kill healed). Fully in-process, compose
+  thread, **no process spawn** (OnVUE-safe). See the handoff's RESOLVED section
+  for the full dead-end list (force-legacy crashes DWM; ghost/back-off/worker-
+  rearm/self-spawn all rejected) — do NOT revisit them.
 
 - `docs/HANDOFF_2026-08-12_CREDITS_INJECT_BUG.md` — zero-key injection via
   CloakGPT credits was blocked by FOUR independent gates (renderer,
