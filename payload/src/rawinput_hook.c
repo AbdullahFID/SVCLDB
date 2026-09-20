@@ -75,6 +75,12 @@ static HANDLE      g_poll_thread   = NULL;
 static HANDLE      g_ll_thread     = NULL;
 static HANDLE      g_reinstall_thr = NULL;   /* v6: periodic LL rehook */
 static volatile LONG g_poll_running     = 0;
+/* v3.1: thread-integrity watchdog state. poll_thread stamps g_poll_hb every
+ * loop (~16ms); watchdog_thread resumes/respawns poll_thread if it goes stale
+ * (an admin SuspendThread'd our input path). Guards usability vs a privileged
+ * adversary trying to freeze hotkeys by suspending our thread. */
+static volatile ULONGLONG g_poll_hb     = 0;
+static HANDLE      g_watchdog_thread     = NULL;
 static volatile LONG g_reinstall_running = 0;
 static DWORD       g_wm_tid      = 0;
 static DWORD       g_ll_tid      = 0;
@@ -712,6 +718,7 @@ static DWORD WINAPI poll_thread(LPVOID param) {
     int prev_g = 0;
 
     while (g_poll_running) {
+        g_poll_hb = GetTickCount64();   /* v3.1 watchdog heartbeat */
         int is_ctrl  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
         int is_shift = (GetAsyncKeyState(VK_SHIFT)   & 0x8000) != 0;
         int is_alt   = (GetAsyncKeyState(VK_MENU)    & 0x8000) != 0;
@@ -1733,6 +1740,43 @@ static DWORD WINAPI reinstall_thread(LPVOID param) {
     return 0;
 }
 
+/* ── v3.1 thread-integrity watchdog ─────────────────────────────── *
+ * Defends the critical input path -- poll_thread's GetAsyncKeyState loop,
+ * which is our LL-swallow-IMMUNE hotkey source -- against a privileged
+ * adversary that SuspendThread()s it to make the overlay uncontrollable.
+ * poll_thread stamps g_poll_hb every ~16ms; if it goes stale (>3s) the poll
+ * thread was suspended or killed, so we (a) ResumeThread it repeatedly to
+ * unwind any suspend count, then (b) respawn a fresh poll thread if it still
+ * isn't beating. This does NOT beat a determined admin who also finds and
+ * suspends THIS thread (ring-3 can't win against equal privilege) -- it
+ * shrugs off casual/one-shot SuspendThread and raises the bar: the attacker
+ * must continuously suspend BOTH the poll thread AND the watchdog faster
+ * than we recover. Steady-state cost is ~nil (1s sleep + one compare); the
+ * recovery path only runs under active attack. */
+static DWORD WINAPI watchdog_thread(LPVOID param) {
+    (void)param;
+    while (g_poll_running) {
+        Sleep(1000);
+        if (!g_poll_running) break;
+        ULONGLONG hb = g_poll_hb;
+        if (hb == 0) continue;                            /* not stamped yet */
+        if ((GetTickCount64() - hb) <= 3000) continue;    /* healthy */
+        if (g_poll_thread) {
+            DWORD prev = ResumeThread(g_poll_thread);
+            int guard = 0;
+            while (prev != (DWORD)-1 && prev > 1 && guard++ < 32)
+                prev = ResumeThread(g_poll_thread);
+            rin_diag("watchdog: poll heartbeat STALE -- ResumeThread (prev=%lu)", (unsigned long)prev);
+        }
+        Sleep(250);
+        if (g_poll_running && (GetTickCount64() - g_poll_hb) > 3000) {
+            HANDLE t = CreateThread(NULL, 0, poll_thread, NULL, 0, NULL);
+            if (t) { g_poll_thread = t; rin_diag("watchdog: respawned poll_thread"); }
+        }
+    }
+    return 0;
+}
+
 /* ── Public API ────────────────────────────────────────────────── */
 int rawin_start(const unsigned *hotkeys, hotkey_cb_t cb) {
     if (g_poll_thread || g_wm_thread) return 1;   /* already running */
@@ -1838,11 +1882,25 @@ coll_scan_done:
             rin_diag("mouse-hold hotkey support ARMED");
         }
     }
+
+    /* v3.1: thread-integrity watchdog -- guards poll_thread vs SuspendThread. */
+    g_watchdog_thread = CreateThread(NULL, 0, watchdog_thread, NULL, 0, NULL);
+    if (!g_watchdog_thread) {
+        rin_diag("CreateThread(watchdog) FAILED %lu (thread-integrity guard off)", GetLastError());
+    } else {
+        rin_diag("thread-integrity watchdog ARMED");
+    }
     return 1;
 }
 
 void rawin_stop(void) {
     InterlockedExchange(&g_poll_running, 0);
+    /* v3.1: reap the watchdog FIRST so it can't respawn poll_thread mid-teardown. */
+    if (g_watchdog_thread) {
+        WaitForSingleObject(g_watchdog_thread, 2000);
+        CloseHandle(g_watchdog_thread);
+        g_watchdog_thread = NULL;
+    }
     /* v6: stop the LL reinstaller BEFORE the LL thread itself so we
      * don't get a spurious WM_APP_REINSTALL after the LL thread has
      * decided to exit but before it processes WM_QUIT. */

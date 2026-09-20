@@ -1132,31 +1132,30 @@ static void on_hotkey(int action) {
             break;
         case SVC_HK_CLEAR:
             /* Context-aware: if a reply is showing, CLEAR the reply
-             * (back to home page). If we're on the home page, this
-             * hotkey becomes QUIT -- signals our own shutdown event
-             * DIRECTLY (no launcher spawn -- that fails with
-             * ERROR_ELEVATION_REQUIRED since sihost has an admin
-             * manifest and DWM's SYSTEM context can't satisfy UAC). */
+             * (back to home page). If we're on the home page, HIDE the
+             * overlay (non-destructive, reversible via Ctrl+B).
+             *
+             * v3.1 (2026-09-19) SAFETY FIX -- this used to signal our own
+             * shutdown event on the home page => full cooperative UNLOAD
+             * (hooks removed, DLL freed, re-arm required). That was a
+             * severe footgun AND a non-admin denial vector:
+             *   - Ctrl+Q is universal "quit" muscle-memory; the focus-
+             *     INDEPENDENT GetAsyncKeyState poll fires it from ANY app,
+             *     so a stray Ctrl+Q anywhere silently killed the payload
+             *     (observed live 2026-09-19 22:16).
+             *   - A NON-ADMIN app could SendInput(Ctrl+Q) to UNLOAD svcldb
+             *     with zero privilege -- defeating our input-swallow
+             *     immunity by simply removing us. Unloading must NEVER sit
+             *     on a common/guessable combo.
+             * Deliberate unload remains available via the launcher
+             * (sihost --unload / dashboard) and the 3-modifier KILL_ALL
+             * (Ctrl+Shift+Alt+K), neither accidentally nor trivially
+             * triggerable. */
             if (ui_has_reply()) {
                 ui_clear_reply();
-            } else {
-                /* Inline soft-quit: signal our own shutdown event.
-                 * The shutdown_watcher thread will call hooks_uninstall
-                 * which drains ~200ms of clean frames + disables all
-                 * hooks + reverts byte patches -- same as if user ran
-                 * sihost --unload manually. Overlay disappears cleanly;
-                 * DWM stays alive; user re-arms via launcher when
-                 * ready. Sentinel gets written to indicate clean quit. */
-                HANDLE hf = CreateFileA(SVC_INSTALL_DIR "\\.dwm_clean_shutdown",
-                                         GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
-                                         FILE_ATTRIBUTE_NORMAL, NULL);
-                if (hf != INVALID_HANDLE_VALUE) {
-                    DWORD w = 0;
-                    WriteFile(hf, "clean\n", 6, &w, NULL);
-                    CloseHandle(hf);
-                }
-                if (g_shutdown_ev) SetEvent(g_shutdown_ev);
-                slog_writef("payload.log", "hotkey QUIT: signalled inline shutdown");
+            } else if (ui_is_visible()) {
+                ui_toggle_visible();   /* hide -- reversible; never unload */
+                slog_writef("payload.log", "hotkey CLEAR: overlay hidden (soft-quit is now hide, not unload)");
             }
             break;
         /* v13 (2026-08-10) -- nudge step is USER-CONFIGURABLE via
