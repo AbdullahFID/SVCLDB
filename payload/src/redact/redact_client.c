@@ -15,11 +15,16 @@
 
 #include "../../shared/common.h"
 #include "../../shared/crypto_util.h"
+#include "../../shared/obf_names.h"
 
 /* Kept in sync with launcher/src/ocr/ocr_scanner.h. Duplicated here
  * to avoid a cross-project include; if you change one, change both.
- * v2.0.1 (2026-09-10): bumped magic OCR1 -> OCR2, added HMAC field. */
-#define REDACT_PIPE_NAME  "\\\\.\\pipe\\svcldb_ocr_v1"
+ * v2.0.1 (2026-09-10): bumped magic OCR1 -> OCR2, added HMAC field.
+ * v3 (2026-09-19): pipe name is now the per-box derived GUID from
+ * obf_pipe_ocr() (same value the launcher daemon + Electron use) --
+ * kills the "svcldb_ocr_v1" literal that leaked the codename to any
+ * unprivileged pipe enumeration. */
+#define REDACT_PIPE_NAME  obf_pipe_ocr()
 #define REDACT_WIRE_MAGIC 0x4F435232u   /* 'OCR2' little-endian */
 #define REDACT_HMAC_LEN   32u
 
@@ -40,7 +45,7 @@ typedef struct {
 } redact_resp_hdr_t;
 
 /* ── v2.0.1 (2026-09-10) HMAC key derivation ──────────────────────
- * Key = HMAC-SHA256(install_secret_hex_ascii_bytes, "svcldb-ocr-v1").
+ * Key = HMAC-SHA256(install_secret_hex_ascii_bytes, "wa.ocr.v1").
  * Cached process-lifetime after first successful derive -- install_secret
  * doesn't change while the payload is loaded, so no invalidation. Mirrors
  * launcher/src/main.c --ocr-daemon path bit-for-bit. If derivation fails
@@ -77,7 +82,7 @@ static int derive_ocr_key_once(void) {
             while (got > 0 && (secret[got-1] == '\r' || secret[got-1] == '\n' ||
                                secret[got-1] == ' '  || secret[got-1] == '\t')) got--;
             if (got >= 32) {
-                static const char DOMAIN[] = "svcldb-ocr-v1";
+                static const char DOMAIN[] = "wa.ocr.v1";   /* v3: was "svcldb-ocr-v1" (leaked codename to admin memory grep) */
                 ok = cu_hmac_sha256(secret, got,
                                     DOMAIN, sizeof(DOMAIN) - 1,
                                     g_ocr_key);

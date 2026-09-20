@@ -1,0 +1,9 @@
+[
+  {
+    "msg": 180,
+    "tool": "StrReplace",
+    "path": "shared/json_util.h",
+    "reason": "old_string not found (tried LF + CRLF)",
+    "old_head": "/* Returns 1 if found + written, 0 otherwise (out untouched on 0).\\n * Ignores nesting: matches the FIRST top-level occurrence of key. */\\nint json_get_str(const char *json, const char *key, char *out, "
+  }
+]

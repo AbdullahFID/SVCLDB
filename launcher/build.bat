@@ -80,6 +80,7 @@ set SOURCES=^
  "%SHARED%\crypto_util.c" "%SHARED%\supabase_config.c" ^
  "%SHARED%\handshake.c" ^
  "%SHARED%\str_enc.c" "%SHARED%\lazy_api.c" ^
+ "%SHARED%\obf_names.c" ^
  "%SRC%\oauth.c" "%SRC%\license.c" ^
  "%SRC%\inject.c" "%SRC%\config_write.c" ^
  "%SRC%\main.c"

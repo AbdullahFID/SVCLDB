@@ -31,7 +31,7 @@
 extern int ui_has_reply(void);
 
 /* ── Constants (avoid pulling in whole winuser structs) ─────────── */
-#define WORKER_CLASS_NAME  L"MSDiagEventSink"
+#define WORKER_CLASS_NAME  L"SysCompositorSink"
 #define RIDEV_INPUTSINK    0x00000100
 #define RIDEV_REMOVE       0x00000001
 #define RID_INPUT          0x10000003

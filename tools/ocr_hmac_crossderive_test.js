@@ -19,7 +19,7 @@ const path = require('path');
 const crypto = require('crypto');
 
 const SECRET_PATH = 'C:\\ProgramData\\WinAudioSvc\\.svchelper_install_secret';
-const DOMAIN      = 'svcldb-ocr-v1';
+const DOMAIN      = 'wa.ocr.v1';   // v3 (2026-09-19): must match C payload + launcher + Electron OCR_HMAC_DOMAIN.
 
 if (!fs.existsSync(SECRET_PATH)) {
   console.error(`Install secret not found at ${SECRET_PATH}`);

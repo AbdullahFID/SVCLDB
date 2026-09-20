@@ -13,14 +13,19 @@
 #define SVCLDB_OCR_SCANNER_H
 
 #include <stdint.h>
+#include "../../../shared/obf_names.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /* Named-pipe endpoint used by payload ↔ sihost daemon.
- * Local machine, single client (payload) at a time. */
-#define OCR_PIPE_NAME "\\\\.\\pipe\\svcldb_ocr_v1"
+ * Local machine, single client (payload) at a time.
+ * v3 (2026-09-19): per-box derived GUID (see shared/obf_names.h) --
+ * replaces the fixed "svcldb_ocr_v1" literal that any non-admin pipe
+ * enumeration would flag by name. Same value on all three endpoints
+ * (launcher daemon server, payload redact client, Electron client). */
+#define OCR_PIPE_NAME obf_pipe_ocr()
 
 /* Wire-format magic (4 bytes) -- validates the peer is actually a
  * payload-side pipe client and not a stray connection.

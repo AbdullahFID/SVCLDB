@@ -93,6 +93,41 @@ foreach ($n in $ExtraNames) { $candidates += @{ kind='event'; name=$n }; $candid
 $objResults = foreach ($c in $candidates) { Probe-Object -Kind $c.kind -Name $c.name }
 $leaks = @($objResults | Where-Object { $_.leaksExistence -and $_.result -ne 'NOT_FOUND' })
 
+# ---- 2b. Derived per-box names (POSITIVE CONTROL) ---------------------------
+# Mirror shared/obf_names.c exactly: SHA256(salt + ':' + machineguid_lower),
+# first 16 bytes -> canonical lowercase GUID. When the payload is INJECTED
+# these objects exist -- but they are GUID-shaped + per-box, so their
+# presence is NOT a leak (indistinguishable from the legit COM/RPC/mojo GUID
+# objects already on the box). This block confirms the hardened names resolve
+# and shows what an attacker who fully RE'd the scheme would STILL only see:
+# a GUID. It does NOT feed the verdict.
+function Get-MachineGuidLower {
+    try { $g = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid -ErrorAction Stop).MachineGuid }
+    catch { $g = '' }
+    if (-not $g) { $g = '3b1e9c27-1d54-4a8f-9e2b-7c6a0f5d84b1' }
+    return $g.Trim().ToLower()
+}
+function Get-DerivedGuid([string]$salt) {
+    $g = Get-MachineGuidLower
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $h = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($salt + ':' + $g))
+    $sha.Dispose()
+    $hex = -join ($h[0..15] | ForEach-Object { $_.ToString('x2') })
+    return ('{0}-{1}-{2}-{3}-{4}' -f $hex.Substring(0,8), $hex.Substring(8,4), $hex.Substring(12,4), $hex.Substring(16,4), $hex.Substring(20,12))
+}
+$dTok = Get-DerivedGuid 'wasvc.pipe.token.1'
+$dOcr = Get-DerivedGuid 'wasvc.pipe.ocr.1'
+$dIni = Get-DerivedGuid 'wasvc.mtx.init.1'
+$dOcd = Get-DerivedGuid 'wasvc.mtx.ocrd.1'
+$dShu = Get-DerivedGuid 'wasvc.evt.shut.1'
+$derivedResults = @(
+    [pscustomobject]@{ kind='pipe';  purpose='token';      name=$dTok; present=($pipeNames -contains $dTok); camouflaged=$true }
+    [pscustomobject]@{ kind='pipe';  purpose='ocr';        name=$dOcr; present=($pipeNames -contains $dOcr); camouflaged=$true }
+    [pscustomobject]@{ kind='mutex'; purpose='init-guard'; name="Local\$dIni";  probe=(Probe-Object -Kind 'mutex' -Name "Local\$dIni") }
+    [pscustomobject]@{ kind='mutex'; purpose='ocr-daemon'; name="Global\$dOcd"; probe=(Probe-Object -Kind 'mutex' -Name "Global\$dOcd") }
+    [pscustomobject]@{ kind='event'; purpose='shutdown';   name="Global\$dShu"; probe=(Probe-Object -Kind 'event' -Name "Global\$dShu") }
+)
+
 # ---- 3. Verdict + report ----------------------------------------------------
 $report = [pscustomobject]@{
     timestamp        = (Get-Date).ToString('o')
@@ -101,6 +136,7 @@ $report = [pscustomobject]@{
     pipeTotal        = $pipeNames.Count
     suspiciousPipes  = $suspiciousPipes
     objectProbes     = $objResults
+    derivedProbes    = $derivedResults
     existenceLeaks   = @($leaks | ForEach-Object { $_.name })
     verdict          = if ($suspiciousPipes.Count -eq 0 -and $leaks.Count -eq 0) { 'CLEAN' } else { 'DETECTED' }
 }

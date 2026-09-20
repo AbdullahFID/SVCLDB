@@ -24,6 +24,7 @@
 #include "../../shared/json_util.h"
 #include "../../shared/log_secure.h"
 #include "../../shared/str_enc.h"
+#include "../../shared/obf_names.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -218,14 +219,14 @@ static int query_supabase_active(const char *access_token) {
  * doesn't have to reach into another translation unit's globals. */
 static void trigger_self_unload(const char *reason) {
     slog_writef("payload.log", SS(SVC_STR_SUBCHK_SELF_UNLOAD), reason);
-    HANDLE ev = OpenEventA(EVENT_MODIFY_STATE, FALSE, SS(SVC_STR_SHUTDOWN_EVENT));
+    HANDLE ev = OpenEventA(EVENT_MODIFY_STATE, FALSE, obf_event_shutdown());
     if (ev) {
         SetEvent(ev);
         CloseHandle(ev);
     } else {
         slog_writef("payload.log",
                     "sub_check: OpenEvent(%s) failed gle=%lu -- payload may not unload cleanly",
-                    SS(SVC_STR_SHUTDOWN_EVENT), GetLastError());
+                    obf_event_shutdown(), GetLastError());
     }
 }
 
@@ -239,7 +240,7 @@ static DWORD WINAPI sub_check_thread(LPVOID param) {
      * never deadlock if event creation fails. */
     HANDLE stop = NULL;
     for (int i = 0; i < 50; i++) {   /* max 5s */
-        stop = OpenEventA(SYNCHRONIZE, FALSE, SS(SVC_STR_SHUTDOWN_EVENT));
+        stop = OpenEventA(SYNCHRONIZE, FALSE, obf_event_shutdown());
         if (stop) break;
         Sleep(100);
     }

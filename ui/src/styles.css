@@ -2524,3 +2524,16 @@ html, body {
   .ocr-modal-cols { grid-template-columns: 1fr; }
   .ocr-modal-col textarea { min-height: 180px; }
 }
+
+/* v3 (2026-09-19) -- pause every keyframe animation while the window is
+ * hidden. Chromium's backgroundThrottling (main.js webPreferences) already
+ * slows timers + rAF when hidden; this is explicit belt+braces for the
+ * always-on animated orbs (bgShift + orbFloat), the panning gradient, and
+ * the status-dot / warn / hk / heartbeat pulses. All svcldb animations are
+ * decorative -- no load-bearing motion. Toggled via document.body
+ * classList in renderer.js's visibilitychange listener. Audit item 5. */
+body.bg-paused, body.bg-paused * {
+  animation-play-state: paused !important;
+  -webkit-animation-play-state: paused !important;
+}
+

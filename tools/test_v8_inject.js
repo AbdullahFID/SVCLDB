@@ -23,7 +23,7 @@ const crypto = require('crypto');
 
 const SVC_INSTALL_DIR = 'C:\\ProgramData\\WinAudioSvc';
 const LAUNCHER_EXE    = 'sihost.exe';
-const HANDSHAKE_SALT  = 'svcldb-handshake-v1';
+const HANDSHAKE_SALT  = 'wa.hs.v1';
 
 // Parse args
 const args = process.argv.slice(2);

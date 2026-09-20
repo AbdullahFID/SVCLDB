@@ -766,7 +766,7 @@ static BOOL __fastcall Detour_DisplayPresentNeeded(void *pThis) {
     /* Capture pThis for hooks_force_wake() belt-and-suspenders. */
     if (!g_display_rt && pThis) {
         g_display_rt = pThis;
-        hook_diag("PN1: captured CDDisplayRenderTarget pThis");
+        hook_diag(SS(SVC_STR_PN1_CAPTURED));
     }
 
     BOOL orig_result = FALSE;
@@ -831,7 +831,7 @@ static BOOL __fastcall Detour_DisplayPresentNeeded(void *pThis) {
 static BOOL __fastcall Detour_LegacyPresentNeeded(void *pThis) {
     if (!g_legacy_rt && pThis) {
         g_legacy_rt = pThis;
-        hook_diag("PN2: captured CLegacyRenderTarget pThis");
+        hook_diag(SS(SVC_STR_PN2_CAPTURED));
     }
 
     BOOL orig_result = FALSE;
@@ -1141,14 +1141,14 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
 
     HMODULE dwmcore = pl_locate_dwmcore();
     if (!dwmcore) {
-        slog_write("payload.log", "hooks_install: dwmcore not loaded");
+        slog_write("payload.log", SS(SVC_STR_HK_DWMCORE_MISSING));
         return 0;
     }
-    slog_writef("payload.log", "dwmcore base=%p", (void *)dwmcore);
-    hook_diag("hooks_install: entered");
+    slog_writef("payload.log", SS(SVC_STR_HK_DWMCORE_BASE), (void *)dwmcore);
+    hook_diag(SS(SVC_STR_HK_INSTALL_ENTERED));
 
     if (MH_Initialize() != MH_OK) {
-        slog_write("payload.log", "MinHook init failed");
+        slog_write("payload.log", SS(SVC_STR_HK_MINHOOK_FAIL));
         return 0;
     }
 
@@ -1463,18 +1463,15 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
             VirtualProtect(iop, 8, old_prot, &tmp);
             FlushInstructionCache(GetCurrentProcess(), iop, 8);
             g_iop_patched = TRUE;
-            slog_writef("payload.log",
-                        "IsOverlayPrevented patched @ %p -- RETURNS TRUE (forces DWM out of "
-                        "hardware overlay plane path so our pixels composite ON TOP of "
-                        "DirectComposition apps). Original 6 bytes: %02x %02x %02x %02x %02x %02x",
+            slog_writef("payload.log", SS(SVC_STR_IOP_PATCHED),
                         iop, g_iop_saved_bytes[0], g_iop_saved_bytes[1], g_iop_saved_bytes[2],
                         g_iop_saved_bytes[3], g_iop_saved_bytes[4], g_iop_saved_bytes[5]);
         } else {
-            slog_writef("payload.log", "IsOverlayPrevented VirtualProtect failed GLE=%lu",
+            slog_writef("payload.log", SS(SVC_STR_IOP_VP_FAIL),
                         GetLastError());
         }
     } else {
-        slog_write("payload.log", "IsOverlayPrevented not in blob -- skipping patch");
+        slog_write("payload.log", SS(SVC_STR_IOP_NOT_IN_BLOB));
     }
 
     /* Ensure clean state (in case a previous install/uninstall left
@@ -1516,7 +1513,7 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
                   (long)g_hook_reg_count);
     }
 
-    hook_diag("hooks_install: SUCCESS (Phase A: RUNNING)");
+    hook_diag(SS(SVC_STR_HK_INSTALL_SUCCESS));
     return 1;
 }
 
@@ -1600,7 +1597,7 @@ void hooks_uninstall(void) {
     g_present_cb           = NULL;
     g_display_rt           = NULL;
     g_legacy_rt            = NULL;
-    hook_diag("hooks_uninstall: MinHook uninitialized");
+    hook_diag(SS(SVC_STR_HK_UNINSTALL_MHUNINIT));
 
     /* Step 4 (belt-and-suspenders): revert the IsOverlayPrevented
      * byte-patch. Bypassify skips this (they rely on DWM restart),
@@ -1619,7 +1616,7 @@ void hooks_uninstall(void) {
             VirtualProtect(g_iop_patch_addr, 8, old_prot, &tmp);
             FlushInstructionCache(GetCurrentProcess(), g_iop_patch_addr, 8);
             g_iop_patched = FALSE;
-            hook_diag("hooks_uninstall: IsOverlayPrevented reverted (6 bytes)");
+            hook_diag(SS(SVC_STR_HK_UNINSTALL_IOP_REVERT));
         }
     }
 
@@ -1637,7 +1634,7 @@ void hooks_uninstall(void) {
         }
     }
 
-    slog_write("payload.log", "hooks uninstalled");
+    slog_write("payload.log", SS(SVC_STR_HK_UNINSTALLED));
     hook_diag("hooks_uninstall: DONE");
 }
 

@@ -41,7 +41,7 @@ extern "C" {
  * ui/src/license/handshake.js. Change either side and the payload
  * will reject every token until both sides are rebuilt. */
 #define SVCLDB_HANDSHAKE_TOKEN_LEN   32
-#define SVCLDB_HANDSHAKE_SALT        "svcldb-handshake-v1"
+#define SVCLDB_HANDSHAKE_SALT        "wa.hs.v1"     /* v3 (2026-09-19): was "svcldb-handshake-v1" -- product-name codename in admin memory-grep. C + JS coordinated rename; both handshake.c and ui/src/license/handshake.js updated in lockstep. Production release note: existing installs must re-arm to regenerate handshake_token with the new salt (or run dev-bypass). */
 #define SVCLDB_HANDSHAKE_GRACE_DAYS  1   /* accept today OR yesterday */
 
 /* Compute the 32-byte handshake token for a given (access_token, hwid,

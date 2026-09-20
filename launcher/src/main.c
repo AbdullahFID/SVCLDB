@@ -26,6 +26,7 @@
 #include "../../shared/json_util.h"
 #include "../../shared/str_enc.h"
 #include "../../shared/lazy_api.h"
+#include "../../shared/obf_names.h"
 #include "config_write.h"
 #include "inject.h"
 #include "license.h"
@@ -510,8 +511,13 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
     cfg->hotkeys[SVC_HK_LATEX_TOGGLE]  = SVC_HK_PACK(MOD_CS,  'L');       /* 30 Ctrl+Shift+L                 */
     cfg->hotkeys[SVC_HK_STOP_GEN]      = SVC_HK_PACK(MOD_CS,  'S');       /* 31 Ctrl+Shift+S  Settings       */
     cfg->hotkeys[SVC_HK_DIRECT_TOGGLE] = SVC_HK_PACK(MOD_CS,  'D');       /* 32 Ctrl+Shift+D                 */
-    /* 33 SVC_HK_QUICK_ASK left UNBOUND -- user opt-in via editor as
-     * MOUSE_HOLD LMB 2000ms for Bypassify-parity Quick-Send UX. */
+    /* 33 SVC_HK_QUICK_ASK: v3 (2026-09-19) -- default triple-middle-click
+     * within 400ms fires screenshot+ask. Mirrors ui/src/injector/injector.js
+     * (JS side already ships this; C fallback matches so a CLI-only inject
+     * without svchelper gets the same out-of-box mouse-only control).
+     * VK_MBUTTON = 4. Middle-triple-click is virtually never a normal
+     * gesture, so this hijacks nothing. Rebind via the hotkey editor. */
+    cfg->hotkeys[SVC_HK_QUICK_ASK]     = SVC_HK_PACK_MOUSE_MULTI(3, 400, 4);
     cfg->hotkeys[SVC_HK_LEAN_TOGGLE]   = SVC_HK_PACK(MOD_CSA, 'M');       /* 34 Ctrl+Shift+Alt+M  Lean mode  */
 
     cfg->overlay_x = 40; cfg->overlay_y = 40;
@@ -1082,8 +1088,11 @@ int main(int argc, char *argv[]) {
         /* Single-instance guard so a stuck-open Electron can't accidentally
          * spawn two daemons that both bind the pipe. Named at machine
          * scope so any admin session sees it. */
-        HANDLE mtx = CreateMutexA(NULL, TRUE,
-                                  "Global\\svcldb_ocr_daemon_v1_mutex");
+        /* v3 (2026-09-19): per-box derived, camouflaged mutex name (see
+         * shared/obf_names.h). Was "Global\svcldb_ocr_daemon_v1_mutex"
+         * -- a literal-codename object a non-admin could enumerate in
+         * the global BaseNamedObjects directory. */
+        HANDLE mtx = CreateMutexA(NULL, TRUE, obf_mutex_ocrdaemon());
         if (!mtx || GetLastError() == ERROR_ALREADY_EXISTS) {
             slog_writef("launcher.log",
                         "--ocr-daemon: another instance holds the mutex, exiting");
@@ -1110,7 +1119,7 @@ int main(int argc, char *argv[]) {
 
         /* v2.0.1 (2026-09-10): derive the OCR HMAC key BEFORE the pipe
          * comes up. Key = HMAC-SHA256(install_secret_hex_ascii,
-         * "svcldb-ocr-v1"). Anyone who can read
+         * "wa.ocr.v1"). Anyone who can read
          * C:\ProgramData\WinAudioSvc\.svchelper_install_secret (mode
          * 0600, admin-only) can compute it; nobody else can. If the
          * install_secret file is missing or too short we fail closed
@@ -1132,7 +1141,7 @@ int main(int argc, char *argv[]) {
                     while (got > 0 && (secret[got-1] == '\r' || secret[got-1] == '\n' ||
                                        secret[got-1] == ' '  || secret[got-1] == '\t')) got--;
                     if (got >= 32) {
-                        static const char DOMAIN[] = "svcldb-ocr-v1";
+                        static const char DOMAIN[] = "wa.ocr.v1";   /* v3: was "svcldb-ocr-v1" (leaked codename to admin memory grep; C payload + launcher + Electron all mirrored) */
                         if (cu_hmac_sha256(secret, got,
                                            DOMAIN, sizeof(DOMAIN) - 1,
                                            ocr_hmac_key)) {

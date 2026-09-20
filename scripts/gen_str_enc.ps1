@@ -86,9 +86,11 @@ for ($i = 0; $i -lt $table.Count; $i++) {
 [void]$sb.AppendLine('} svc_str_id_t;')
 [void]$sb.AppendLine('')
 
-# Blob (writable — we XOR in place at init)
-[void]$sb.AppendLine('/* Writable so svc_str_init() can XOR in place. Read-only after init. */')
-[void]$sb.AppendLine("extern char g_svc_enc_blob[$($blob.Count)];")
+# Blob (const — stays ciphertext at rest; svc_str() decrypts on demand
+# into a transient ring, never in place. const => read-only .rdata.)
+[void]$sb.AppendLine('/* const: ciphertext at rest for the whole process lifetime. svc_str()')
+[void]$sb.AppendLine(' * decrypts on demand into a transient scratch ring (see str_enc.c). */')
+[void]$sb.AppendLine("extern const char g_svc_enc_blob[$($blob.Count)];")
 [void]$sb.AppendLine('')
 
 # Offset/length table
@@ -110,8 +112,8 @@ $sbData = New-Object System.Text.StringBuilder
 [void]$sbData.AppendLine('#include "str_enc_generated.h"')
 [void]$sbData.AppendLine('')
 
-# blob definition
-[void]$sbData.Append('char g_svc_enc_blob[' + $blob.Count + '] = {')
+# blob definition (const -> read-only .rdata; never mutated at runtime)
+[void]$sbData.Append('const char g_svc_enc_blob[' + $blob.Count + '] = {')
 for ($i = 0; $i -lt $blob.Count; $i++) {
   if (($i % 16) -eq 0) { [void]$sbData.AppendLine(); [void]$sbData.Append('    ') }
   [void]$sbData.Append("0x$('{0:X2}' -f $blob[$i]),")

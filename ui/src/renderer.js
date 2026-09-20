@@ -16,6 +16,11 @@
 // ─── Screen management ──────────────────────────────────────────
 const SCREENS = ['splash', 'login', 'nosub', 'dashboard', 'suspended', 'devicelimit'];
 function showScreen(name) {
+  // v3: stop the dashboard status poll (a 3.5s child-spawn loop) whenever we
+  // navigate away, so it never leaks across sign-out / lockout screens
+  // (Electron CPU/battery audit, item 7). Dashboard re-entry re-arms it via
+  // pollStatusLoop(). clearInterval(null/undefined) is a safe no-op.
+  if (name !== 'dashboard') { try { clearInterval(_pollTimer); } catch (_) {} }
   for (const s of SCREENS) {
     const el = document.getElementById(`screen-${s}`);
     if (el) el.classList.toggle('active', s === name);
@@ -1866,6 +1871,21 @@ function pollStatusLoop() {
   _refreshStatus();
   _pollTimer = setInterval(_refreshStatus, 3500);
 }
+
+// v3 (2026-09-19): with backgroundThrottling=true (main.js) the renderer's
+// timers slow to ~1/s while the window is hidden. Refresh immediately on
+// hidden->visible so the dashboard is fresh the moment the user restores it,
+// without waiting the throttled interval. Also toggle body.bg-paused which
+// pauses every decorative CSS keyframe animation while hidden (belt+braces
+// on top of Chromium's throttling -- audit item 5). No-op if the dashboard
+// isn't active (showScreen clears _pollTimer when we leave).
+document.addEventListener('visibilitychange', () => {
+  const hidden = document.visibilityState !== 'visible';
+  try { document.body.classList.toggle('bg-paused', hidden); } catch (_) {}
+  if (!hidden && _pollTimer) {
+    try { _refreshStatus(); } catch (_) {}
+  }
+});
 
 // ─── Export encrypted logs for support ────────────────────────
 document.getElementById('btn-export-logs').addEventListener('click', async () => {

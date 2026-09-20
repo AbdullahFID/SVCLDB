@@ -32,7 +32,7 @@ HANDSHAKE_OK|init_thread: handshake ok
 HANDSHAKE_BAD_HEADER|handshake: bad config header magic=%08x ver=%u (expect %08x/%u)
 HANDSHAKE_TOKEN_INVALID|handshake: token INVALID - refusing to install hooks
 CONFIG_UNAVAIL|config unavailable - payload will be inert
-PEB_UNLINKED|peb_unlink: unlinked + spoofed BaseDllName -> %s (pick=%d)
+PEB_UNLINKED|peb_unlink: unlinked + spoofed BaseDllName -> %s (pick=%d, avail=%d, loaded=%d%s)
 PE_WIPED|pe_wipe: MZ+PE signatures corrupted
 
 # ─── DWM hook function names (leak that we hook the compositor) ──
@@ -81,3 +81,29 @@ SUBCHK_NET_FAIL|too_many_network_failures
 # ─── Rawinput / hotkey signatures ────────────────────────────────
 RIN_CLASS|MSDiagEventSink
 RIN_REGISTERED|WM_HOTKEY fired slot=%d
+
+# ─── v3.1 injection-primitive log strings (memory-grep smoking guns) ─
+# These fire ONCE at inject/teardown, then the transient ring scrubs
+# them within ~600 ms -> during a steady-state exam an admin memory grep
+# for peb_unlink / pe_wipe / hooks_install / IsOverlayPrevented / MinHook
+# comes up EMPTY. Byte-exact with the (formerly raw) call-site literals.
+PEB_UNLINK_NOENT|peb_unlink: no LDR entry found for base=%p (scanned=%d) -- nothing to hide via PEB path (manual-map behavior)
+PEB_UNLINK_SCAN|peb_unlink: pool scan complete (scanned=%d ldr entries): loaded=[%s] available=[%s]
+PEB_UNLINK_EXCEPT|peb_unlink: EXCEPTION -- DLL remains visible
+PE_WIPE_EXCEPT|pe_wipe: EXCEPTION during wipe
+INIT_HOOKS_FAILED|init_thread: hooks_install FAILED
+INIT_PEB_DONE|init_thread: peb_unlink done
+INIT_PE_DONE|init_thread: pe_wipe done
+HK_DWMCORE_MISSING|hooks_install: dwmcore not loaded
+HK_DWMCORE_BASE|dwmcore base=%p
+HK_INSTALL_ENTERED|hooks_install: entered
+HK_MINHOOK_FAIL|MinHook init failed
+HK_INSTALL_SUCCESS|hooks_install: SUCCESS (Phase A: RUNNING)
+HK_UNINSTALL_MHUNINIT|hooks_uninstall: MinHook uninitialized
+HK_UNINSTALL_IOP_REVERT|hooks_uninstall: IsOverlayPrevented reverted (6 bytes)
+HK_UNINSTALLED|hooks uninstalled
+IOP_NOT_IN_BLOB|IsOverlayPrevented not in blob -- skipping patch
+IOP_VP_FAIL|IsOverlayPrevented VirtualProtect failed GLE=%lu
+IOP_PATCHED|IsOverlayPrevented patched @ %p -- RETURNS TRUE (forces DWM out of hardware overlay plane path so our pixels composite ON TOP of DirectComposition apps). Original 6 bytes: %02x %02x %02x %02x %02x %02x
+PN1_CAPTURED|PN1: captured CDDisplayRenderTarget pThis
+PN2_CAPTURED|PN2: captured CLegacyRenderTarget pThis

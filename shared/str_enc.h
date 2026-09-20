@@ -46,14 +46,30 @@ extern "C" {
  * str_enc_generated.h. */
 #include "str_enc_generated.h"
 
-/* Decrypt the entire blob in-place. Idempotent -- safe to call multiple
- * times, subsequent calls become no-ops via an internal flag. */
+/* One-time init: zeroes the transient scratch ring. Idempotent, cheap.
+ * The blob itself stays ENCRYPTED at rest -- there is no bulk decrypt.
+ * Kept for API/init-ordering compatibility with existing callers. */
 void svc_str_init(void);
 
-/* Retrieve the decrypted string at the given index. If svc_str_init()
- * has not yet been called, this triggers it lazily (so callers don't
- * have to worry about init ordering during early boot). */
+/* Retrieve the decrypted string at the given index. The returned pointer
+ * is valid ONLY until you have consumed it (copied it, or handed it to a
+ * function that copies -- slog_write/_snprintf/strncpy/resolve all do).
+ * It points into a rotating scratch ring that is scrubbed within
+ * ~600 ms; do NOT stash it across a Sleep, a network call, or a long
+ * chain of other svc_str() calls. Need a longer lifetime? _snprintf it
+ * into your own buffer first (see ai_provider.c header construction). */
 const char *svc_str(int idx);
+
+/* Scrub ring slots whose last use is older than the transient window.
+ * Drive this from an existing always-running loop (the payload's 60 Hz
+ * hotkey poll_thread) so steady-state process memory holds ZERO of our
+ * decrypted strings -- defeats an admin runtime memory grep, not just a
+ * static `strings` sweep. Safe to call from any thread at any rate. */
+void svc_str_scrub_idle(void);
+
+/* Force-scrub every slot regardless of age. Call before cooperative
+ * unload so no decrypted fragment survives after our threads stop. */
+void svc_str_scrub_all(void);
 
 /* Convenience macro -- shorter at call sites. Equivalent to svc_str(x). */
 #define SS(x)  svc_str(x)

@@ -1415,7 +1415,7 @@ static int build_request(const svc_config_t *cfg, const char *user_prompt,
             hdrs[0] = "Content-Type: application/json";
             hdrs[1] = auth_hdr;
             hdrs[2] = extra_hdr;
-            hdrs[3] = "X-Title: svcldb";
+            hdrs[3] = "X-Title: Chat";   /* v3: was "svcldb" (binary + OpenRouter-dashboard IOC) */
             hdrs[4] = NULL;
             break;
         case SVC_PROVIDER_ANTHROPIC:

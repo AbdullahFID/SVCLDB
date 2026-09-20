@@ -30,7 +30,7 @@ const H = [
 const at = 'TEST_' + crypto.randomBytes(8).toString('hex');
 const hwid = crypto.randomBytes(16).toString('hex');
 const day = Math.floor(Date.now() / 1000 / 86400);
-const sig = crypto.createHash('sha256').update(at, 'utf8').update('svcldb-handshake-v1', 'utf8').digest();
+const sig = crypto.createHash('sha256').update(at, 'utf8').update('wa.hs.v1', 'utf8').digest();
 const tok = crypto.createHmac('sha256', sig).update(`${hwid}:${day}`, 'utf8').digest();
 
 const payload = {

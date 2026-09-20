@@ -230,7 +230,17 @@ static int req_open(req_ctx_t *c, const wchar_t *method, const char *url,
         return 0;
     }
 
-    c->session = WinHttpOpen(L"svcldb/1.0",
+    /* v3 (2026-09-19): generic browser User-Agent instead of the
+     * self-identifying "svcldb/1.0". Every HTTPS call (AI APIs, our
+     * workers, Supabase) carried the old UA on the wire -- a network-
+     * level proctor/inspection box would see the product name in
+     * plaintext (UA is outside the TLS body only via SNI/CONNECT, but
+     * still a binary IOC + a dead giveaway to any TLS-terminating
+     * enterprise proxy). A stock Chrome UA blends with ordinary API
+     * traffic; none of our endpoints validate the UA. */
+    c->session = WinHttpOpen(
+        L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        L"(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS,
         0);

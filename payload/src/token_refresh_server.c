@@ -79,13 +79,20 @@
 #include "../../shared/log_secure.h"
 #include "../../shared/crypto_util.h"
 #include "../../shared/config_types.h"
+#include "../../shared/obf_names.h"
 
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
 
 /* ─── Wire constants ─────────────────────────────────────────────── */
-#define TOKEN_PIPE_NAME     "\\\\.\\pipe\\svcldb_token_v1"
+/* v3 (2026-09-19): per-box derived, camouflaged pipe name -- see
+ * shared/obf_names.h. Was the fixed literal "\\.\pipe\svcldb_token_v1",
+ * a zero-effort IOC for any non-admin `\\.\pipe\*` enumeration. Now a
+ * per-machine GUID indistinguishable from legit COM/RPC/mojo pipes.
+ * (Function call, not a string literal -- only ever used as a runtime
+ * pipe-name argument, cached after first derivation.) */
+#define TOKEN_PIPE_NAME     obf_pipe_token()
 #define TOKEN_PIPE_MAGIC    0x544F4B31u    /* 'TOK1' */
 #define TOKEN_HMAC_LEN      32u
 #define TOKEN_REQ_HDR_LEN   (4u + 4u + 32u + 4u)   /* magic+reserved+hmac+token_len */

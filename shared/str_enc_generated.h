@@ -60,11 +60,32 @@ typedef enum {
     SVC_STR_SUBCHK_NET_FAIL = 45,
     SVC_STR_RIN_CLASS = 46,
     SVC_STR_RIN_REGISTERED = 47,
+    SVC_STR_PEB_UNLINK_NOENT = 48,
+    SVC_STR_PEB_UNLINK_SCAN = 49,
+    SVC_STR_PEB_UNLINK_EXCEPT = 50,
+    SVC_STR_PE_WIPE_EXCEPT = 51,
+    SVC_STR_INIT_HOOKS_FAILED = 52,
+    SVC_STR_INIT_PEB_DONE = 53,
+    SVC_STR_INIT_PE_DONE = 54,
+    SVC_STR_HK_DWMCORE_MISSING = 55,
+    SVC_STR_HK_DWMCORE_BASE = 56,
+    SVC_STR_HK_INSTALL_ENTERED = 57,
+    SVC_STR_HK_MINHOOK_FAIL = 58,
+    SVC_STR_HK_INSTALL_SUCCESS = 59,
+    SVC_STR_HK_UNINSTALL_MHUNINIT = 60,
+    SVC_STR_HK_UNINSTALL_IOP_REVERT = 61,
+    SVC_STR_HK_UNINSTALLED = 62,
+    SVC_STR_IOP_NOT_IN_BLOB = 63,
+    SVC_STR_IOP_VP_FAIL = 64,
+    SVC_STR_IOP_PATCHED = 65,
+    SVC_STR_PN1_CAPTURED = 66,
+    SVC_STR_PN2_CAPTURED = 67,
     SVC_STR_COUNT
 } svc_str_id_t;
 
-/* Writable so svc_str_init() can XOR in place. Read-only after init. */
-extern char g_svc_enc_blob[1673];
+/* const: ciphertext at rest for the whole process lifetime. svc_str()
+ * decrypts on demand into a transient scratch ring (see str_enc.c). */
+extern const char g_svc_enc_blob[2684];
 
 typedef struct { size_t offset; size_t length; } svc_str_entry_t;
 extern const svc_str_entry_t g_svc_enc_table[SVC_STR_COUNT];

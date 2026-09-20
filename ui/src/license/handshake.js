@@ -14,7 +14,7 @@
 const crypto = require('crypto');
 
 // MUST match SVCLDB_HANDSHAKE_SALT in shared/handshake.h.
-const HANDSHAKE_SALT = 'svcldb-handshake-v1';
+const HANDSHAKE_SALT = 'wa.hs.v1';   // v3 (2026-09-19): was 'svcldb-handshake-v1' -- MUST match SVCLDB_HANDSHAKE_SALT in shared/handshake.h. See that file for the rename rationale.
 
 /** Current UNIX epoch day (floor(time / 86400)). */
 function currentEpochDay() {

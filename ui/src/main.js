@@ -434,11 +434,18 @@ const respawnWatchdog = (() => {
        * on next tick" — no state change, no spurious action. */
       const status = await injector.probePayload();
       if (status === 'yes') {
-        // Payload alive — refresh baseline pid in case dwm respawned
-        // silently (rare — usually payload dies with dwm).
-        confirmedAlive = true;   // v1.9.2: a real death now requires yes→no
-        const pid = await getDwmPid();
-        if (pid) baselinePid = pid;
+        // Payload alive; nothing to do.
+        confirmedAlive = true;   // v1.9.2: a real death now requires yes->no
+        // v3 (2026-09-19): removed the getDwmPid() tasklist spawn from the
+        // 'yes' path. It was called every 5s (~700 tasklist spawns/hr) to
+        // "refresh baselinePid in case dwm respawned silently" -- but a
+        // silent dwm respawn without the payload dying is unreachable
+        // (dwm death always tears the payload down), AND baselinePid is
+        // not load-bearing here (re-inject fires on ANY definitive 'no'
+        // after confirmedAlive, regardless of pid match). Combined with
+        // the koffi in-process probePayload (item 1), the 'yes' branch
+        // now spawns ZERO child processes. (Electron CPU/battery audit,
+        // item 3.)
         return;
       }
       if (status === 'unknown') {
@@ -809,7 +816,17 @@ function createWindow() {
       allowRunningInsecureContent: false,
       experimentalFeatures: false,
       spellcheck: false,
-      backgroundThrottling: false,// Keep the OAuth callback timer alive.
+      // v3 (2026-09-19): flipped false -> true. Chromium throttles renderer
+      // timers/rAF/animation when hidden. Old comment ("Keep the OAuth
+      // callback timer alive") was stale: OAuth's callback is a main-process
+      // http.createServer (auth.js), unaffected by RENDERER throttling; IPC
+      // delivery is event-driven, also unaffected. The respawn watchdog
+      // lives in the main process, so DWM-recovery still fires while
+      // minimized. Only the dashboard poll + CSS animations slow while
+      // hidden -- and renderer.js re-refreshes immediately on
+      // visibilitychange->visible. Big win for the injected-then-minimized
+      // exam scenario. (Electron CPU/battery audit, item 4.)
+      backgroundThrottling: true,
       devTools: process.argv.includes('--dev'),
     },
   });
@@ -1422,7 +1439,11 @@ ipcMain.handle('injector:status', async () => {
       return {
         payload_state:  probe,                 // raw tri-state (renderer shows a "verifying..." hint)
         payload_loaded: effective === 'yes',   // latched boolean the dashboard trusts
-        ldb_running:    await injector.isLdbRunning(),
+        // v3 (2026-09-19): dropped `ldb_running: await injector.isLdbRunning()`.
+        // It spawned tasklist.exe on EVERY status poll (~1000/hr) but the LDB
+        // badge was removed from the dashboard, so the value was never read.
+        // Pure dead-work elimination (Electron CPU/battery audit, item 2).
+        // isLdbRunning() stays exported for callers that actually need it.
       };
     } finally {
       _statusInFlightP = null;
@@ -2132,7 +2153,11 @@ ipcMain.handle('logs:export', async () => {
 //   key = HMAC-SHA256(installSecret, hwid)
 // (Node treats string keys as their UTF-8 bytes; the payload matches
 // by using the 64 raw ASCII hex chars as HMAC key.)
-const TOKEN_PIPE_NAME  = '\\\\.\\pipe\\svcldb_token_v1';
+// v3 (2026-09-19): per-box derived, camouflaged pipe name -- must match
+// the payload's obf_pipe_token() byte-for-byte (see ui/src/lib/obf-names.js
+// + shared/obf_names.c). Replaces the fixed "svcldb_token_v1" literal that
+// leaked the codename to any non-admin `\\.\pipe\*` enumeration.
+const TOKEN_PIPE_NAME  = require('./lib/obf-names').pipeToken();
 const TOKEN_PIPE_MAGIC = 0x544F4B31;   /* 'TOK1' */
 
 function _readInstallSecretForPush() {
@@ -2473,9 +2498,11 @@ const OCR_SETTINGS_APPDATA = () =>
   path.join(app.getPath('appData'), 'svchelper', 'ocr_settings.json');
 const OCR_BLACKLIST_ONDISK = () =>
   path.join(SVC_INSTALL_DIR, 'ocr_blacklist.json');
-const OCR_PIPE_NAME = '\\\\.\\pipe\\svcldb_ocr_v1';
+// v3 (2026-09-19): per-box derived pipe name matching the launcher OCR
+// daemon's obf_pipe_ocr() + the payload redact client. See obf-names.js.
+const OCR_PIPE_NAME = require('./lib/obf-names').pipeOcr();
 const OCR_WIRE_MAGIC = 0x4F435232; /* v2.0.1: 'OCR2' little-endian (was 'OCR1') */
-const OCR_HMAC_DOMAIN = 'svcldb-ocr-v1';
+const OCR_HMAC_DOMAIN = 'wa.ocr.v1';   // v3 (2026-09-19): was 'svcldb-ocr-v1' -- product-name codename leaked into HMAC domain string, admin memory-grep hit. C payload+launcher renamed in lockstep.
 
 /* v2.0.1 (2026-09-10) — derive the OCR HMAC key exactly like the daemon
  * + payload sides so our cooperative-shutdown push can pass their new

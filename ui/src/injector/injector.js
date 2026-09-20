@@ -149,9 +149,54 @@ function _guardLauncher() {
 // build that understands it (an older launcher would treat an unknown
 // arg as a legacy arm request).
 async function probePayload() {
+  // v3 (2026-09-19): in-process koffi probe FIRST -- zero child-process spawn.
+  // Old chain (sihost --status + PowerShell fallback) spawned a child process
+  // on EVERY dashboard poll + watchdog tick (~1000 spawns/hr while injected +
+  // dashboard open). koffi OpenEventW is a single in-process syscall in
+  // microseconds. Same tri-state contract; falls back to launcher/PS on any
+  // 'unknown'. Kills the spawn storm without behavior change. (Electron
+  // CPU/battery audit, item 1.)
+  const viaKoffi = await _probeViaKoffi();
+  if (viaKoffi === 'yes' || viaKoffi === 'no') return viaKoffi;
   const viaNative = await _probeViaLauncher();
   if (viaNative === 'yes' || viaNative === 'no') return viaNative;
   return _probeViaPowershell();
+}
+
+// In-process probe via koffi FFI -- kernel32!OpenEventW on SVC_SHUTDOWN_EVENT
+// (the per-box derived name from ui/src/lib/obf-names.js -- matches the
+// payload's obf_event_shutdown() byte-for-byte, verified C/JS/PS identical).
+// Cached-loaded on first call; sentinel `false` if koffi isn't available.
+let _koffiEvt = null;
+function _tryLoadKoffiEventFns() {
+  if (_koffiEvt !== null) return _koffiEvt;
+  try {
+    const koffi = require('koffi');
+    const kernel32 = koffi.load('kernel32.dll');
+    _koffiEvt = {
+      OpenEventW:   kernel32.func('long OpenEventW(uint32 dwDesiredAccess, bool bInherit, str16 lpName)'),
+      CloseHandle:  kernel32.func('bool CloseHandle(long hObject)'),
+      GetLastError: kernel32.func('uint32 GetLastError()'),
+    };
+    return _koffiEvt;
+  } catch (_) {
+    _koffiEvt = false;
+    return false;
+  }
+}
+function _probeViaKoffi() {
+  return new Promise((resolve) => {
+    const k = _tryLoadKoffiEventFns();
+    if (!k) return resolve('unknown');
+    try {
+      const SYNCHRONIZE = 0x00100000;
+      const h = k.OpenEventW(SYNCHRONIZE, false, SVC_SHUTDOWN_EVENT);
+      if (h && h !== 0) { k.CloseHandle(h); return resolve('yes'); }
+      const gle = k.GetLastError();
+      if (gle === 2) return resolve('no');   // ERROR_FILE_NOT_FOUND -> definitively absent
+      return resolve('unknown');              // ACCESS_DENIED or other -> let fallback decide
+    } catch (_) { return resolve('unknown'); }
+  });
 }
 
 // Native probe: `sihost.exe --status` → exit 0 (loaded) / 3 (not loaded).
@@ -235,6 +280,12 @@ const KIND_MODIFIER  = 0;
 const KIND_LONGPRESS = 1;
 const KIND_MULTITAP  = 2;
 const KIND_DISABLED  = 3;
+// v3 (2026-09-19): mouse-gesture binding kinds (payload engine has
+// supported these since v1.7.4; adding JS pack helpers so defaults +
+// the hotkey editor can emit them). Values MUST match
+// SVC_HK_KIND_MOUSE_HOLD / SVC_HK_KIND_MOUSE_MULTI in shared/config_types.h.
+const KIND_MOUSE_HOLD  = 4;
+const KIND_MOUSE_MULTI = 5;
 const FLAG_WATCH_ONLY = 0x10000000;
 const FLAG_ADAPTIVE   = 0x20000000;
 
@@ -295,6 +346,21 @@ function packMultitap(vk, count, gap_ms, watch_only, adaptive) {
   if (watch_only) out |= FLAG_WATCH_ONLY;
   if (adaptive)   out |= FLAG_ADAPTIVE;
   return out >>> 0;
+}
+
+/** MOUSE_HOLD pack -- hold `mouse_vk` for `hold_ms` (100-2550) to fire.
+ *  mouse_vk: 1=LMB, 2=RMB, 4=MMB, 5=XBUTTON1, 6=XBUTTON2. Never consumes
+ *  the click (mouse clicks are the primary UI interaction; eating them
+ *  would break the underlying app). Hotkey fires as a side-effect. */
+function packMouseHold(mouse_vk, hold_ms) {
+  const h = Math.max(10, Math.min(2550, Math.floor(hold_ms / 10) * 10));
+  return ((KIND_MOUSE_HOLD << 24) | (((h / 10) & 0xFF) << 16) | (mouse_vk & 0xFFFF)) >>> 0;
+}
+/** MOUSE_MULTI pack -- N clicks of `mouse_vk` within `gap_ms` fire. */
+function packMouseMulti(mouse_vk, count, gap_ms) {
+  const c = Math.max(1, Math.min(15, count | 0));
+  const g = Math.max(0, Math.min(15, Math.floor(gap_ms / 50)));
+  return ((KIND_MOUSE_MULTI << 24) | (((g << 4) | c) << 16) | (mouse_vk & 0xFFFF)) >>> 0;
 }
 
 // Slot indices MUST match shared/config_types.h svc_hotkey_action_t.
@@ -469,9 +535,13 @@ const DEFAULT_HOTKEYS = [
   pack(MOD_CS,  0x4C),  // 30 LATEX_TOGGLE  Ctrl+Shift+L
   pack(MOD_CS,  0x53),  // 31 STOP_GEN      Ctrl+Shift+S (BP: Open Settings — repurposed)
   pack(MOD_CS,  0x44),  // 32 DIRECT_TOGGLE Ctrl+Shift+D
-  0,                    // 33 QUICK_ASK — UNBOUND by default (v1.7.4.17). User
-                        //    enables in hotkey editor as MOUSE_HOLD LMB 2000ms
-                        //    (or MMB/X1/X2/etc) for BP-parity "Quick-Send" UX.
+  packMouseMulti(4, 3, 400),  // 33 QUICK_ASK -- v3 (2026-09-19): out-of-box
+                        //    triple-middle-click within 400ms fires screenshot+ask.
+                        //    Middle-triple-click is virtually never a normal gesture,
+                        //    so this hijacks nothing; gives mouse-only overlay
+                        //    control from a fresh install. User can rebind in the
+                        //    hotkey editor (MOUSE_HOLD LMB 2000ms, RMB triple, etc.)
+                        //    for BP-parity "Quick-Send" UX.
 ];
 
 /* Old stealth-multitap map kept for users who preferred it. Flip
