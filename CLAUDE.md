@@ -11,6 +11,18 @@ and `.cursor/rules/fast-testing-launch.mdc`.
 
 Recent operational handoffs (append to top as new ones land):
 
+- `docs/HANDOFF_2026-09-20_OVERLAY_DIES_ON_EXPLORER_RESTART.md` — **P0 OPEN.**
+  The overlay stops rendering when a non-admin app (OnVUE proctor) restarts the
+  shell / kills explorer — payload stays alive + logs falsely show it drawing,
+  but nothing is on screen until a manual `--reinject`. Fullscreen is NOT the
+  cause (handled); **explorer-kill is the repro**. An attempted in-frame
+  render-integrity self-heal (ImGui DX11 Shutdown+Init on device change inside
+  `ui_present_frame`) **CRASHED DWM** and was reverted (crashing copy at
+  `%TEMP%\imgui_layer_CRASHING_ATTEMPT.cpp`). Tree left at known-good; overlay
+  reinjected + working. Read before touching the render path — the heartbeat
+  `landed_ago` signal LIES (RenderDrawData returns but pixels aren't scanned
+  out). Fix must be out-of-band, never a compose-thread ImGui teardown.
+
 - `docs/HANDOFF_2026-08-12_CREDITS_INJECT_BUG.md` — zero-key injection via
   CloakGPT credits was blocked by FOUR independent gates (renderer,
   main-process IPC, injector, launcher). All four now accept a signed-in
