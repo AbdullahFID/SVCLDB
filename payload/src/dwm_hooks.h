@@ -180,14 +180,6 @@ int hooks_add_dirty_full(void);
  * covers the whole burst). */
 void hooks_bump_compose_grace(unsigned ms);
 
-/* v3.2 (P0: overlay dies on explorer/shell restart). Called by the UI layer's
- * ensure_fake_hwnd_valid() when Progman is recreated (= the shell restarted).
- * Arms a short window during which the PN detours stop forcing composition and
- * the Present detour skips our overlay draw, so DWM can rebuild + reconnect its
- * desktop visual tree to scanout natively -- then we resume. Without this the
- * overlay stays dark after a shell restart until a manual --reinject. */
-void hooks_note_shell_restart(void);
-
 #ifdef __cplusplus
 }
 #endif

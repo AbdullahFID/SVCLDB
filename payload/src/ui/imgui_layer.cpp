@@ -6015,6 +6015,23 @@ static void om_restore(ID3D11DeviceContext *ctx, OMBackup *b) {
     if (b->sc_count > 0) ctx->RSSetScissorRects(b->sc_count, b->scs);
 }
 
+/* v3.5 (P0 explorer-restart, BP-parity redundancy): re-attach the input
+ * subsystem (LL keyboard/mouse hooks + poll/WM_INPUT threads) to the CURRENT
+ * input desktop after a shell restart. rawin_restart() stops+restarts its own
+ * threads (WaitForSingleObject), so it MUST run off the compose thread -- hence
+ * this worker. Overlay input already survives the restart, but BP re-inits input
+ * as part of its recovery, so we mirror that. Guarded so overlapping shell
+ * restarts don't race two stop/start cycles. NOT a process spawn -- an internal
+ * thread, invisible to OnVUE's process enumeration. */
+extern "C" void rawin_restart(void);   /* rawinput_hook.c (C linkage) */
+static volatile LONG g_input_reattach_busy = 0;
+static DWORD WINAPI input_reattach_worker(LPVOID) {
+    if (InterlockedExchange(&g_input_reattach_busy, 1) != 0) return 0;
+    rawin_restart();
+    InterlockedExchange(&g_input_reattach_busy, 0);
+    return 0;
+}
+
 /* ---------- Main frame entry ---------- */
 extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
     (void)pCtx;
@@ -6032,6 +6049,9 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
     if (InterlockedExchange(&g_needs_client_reinit, 0) != 0) {
         diag("[RECOVERY] full client teardown (shell restart, BP-1:1) -- rebuild next frame");
         ui_reinit();
+        /* BP-parity redundancy: re-attach input on a worker (off compose thread). */
+        HANDLE t = CreateThread(NULL, 0, input_reattach_worker, NULL, 0, NULL);
+        if (t) CloseHandle(t);
         return;
     }
 

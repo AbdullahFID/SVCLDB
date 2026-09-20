@@ -437,174 +437,15 @@ static volatile void *g_legacy_rt  = NULL;
 static volatile LONG g_active     = 0;   /* 1 while payload is alive (RUNNING + DRAINING) */
 static volatile LONG g_stop_draw  = 0;   /* 1 = Present skips our draw callback */
 
-/* ── v3.2 in-process soft-reinject on shell restart (P0: overlay dies on
- *    explorer restart) ──────────────────────────────────────────────────────
- * ROOT CAUSE (proven by RDIAG + PN1 probes + live no-code tests, 2026-09-20):
- * on an explorer/shell restart EVERY object we touch is byte-for-byte identical
- * -- same COverlayContext, same layer texture, same D3D device, same
- * CDDisplayRenderTarget (PN1 pThis) -- and we keep drawing flawlessly every
- * frame (draws climb, skips=0, nulltex=0), yet DWM stops scanning our context
- * out. DISPROVEN dead-ends: (1) merely backing off our PN=TRUE + SCP compose
- * force for a window did NOT heal it; (2) Win+L (full secure-desktop/compose
- * rebuild), a resolution change, window drags, and Ctrl+Alt+R all fail to heal
- * it. The ONLY thing that heals it is re-running OUR init (--reinject). So the
- * stale binding is something our injection establishes that nothing DWM does on
- * its own re-establishes -- and it is NOT any pointer we track.
- *
- * FIX (fully in-payload, no external/svchelper watchdog a proctor could
- * enumerate or kill): when the shell restarts (Progman recreated -- signalled
- * by ensure_fake_hwnd_valid), do an in-process "soft reinject" from a dedicated
- * worker thread: hooks_uninstall() (MH_DisableHook + revert IOP/FFD, DWM runs
- * fully native) -> brief native window so DWM reconnects its rebuilt desktop
- * visual tree to scanout -> hooks_install() (re-hook + re-apply IOP/FFD on the
- * current dwmcore). This is exactly what --reinject does on the DWM side, minus
- * the process spawn. We deliberately leave the ImGui context intact (the D3D
- * device is unchanged so the DX11 backend stays valid) -- NO compose-thread
- * ImGui teardown (that crashed DWM in the prior attempt). */
-static pl_offsets_t    g_saved_off;
-static present_cb_t    g_saved_cb    = NULL;
-static BOOL            g_saved_valid = FALSE;
-static volatile LONG   g_rearm_busy  = 0;
-/* Forward tentative decl -- real one lives with the ghost code below; needed
- * here because rearm_worker resets it to respawn the ghost on re-arm. */
-static volatile LONG   g_ghost_spawned;
-
-static DWORD WINAPI rearm_worker(LPVOID p) {
-    (void)p;
-    if (InterlockedExchange(&g_rearm_busy, 1) != 0) return 0;   /* one re-arm at a time */
-    if (!g_saved_valid) { InterlockedExchange(&g_rearm_busy, 0); return 0; }
-
-    /* v3.2 SETTLE DELAY: the Progman-change that triggers us fires within ~40ms
-     * of the shell dying -- while explorer is still relaunching and DWM is still
-     * rebuilding its desktop visual tree. A manual --reinject (which reliably
-     * heals) is always run SECONDS later, after everything has settled. Re-arm
-     * too early and we re-hook onto a still-transitioning compositor. Wait for
-     * the shell to stabilize first: poll until an explorer.exe is up and a
-     * Progman window has been stable, then give DWM a bit more. */
-    {
-        int settled = 0;
-        for (int i = 0; i < 40; i++) {   /* up to ~8s */
-            Sleep(200);
-            HWND pm = FindWindowA("Progman", NULL);
-            if (pm && IsWindow(pm)) { if (++settled >= 6) break; }  /* stable ~1.2s */
-            else settled = 0;
-        }
-        Sleep(1500);   /* extra headroom for DWM to finish reconnecting scanout */
-    }
-
-    slog_writef("payload.log",
-        "rearm: in-process soft-reinject BEGIN (shell restart, settled) -- unhook + native window + re-hook");
-
-    /* 1. Full DWM-side unhook: MH_DisableHook+Uninitialize, revert IOP/FFD,
-     *    clear g_active. Identical to --reinject's cooperative unload on the
-     *    DWM side. Sets g_stop_draw + drains, so the compose thread is no longer
-     *    inside ui_present_frame after this returns. */
-    hooks_uninstall();
-
-    /* 1b. Render-layer re-init: drop the ImGui context + DX11/Win32 backends so
-     *     the next present rebuilds them fresh on the current device/Progman --
-     *     the render half a fresh --reinject performs. Safe here: draws are
-     *     stopped + hooks are gone, so nothing is inside ui_present_frame. */
-    {
-        extern void ui_reinit(void);   /* imgui_layer.cpp (extern "C") */
-        ui_reinit();
-    }
-
-    /* 2. Native window: no detours, IOP reverted -> DWM composes fully natively
-     *    and reconnects its freshly-rebuilt desktop visual tree to scanout. The
-     *    step a running payload never performs (Win+L / res-change don't heal;
-     *    only re-running init does). */
-    Sleep(600);
-
-    /* 2b. GHOST RESPAWN. hooks_uninstall above set g_active=0, which made the
-     *     ghost_wnd_thread exit + DestroyWindow its fullscreen TOPMOST layered
-     *     window -- but g_ghost_spawned stayed 1, so hooks_install's guarded
-     *     spawn would NOT recreate it. That is the bug that made every prior
-     *     in-process rearm fail where a real --reinject (fresh DLL =>
-     *     g_ghost_spawned=0) succeeds: the ghost is what keeps DWM compositing
-     *     our overlay to the scanned-out desktop. Reset the guard so
-     *     hooks_install respawns the ghost on the CURRENT input desktop. */
-    InterlockedExchange(&g_ghost_spawned, 0);
-
-    /* 3. Re-install hooks + re-apply IOP/FFD on the CURRENT dwmcore; respawns the
-     *    ghost (guard reset above). Clears g_stop_draw + sets g_active=1; next
-     *    Present drives our freshly re-inited ImGui into the reconnected layer. */
-    if (!hooks_install(&g_saved_off, g_saved_cb)) {
-        slog_writef("payload.log", "rearm: hooks_install FAILED -- manual --reinject needed");
-        InterlockedExchange(&g_rearm_busy, 0);
-        return 0;
-    }
-
-    /* 4. Re-attach the input subsystem (poll thread + WM_INPUT + LL keyboard/
-     *    mouse hooks) to the CURRENT input desktop. hooks_uninstall never
-     *    touched rawin, so its hooks were left on the pre-restart desktop ->
-     *    mouse + hotkeys dead until now. This is the input half of a fresh
-     *    inject, done in-process. */
-    {
-        extern void rawin_restart(void);   /* rawinput_hook.c */
-        rawin_restart();
-    }
-
-    slog_writef("payload.log", "rearm: soft-reinject DONE -- overlay + input should return");
-    InterlockedExchange(&g_rearm_busy, 0);
-    return 0;
-}
-
-/* v3.3 SELF-TRIGGERED FRESH REINJECT (P0 explorer-restart).
- * The in-process rearm (unhook+ImGui+input re-init) is flaky and the ghost/
- * force-legacy paths failed -- because the overlay death is at the driver/MPO
- * scanout level, invisible to every dwmcore signal. The ONE thing that heals
- * 100% is a full fresh manual-map inject (launcher --reinject): cooperative
- * unload of the current payload + a brand-new mapped copy. So on shell restart
- * we self-trigger exactly that: spawn `sihost --reinject`. It is TRANSIENT (runs
- * ~1s and exits), not a persistent watchdog. If the spawn is blocked by
- * elevation from DWM's token, the log records it and we fall back. */
-static volatile LONG g_reheal_busy = 0;
-static DWORD WINAPI reheal_worker(LPVOID p) {
-    (void)p;
-    if (InterlockedExchange(&g_reheal_busy, 1) != 0) return 0;
-    Sleep(2500);   /* let explorer + DWM settle so the fresh inject lands clean */
-    char cmd[MAX_PATH * 2];
-    _snprintf(cmd, sizeof(cmd) - 1, "\"%s\\sihost.exe\" --reinject --quiet", SVC_INSTALL_DIR);
-    STARTUPINFOA si; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
-    PROCESS_INFORMATION pi; ZeroMemory(&pi, sizeof(pi));
-    /* sihost.exe's manifest is requireAdministrator, so a plain spawn from DWM's
-     * (non-UAC-elevated) token fails ERROR_ELEVATION_REQUIRED (740). The
-     * __COMPAT_LAYER=RunAsInvoker shim tells the loader to ignore the manifest
-     * elevation and run sihost with OUR token (DWM's) -- same account, so it can
-     * OpenProcess+CreateRemoteThread back into DWM to do the reinject. Set it in
-     * our env briefly (child inherits); restore after. */
-    SetEnvironmentVariableA("__COMPAT_LAYER", "RunAsInvoker");
-    if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW,
-                       NULL, SVC_INSTALL_DIR, &si, &pi)) {
-        SetEnvironmentVariableA("__COMPAT_LAYER", NULL);
-        slog_writef("payload.log",
-            "reheal: spawned sihost --reinject pid=%lu (self-triggered fresh heal)",
-            (unsigned long)pi.dwProcessId);
-        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
-    } else {
-        DWORD gle = GetLastError();
-        SetEnvironmentVariableA("__COMPAT_LAYER", NULL);
-        slog_writef("payload.log",
-            "reheal: sihost --reinject spawn FAILED gle=%lu (elevation from DWM token?)",
-            gle);
-    }
-    /* The spawned reinject cooperatively unloads US, so we may be torn down
-     * before this returns -- that is the intended handoff to the fresh copy. */
-    Sleep(4000);
-    InterlockedExchange(&g_reheal_busy, 0);
-    return 0;
-}
-
-void hooks_note_shell_restart(void) {
-    if (g_reheal_busy) return;   /* debounce the rapid double Progman-swap */
-    (void)rearm_worker;          /* legacy in-process rearm kept for reference (#if 0 below) */
-    slog_writef("payload.log",
-        "hooks: shell-restart detected (Progman recreated) -- scheduling self-triggered sihost --reinject");
-    HANDLE t = CreateThread(NULL, 0, reheal_worker, NULL, 0, NULL);
-    if (t) CloseHandle(t);
-    else   slog_writef("payload.log", "hooks: reheal CreateThread FAILED gle=%lu", GetLastError());
-}
+/* v3.5 (P0 explorer-restart) -- the shell-restart recovery lives ENTIRELY in
+ * imgui_layer.cpp: ensure_fake_hwnd_valid() detects a restart (Progman HWND *or
+ * its owning explorer PID* changed -- PID catches Windows' HWND reuse) and sets
+ * g_needs_client_reinit; ui_present_frame (compose thread) then does ui_reinit()
+ * and re-acquires fresh next frame -- Bypassify's exact Uninitialize->Initialize,
+ * on the compose thread, no worker, no process spawn. This session's dead-end
+ * experiments (worker-thread soft-reinject, sihost --reinject process spawn,
+ * force-legacy-present which crashed DWM) were removed 2026-09-20. */
+static volatile LONG   g_ghost_spawned;   /* real def with the ghost code below */
 
 /* Legacy name for compatibility with hooks_bump_wake / hooks_force_wake
  * -- set to 1 alongside g_stop_draw so those helpers become no-ops
@@ -631,17 +472,6 @@ static volatile LONG  g_burst_frames_per_pump = 30;
 static BYTE  g_iop_saved_bytes[6] = {0};
 static void *g_iop_patch_addr     = NULL;
 static BOOL  g_iop_patched        = FALSE;
-
-/* v3.3 force-legacy-present patch bookkeeping (P0 explorer-restart). Patches
- * COverlayContext::LegacyPresentRequired -> return TRUE so COverlayContext::
- * Present always takes the legacy composited swapchain present (swapChain->
- * Present) instead of PresentMPO. Hypothesis: the MPO hardware-plane assignment
- * is what's lost on a shell rebuild; the composited path survives. RVA is
- * build-specific (dwmcore 10.0.26100.8115). */
-#define LEGACYPRESENTREQ_RVA_26100_8115 0x1dd51c
-static BYTE  g_flp_saved_bytes[3] = {0};
-static void *g_flp_patch_addr     = NULL;
-static BOOL  g_flp_patched        = FALSE;
 
 /* v1.7.4.14 (2026-07-24) -- ForceFullDirtyRendering-adjacent byte-patch
  * to force dwmcore into "always full-dirty compose" mode. BP does
@@ -1332,10 +1162,6 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
 
     g_present_cb = present_cb;
 
-    /* v3.2: stash offsets + cb so rearm_worker (in-process soft-reinject on
-     * shell restart) can re-install without the launcher/process. */
-    g_saved_off = *off; g_saved_cb = present_cb; g_saved_valid = TRUE;
-
     /* ── 1. COverlayContext::Present ── (REQUIRED) */
     if (!off->cOverlayContextPresent) {
         slog_write("payload.log", "hooks: no cOverlayContextPresent in blob");
@@ -1652,14 +1478,6 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
             slog_writef("payload.log", SS(SVC_STR_IOP_VP_FAIL),
                         GetLastError());
         }
-
-        /* v3.3 FORCE-LEGACY-PRESENT: TESTED + REVERTED -- CRASHES DWM.
-         * Patching LegacyPresentRequired->TRUE made COverlayContext::Present call
-         * the swapchain's legacy present (slot 0x170) which returns E_NOTIMPL
-         * (0x80004001) in our MPO context; MilInstrumentationCheckHR_MaybeFailFast
-         * then __fastfails -> DWM crash ~2s after inject (pid 42592->22944, log
-         * "PRESENTRET ret=0x80004001" 2026-09-20). The legacy path is NOT valid
-         * for this swapchain. Do NOT re-enable. Left disabled for the record. */
     } else {
         slog_write("payload.log", SS(SVC_STR_IOP_NOT_IN_BLOB));
     }
@@ -1807,22 +1625,6 @@ void hooks_uninstall(void) {
             FlushInstructionCache(GetCurrentProcess(), g_iop_patch_addr, 8);
             g_iop_patched = FALSE;
             hook_diag(SS(SVC_STR_HK_UNINSTALL_IOP_REVERT));
-        }
-    }
-
-    /* v3.3 revert the force-legacy-present patch. */
-    if (g_flp_patched && g_flp_patch_addr) {
-        DWORD old_prot = 0;
-        if (VirtualProtect(g_flp_patch_addr, 3, PAGE_EXECUTE_READWRITE, &old_prot)) {
-            BYTE *flp = (BYTE *)g_flp_patch_addr;
-            flp[0] = g_flp_saved_bytes[0];
-            flp[1] = g_flp_saved_bytes[1];
-            flp[2] = g_flp_saved_bytes[2];
-            DWORD tmp = 0;
-            VirtualProtect(g_flp_patch_addr, 3, old_prot, &tmp);
-            FlushInstructionCache(GetCurrentProcess(), g_flp_patch_addr, 3);
-            g_flp_patched = FALSE;
-            hook_diag("hooks_uninstall: force-legacy patch reverted");
         }
     }
 
