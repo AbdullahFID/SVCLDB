@@ -3817,7 +3817,21 @@ static ID3D11RenderTargetView *get_or_create_rtv(ID3D11Device *dev,
     g_cache[slot].h   = desc.Height;
     g_cache[slot].fmt = desc.Format;
     *out_w = desc.Width; *out_h = desc.Height; *out_fmt = desc.Format;
-    diag("RTV cached slot=%d %ux%u fmt=%u", slot, desc.Width, desc.Height, (unsigned)desc.Format);
+    /* PERF (v3.1): this used to diag() on EVERY insert. When DWM hands us a
+     * freshly-QI'd Texture2D pointer each frame (common -- the cache key is
+     * the COM pointer, which changes even for the same underlying resource),
+     * the insert path runs every frame and the encrypted per-line slog write
+     * (AES-256-GCM) burned measurable CPU/battery inside dwm.exe at ~display
+     * refresh rate whenever the overlay was visible. Dedupe: only log when
+     * the effective target geometry/format actually changes. Rendering path
+     * is UNTOUCHED -- this is a pure logging gate. */
+    {
+        static UINT s_lw = 0, s_lh = 0; static unsigned s_lfmt = 0xFFFFFFFFu;
+        if (desc.Width != s_lw || desc.Height != s_lh || (unsigned)desc.Format != s_lfmt) {
+            s_lw = desc.Width; s_lh = desc.Height; s_lfmt = (unsigned)desc.Format;
+            diag("RTV cached slot=%d %ux%u fmt=%u", slot, desc.Width, desc.Height, (unsigned)desc.Format);
+        }
+    }
     return rtv;
 }
 

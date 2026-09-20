@@ -7,13 +7,18 @@
  * paths, named events, hook function names, model names, error       *
  * messages, etc. Analysts use these as the FIRST triage step.        *
  *                                                                    *
- * Fix: XOR-encrypt each smoking-gun string at build time and write   *
- * the encrypted blob into .rdata. At DllMain time, XOR back in-place  *
- * so runtime code sees plaintext. Analyst sees garbage in `strings`  *
- * but a memory dump of the running process still shows plaintext --   *
- * that's a tradeoff: static analysis becomes MUCH harder, dynamic    *
- * analysis is unaffected. Since this project's real threat is        *
- * static RE / theft (not runtime EDR), this is the right tradeoff.   *
+ * Fix (v3.1 transient ring): XOR-encrypt each smoking-gun string at   *
+ * build time into a CONST .rdata blob that stays ENCRYPTED at rest    *
+ * for the whole process lifetime. svc_str() decrypts ON DEMAND into a *
+ * small rotating scratch ring, returns a pointer, and the slot is     *
+ * SecureZeroMemory'd again within ~600 ms (opportunistically on the   *
+ * next svc_str() call + periodically via svc_str_scrub_idle() driven  *
+ * from the 60 Hz poll_thread). Result: `strings` sees only garbage    *
+ * AND an admin OpenProcess(dwm,VM_READ) memory grep at steady state   *
+ * finds NONE of our vocabulary -- only the handful of strings touched *
+ * in the last ~600 ms are ever plaintext anywhere. Defeats BOTH the   *
+ * static `strings` sweep and the runtime memory grep. See str_enc.c   *
+ * for the full contract (returned pointer is valid only until used).  *
  *                                                                    *
  * Implementation:                                                     *
  *   1. `strings.list` (kept in `scripts/`) enumerates every string   *
@@ -26,8 +31,8 @@
  *      `const char *` to the decrypted string. Call `svc_str_init()`  *
  *      ONCE from DllMain (payload) or main() (launcher) before any    *
  *      logging code runs.                                             *
- *   4. Decryption happens IN-PLACE on the blob -- after init the blob  *
- *      contains plaintext. No allocation, no thread-local buffers.   *
+ *   4. Decryption happens ON DEMAND into a transient scratch ring --  *
+ *      the blob stays ciphertext at rest; no bulk in-place decrypt.   *
  *                                                                    *
  * The generated file is committed to the repo (not built each time)  *
  * so incremental rebuilds are fast; only re-run gen_str_enc.ps1      *

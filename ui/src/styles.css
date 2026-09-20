@@ -2537,3 +2537,20 @@ body.bg-paused, body.bg-paused * {
   -webkit-animation-play-state: paused !important;
 }
 
+/* v3.1 (2026-09-19) -- honor the OS "reduce motion" preference. Battery +
+ * accessibility win: the always-on decorative motion (bgShift gradient pan,
+ * 3x orbFloat, status/warn/heartbeat pulses, spinner) drives continuous GPU
+ * compositing under the backdrop-filter blurs even while the dashboard just
+ * sits foreground-idle. For users who set Settings > Accessibility > Visual
+ * effects > Animation effects OFF (or prefers-reduced-motion), collapse all
+ * of it to a single instant frame. Default appearance is unchanged for
+ * everyone else -- no feature removed, purely opt-in per OS preference. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
