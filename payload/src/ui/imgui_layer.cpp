@@ -577,6 +577,14 @@ static volatile LONG    g_lean_mode   = 0;
 static HWND             g_fake_hwnd            = NULL;
 static bool             g_win32_backend_inited = false;
 static ULONGLONG        g_last_progman_check   = 0;
+static DWORD            g_progman_pid          = 0;   /* owning explorer PID of g_fake_hwnd */
+/* v3.4 (P0 explorer-restart fix, BP-1:1). Set by ensure_fake_hwnd_valid when
+ * Progman changes (shell restart). Consumed at the TOP of ui_present_frame (on
+ * the DWM compose thread) to do a FULL client teardown + fresh re-acquire --
+ * exactly Bypassify's Uninitialize->Initialize recovery. Doing it on the compose
+ * thread (not a worker) is why BP is reliable and our old worker-thread rearm
+ * was flaky (it raced the compose thread). */
+static volatile LONG    g_needs_client_reinit  = 0;
 
 /* Progman-recovery: fired every frame from ui_present_frame. If our
  * fake HWND is null or destroyed, teardown ImGui-Win32 backend, refind
@@ -584,28 +592,51 @@ static ULONGLONG        g_last_progman_check   = 0;
  * IsWindow every vsync. */
 static bool ensure_fake_hwnd_valid(void) {
     ULONGLONG now = GetTickCount64();
-    if (g_fake_hwnd && IsWindow(g_fake_hwnd)) {
-        return true;
+    /* v3.5 (P0 reliability): the old fast-path `if (IsWindow(g_fake_hwnd)) return`
+     * MISSED explorer restarts whenever the new Progman reused the OLD HWND value
+     * -- Windows recycles HWNDs (observed 0x1D040A reused across restarts), so
+     * the 2nd/3rd explorer-kill never tripped the reinit and the overlay stayed
+     * dead. BP-1:1 fix: poll FindWindow("Progman") on a ~200ms cadence and treat
+     * a change in EITHER the HWND *or its owning process id* (explorer's PID) as
+     * a shell restart. The PID change reliably catches the HWND-reuse case. */
+    if ((now - g_last_progman_check) < 200) {
+        return g_fake_hwnd != NULL;   /* between polls -- cheap */
     }
-    /* Slow path only when HWND missing or invalid. */
+    g_last_progman_check = now;
     HWND newh = FindWindowA("Progman", "Program Manager");
     if (!newh) {
         /* Fallback: try WorkerW (behind-desktop worker windows). */
         newh = FindWindowA("WorkerW", NULL);
     }
-    if (newh == g_fake_hwnd) {
+    DWORD newpid = 0;
+    if (newh) GetWindowThreadProcessId(newh, &newpid);
+    /* Shell restart if the HWND changed, OR the owning explorer PID changed
+     * (HWND reuse), OR our cached HWND went invalid. */
+    BOOL restarted = (newh != g_fake_hwnd) || (newpid != g_progman_pid) ||
+                     (g_fake_hwnd && !IsWindow(g_fake_hwnd));
+    if (!restarted) {
         return g_fake_hwnd != NULL;   /* nothing changed */
     }
     /* Progman changed (explorer restart, session switch, etc.) --
      * teardown Win32 backend, swap HWND, re-init on next frame. */
     if (g_win32_backend_inited) {
-        diag("[RECOVERY] Progman changed %p -> %p; teardown Win32 backend",
-             g_fake_hwnd, newh);
+        diag("[RECOVERY] shell restart: Progman %p(pid %lu) -> %p(pid %lu); teardown Win32 backend",
+             g_fake_hwnd, (unsigned long)g_progman_pid, newh, (unsigned long)newpid);
         ImGui_ImplWin32_Shutdown();
         g_win32_backend_inited = false;
+        /* v3.4 (P0 fix, BP-1:1): a Progman swap while we already had a backend
+         * means the shell (explorer) restarted and rebuilt the desktop's visual
+         * tree, which silently drops our overlay from the scanned-out MPO plane
+         * set. Flag a FULL client teardown + fresh re-acquire -- consumed at the
+         * top of ui_present_frame ON THIS (compose) THREAD next frame. This is
+         * exactly what Bypassify does (Uninitialize -> Initialize on Progman
+         * change): release device/RTV/ImGui, then re-acquire the device +
+         * swapchain fresh from the CURRENT layer + rebuild ImGui. Fully
+         * in-process, no worker thread, no process spawn (OnVUE-safe). */
+        InterlockedExchange(&g_needs_client_reinit, 1);
     }
-    g_fake_hwnd = newh;
-    g_last_progman_check = now;
+    g_fake_hwnd   = newh;
+    g_progman_pid = newpid;
     if (!g_fake_hwnd) return false;
     return true;
 }
@@ -5988,6 +6019,22 @@ static void om_restore(ID3D11DeviceContext *ctx, OMBackup *b) {
 extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
     (void)pCtx;
     if (!pLayer) return;
+
+    /* v3.4 (P0 explorer-restart fix, BP-1:1): full client teardown + rebuild on
+     * shell restart, done HERE on the compose thread (not a worker -> no race).
+     * ensure_fake_hwnd_valid set this when Progman changed. ui_reinit() releases
+     * the ImGui context + DX11/Win32 backends + RTV cache + resets the layer
+     * target/device; we then SKIP this frame so DWM composes one clean native
+     * frame (BP's Uninitialize frame). The NEXT frame hits the !g_imgui_inited
+     * path below and re-acquires the device + rebuilds ImGui fresh from the
+     * CURRENT layer (BP's Initialize frame) -> overlay rejoins the scanned-out
+     * plane set. Mirrors Bypassify's Uninitialize->Initialize exactly. */
+    if (InterlockedExchange(&g_needs_client_reinit, 0) != 0) {
+        diag("[RECOVERY] full client teardown (shell restart, BP-1:1) -- rebuild next frame");
+        ui_reinit();
+        return;
+    }
+
     g_frame_count++;
     /* v11.2.5 message pump REMOVED (LO tested and reported "hotkeys somehow
      * less responsive"). BP does pump the queue per frame via FUN_18000b290
@@ -6631,6 +6678,35 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
         if (InterlockedCompareExchange(&s_first_exc, 1, 0) == 0)
             diag("EXCEPTION in ui_present_frame (silently swallowed to avoid DWM crash)");
     }
+}
+
+/* v3.2 (P0: overlay dies on explorer/shell restart) -- in-process render-layer
+ * re-init for the soft-reinject worker. Unlike ui_shutdown() this does NOT
+ * delete g_ui_cs (keeps the lock valid for concurrent ui_* callers) and does
+ * NOT run the shutdown RedrawWindow cascade. It just drops the ImGui context +
+ * backends + RTV cache + layer target so the next ui_present_frame rebuilds
+ * everything fresh on the CURRENT device/Progman -- exactly what a fresh inject
+ * would build. Safe to call from the rearm worker because draws are stopped
+ * (hooks uninstalled) before this runs, so the compose thread is not inside
+ * ui_present_frame. Chat history + settings are preserved (not touched). */
+extern "C" void ui_reinit(void) {
+    if (g_win32_backend_inited) {
+        ImGui_ImplWin32_Shutdown();
+        g_win32_backend_inited = false;
+    }
+    if (g_imgui_inited) {
+        ImGui_ImplDX11_Shutdown();
+        ImGui::DestroyContext();
+        g_imgui_inited = false;
+    }
+    for (int i = 0; i < RTV_CACHE_MAX; i++) {
+        if (g_cache[i].rtv) g_cache[i].rtv->Release();
+        g_cache[i] = {};
+    }
+    g_last_device = nullptr;
+    g_target_w = g_target_h = 0;
+    g_target_tex = nullptr;
+    diag("ui_reinit: render layer torn down -- next present rebuilds ImGui fresh (shell-restart soft-reinject)");
 }
 
 extern "C" void ui_shutdown() {

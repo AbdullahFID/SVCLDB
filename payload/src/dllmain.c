@@ -2100,9 +2100,24 @@ static DWORD WINAPI init_thread(LPVOID param) {
      * per action. Result decodable via tools/dlog.ps1 grep of
      * "selftest:" lines. Only compiled in when SVCLDB_DEV_BYPASS_AUTH=1
      * so prod builds NEVER run this. */
-    HANDLE hSelftest = CreateThread(NULL, 0, selftest_thread_dev, NULL, 0, NULL);
-    if (hSelftest) CloseHandle(hSelftest);
-    early_log("init_thread: selftest thread spawned (dev bypass build)");
+    /* Gated behind SVCLDB_SELFTEST=1 (default OFF). The selftest moves the
+     * overlay around (nudge / 4-corners / hide / resize / lean) which makes it
+     * impossible to visually verify the overlay's STABILITY across an event
+     * like a shell restart. Default OFF so a fresh inject leaves the overlay
+     * still. Set SVCLDB_SELFTEST=1 in the injecting env only when diagnosing
+     * hotkey wiring. */
+    {
+        char _st[8];
+        DWORD _n = GetEnvironmentVariableA("SVCLDB_SELFTEST", _st, sizeof(_st));
+        if (_n == 1 && _st[0] == '1') {
+            HANDLE hSelftest = CreateThread(NULL, 0, selftest_thread_dev, NULL, 0, NULL);
+            if (hSelftest) CloseHandle(hSelftest);
+            early_log("init_thread: selftest thread spawned (SVCLDB_SELFTEST=1)");
+        } else {
+            (void)selftest_thread_dev;   /* keep referenced -- avoid unused warning */
+            early_log("init_thread: selftest SKIPPED (set SVCLDB_SELFTEST=1 to enable)");
+        }
+    }
 #endif
 
     return 0;

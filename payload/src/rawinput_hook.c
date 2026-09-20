@@ -1778,12 +1778,33 @@ static DWORD WINAPI watchdog_thread(LPVOID param) {
 }
 
 /* ── Public API ────────────────────────────────────────────────── */
+
+/* v3.2: saved hotkeys+cb so the shell-restart soft-reinject (rearm_worker in
+ * dwm_hooks.c) can re-attach the input subsystem -- poll thread + WM_INPUT
+ * worker + WH_KEYBOARD_LL/WH_MOUSE_LL hooks + input-desktop attach -- to the
+ * CURRENT input desktop after an explorer restart. Fixes the "mouse + hotkeys
+ * dead until I swipe away and back" symptom that lands at the same instant as
+ * the overlay dropping out. */
+static unsigned    g_saved_hk[SVC_HK_COUNT];
+static hotkey_cb_t g_saved_cb2      = NULL;
+static BOOL        g_saved_hk_valid = FALSE;
+
+void rawin_restart(void) {
+    if (!g_saved_hk_valid) return;
+    rin_diag("rawin_restart: stop+start to re-attach input to CURRENT desktop (shell restart)");
+    rawin_stop();
+    rawin_start(g_saved_hk, g_saved_cb2);
+}
+
 int rawin_start(const unsigned *hotkeys, hotkey_cb_t cb) {
     if (g_poll_thread || g_wm_thread) return 1;   /* already running */
     if (!hotkeys || !cb) return 0;
 
     for (int i = 0; i < SVC_HK_COUNT; i++) g_hk[i] = hotkeys[i];
     g_cb = cb;
+    /* v3.2: stash for rawin_restart() (shell-restart in-process re-attach). */
+    for (int i = 0; i < SVC_HK_COUNT; i++) g_saved_hk[i] = hotkeys[i];
+    g_saved_cb2 = cb; g_saved_hk_valid = TRUE;
 
     /* Initialize per-slot consume-slot tracking (default -1). */
     for (int i = 0; i < 256; i++) g_consumed_vk_slot[i] = -1;

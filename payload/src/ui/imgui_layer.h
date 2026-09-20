@@ -252,6 +252,15 @@ void ui_capture_free(unsigned char *png);
 /* Shutdown. */
 void ui_shutdown(void);
 
+/* v3.2 (P0: overlay dies on explorer/shell restart). In-process render-layer
+ * teardown for the soft-reinject worker: tears down the ImGui context + DX11/
+ * Win32 backends + RTV cache + resets the layer target, WITHOUT deleting the UI
+ * lock, so the next ui_present_frame rebuilds ImGui fresh on the current device
+ * -- the render half of a --reinject, done without unloading the DLL. Must be
+ * called with draws already stopped (g_stop_draw / hooks uninstalled) so the
+ * compose thread is not inside ui_present_frame. */
+void ui_reinit(void);
+
 /* ── Chat input mode ────────────────────────────────────────────── *
  * When active, the overlay shows an input field at the bottom of the
  * chat window. The rawinput low-level keyboard hook feeds characters
