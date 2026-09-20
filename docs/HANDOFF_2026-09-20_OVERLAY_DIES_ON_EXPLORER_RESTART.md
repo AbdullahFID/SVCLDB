@@ -66,6 +66,17 @@ overlay **disappears from screen and does NOT come back** — until a manual
   fixes it. NOTE: when I killed explorer during testing the overlay died even
   though the heartbeat kept firing — matching the OnVUE report exactly.
 
+**Log evidence during the dead-overlay state (important — narrows it):** the
+render path reports **NO error**. There is NO `device changed -> RTV cache
+cleared`, NO `RTV gate REJECT`, and the one-time render markers (`got backbuffer
+tex (first)`, `RTV cached`, `RenderDrawData completed (first frame)`) only ever
+fire at inject — never again during the dead state. So `present_frame` runs, an
+RTV is obtained (not rejected), and `RenderDrawData` completes — yet nothing is
+scanned out. **=> bug #1 is a scanout / DWM visual-tree-level failure, NOT an
+RTV / device-removed / hook-disabled error.** Do not waste time chasing device
+recreation or RTV failures; the draw chain "succeeds" into a layer that is no
+longer the primary scanned-out surface.
+
 **Working hypothesis (unconfirmed):** on shell restart, DWM re-creates its
 composition device/swapchain and/or the primary scanned-out **visual/layer**
 changes. Our overlay keeps drawing into the layer `get_backbuffer_texture()`
