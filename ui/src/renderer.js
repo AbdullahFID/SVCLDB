@@ -83,7 +83,7 @@ document.getElementById('tb-quit').addEventListener('click', () => {
   try {
     const v = await window.svc.app.getVersion();
     if (!v) return;
-    const short = 'v' + v.split('.').slice(0, 2).join('.');   // "v1.2"
+    const short = 'v' + v;                                    // full version, e.g. "v3.0.0"
     const long  = 'CloakGPT v' + v;                             // "CloakGPT v1.2.0"
     const tb    = document.getElementById('titlebar-ver');
     if (tb)  tb.textContent = short;
