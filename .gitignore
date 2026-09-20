@@ -83,3 +83,9 @@ payload/test/*.obj
 # Ephemeral commit-message drafts (used by tooling that pipes multi-line
 # messages through a temp file, e.g., agent workflows).
 .git-commit-msg.tmp
+
+tools/redteam/probes/ddup.exe
+
+tools/redteam/probes/*.obj
+
+tools/redteam/runtime/
