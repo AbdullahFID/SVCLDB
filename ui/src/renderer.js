@@ -107,6 +107,25 @@ let state = {
 async function boot() {
   showScreen('splash');
   const st = document.getElementById('splash-status');
+
+  /* v5.0.1 (2026-09-21) BUG FIX: load persisted UI-prefs BEFORE any
+   * dashboard paint so chip-active class reflects saved tier/provider.
+   * Previously state.chosen_tier / state.chosen_provider were
+   * in-memory only + reset to hardcoded defaults on every boot; users
+   * reported "clicked STRONG, closed app, didn't save." Fire-and-
+   * forget best-effort -- on load failure we use the hardcoded state
+   * defaults (tier=1 MEDIUM, provider=null auto), same as pre-fix
+   * behavior so nothing regresses if IPC fails. */
+  try {
+    if (window.svc && window.svc.uiPrefs && window.svc.uiPrefs.load) {
+      const p = await window.svc.uiPrefs.load();
+      if (p && typeof p === 'object') {
+        if (typeof p.tier === 'number') state.chosen_tier = p.tier;
+        if (p.provider === null || typeof p.provider === 'number') state.chosen_provider = p.provider;
+      }
+    }
+  } catch (e) { /* silent -- fall back to state defaults */ }
+
   st.textContent = 'Verifying hardware fingerprint…';
   const dto = await window.svc.license.load();
   if (dto && dto.hwid) state.hwid = dto.hwid;
@@ -892,11 +911,26 @@ document.getElementById('btn-signout').addEventListener('click', async () => {
 // Provider chips removed in v4.4 — provider is auto-picked from
 // whichever keys are configured, with runtime failover between them.
 // Tier chips remain (users still want STRONG/MED/CHEAP control).
+//
+// v5.0.1 (2026-09-21) BUG FIX: click handler used to only update
+// in-memory state.chosen_tier without persisting to disk. Users
+// reported "clicked STRONG, closed app, didn't save" -- correct: on
+// next boot state.chosen_tier reset to hardcoded default 1 (MEDIUM).
+// Now: every click also fires window.svc.uiPrefs.save() so the choice
+// survives app restart. boot() loads via .load() before UI paint so
+// chip-active class reflects the saved tier.
 document.querySelectorAll('#chip-tier .chip[data-tier]').forEach(c => {
   c.addEventListener('click', () => {
     document.querySelectorAll('#chip-tier .chip[data-tier]').forEach(x => x.classList.remove('active'));
     c.classList.add('active');
     state.chosen_tier = parseInt(c.dataset.tier, 10);
+    /* Persist immediately (single-value, no debounce needed). Best-
+     * effort -- on save failure the choice still applies for THIS
+     * session; only survival across restart is lost. */
+    if (window.svc && window.svc.uiPrefs && window.svc.uiPrefs.save) {
+      window.svc.uiPrefs.save({ tier: state.chosen_tier, provider: state.chosen_provider })
+        .catch(e => console.log('[ui-prefs] tier save failed:', e && e.message));
+    }
   });
 });
 function _syncChipUi() {

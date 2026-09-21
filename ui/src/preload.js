@@ -97,6 +97,15 @@ contextBridge.exposeInMainWorld('svc', {
     saveSpeed: (mode)     => ipcRenderer.invoke('hotkeys:save-speed', mode),
     reset: ()             => ipcRenderer.invoke('hotkeys:reset'),
   },
+  /* v5.0.1 (2026-09-21): UI-prefs (tier + provider chip choices).
+   * BUG: users reported "I clicked STRONG and it didn't save" -- because
+   * renderer's chip click handler updated only in-memory state.chosen_tier
+   * without any IPC to persist. Fix: renderer now saves on every click
+   * + loads in boot() before UI paint. See storage.js loadUiPrefs/saveUiPrefs. */
+  uiPrefs: {
+    load: ()              => ipcRenderer.invoke('ui-prefs:load'),
+    save: (prefs)         => ipcRenderer.invoke('ui-prefs:save', prefs),
+  },
   /* v1.2 (2026-07-06): overlay-appearance settings — user-picked
    * launch width / height / alpha + ultra-size toggle. Applied on
    * next Inject Now. Storage returns fully-clamped values so the

@@ -1855,6 +1855,24 @@ ipcMain.handle('hotkeys:save-speed', async (_e, mode) => {
   return { ok };
 });
 
+/* v5.0.1 (2026-09-21): UI-prefs (tier + provider chip choices).
+ *
+ * Users reported "clicked STRONG, closed app, didn't save" -- because
+ * renderer.js click handlers updated only in-memory state.chosen_tier /
+ * state.chosen_provider without any IPC to persist. Fix: renderer now
+ * calls window.svc.uiPrefs.save() on every chip click + loads via
+ * .load() in boot() before painting so chip-active class reflects
+ * the saved choice. See storage.js loadUiPrefs/saveUiPrefs. */
+ipcMain.handle('ui-prefs:load', async () => {
+  return storage.loadUiPrefs();
+});
+
+ipcMain.handle('ui-prefs:save', async (_e, prefs) => {
+  if (!prefs || typeof prefs !== 'object') return { ok: false, err: 'bad_prefs' };
+  const ok = storage.saveUiPrefs(prefs);
+  return { ok };
+});
+
 ipcMain.handle('hotkeys:reset', async () => {
   storage.clearHotkeyOverrides();
   return { ok: true };

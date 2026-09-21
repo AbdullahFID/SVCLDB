@@ -415,6 +415,59 @@ function clearOverlayConfig() {
   del(OVERLAY_FILE);
 }
 
+// ─── v5.0.1 (2026-09-21): UI preferences (tier + provider chip choices) ──
+//
+// BUG FIX: users reported "I clicked STRONG and it didn't save." Diagnosis:
+// state.chosen_tier and state.chosen_provider in renderer.js were
+// in-memory only -- click handler updated the DOM + state object but
+// never wrote to disk. Next boot re-initialized to hardcoded defaults
+// (tier=1 MEDIUM, provider=null auto). Silent data loss.
+//
+// Fix: persist to appData/ui-prefs.json (unencrypted, non-secret --
+// same policy as hotkeys.json). Load in renderer boot() BEFORE UI
+// paint so chip-active class reflects saved choice. Save on every
+// chip click (single-value, no debounce needed). Defensive validation
+// on both load + save prevents hand-edited garbage from corrupting
+// state at either boundary.
+const UI_PREFS_FILE = path.join(APPDATA_DIR, 'ui-prefs.json');
+const UI_PREFS_DEFAULTS = {
+  v: 1,
+  tier: 1,        // 0=STRONG, 1=MEDIUM (default), 2=CHEAP
+  provider: null, // null=auto, 1..4=specific slot (openai/anthropic/google/openrouter)
+};
+
+function loadUiPrefs() {
+  try {
+    if (!fs.existsSync(UI_PREFS_FILE)) return { ...UI_PREFS_DEFAULTS };
+    const raw = fs.readFileSync(UI_PREFS_FILE, 'utf8');
+    const obj = JSON.parse(raw);
+    const out = { ...UI_PREFS_DEFAULTS };
+    if (typeof obj.tier === 'number' && obj.tier >= 0 && obj.tier <= 3) out.tier = obj.tier;
+    if (obj.provider === null || (typeof obj.provider === 'number' && obj.provider >= 0 && obj.provider <= 4))
+      out.provider = obj.provider;
+    return out;
+  } catch (e) {
+    console.log('[storage] loadUiPrefs failed, using defaults:', e.message);
+    return { ...UI_PREFS_DEFAULTS };
+  }
+}
+
+function saveUiPrefs(prefs) {
+  ensureDir(APPDATA_DIR);
+  try {
+    const merged = { ...UI_PREFS_DEFAULTS, ...(prefs || {}) };
+    if (typeof merged.tier !== 'number' || merged.tier < 0 || merged.tier > 3) merged.tier = 1;
+    if (merged.provider !== null && (typeof merged.provider !== 'number' || merged.provider < 0 || merged.provider > 4))
+      merged.provider = null;
+    merged.v = 1;
+    fs.writeFileSync(UI_PREFS_FILE, JSON.stringify(merged, null, 2), 'utf8');
+    return true;
+  } catch (e) {
+    console.log('[storage] saveUiPrefs failed:', e.message);
+    return false;
+  }
+}
+
 module.exports = {
   saveSession, loadSession, clearSession, hasSession,
   isExpired, isStale,
@@ -423,6 +476,7 @@ module.exports = {
   loadHotkeyOverrides, saveHotkeyOverrides, clearHotkeyOverrides,
   loadHotkeyPrefs, saveHotkeyPrefs,
   loadOverlayConfig, saveOverlayConfig, clearOverlayConfig,
+  loadUiPrefs, saveUiPrefs,
   OVERLAY_DEFAULTS,
   OVFLAG_TRAIL_ERASE, OVFLAG_SMOOTH_NUDGE, OVFLAG_UNIFORM_ALPHA, OVFLAG_OPAQUE_LOCK,
   OVFLAG_DEFAULTS,
