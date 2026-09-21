@@ -49,6 +49,7 @@
 
 extern "C" {
 #include "../../../shared/log_secure.h"
+#include "../../../shared/obf_names.h"   /* v3.0.2.4: GUID-per-install names */
 #include "../dwm_hooks.h"
 #include "../clipboard_out.h"   /* v9: unified retry+UNICODETEXT copy helper */
 #include "../redact/redact_client.h"   /* screenshot-redactor pipe client */
@@ -1124,11 +1125,12 @@ static void ensure_chat_cs() {
  * wl_input helper installs its OWN WH_KEYBOARD_LL on the iso desktop
  * and needs to know when to swallow keys (during chat-typing mode).
  *
- * Cross-process signal: a NULL-DACL named event Global\NetSvcCoord_Chat.
- * Set when g_chat_active flips to 1; reset when it flips to 0. Helper's
- * LL hook does a fast WaitForSingleObject(ev, 0) per key event to decide
- * consume vs pass-through -- no IPC / no allocation, safe from the LL
- * callback's fast-return constraint. */
+ * Cross-process signal: a NULL-DACL named event named via obf_event_iso_chat()
+ * (GUID-per-install, statistically indistinguishable from Windows/COM
+ * events). Set when g_chat_active flips to 1; reset when it flips to 0.
+ * Helper's LL hook does a fast WaitForSingleObject(ev, 0) per key event
+ * to decide consume vs pass-through -- no IPC / no allocation, safe
+ * from the LL callback's fast-return constraint. */
 static HANDLE g_chat_state_event = NULL;
 static void chat_state_export(void) {
     if (!g_chat_state_event) {
@@ -1138,9 +1140,12 @@ static void chat_state_export(void) {
         SECURITY_ATTRIBUTES sa;
         sa.nLength = sizeof(sa); sa.bInheritHandle = FALSE;
         sa.lpSecurityDescriptor = &sd;
+        /* Convert obf_event_iso_chat()'s ANSI name to wide for CreateEventW. */
+        const char *nm_a = obf_event_iso_chat();
+        wchar_t nm_w[128] = {0};
+        for (int i = 0; nm_a[i] && i < 127; i++) nm_w[i] = (wchar_t)nm_a[i];
         g_chat_state_event = CreateEventW(&sa, TRUE /*manual reset*/,
-                                          FALSE /*initial*/,
-                                          L"Global\\NetSvcCoord_Chat");
+                                          FALSE /*initial*/, nm_w);
     }
     if (g_chat_state_event) {
         if (g_chat_active) SetEvent(g_chat_state_event);

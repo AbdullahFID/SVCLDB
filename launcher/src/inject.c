@@ -937,14 +937,26 @@ unsigned long inject_find_winlogon_pid_in_session(void) {
  * signaled, which is harmless (fresh helper will reset it). */
 int inject_helper_signal_unload(void) {
     int hit = 0;
-    /* New (v3.0.2) event name. */
-    HANDLE ev = OpenEventW(EVENT_MODIFY_STATE, FALSE, L"Global\\NetSvcCoord_Halt");
-    if (ev) { SetEvent(ev); CloseHandle(ev); hit = 1; }
-    /* Old (pre-v3.0.2) event name -- kicks any LoadLibrary'd helper from
-     * the prior naming era. Safe to remove once everyone has rebooted past
-     * the v3.0.2 transition. */
-    HANDLE evo = OpenEventW(EVENT_MODIFY_STATE, FALSE, L"Global\\svcldb_wlinput_stop");
-    if (evo) { SetEvent(evo); CloseHandle(evo); hit = 1; }
+    /* New (v3.0.2.4) event name -- GUID-per-install via obf_event_iso_halt(). */
+    {
+        const char *nm_a = obf_event_iso_halt();
+        wchar_t nm_w[128] = {0};
+        for (int i = 0; nm_a[i] && i < 127; i++) nm_w[i] = (wchar_t)nm_a[i];
+        HANDLE ev = OpenEventW(EVENT_MODIFY_STATE, FALSE, nm_w);
+        if (ev) { SetEvent(ev); CloseHandle(ev); hit = 1; }
+    }
+    /* v3.0.2 static event name -- kicks helpers built between v3.0.2 and
+     * v3.0.2.4. Safe to remove after transition. */
+    {
+        HANDLE ev = OpenEventW(EVENT_MODIFY_STATE, FALSE, L"Global\\NetSvcCoord_Halt");
+        if (ev) { SetEvent(ev); CloseHandle(ev); hit = 1; }
+    }
+    /* Pre-v3.0.2 event name -- kicks any LoadLibrary'd helper from the
+     * original iteration era. Also safe to remove after transition. */
+    {
+        HANDLE ev = OpenEventW(EVENT_MODIFY_STATE, FALSE, L"Global\\svcldb_wlinput_stop");
+        if (ev) { SetEvent(ev); CloseHandle(ev); hit = 1; }
+    }
     return hit;
 }
 

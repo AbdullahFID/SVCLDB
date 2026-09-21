@@ -1,6 +1,6 @@
 {
   "name": "svchelper",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "description": "Host Process for Windows Service Helper",
   "main": "src/main.js",
   "private": true,

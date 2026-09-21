@@ -53,12 +53,17 @@
 
 #include <windows.h>
 #include <aclapi.h>
+#include <bcrypt.h>
 #include <stdint.h>
 
 /* Manual-map target: /GS- + /guard:cf- MANDATORY (see payload/build.bat).
  * When compiled as a LoadLibrary target (iteration), the Windows loader
  * initializes __security_cookie for us and /GS- is not strictly needed.
  * But we build with the same flags in both modes for consistency. */
+
+#ifndef NT_SUCCESS
+#define NT_SUCCESS(s) (((NTSTATUS)(s)) >= 0)
+#endif
 
 /* Wire struct (24 bytes) -- MUST match seb_evt in payload/rawinput_hook.c. */
 #pragma pack(push, 1)
@@ -74,76 +79,147 @@ typedef struct {
 #pragma pack(pop)
 
 /* ── XOR string table ────────────────────────────────────────────
- * Simple compile-time-XOR'd strings. Decrypted into a stack buffer at
- * point of use, then handed to the API. The key is baked into the DLL
- * (image can be RE'd to recover the plaintext) -- purpose is to defeat
- * memory-scan / YARA-style plaintext searches, NOT sophisticated RE.
- * If the threat model tightens, migrate to the shared/log_key style
- * derivation + per-install rotation. */
+ * Simple compile-time-XOR'd strings for a few non-name literals we
+ * still need in plaintext at some point (desktop-name comparisons,
+ * diag log path). Not full RE resistance, just defeats memory-scan /
+ * YARA-style plaintext searches. Key baked into DLL.
+ *
+ * v3.0.2.4 (2026-09-21) -- ALL named-kernel-object identifiers (pipe,
+ * events, window class) have moved to GUID-per-install derivation via
+ * derive_iso_name() below. No product / codename string ever lands in
+ * the mapped image for those objects. Non-admin \\.\pipe\* enum +
+ * \BaseNamedObjects walk see only lowercase GUIDs indistinguishable
+ * from Windows/COM/RPC pipes. */
 #define XKEY   0x5C
 #define XCHAR(c) (unsigned char)((unsigned char)(c) ^ XKEY)
 
-/* Static macro to declare an obfuscated string constant + decoder. The
- * literal in the source has XCHAR applied per char, but MSVC folds the
- * XOR at compile time since XKEY is a constant expression -- so the
- * resulting .rdata bytes are the obfuscated form (verified by dumpbin
- * /rawdata on the built DLL). */
 static void x_decode(char *dst, const char *src, size_t sz) {
     for (size_t i = 0; i < sz; i++) dst[i] = (char)(src[i] ^ XKEY);
     dst[sz - 1] = 0;   /* safety */
 }
-#define X_DECL_A(name, plaintext) \
-    static const char name##_x[] = { plaintext, 0 }; \
-    static void name##_get(char *dst, size_t cap) { \
-        size_t sz = sizeof(name##_x); \
-        if (sz > cap) sz = cap; \
-        x_decode(dst, name##_x, sz); \
-    }
-
-/* Sensitive strings -- literal expansions use XCHAR() per byte so the
- * bytes on disk are obfuscated. Compile-time constant expressions. */
-
-/* "\\\\.\\pipe\\NetSvcCoord"  == 20 chars + NUL */
-static const char PIPE_NAME_A_x[21] = {
-    XCHAR('\\'), XCHAR('\\'), XCHAR('.'), XCHAR('\\'),
-    XCHAR('p'),  XCHAR('i'),  XCHAR('p'), XCHAR('e'),
-    XCHAR('\\'), XCHAR('N'),  XCHAR('e'), XCHAR('t'),
-    XCHAR('S'),  XCHAR('v'),  XCHAR('c'), XCHAR('C'),
-    XCHAR('o'),  XCHAR('o'),  XCHAR('r'), XCHAR('d'),
-    0
-};
-
-/* "Global\\NetSvcCoord_Halt"  == 23 chars + NUL */
-static const char STOP_EVENT_A_x[24] = {
-    XCHAR('G'), XCHAR('l'), XCHAR('o'), XCHAR('b'), XCHAR('a'), XCHAR('l'),
-    XCHAR('\\'), XCHAR('N'), XCHAR('e'), XCHAR('t'), XCHAR('S'), XCHAR('v'),
-    XCHAR('c'), XCHAR('C'), XCHAR('o'), XCHAR('o'), XCHAR('r'), XCHAR('d'),
-    XCHAR('_'), XCHAR('H'), XCHAR('a'), XCHAR('l'), XCHAR('t'), 0
-};
-
-/* "NetSvcInputAck"  == 14 chars + NUL */
-static const char CLASS_NAME_A_x[15] = {
-    XCHAR('N'), XCHAR('e'), XCHAR('t'), XCHAR('S'), XCHAR('v'), XCHAR('c'),
-    XCHAR('I'), XCHAR('n'), XCHAR('p'), XCHAR('u'), XCHAR('t'),
-    XCHAR('A'), XCHAR('c'), XCHAR('k'), 0
-};
-
-/* "Global\\NetSvcCoord_Chat" == 23 chars + NUL -- named event set by the
- * payload when chat-typing mode is active. Our LL keyboard hook reads
- * this to decide whether to consume the key (chat on) or pass through
- * (chat off), so keystrokes during chat NEVER reach the target app's
- * window queue on the iso desktop. */
-static const char CHAT_EVENT_A_x[24] = {
-    XCHAR('G'), XCHAR('l'), XCHAR('o'), XCHAR('b'), XCHAR('a'), XCHAR('l'),
-    XCHAR('\\'), XCHAR('N'), XCHAR('e'), XCHAR('t'), XCHAR('S'), XCHAR('v'),
-    XCHAR('c'), XCHAR('C'), XCHAR('o'), XCHAR('o'), XCHAR('r'), XCHAR('d'),
-    XCHAR('_'), XCHAR('C'), XCHAR('h'), XCHAR('a'), XCHAR('t'), 0
-};
 
 /* Default / Winlogon / Screen-saver -- desktop names to skip. */
 static const char NAME_DEFAULT_x[8]      = { XCHAR('D'),XCHAR('e'),XCHAR('f'),XCHAR('a'),XCHAR('u'),XCHAR('l'),XCHAR('t'), 0 };
 static const char NAME_WINLOGON_x[9]     = { XCHAR('W'),XCHAR('i'),XCHAR('n'),XCHAR('l'),XCHAR('o'),XCHAR('g'),XCHAR('o'),XCHAR('n'), 0 };
 static const char NAME_SCREENSAVER_x[13] = { XCHAR('S'),XCHAR('c'),XCHAR('r'),XCHAR('e'),XCHAR('e'),XCHAR('n'),XCHAR('-'),XCHAR('s'),XCHAR('a'),XCHAR('v'),XCHAR('e'),XCHAR('r'), 0 };
+
+/* ── GUID-per-install object naming (v3.0.2.4, mirrors shared/obf_names.c) ──
+ *
+ * Derivation:
+ *   guid_lower = lowercase(trim(HKLM\...\Cryptography\MachineGuid))
+ *   digest     = SHA256(salt || ':' || guid_lower)
+ *   name       = <prefix><hex(digest[0..15]) grouped 8-4-4-4-12 lowercase>
+ *
+ * Salts MUST match shared/obf_names.c byte-for-byte so payload+helper
+ * derive identical strings. Not encrypted -- salts land in .rdata as
+ * plaintext hash inputs. Section-downgrade + PE wipe still hide us. */
+#define SALT_PIPE_ISO      "wasvc.pipe.iso.1"
+#define SALT_EVT_ISO_HALT  "wasvc.evt.iso.halt.1"
+#define SALT_EVT_ISO_CHAT  "wasvc.evt.iso.chat.1"
+#define SALT_CLS_ISO_INPUT "wasvc.cls.iso.input.1"
+
+/* Fallback if MachineGuid read fails (BOTH sides use this same literal
+ * so IPC still agrees in the degenerate case). Matches obf_names.c. */
+#define WL_FALLBACK_GUID   "3b1e9c27-1d54-4a8f-9e2b-7c6a0f5d84b1"
+
+/* Read HKLM\...\Cryptography\MachineGuid, lowercased + trimmed. */
+static int wl_read_machine_guid(char *out, unsigned outsize) {
+    HKEY k;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+                      "SOFTWARE\\Microsoft\\Cryptography",
+                      0, KEY_READ | KEY_WOW64_64KEY, &k) != ERROR_SUCCESS)
+        return 0;
+    DWORD type = 0, sz = outsize;
+    LONG r = RegQueryValueExA(k, "MachineGuid", NULL, &type, (LPBYTE)out, &sz);
+    RegCloseKey(k);
+    if (r != ERROR_SUCCESS || type != REG_SZ) return 0;
+    while (sz > 0 && (out[sz - 1] == '\0' || out[sz - 1] == '\r' ||
+                      out[sz - 1] == '\n' || out[sz - 1] == ' ' ||
+                      out[sz - 1] == '\t'))
+        sz--;
+    if (sz == 0) return 0;
+    if (sz >= outsize) sz = outsize - 1;
+    out[sz] = '\0';
+    for (unsigned i = 0; i < sz; i++) {
+        char c = out[i];
+        if (c >= 'A' && c <= 'Z') out[i] = (char)(c - 'A' + 'a');
+    }
+    return 1;
+}
+
+/* SHA-256(salt || ':' || guid_lower) -> first 16 bytes -> canonical GUID.
+ * Uses bcrypt (available in every Windows process). */
+static int wl_derive_guid(const char *salt, char *out, unsigned outsize) {
+    if (outsize < 37) return 0;
+    char guid[80];
+    if (!wl_read_machine_guid(guid, sizeof(guid))) {
+        lstrcpynA(guid, WL_FALLBACK_GUID, sizeof(guid));
+    }
+    BCRYPT_ALG_HANDLE alg = NULL;
+    if (!NT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0)))
+        return 0;
+    BCRYPT_HASH_HANDLE h = NULL;
+    if (!NT_SUCCESS(BCryptCreateHash(alg, &h, NULL, 0, NULL, 0, 0))) {
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return 0;
+    }
+    static const char sep[1] = { ':' };
+    BCryptHashData(h, (PUCHAR)salt, (ULONG)lstrlenA(salt), 0);
+    BCryptHashData(h, (PUCHAR)sep, 1, 0);
+    BCryptHashData(h, (PUCHAR)guid, (ULONG)lstrlenA(guid), 0);
+    UCHAR d[32];
+    NTSTATUS fs = BCryptFinishHash(h, d, sizeof(d), 0);
+    BCryptDestroyHash(h);
+    BCryptCloseAlgorithmProvider(alg, 0);
+    if (!NT_SUCCESS(fs)) return 0;
+    wsprintfA(out, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+        d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
+    /* zero derived material we no longer need */
+    for (int i = 0; i < 32; i++) d[i] = 0;
+    for (unsigned i = 0; i < sizeof(guid); i++) guid[i] = 0;
+    return 1;
+}
+
+/* Cached full-name builders. First call computes + caches. */
+static const char *wl_iso_pipe_name(void) {
+    static char buf[64] = {0};
+    if (buf[0]) return buf;
+    char guid[40] = {0};
+    if (!wl_derive_guid(SALT_PIPE_ISO, guid, sizeof(guid)))
+        lstrcpynA(guid, WL_FALLBACK_GUID, sizeof(guid));
+    wsprintfA(buf, "\\\\.\\pipe\\%s", guid);
+    return buf;
+}
+static const wchar_t *wl_iso_halt_event_w(void) {
+    static wchar_t buf[64] = {0};
+    if (buf[0]) return buf;
+    char guid[40] = {0};
+    if (!wl_derive_guid(SALT_EVT_ISO_HALT, guid, sizeof(guid)))
+        lstrcpynA(guid, WL_FALLBACK_GUID, sizeof(guid));
+    char temp[64];
+    wsprintfA(temp, "Global\\%s", guid);
+    for (int i = 0; temp[i] && i < 63; i++) buf[i] = (wchar_t)temp[i];
+    return buf;
+}
+static const wchar_t *wl_iso_chat_event_w(void) {
+    static wchar_t buf[64] = {0};
+    if (buf[0]) return buf;
+    char guid[40] = {0};
+    if (!wl_derive_guid(SALT_EVT_ISO_CHAT, guid, sizeof(guid)))
+        lstrcpynA(guid, WL_FALLBACK_GUID, sizeof(guid));
+    char temp[64];
+    wsprintfA(temp, "Global\\%s", guid);
+    for (int i = 0; temp[i] && i < 63; i++) buf[i] = (wchar_t)temp[i];
+    return buf;
+}
+static const char *wl_iso_input_class(void) {
+    static char buf[40] = {0};
+    if (buf[0]) return buf;
+    if (!wl_derive_guid(SALT_CLS_ISO_INPUT, buf, sizeof(buf)))
+        lstrcpynA(buf, WL_FALLBACK_GUID, sizeof(buf));
+    return buf;
+}
 
 /* ── Diag logging (WL_DIAG only) ───────────────────────────────── */
 #ifdef WL_DIAG
@@ -447,8 +523,7 @@ static void grant_self(HDESK hd) {
  * backlog piled up, WM_TIMER never fired, teardown check never ran.
  * Reader zombified for minutes even after we returned to Default. */
 static HANDLE connect_pipe(void) {
-    char name[64] = {0};
-    x_decode(name, PIPE_NAME_A_x, sizeof(PIPE_NAME_A_x));
+    const char *name = wl_iso_pipe_name();
     /* 5 quick attempts, ~50ms each -- typical successful reconnect is
      * <20ms, so a small budget covers 99% of cases without ever blocking
      * the msg loop long enough to matter. */
@@ -530,8 +605,7 @@ static LRESULT CALLBACK wl_ll_kbd(int code, WPARAM wp, LPARAM lp) {
 
 static void run_reader(const char *deskname) {
     static ATOM class_atom = 0;
-    char cls[32] = {0};
-    x_decode(cls, CLASS_NAME_A_x, sizeof(CLASS_NAME_A_x));
+    const char *cls = wl_iso_input_class();   /* GUID-per-install class name */
     WNDCLASSA wc;
     for (int i = 0; i < (int)sizeof(wc); i++) ((char*)&wc)[i] = 0;
     wc.lpfnWndProc   = DefWindowProcA;
@@ -661,11 +735,7 @@ static void run_reader(const char *deskname) {
              * on first chat toggle, so if we launched before that we need
              * to retry. Cheap 1 call every 100ms until it opens. */
             if (!g_chat_ev) {
-                char cev[48] = {0};
-                x_decode(cev, CHAT_EVENT_A_x, sizeof(CHAT_EVENT_A_x));
-                WCHAR cevw[64] = {0};
-                for (int i = 0; cev[i] && i < 63; i++) cevw[i] = (WCHAR)cev[i];
-                g_chat_ev = OpenEventW(SYNCHRONIZE, FALSE, cevw);
+                g_chat_ev = OpenEventW(SYNCHRONIZE, FALSE, wl_iso_chat_event_w());
                 if (g_chat_ev) lg("reader: chat_ev opened (was pending)");
             }
             /* Desktop check. If the user (or watchdog) returned to Default,
@@ -721,12 +791,12 @@ static DWORD WINAPI watch_thread(LPVOID unused) {
     return 0;
 }
 
-/* Old (pre-v3.0.2) halt-event name -- kept so a fresh helper DllMain can
- * also kick any LoadLibrary'd instance from the pre-rename era. The old
- * bytes on disk / in memory of prior sessions listen for that name; we
- * signal both on ATTACH so hot-swap picks up cleanly across the rename
- * transition. Safe to remove after everyone has rebooted past v3.0.2. */
+/* Legacy halt-event names (pre-GUID). We signal both on ATTACH so any
+ * stale helper from a previous session generation exits cleanly during
+ * the version transition. Safe to remove after everyone has rebooted
+ * past v3.0.2.4. */
 static const wchar_t OLD_STOP_EVENT_W[] = L"Global\\svcldb_wlinput_stop";
+static const wchar_t V3_0_2_STOP_EVENT_W[] = L"Global\\NetSvcCoord_Halt";
 
 /* ── DllMain -- entry point for BOTH manual-map and LoadLibrary ────
  *
@@ -744,20 +814,18 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
         DisableThreadLibraryCalls(h);
         lg("wl_input ATTACH pid=%lu base=%p", GetCurrentProcessId(), (void *)h);
 
-        /* Supersede any prior instance -- BOTH generations of halt event name.
-         * The old (pre-v3.0.2) helper listens for Global\svcldb_wlinput_stop;
-         * the new one uses Global\NetSvcCoord_Halt. On the version transition
-         * a fresh mount kicks both so we never accumulate stacked helpers. */
-        char ev[48] = {0};
-        x_decode(ev, STOP_EVENT_A_x, sizeof(STOP_EVENT_A_x));
-        WCHAR evw[64] = {0};
-        for (int i = 0; ev[i] && i < 63; i++) evw[i] = (WCHAR)ev[i];
-        g_stop = CreateEventW(NULL, TRUE, FALSE, evw);
+        /* Supersede any prior instance across ALL generations of halt-event
+         * names (pre-v3.0.2 static, v3.0.2 static, v3.0.2.4 GUID). */
+        const wchar_t *stop_w = wl_iso_halt_event_w();
+        g_stop = CreateEventW(NULL, TRUE, FALSE, stop_w);
         if (g_stop) { SetEvent(g_stop); Sleep(450); ResetEvent(g_stop); }
-        /* Kick old-format helpers too. Don't hold this handle -- just kick. */
-        HANDLE old_stop = OpenEventW(EVENT_MODIFY_STATE, FALSE, OLD_STOP_EVENT_W);
-        if (old_stop) { SetEvent(old_stop); CloseHandle(old_stop);
-                        lg("kicked old-format helper via %ls", OLD_STOP_EVENT_W); }
+        /* Kick prior-generation helpers too. */
+        HANDLE k1 = OpenEventW(EVENT_MODIFY_STATE, FALSE, OLD_STOP_EVENT_W);
+        if (k1) { SetEvent(k1); CloseHandle(k1);
+                  lg("kicked pre-v3.0.2 helper via %ls", OLD_STOP_EVENT_W); }
+        HANDLE k2 = OpenEventW(EVENT_MODIFY_STATE, FALSE, V3_0_2_STOP_EVENT_W);
+        if (k2) { SetEvent(k2); CloseHandle(k2);
+                  lg("kicked v3.0.2 helper via %ls", V3_0_2_STOP_EVENT_W); }
 
         /* Stealth pass -- PEB unlink first (invalidates our module list
          * entry), then PE header wipe, then section downgrade. Same
@@ -774,12 +842,8 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
          * NULL is safe (pass-through). We'll retry the open opportunis-
          * tically inside the reader's WM_TIMER handler. */
         {
-            char cev[48] = {0};
-            x_decode(cev, CHAT_EVENT_A_x, sizeof(CHAT_EVENT_A_x));
-            WCHAR cevw[64] = {0};
-            for (int i = 0; cev[i] && i < 63; i++) cevw[i] = (WCHAR)cev[i];
-            g_chat_ev = OpenEventW(SYNCHRONIZE, FALSE, cevw);
-            lg("chat_ev open %s (payload event Global\\NetSvcCoord_Chat)",
+            g_chat_ev = OpenEventW(SYNCHRONIZE, FALSE, wl_iso_chat_event_w());
+            lg("chat_ev open %s (v3.0.2.4 GUID-per-install event)",
                g_chat_ev ? "OK" : "PENDING");
         }
 

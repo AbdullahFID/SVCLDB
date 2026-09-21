@@ -79,6 +79,16 @@ const char *obf_mutex_ocrdaemon(void);
  * an injected end-to-end status test. */
 const char *obf_event_shutdown(void);
 
+/* v3.0.2.4 (2026-09-21) -- iso-desktop input plumbing. Same treatment
+ * as the Default-desktop pipes: GUID-per-install derived at runtime,
+ * no static IOC in the binary. MUST match the inline derivation in
+ * tools/redteam/probes/wl_input.c (helper is manual-mapped + self-
+ * contained). */
+const char *obf_pipe_iso(void);
+const char *obf_event_iso_halt(void);
+const char *obf_event_iso_chat(void);
+const char *obf_class_iso_input(void);
+
 #ifdef __cplusplus
 }
 #endif

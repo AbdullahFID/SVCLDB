@@ -26,6 +26,15 @@
 #define SALT_MTX_INIT     "wasvc.mtx.init.1"
 #define SALT_MTX_OCRD     "wasvc.mtx.ocrd.1"
 #define SALT_EVT_SHUT     "wasvc.evt.shut.1"
+/* v3.0.2.4 (2026-09-21) -- iso-desktop input plumbing. Same GUID-per-
+ * install treatment as the Default-desktop pipes, so a non-admin
+ * enumeration of \\.\pipe\* + \BaseNamedObjects sees only GUID-named
+ * objects statistically indistinguishable from Windows/COM/RPC pipes.
+ * Salts MUST match the copies in tools/redteam/probes/wl_input.c. */
+#define SALT_PIPE_ISO      "wasvc.pipe.iso.1"
+#define SALT_EVT_ISO_HALT  "wasvc.evt.iso.halt.1"
+#define SALT_EVT_ISO_CHAT  "wasvc.evt.iso.chat.1"
+#define SALT_CLS_ISO_INPUT "wasvc.cls.iso.input.1"
 
 /* Fallback machine key used only if the registry read fails. Both C
  * and JS use this SAME literal so the endpoints still agree in the
@@ -142,4 +151,29 @@ const char *obf_mutex_ocrdaemon(void) {
 const char *obf_event_shutdown(void) {
     static char buf[64] = {0};
     return cached_name(buf, sizeof(buf), "Global\\", SALT_EVT_SHUT);
+}
+
+/* ── v3.0.2.4 (2026-09-21) iso-desktop names ───────────────────────
+ * Same GUID-per-install treatment as the Default-desktop pipes.
+ * MUST match the inline derivation in tools/redteam/probes/wl_input.c
+ * (the helper is manual-mapped + self-contained, so it re-derives
+ * from the same salts + MachineGuid input). */
+const char *obf_pipe_iso(void) {
+    static char buf[64] = {0};
+    return cached_name(buf, sizeof(buf), "\\\\.\\pipe\\", SALT_PIPE_ISO);
+}
+const char *obf_event_iso_halt(void) {
+    static char buf[64] = {0};
+    return cached_name(buf, sizeof(buf), "Global\\", SALT_EVT_ISO_HALT);
+}
+const char *obf_event_iso_chat(void) {
+    static char buf[64] = {0};
+    return cached_name(buf, sizeof(buf), "Global\\", SALT_EVT_ISO_CHAT);
+}
+/* Class names have NO prefix (raw GUID); a plain lowercase-GUID class
+ * looks like a random Windows registered class atom (there are dozens
+ * in a live session). */
+const char *obf_class_iso_input(void) {
+    static char buf[64] = {0};
+    return cached_name(buf, sizeof(buf), "", SALT_CLS_ISO_INPUT);
 }

