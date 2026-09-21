@@ -11,6 +11,38 @@ and `.cursor/rules/fast-testing-launch.mdc`.
 
 Recent operational handoffs (append to top as new ones land):
 
+- `docs/HANDOFF_2026-09-21_SEB_ARCH_B_LANDED.md` — **✅ P1 RESOLVED 2026-09-21.**
+  SEB secure-desktop overlay input works via a `winlogon`-hosted SYSTEM helper
+  (`tools/redteam/probes/wl_input.c`) that reads raw input on whatever desktop
+  is active and forwards keyboard + mouse to the payload over a named pipe
+  (`\\.\pipe\svcldb_seb_input`). The payload runs events through the SAME
+  `match_hk`/`fire()` and chat-typing helpers as its local LL hook, so user
+  bindings apply verbatim. **Mouse works flawlessly** (position, click, drag,
+  wheel, triple-click, mouse-hold). **Keyboard hotkeys fire** (Ctrl+arrow,
+  Ctrl+B, Ctrl+T etc.) — dispatched on both DN and UP because Windows suppresses
+  many `Ctrl+key` DOWN events on bare secure desktops; `fire()`'s debounce
+  dedups when both arrive. **Chat typing works** end-to-end via `ToUnicodeEx`.
+  All validated on `desktop_switch.exe` simulator — real-SEB validation is
+  still pending. **Do NOT** put back `rawin_restart()` on entering a secure
+  desktop (that churn was the earlier flakiness source). **Do NOT** attempt
+  Architecture A again (DWM-4 walled from foreign desktops even after DACL
+  grant — proven dead end). Production hardening (manual-map helper, auto-
+  inject at setup, host auto-select, strip diag logs, rename pipe) still TBD.
+- `docs/HANDOFF_2026-09-21_SEB_HOLD_TO_MOVE.md` — **🟡 P2 OPEN 2026-09-21.**
+  Isolated sub-item of the SEB fix above. Keyboard **hold-to-move** (Ctrl+arrow
+  continuous glide) doesn't feel 1:1 with the local Default-desktop behavior.
+  Root cause: Windows on the secure desktop delivers `Ctrl+key` UP events only
+  every 400-700 ms (not typematic ~33 ms) and no user-mode API reports "physically
+  held" state to a non-foreground thread on a foreign desktop. Tap-nudge works
+  fine (fire-on-UP); continuous hold-slide does not. Virtual-hold + 60Hz repeat
+  driver attempted, didn't feel right, reverted. Doc lists the avenues to explore
+  (foreground-steal transparent window; `AttachThreadInput`; adaptive virt-hold;
+  client-side glide smoothing). Mouse hold + gestures are fine — this is
+  keyboard-chord-repeat only.
+- `docs/HANDOFF_2026-09-20_SEB_SECURE_DESKTOP.md` — original investigation
+  record for the SEB P1 (superseded by the LANDED doc above; kept for the
+  full trail of dead ends: DWM-4 DACL self-grant, re-attach on retry, etc.).
+
 - `docs/HANDOFF_2026-09-20_OVERLAY_DIES_ON_EXPLORER_RESTART.md` — **✅ RESOLVED
   2026-09-20** (commits `b5c83d8` + `921d908`, branch v3). Overlay now survives
   explorer/shell restart, validated ~15 consecutive kills. **Root cause:**

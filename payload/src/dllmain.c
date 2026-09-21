@@ -1495,6 +1495,10 @@ static DWORD WINAPI shutdown_watcher(LPVOID param) {
     slog_write("payload.log", "shutdown signal received");
 
     InterlockedExchange(&g_running, 0);
+    /* v3.0.1: stop the secure-desktop watcher FIRST so it can't fire a
+     * rawin_restart() mid-teardown (it calls rawin_stop/start internally). */
+    rawin_stop_desktop_watch();
+    rawin_stop_seb_pipe();
     rawin_stop();
     ldb_detect_stop();
     sub_check_stop();
@@ -2001,6 +2005,13 @@ static DWORD WINAPI init_thread(LPVOID param) {
     /* Start background workers. */
     ldb_detect_start(on_ldb_arm, on_ldb_disarm);
     rawin_start(cfg->hotkeys, on_hotkey);
+    /* v3.0.1 (2026-09-20): follow SEB / WinLogon / UAC secure-desktop switches
+     * -- re-attach input to whatever desktop becomes active. See
+     * rawinput_hook.c desktop_watch_thread. */
+    rawin_start_desktop_watch();
+    /* v3.0.1 (SEB Architecture B): receive forwarded input from the SYSTEM
+     * secure-desktop helper (winlogon) over a named pipe. */
+    rawin_start_seb_pipe();
 
     /* Push hotkey bindings to UI so buttons show mapped hotkeys
      * (e.g. "Copy full [Ctrl+Alt+C]"). Fires once at arm; if user

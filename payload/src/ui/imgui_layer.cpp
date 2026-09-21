@@ -1792,6 +1792,19 @@ extern "C" int ui_point_in_overlay(int x, int y) {
 static volatile LONG g_ui_mouse_left_down = 0;
 static volatile LONG g_mouse_over_widget  = 0;
 
+/* v3.0.1 (SEB Arch B): forced cursor position. On a secure (SEB) desktop the
+ * compose thread's GetCursorPos is wrong for that desktop, so the winlogon
+ * input helper feeds the real position here (via rawinput_hook's pipe handler)
+ * and the compose thread uses it instead of GetCursorPos when active. */
+static volatile LONG g_forced_mouse_active = 0;
+static volatile LONG g_forced_mouse_x = 0;
+static volatile LONG g_forced_mouse_y = 0;
+extern "C" void ui_set_forced_mouse(int active, int x, int y) {
+    InterlockedExchange(&g_forced_mouse_x, x);
+    InterlockedExchange(&g_forced_mouse_y, y);
+    InterlockedExchange(&g_forced_mouse_active, active ? 1 : 0);
+}
+
 extern "C" void ui_set_mouse_left_down(int down) {
     InterlockedExchange(&g_ui_mouse_left_down, down ? 1 : 0);
 }
@@ -5939,22 +5952,28 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
             ImGui::PushStyleColor(ImGuiCol_Text, col_text_dim);
             if (sl == 0) {
                 /* Home view (either empty history OR user hit back).
-                 * Ctrl+Alt+X here QUITS since there's no chat to hide.
                  *
                  * v1.7.4 (2026-07-23): footer uses ui_format_hotkey to
                  * dynamically resolve the current binding label so it
                  * stays truthful when user rebinds. Falls back to sane
-                 * default text if action unbound. */
-                char ask_l[64] = {0}, type_l[64] = {0}, toggle_l[64] = {0}, quit_l[64] = {0};
+                 * default text if action unbound.
+                 *
+                 * v3.0.1 (2026-09-20): "quit" hint (SVC_HK_CLEAR / Ctrl+Q)
+                 * REMOVED from this strip. On the home view Ctrl+Q only
+                 * *hides* (soft-quit was deliberately downgraded from unload
+                 * for the SendInput/GetAsyncKeyState footgun -- see
+                 * dllmain.c SVC_HK_CLEAR). Advertising it as "quit" made
+                 * users press it expecting a real quit and see nothing but
+                 * a hide -- confusing. Toggle already covers hide/show, so
+                 * the label is just dropped here. Binding is untouched. */
+                char ask_l[64] = {0}, type_l[64] = {0}, toggle_l[64] = {0};
                 ui_format_hotkey(SVC_HK_ASK,    ask_l,    sizeof(ask_l));
                 ui_format_hotkey(SVC_HK_TYPING, type_l,   sizeof(type_l));
                 ui_format_hotkey(SVC_HK_TOGGLE, toggle_l, sizeof(toggle_l));
-                ui_format_hotkey(SVC_HK_CLEAR,  quit_l,   sizeof(quit_l));
-                ImGui::Text("%s ask   |   %s type   |   %s toggle   |   %s quit",
+                ImGui::Text("%s ask   |   %s type   |   %s toggle",
                             ask_l[0] ? ask_l : "(unbound)",
                             type_l[0] ? type_l : "(unbound)",
-                            toggle_l[0] ? toggle_l : "(unbound)",
-                            quit_l[0] ? quit_l : "(unbound)");
+                            toggle_l[0] ? toggle_l : "(unbound)");
             } else {
                 /* Chat visible.
                  *  - Ctrl+Alt+X = BACK (hide chat, preserve msgs)
@@ -6023,7 +6042,7 @@ static void om_restore(ID3D11DeviceContext *ctx, OMBackup *b) {
  * as part of its recovery, so we mirror that. Guarded so overlapping shell
  * restarts don't race two stop/start cycles. NOT a process spawn -- an internal
  * thread, invisible to OnVUE's process enumeration. */
-extern "C" void rawin_restart(void);   /* rawinput_hook.c (C linkage) */
+extern "C" int rawin_restart(void);   /* rawinput_hook.c (C linkage) */
 static volatile LONG g_input_reattach_busy = 0;
 static DWORD WINAPI input_reattach_worker(LPVOID) {
     if (InterlockedExchange(&g_input_reattach_busy, 1) != 0) return 0;
@@ -6570,9 +6589,15 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
          * (published by the LL mouse hook -- the backend never sees clicks
          * because they route to the app under the cursor). */
         {
-            POINT _cur;
-            if (GetCursorPos(&_cur))
-                io.AddMousePosEvent((float)_cur.x, (float)_cur.y);
+            if (InterlockedCompareExchange(&g_forced_mouse_active, 0, 0)) {
+                /* Secure desktop: use the position the winlogon helper forwarded. */
+                io.AddMousePosEvent((float)(int)InterlockedCompareExchange(&g_forced_mouse_x, 0, 0),
+                                    (float)(int)InterlockedCompareExchange(&g_forced_mouse_y, 0, 0));
+            } else {
+                POINT _cur;
+                if (GetCursorPos(&_cur))
+                    io.AddMousePosEvent((float)_cur.x, (float)_cur.y);
+            }
             io.AddMouseButtonEvent(0, g_ui_mouse_left_down != 0);
         }
         ImGui::NewFrame();

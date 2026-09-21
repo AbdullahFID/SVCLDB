@@ -1,3 +1,11 @@
 # Transient scorecard / probe output -- never commit run artifacts.
 runtime/
 *.log
+
+# Iterative probe/helper builds (source .c/.cpp is committed, binaries are not).
+probes/*.dll
+probes/*.exe
+probes/*.obj
+probes/*.exp
+probes/*.lib
+probes/*.pdb

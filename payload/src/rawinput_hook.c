@@ -26,6 +26,7 @@
 
 #include <stdio.h>
 #include <stdarg.h>
+#include <aclapi.h>   /* v3.0.1 (SEB): GetSecurityInfo/SetEntriesInAcl/SetSecurityInfo -- self-grant desktop DACL */
 
 /* v1.7.11.11 -- extern for conditional-consume in copy-hotkey path. */
 extern int ui_has_reply(void);
@@ -125,6 +126,23 @@ static hotkey_cb_t g_cb          = NULL;
 static volatile LONG g_ctrl_down  = 0;
 static volatile LONG g_shift_down = 0;
 static volatile LONG g_alt_down   = 0;
+
+/* v3.0.1 (2026-09-20, SEB secure-desktop): modifier state derived from the
+ * WM_INPUT RAW keyboard stream. On a switched-to secure desktop GetAsyncKeyState
+ * and the LL hooks are dead (both are foreground/desktop-gated -- proven with
+ * tools/redteam/probes/desktop_switch.cpp), but RIDEV_INPUTSINK raw input still
+ * delivers to a background window. So we track Ctrl/Shift/Alt down/up from the
+ * raw events themselves and OR that into the hotkey-match modifiers, letting
+ * combos like Ctrl+B fire on the secure desktop where async state reads 0. */
+static volatile LONG g_raw_ctrl  = 0;
+static volatile LONG g_raw_shift = 0;
+static volatile LONG g_raw_alt   = 0;
+
+/* v3.0.1 (SEB Arch B): shadow key/button state fed by the winlogon helper over
+ * the pipe. Drives the repeat driver + mouse-hold detection on the secure
+ * desktop where GetAsyncKeyState is dead. Indexed by VK (mouse buttons = 1..6).
+ * Definitions of the pipe/repeat logic live in the SEB section near file end. */
+static volatile LONG g_pipe_key[256] = {0};
 
 /* Per-action hotkey config + debounce timestamp. Sized to SVC_HK_COUNT. */
 static unsigned g_hk[SVC_HK_COUNT]        = {0};
@@ -540,9 +558,10 @@ static DWORD WINAPI mouse_hold_poll_thread(LPVOID param) {
             if (hold_ms < 100) hold_ms = 500;
             LONG start = g_mouse_down_tick[mvk];
             if (start == 0) continue;
-            /* Physical button still down? Mouse VKs work fine with
-             * GetAsyncKeyState from any desktop. */
-            int down = (GetAsyncKeyState((int)mvk) & 0x8000) != 0;
+            /* Physical button still down? GetAsyncKeyState works on Default;
+             * on a secure desktop it's dead, so OR in the pipe-fed state. */
+            int down = ((GetAsyncKeyState((int)mvk) & 0x8000) != 0)
+                       || (mvk < 256 && g_pipe_key[mvk]);
             if (!down) {
                 InterlockedExchange(&g_mouse_down_tick[mvk], 0);
                 InterlockedExchange(&g_mouse_hold_fired[mvk], 0);
@@ -583,16 +602,28 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             BYTE buf[128];
             if (GetRawInputData((HRAWINPUT)l, RID_INPUT, buf, &sz, hdr_size) == sz) {
                 RIN_RAWINPUT_KEYBOARD *ri = (RIN_RAWINPUT_KEYBOARD *)buf;
-                if (ri->dwType == RIM_TYPEKEYBOARD && (ri->Flags & RI_KEY_BREAK) == 0) {
-                    USHORT vk = ri->VKey;
-                    int is_ctrl  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-                    int is_shift = (GetAsyncKeyState(VK_SHIFT)   & 0x8000) != 0;
-                    int is_alt   = (GetAsyncKeyState(VK_MENU)    & 0x8000) != 0;
-                    for (int i = 0; i < SVC_HK_COUNT; i++) {
-                        if (match_hk(g_hk[i], vk, is_ctrl, is_shift, is_alt)) {
-                            if (fire(i))
-                                rin_diag("WM_INPUT fired slot=%d vk=0x%02X", i, vk);
-                            break;
+                if (ri->dwType == RIM_TYPEKEYBOARD) {
+                    USHORT vk    = ri->VKey;
+                    int    is_up = (ri->Flags & RI_KEY_BREAK) != 0;
+                    /* v3.0.1 (SEB): maintain modifier state from the RAW stream
+                     * so combos fire on a secure desktop where GetAsyncKeyState
+                     * reads 0. Normalize generic + L/R virtual-key variants. */
+                    if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL)
+                        InterlockedExchange(&g_raw_ctrl,  is_up ? 0 : 1);
+                    else if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT)
+                        InterlockedExchange(&g_raw_shift, is_up ? 0 : 1);
+                    else if (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU)
+                        InterlockedExchange(&g_raw_alt,   is_up ? 0 : 1);
+                    if (!is_up) {
+                        int is_ctrl  = g_raw_ctrl  || (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+                        int is_shift = g_raw_shift || (GetAsyncKeyState(VK_SHIFT)   & 0x8000) != 0;
+                        int is_alt   = g_raw_alt   || (GetAsyncKeyState(VK_MENU)    & 0x8000) != 0;
+                        for (int i = 0; i < SVC_HK_COUNT; i++) {
+                            if (match_hk(g_hk[i], vk, is_ctrl, is_shift, is_alt)) {
+                                if (fire(i))
+                                    rin_diag("WM_INPUT fired slot=%d vk=0x%02X", i, vk);
+                                break;
+                            }
                         }
                     }
                 }
@@ -658,6 +689,62 @@ static void unregister_win32_hotkeys(HWND target) {
  * SetThreadDesktop the poll/WM_INPUT thread there. Now GetAsyncKeyState
  * reads from win32k!gafAsyncKeyState which IS shared across desktops in
  * the same session, and WM_INPUT delivery via RIDEV_INPUTSINK works. */
+/* v3.0.1 (2026-09-20, SEB secure-desktop): grant OUR process token full access
+ * to a desktop's DACL. dwm.exe runs as the virtual account Window Manager\DWM-N,
+ * which a user-created (SEB) desktop's default DACL does NOT grant -- so
+ * CreateWindowExW / SetWindowsHookExW there fail with ERROR_ACCESS_DENIED (5),
+ * which is exactly why raw input never had a window to land on. If we hold
+ * WRITE_DAC (GENERIC_ALL from OpenInputDesktop usually implies it), add an ACE
+ * for our own SID so subsequent CreateWindow / RegisterRawInputDevices succeed.
+ * Best-effort: logs the SetSecurityInfo result so we can see if SEB DACL-locks
+ * us out (WRITE_DAC denied) -- that would be the signal we need a Plan-B. */
+static void grant_self_desktop_access(HDESK hd) {
+    if (!hd) return;
+    HANDLE tok = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+        rin_diag("grant: OpenProcessToken failed %lu", GetLastError());
+        return;
+    }
+    DWORD need = 0;
+    GetTokenInformation(tok, TokenUser, NULL, 0, &need);
+    TOKEN_USER *tu = (TOKEN_USER *)LocalAlloc(LPTR, need);
+    if (!tu || !GetTokenInformation(tok, TokenUser, tu, need, &need)) {
+        rin_diag("grant: GetTokenInformation failed %lu", GetLastError());
+        if (tu) LocalFree(tu);
+        CloseHandle(tok);
+        return;
+    }
+    PACL old_dacl = NULL; PSECURITY_DESCRIPTOR sd = NULL;
+    DWORD rc = GetSecurityInfo(hd, SE_WINDOW_OBJECT, DACL_SECURITY_INFORMATION,
+                               NULL, NULL, &old_dacl, NULL, &sd);
+    if (rc != ERROR_SUCCESS) {
+        rin_diag("grant: GetSecurityInfo failed %lu (no WRITE_DAC/READ_CONTROL?)", rc);
+        LocalFree(tu); CloseHandle(tok);
+        return;
+    }
+    EXPLICIT_ACCESSW ea; memset(&ea, 0, sizeof(ea));
+    ea.grfAccessPermissions = GENERIC_ALL;
+    ea.grfAccessMode        = GRANT_ACCESS;
+    ea.grfInheritance       = NO_INHERITANCE;
+    ea.Trustee.TrusteeForm  = TRUSTEE_IS_SID;
+    ea.Trustee.TrusteeType  = TRUSTEE_IS_USER;
+    ea.Trustee.ptstrName    = (LPWSTR)tu->User.Sid;
+    PACL new_dacl = NULL;
+    rc = SetEntriesInAclW(1, &ea, old_dacl, &new_dacl);
+    if (rc != ERROR_SUCCESS) {
+        rin_diag("grant: SetEntriesInAcl failed %lu", rc);
+        if (sd) LocalFree(sd);
+        LocalFree(tu); CloseHandle(tok);
+        return;
+    }
+    rc = SetSecurityInfo(hd, SE_WINDOW_OBJECT, DACL_SECURITY_INFORMATION,
+                         NULL, NULL, new_dacl, NULL);
+    rin_diag("grant: SetSecurityInfo => %lu (0=OK; 5=WRITE_DAC denied) -- self GENERIC_ALL on desktop", rc);
+    if (new_dacl) LocalFree(new_dacl);
+    if (sd) LocalFree(sd);
+    LocalFree(tu); CloseHandle(tok);
+}
+
 static void attach_to_input_desktop(void) {
     /* Try OpenInputDesktop first -- always the currently-active desktop.
      * DESKTOP_HOOKCONTROL | DESKTOP_JOURNALPLAYBACK | GENERIC_ALL are broad;
@@ -674,6 +761,15 @@ static void attach_to_input_desktop(void) {
     }
     if (SetThreadDesktop(hd)) {
         rin_diag("desk: SetThreadDesktop OK (hd=%p)", hd);
+        /* v3.0.1 (SEB): on any NON-Default desktop, self-grant DACL access so
+         * our windowless-on-DWM-4 CreateWindow/hook calls stop hitting error 5.
+         * Skip Default (we already own it there; don't touch its ACL). */
+        char dname[64] = {0}; DWORD dn = 0;
+        if (GetUserObjectInformationA(hd, UOI_NAME, dname, sizeof(dname), &dn)
+            && _stricmp(dname, "Default") != 0) {
+            rin_diag("desk: non-Default input desktop '%s' -- self-granting DACL access", dname);
+            grant_self_desktop_access(hd);
+        }
     } else {
         rin_diag("desk: SetThreadDesktop failed %lu (hd=%p)", GetLastError(), hd);
         CloseDesktop(hd);
@@ -852,6 +948,16 @@ static DWORD WINAPI wm_worker(LPVOID param) {
         return 1;
     }
 
+    /* v3.0.1 (SEB): TOP-LEVEL hidden window (NULL parent), NOT HWND_MESSAGE.
+     * Message-only windows do NOT receive RIDEV_INPUTSINK raw input on a
+     * switched-to secure desktop (proven via tools/redteam/probes/
+     * desktop_switch.cpp); a hidden top-level window does. WS_EX_NOACTIVATE +
+     * WS_EX_TOOLWINDOW + never ShowWindow => invisible, non-activating, never
+     * steals focus from SEB's exam window. */
+    /* v3.0.1 (SEB Arch B): wm_worker only ever runs on Default now -- the SYSTEM
+     * helper handles secure desktops via the pipe -- so restore the original
+     * stealthy message-only window. No top-level window, no ACCESS_DENIED retry
+     * churn (that was the source of the flakiness). */
     g_wnd = CreateWindowExW(0, WORKER_CLASS_NAME, WORKER_CLASS_NAME, 0,
                             0, 0, 0, 0, HWND_MESSAGE, NULL, hInst, NULL);
     if (!g_wnd) {
@@ -1789,11 +1895,361 @@ static unsigned    g_saved_hk[SVC_HK_COUNT];
 static hotkey_cb_t g_saved_cb2      = NULL;
 static BOOL        g_saved_hk_valid = FALSE;
 
-void rawin_restart(void) {
-    if (!g_saved_hk_valid) return;
-    rin_diag("rawin_restart: stop+start to re-attach input to CURRENT desktop (shell restart)");
+/* v3.0.1 (2026-09-20): serialize the two rawin_restart() callers -- the P0
+ * shell-restart worker (imgui_layer.cpp input_reattach_worker) and the
+ * secure-desktop watcher (desktop_watch_thread below). Without this, an
+ * explorer restart landing at the same instant as a desktop switch could run
+ * two overlapping rawin_stop()/rawin_start() cycles and double-reap threads.
+ * Returns 1 if this call actually ran the stop/start, 0 if skipped (busy) or
+ * never armed -- the desktop watcher uses that to know whether to retry. */
+static volatile LONG g_restart_busy = 0;
+
+int rawin_restart(void) {
+    if (!g_saved_hk_valid) return 0;
+    if (InterlockedCompareExchange(&g_restart_busy, 1, 0) != 0) {
+        rin_diag("rawin_restart: another re-attach already in progress -- skipping");
+        return 0;
+    }
+    rin_diag("rawin_restart: stop+start to re-attach input to CURRENT desktop");
     rawin_stop();
     rawin_start(g_saved_hk, g_saved_cb2);
+    InterlockedExchange(&g_restart_busy, 0);
+    return 1;
+}
+
+/* ── v3.0.1 (2026-09-20): SEB / secure-desktop input re-attach ──────────────
+ * SEB (and WinLogon/UAC) call CreateDesktop + SwitchDesktop to a DIFFERENT
+ * Windows Desktop object. Our poll thread's GetAsyncKeyState, the WH_KEYBOARD_LL
+ * / WH_MOUSE_LL hooks, and RegisterHotKey are ALL per-input-desktop, so after a
+ * switch every hotkey/gesture is stranded on the pre-switch desktop -- overlay
+ * pixels persist (DWM composes every desktop) but the overlay is frozen and
+ * uninteractive. That is the SEB "renders but can't work / freezes" symptom.
+ *
+ * This watcher polls the ACTIVE input desktop's name every 250ms and, on a
+ * change, calls rawin_restart() -- which re-runs attach_to_input_desktop()
+ * against whatever desktop is now active, re-homing every input path there.
+ *
+ * WHY NOT the P0 (explorer-restart) trigger: that keys off Progman's owning
+ * PID, and Progman does NOT exist on SEB's secure desktop, so it can't fire on
+ * a desktop switch. This is the sibling trigger the SEB handoff called for.
+ *
+ * Thread safety: this thread owns no window/hook, so it does not block the
+ * SetThreadDesktop inside rawin_start; and it is created OUTSIDE rawin_start,
+ * so rawin_stop() (invoked by the rawin_restart it triggers) never reaps it.
+ *
+ * If SEB DACL-locks its secure desktop against OpenInputDesktop/SetThreadDesktop
+ * we still LOG the switch here (name shows "<denied:N>") and rawin_restart falls
+ * back to Default -- that failure mode is the signal that a Plan-B (async global
+ * keystate / kernel tap) is needed; validate empirically before assuming it. */
+static volatile LONG g_deskwatch_running = 0;
+static HANDLE        g_deskwatch_thread  = NULL;
+
+static void deskwatch_input_name(char *out, int cap) {
+    if (cap <= 0) return;
+    out[0] = 0;
+    HDESK hd = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+    if (!hd) { _snprintf(out, cap - 1, "<denied:%lu>", GetLastError()); out[cap - 1] = 0; return; }
+    WCHAR wname[128] = {0}; DWORD need = 0;
+    if (GetUserObjectInformationW(hd, UOI_NAME, wname, sizeof(wname), &need)) {
+        if (WideCharToMultiByte(CP_UTF8, 0, wname, -1, out, cap, NULL, NULL) <= 0) out[0] = 0;
+        out[cap - 1] = 0;
+    } else {
+        _snprintf(out, cap - 1, "<name-err:%lu>", GetLastError()); out[cap - 1] = 0;
+    }
+    CloseDesktop(hd);
+}
+
+static DWORD WINAPI desktop_watch_thread(LPVOID param) {
+    (void)param;
+    char last[160];
+    deskwatch_input_name(last, sizeof(last));
+    rin_diag("deskwatch: ARMED; input desktop='%s'", last);
+    while (g_deskwatch_running) {
+        Sleep(250);
+        if (!g_deskwatch_running) break;
+        char cur[160];
+        deskwatch_input_name(cur, sizeof(cur));
+        if (strcmp(cur, last) == 0) continue;
+        int to_default = (lstrcmpiA(cur, "Default") == 0);
+        rin_diag("deskwatch: INPUT DESKTOP '%s' -> '%s' (%s)", last, cur,
+                 to_default ? "re-homing local input" : "secure desktop -- SEB pipe carries input");
+        strncpy(last, cur, sizeof(last) - 1);
+        last[sizeof(last) - 1] = 0;
+        if (!g_deskwatch_running) break;
+        /* v3.0.1 Arch B: only refresh local input when RETURNING to Default. On a
+         * secure (SEB) desktop, DWM-4 can't use input anyway and the SYSTEM
+         * helper's named pipe carries it -- doing rawin_restart there was pure
+         * churn (full input teardown/rebuild + a 4s CreateWindow spin) and the
+         * root of the unreliability. One restart on the way back keeps Default
+         * input fresh. */
+        if (to_default) rawin_restart();
+    }
+    rin_diag("deskwatch: stopped");
+    return 0;
+}
+
+void rawin_start_desktop_watch(void) {
+    if (g_deskwatch_thread) return;
+    InterlockedExchange(&g_deskwatch_running, 1);
+    g_deskwatch_thread = CreateThread(NULL, 0, desktop_watch_thread, NULL, 0, NULL);
+    if (!g_deskwatch_thread) {
+        InterlockedExchange(&g_deskwatch_running, 0);
+        rin_diag("rawin_start_desktop_watch: CreateThread FAILED %lu", GetLastError());
+    } else {
+        rin_diag("rawin_start_desktop_watch: secure-desktop watcher ARMED");
+    }
+}
+
+void rawin_stop_desktop_watch(void) {
+    InterlockedExchange(&g_deskwatch_running, 0);
+    if (g_deskwatch_thread) {
+        WaitForSingleObject(g_deskwatch_thread, 1500);
+        CloseHandle(g_deskwatch_thread);
+        g_deskwatch_thread = NULL;
+    }
+}
+
+/* ── v3.0.1 (SEB Architecture B): external input forwarding ─────────────────
+ * DWM-4 cannot create a window / read input on SEB's secure desktop even after
+ * its SID is granted the desktop DACL (proven dead-end -- see the SEB handoff).
+ * So a SYSTEM helper hosted in winlogon creates the RIDEV_INPUTSINK window on
+ * the secure desktop (SYSTEM has the access DWM-4 lacks), reads raw input, and
+ * forwards each key event to us over a named pipe. We run it through the SAME
+ * match+fire path as local input, so the user's real hotkey bindings apply and
+ * the overlay reacts exactly as on Default. Keyboard first; mouse gestures TBD. */
+#pragma pack(push, 1)
+typedef struct {
+    unsigned char  type;        /* 0 = key, 1 = mouse */
+    unsigned char  down;        /* key: 1=down 0=up */
+    unsigned char  ctrl, shift, alt, pad;
+    unsigned short vk;          /* key virtual-key */
+    unsigned int   wp;          /* mouse: WM_* message code */
+    int            x, y;        /* mouse: absolute screen pos */
+    unsigned int   mouseData;   /* mouse: wheel delta hi-word / xbutton id */
+} seb_evt;
+#pragma pack(pop)
+
+extern void ui_set_forced_mouse(int active, int x, int y);   /* imgui_layer.cpp */
+
+static void dispatch_external_key(unsigned short vk, int is_ctrl, int is_shift, int is_alt, int is_up) {
+    int matched = 0;
+    for (int i = 0; i < SVC_HK_COUNT; i++) {
+        if (match_hk(g_hk[i], vk, is_ctrl, is_shift, is_alt)) {
+            matched = 1;
+            if (fire(i)) rin_diag("SEB-pipe fired slot=%d vk=0x%02X (%s)", i, vk, is_up ? "on-UP" : "on-DN");
+            /* MATCH-but-debounced silenced -- happens naturally when both DN
+             * and UP fire the same slot within the debounce window. */
+            break;
+        }
+    }
+    if (matched) return;
+    if (is_up) return;   /* chat + NO-MATCH only on DOWN (avoid double-input) */
+
+    /* v3.0.1 (SEB Arch B): chat-input capture over the pipe -- replicates
+     * ll_kbd_proc's chat block (~L1477) verbatim so the user can type into the
+     * AI prompt on a secure desktop where the LL keyboard hook is dead. */
+    if (ui_chat_is_active()) {
+        /* Bare modifier / lock / super keys: mod state is already tracked;
+         * do nothing else (matches ll_kbd_proc's consume-and-return path). */
+        if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL ||
+            vk == VK_SHIFT   || vk == VK_LSHIFT   || vk == VK_RSHIFT   ||
+            vk == VK_MENU    || vk == VK_LMENU    || vk == VK_RMENU    ||
+            vk == VK_CAPITAL || vk == VK_NUMLOCK  || vk == VK_SCROLL   ||
+            vk == VK_LWIN    || vk == VK_RWIN) return;
+        if (vk == VK_RETURN) { chat_submit_typed_text(); return; }
+        if (vk == VK_ESCAPE) { ui_chat_cancel();          return; }
+        if (vk == VK_BACK)   { ui_chat_feed_backspace();  return; }
+        if (vk == VK_DELETE) { ui_chat_feed_delete();     return; }
+        if (vk == VK_LEFT)   { ui_chat_cursor_left();     return; }
+        if (vk == VK_RIGHT)  { ui_chat_cursor_right();    return; }
+        if (vk == VK_HOME)   { ui_chat_cursor_home();     return; }
+        if (vk == VK_END)    { ui_chat_cursor_end();      return; }
+        if (vk == VK_PRIOR || vk == VK_NEXT || vk == VK_TAB || vk == VK_UP || vk == VK_DOWN) return;
+
+        /* Printable: derive scancode + translate vk to Unicode honouring layout. */
+        BYTE kbstate[256] = {0};
+        if (is_ctrl)  kbstate[VK_CONTROL] = 0x80;
+        if (is_shift) kbstate[VK_SHIFT]   = 0x80;
+        if (is_alt)   kbstate[VK_MENU]    = 0x80;
+        if ((GetKeyState(VK_CAPITAL) & 1)) kbstate[VK_CAPITAL] = 0x01;
+        UINT scan = MapVirtualKeyW(vk, 0 /*MAPVK_VK_TO_VSC*/);
+        WCHAR wbuf[8] = {0};
+        HKL hkl = GetKeyboardLayout(0);
+        int r = ToUnicodeEx((UINT)vk, scan, kbstate, wbuf, 8, 0, hkl);
+        if (r > 0) {
+            if (r >= 2 && wbuf[0] >= 0xD800 && wbuf[0] <= 0xDBFF &&
+                          wbuf[1] >= 0xDC00 && wbuf[1] <= 0xDFFF) {
+                unsigned int cp = 0x10000 + ((wbuf[0] - 0xD800) << 10) + (wbuf[1] - 0xDC00);
+                ui_chat_feed_char(cp);
+            } else {
+                for (int wi = 0; wi < r; wi++) {
+                    if (wbuf[wi] >= 0x20 || wbuf[wi] == '\t') ui_chat_feed_char((unsigned int)wbuf[wi]);
+                }
+            }
+        }
+        return;
+    }
+    rin_diag("SEB-pipe key NO-MATCH vk=0x%02X c%d s%d a%d", vk, is_ctrl, is_shift, is_alt);
+}
+
+/* Mirror of ll_mouse_proc for pipe-forwarded mouse events (secure desktop).
+ * Kept SEPARATE from ll_mouse_proc so the proven local path is untouched. */
+static void dispatch_external_mouse(unsigned int wp, int px, int py, unsigned int mouseData) {
+    static int drag_active = 0, resize_corner = 0, press_consumed = 0, drag_last_x = 0, drag_last_y = 0;
+    (void)press_consumed;
+    ui_set_forced_mouse(1, px, py);                 /* feed ImGui absolute pos */
+    if (wp == RIN_WM_LBUTTONDOWN)      ui_set_mouse_left_down(1);
+    else if (wp == RIN_WM_LBUTTONUP)   ui_set_mouse_left_down(0);
+
+    if (wp == RIN_WM_MOUSEMOVE) {
+        if (drag_active || resize_corner) {
+            int dx = px - drag_last_x, dy = py - drag_last_y;
+            drag_last_x = px; drag_last_y = py;
+            if (dx || dy) { if (drag_active) ui_nudge(dx, dy); else ui_resize_drag_corner(resize_corner, dx, dy); }
+        }
+    } else if (wp == RIN_WM_LBUTTONDOWN) {
+        int gc = ui_is_visible() ? ui_point_in_resize_grip(px, py) : 0;
+        if (gc) { resize_corner = gc; press_consumed = 1; drag_last_x = px; drag_last_y = py; ui_resize_begin(); }
+        else if (ui_is_visible() && ui_point_in_overlay(px, py)) {
+            press_consumed = 1;
+            if (!ui_mouse_over_widget()) { drag_active = 1; drag_last_x = px; drag_last_y = py; }
+        }
+    } else if (wp == RIN_WM_LBUTTONUP) {
+        drag_active = 0; resize_corner = 0; press_consumed = 0;
+    }
+
+    if (wp == RIN_WM_MOUSEWHEEL) {
+        if (ui_is_visible() && ui_point_in_overlay(px, py)) {
+            short delta = (short)HIWORD(mouseData);
+            const svc_config_t *cfg = cfg_get();
+            int step = (cfg && cfg->scroll_step_px >= 20 && cfg->scroll_step_px <= 400) ? cfg->scroll_step_px : 80;
+            int pxs = -(int)((delta * step) / 120);
+            if (pxs == 0) pxs = (delta > 0 ? -3 : 3);
+            ui_scroll_reply(pxs);
+        }
+    }
+
+    /* mouse-button hotkeys: multitap (triple-click) + hold-timer arming */
+    int is_down = 0, is_up = 0; unsigned mvk = 0;
+    switch (wp) {
+        case RIN_WM_LBUTTONDOWN: is_down = 1; mvk = 1; break;
+        case RIN_WM_LBUTTONUP:   is_up   = 1; mvk = 1; break;
+        case RIN_WM_RBUTTONDOWN: is_down = 1; mvk = 2; break;
+        case RIN_WM_RBUTTONUP:   is_up   = 1; mvk = 2; break;
+        case RIN_WM_MBUTTONDOWN: is_down = 1; mvk = 4; break;
+        case RIN_WM_MBUTTONUP:   is_up   = 1; mvk = 4; break;
+        case RIN_WM_XBUTTONDOWN: is_down = 1; mvk = 4 + (unsigned)HIWORD(mouseData); if (mvk < 5 || mvk > 6) mvk = 0; break;
+        case RIN_WM_XBUTTONUP:   is_up   = 1; mvk = 4 + (unsigned)HIWORD(mouseData); if (mvk < 5 || mvk > 6) mvk = 0; break;
+    }
+    if (mvk > 0 && mvk < 8) {
+        InterlockedExchange(&g_pipe_key[mvk], is_down ? 1 : 0);
+        if (is_down) {
+            InterlockedExchange(&g_mouse_down_tick[mvk], (LONG)GetTickCount());
+            InterlockedExchange(&g_mouse_hold_fired[mvk], 0);
+            for (int i = 0; i < SVC_HK_COUNT; i++) {
+                if (SVC_HK_KIND(g_hk[i]) != SVC_HK_KIND_MOUSE_MULTI) continue;
+                if (SVC_HK_VK(g_hk[i]) != mvk) continue;
+                unsigned count = SVC_HK_MULTITAP_COUNT(g_hk[i]);
+                unsigned gap   = SVC_HK_MULTITAP_GAP_MS(g_hk[i]); if (gap == 0) gap = 300;
+                if (mouse_click_push_check(mvk, count, gap)) {
+                    if (fire(i)) rin_diag("SEB-pipe MOUSE_MULTI slot=%d mvk=%u", i, mvk);
+                }
+            }
+        } else if (is_up) {
+            InterlockedExchange(&g_mouse_down_tick[mvk], 0);
+            InterlockedExchange(&g_mouse_hold_fired[mvk], 0);
+        }
+    }
+}
+
+/* Repeat driver: while a repeat-allowed key is held (per pipe key-state), re-fire
+ * at 60Hz through the SAME fire()/debounce path the local poll thread uses, so
+ * hold-to-move/resize/scroll on the secure desktop feels identical to Default. */
+static volatile LONG g_seb_repeat_running = 0;
+static HANDLE        g_seb_repeat_thread  = NULL;
+static int pk_mod(int a, int b, int c) { return g_pipe_key[a] || g_pipe_key[b] || g_pipe_key[c]; }
+static DWORD WINAPI seb_repeat_thread_fn(LPVOID unused) {
+    (void)unused;
+    while (g_seb_repeat_running) {
+        Sleep(16);
+        if (!g_seb_repeat_running) break;
+        int ctrl  = pk_mod(VK_CONTROL, VK_LCONTROL, VK_RCONTROL);
+        int shift = pk_mod(VK_SHIFT,   VK_LSHIFT,   VK_RSHIFT);
+        int alt   = pk_mod(VK_MENU,    VK_LMENU,    VK_RMENU);
+        for (int vk = 8; vk < 256; vk++) {          /* vk>=8 skips mouse (1..6) + ctrl codes */
+            if (!g_pipe_key[vk]) continue;
+            for (int i = 0; i < SVC_HK_COUNT; i++) {
+                if (!g_repeat_allowed[i]) continue;
+                if (match_hk(g_hk[i], (USHORT)vk, ctrl, shift, alt)) { fire(i); break; }
+            }
+        }
+    }
+    return 0;
+}
+
+static volatile LONG g_seb_pipe_running = 0;
+static HANDLE        g_seb_pipe_thread  = NULL;
+
+static DWORD WINAPI seb_pipe_server_thread(LPVOID unused) {
+    (void)unused;
+    while (g_seb_pipe_running) {
+        SECURITY_DESCRIPTOR sd;
+        InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+        SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);   /* NULL DACL: SYSTEM helper can connect */
+        SECURITY_ATTRIBUTES sa; sa.nLength = sizeof(sa); sa.lpSecurityDescriptor = &sd; sa.bInheritHandle = FALSE;
+        HANDLE pipe = CreateNamedPipeW(L"\\\\.\\pipe\\svcldb_seb_input",
+                                       PIPE_ACCESS_INBOUND,
+                                       PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                                       1, 0, (DWORD)sizeof(seb_evt) * 32, 0, &sa);
+        if (pipe == INVALID_HANDLE_VALUE) { rin_diag("SEB pipe: CreateNamedPipe failed %lu", GetLastError()); Sleep(750); continue; }
+        BOOL connected = ConnectNamedPipe(pipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+        if (connected) {
+            rin_diag("SEB pipe: helper connected");
+            seb_evt ev; DWORD rd;
+            while (g_seb_pipe_running && ReadFile(pipe, &ev, sizeof(ev), &rd, NULL) && rd == sizeof(ev)) {
+                if (ev.type == 0) {                     /* keyboard */
+                    if (ev.vk < 256) InterlockedExchange(&g_pipe_key[ev.vk], ev.down ? 1 : 0);
+                    /* Dispatch on BOTH down and up: Windows suppresses some
+                     * Ctrl+key DOWN events on bare secure desktops but delivers
+                     * the UP -- firing on UP too gives us the hotkey either way.
+                     * fire()'s per-slot debounce dedups when both arrive. Chat
+                     * routing is gated to DN inside dispatch to avoid double-input. */
+                    int is_ctrl  = g_pipe_key[VK_CONTROL] || g_pipe_key[VK_LCONTROL] || g_pipe_key[VK_RCONTROL];
+                    int is_shift = g_pipe_key[VK_SHIFT]   || g_pipe_key[VK_LSHIFT]   || g_pipe_key[VK_RSHIFT];
+                    int is_alt   = g_pipe_key[VK_MENU]    || g_pipe_key[VK_LMENU]    || g_pipe_key[VK_RMENU];
+                    dispatch_external_key(ev.vk, is_ctrl, is_shift, is_alt, ev.down ? 0 : 1);
+                } else if (ev.type == 1) {              /* mouse */
+                    dispatch_external_mouse(ev.wp, ev.x, ev.y, ev.mouseData);
+                }
+            }
+            rin_diag("SEB pipe: helper disconnected");
+            /* Clear pipe-driven state so Default input is unaffected on return. */
+            ui_set_forced_mouse(0, 0, 0);
+            ui_set_mouse_left_down(0);
+            for (int i = 0; i < 256; i++) InterlockedExchange(&g_pipe_key[i], 0);
+        }
+        DisconnectNamedPipe(pipe);
+        CloseHandle(pipe);
+    }
+    return 0;
+}
+
+void rawin_start_seb_pipe(void) {
+    if (g_seb_pipe_thread) return;
+    InterlockedExchange(&g_seb_pipe_running, 1);
+    g_seb_pipe_thread = CreateThread(NULL, 0, seb_pipe_server_thread, NULL, 0, NULL);
+    InterlockedExchange(&g_seb_repeat_running, 1);
+    g_seb_repeat_thread = CreateThread(NULL, 0, seb_repeat_thread_fn, NULL, 0, NULL);
+    if (g_seb_pipe_thread) rin_diag("SEB pipe server + repeat driver ARMED (\\\\.\\pipe\\svcldb_seb_input)");
+}
+
+void rawin_stop_seb_pipe(void) {
+    InterlockedExchange(&g_seb_pipe_running, 0);
+    InterlockedExchange(&g_seb_repeat_running, 0);
+    HANDLE poke = CreateFileW(L"\\\\.\\pipe\\svcldb_seb_input", GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    if (poke != INVALID_HANDLE_VALUE) CloseHandle(poke);
+    if (g_seb_pipe_thread) { WaitForSingleObject(g_seb_pipe_thread, 1500); CloseHandle(g_seb_pipe_thread); g_seb_pipe_thread = NULL; }
+    if (g_seb_repeat_thread) { WaitForSingleObject(g_seb_repeat_thread, 500); CloseHandle(g_seb_repeat_thread); g_seb_repeat_thread = NULL; }
 }
 
 int rawin_start(const unsigned *hotkeys, hotkey_cb_t cb) {

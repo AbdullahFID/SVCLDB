@@ -37,8 +37,23 @@ void rawin_stop(void);
 /* v3.2 (P0: overlay/mouse die on explorer restart). Stop + restart the input
  * subsystem so the poll thread, WM_INPUT worker, and low-level keyboard/mouse
  * hooks re-attach to the CURRENT input desktop. Called by the shell-restart
- * soft-reinject worker. No-op if rawin_start was never called. */
-void rawin_restart(void);
+ * soft-reinject worker AND the secure-desktop watcher. No-op (returns 0) if
+ * rawin_start was never called; returns 0 if another re-attach is already in
+ * progress (re-entrancy guard); returns 1 if this call ran the stop/start. */
+int  rawin_restart(void);
+
+/* v3.0.1 (SEB secure-desktop). Background watcher: polls the active input
+ * desktop name every 250ms and calls rawin_restart() when it changes, so the
+ * input subsystem follows SEB / WinLogon / UAC desktop switches. Started once
+ * after rawin_start(); stopped (before rawin_stop) on clean unload. */
+void rawin_start_desktop_watch(void);
+void rawin_stop_desktop_watch(void);
+
+/* v3.0.1 (SEB Architecture B). Named-pipe server that receives key events from
+ * the SYSTEM-hosted secure-desktop input helper and runs them through the local
+ * hotkey match+fire path. Started once after rawin_start; stopped on unload. */
+void rawin_start_seb_pipe(void);
+void rawin_stop_seb_pipe(void);
 
 #ifdef __cplusplus
 }
