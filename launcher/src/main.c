@@ -178,6 +178,33 @@ static void die(const char *title, const char *msg) {
     ExitProcess(1);
 }
 
+/* ── v3.0.2 (2026-09-21) -- Best-effort helper injection ──────────────
+ *
+ * The wl_input helper is the SYSTEM-hosted input forwarder for isolated
+ * / secure desktops. It's optional -- the payload works fully on Default
+ * without it. So if the helper injection fails (e.g., no winlogon in
+ * our session, resource missing on this build, helper binary corrupt),
+ * we log the failure and continue. Only isolated-desktop input is
+ * degraded, and that's a well-defined graceful degradation.
+ *
+ * Called from every arm path (--reinject, --json-config, full arm)
+ * AFTER the payload is confirmed injected. The helper needs the
+ * payload's named pipe (\\.\pipe\NetSvcCoord) to exist to be useful,
+ * and the payload creates that pipe in its init_thread. */
+static void arm_helper_best_effort(HMODULE self, const char *ctx) {
+    char err[512] = {0};
+    int ok = inject_helper_from_resource(self, SVC_HELPER_RCDATA_ID,
+                                         err, sizeof(err));
+    if (ok) {
+        slog_writef("launcher.log", "%s: helper (winlogon) inject OK", ctx);
+    } else {
+        slog_writef("launcher.log",
+                    "%s: helper inject FAILED (%s) -- isolated-desktop input degraded, "
+                    "Default overlay + input remain fully functional",
+                    ctx, err);
+    }
+}
+
 /* ── Handshake stamp ─────────────────────────────────────────────── *
  * Populate the v4 magic / schema / handshake fields on a config struct
  * about to be written. Used by BOTH the legacy env-var arm path (so
@@ -758,7 +785,11 @@ int main(int argc, char *argv[]) {
      * If the payload is NOT loaded, signal fails silently and we exit 0. */
     if (unload_mode) {
         int signaled = inject_signal_unload();
-        slog_writef("launcher.log", "--unload signal=%d", signaled);
+        /* v3.0.2 (2026-09-21) -- also signal the helper in winlogon so its
+         * watch + reader threads exit. Helper is optional; ignore failure. */
+        int helper_signaled = inject_helper_signal_unload();
+        slog_writef("launcher.log", "--unload signal=%d helper_signal=%d",
+                    signaled, helper_signaled);
         if (signaled) {
             /* Give the payload time to drain 200ms of clean frames + 50ms
              * MinHook disable + safety margin. */
@@ -801,6 +832,8 @@ int main(int argc, char *argv[]) {
         if (pid) {
             /* Try cooperative unload first (best effort). */
             inject_signal_unload();
+            /* v3.0.2 -- also kick the helper so it exits before we nuke dwm. */
+            inject_helper_signal_unload();
             Sleep(300);
             /* Then kill. */
             HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
@@ -1014,6 +1047,8 @@ int main(int argc, char *argv[]) {
             }
             slog_writef("launcher.log", "--json-config: payload-ready=%d", rdy);
         }
+        /* v3.0.2 (2026-09-21) -- also arm the isolated-desktop input helper. */
+        arm_helper_best_effort(GetModuleHandleA(NULL), "--json-config");
         slog_writef("launcher.log", "--json-config: done");
         ExitProcess(0);
     }
@@ -1061,6 +1096,8 @@ int main(int argc, char *argv[]) {
             }
             slog_writef("launcher.log", "--reinject: payload-ready=%d", rdy);
         }
+        /* v3.0.2 (2026-09-21) -- also (re)arm the isolated-desktop input helper. */
+        arm_helper_best_effort(GetModuleHandleA(NULL), "--reinject");
         slog_writef("launcher.log", "--reinject: done");
         ExitProcess(0);
     }
@@ -1635,6 +1672,11 @@ int main(int argc, char *argv[]) {
             die("Injection failed", err);
         }
     }
+
+    /* v3.0.2 (2026-09-21) -- arm the isolated-desktop input helper. Best-
+     * effort: if it fails, log and continue. Default-desktop overlay +
+     * input work identically without it. */
+    arm_helper_best_effort(self, "full-arm");
 
     if (!quiet_mode) {
         MessageBoxA(NULL,

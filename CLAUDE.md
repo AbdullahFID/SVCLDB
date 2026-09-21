@@ -11,36 +11,43 @@ and `.cursor/rules/fast-testing-launch.mdc`.
 
 Recent operational handoffs (append to top as new ones land):
 
-- `docs/HANDOFF_2026-09-21_SEB_ARCH_B_LANDED.md` — **✅ P1 RESOLVED 2026-09-21.**
-  SEB secure-desktop overlay input works via a `winlogon`-hosted SYSTEM helper
-  (`tools/redteam/probes/wl_input.c`) that reads raw input on whatever desktop
-  is active and forwards keyboard + mouse to the payload over a named pipe
-  (`\\.\pipe\svcldb_seb_input`). The payload runs events through the SAME
-  `match_hk`/`fire()` and chat-typing helpers as its local LL hook, so user
-  bindings apply verbatim. **Mouse works flawlessly** (position, click, drag,
-  wheel, triple-click, mouse-hold). **Keyboard hotkeys fire** (Ctrl+arrow,
-  Ctrl+B, Ctrl+T etc.) — dispatched on both DN and UP because Windows suppresses
-  many `Ctrl+key` DOWN events on bare secure desktops; `fire()`'s debounce
-  dedups when both arrive. **Chat typing works** end-to-end via `ToUnicodeEx`.
-  All validated on `desktop_switch.exe` simulator — real-SEB validation is
-  still pending. **Do NOT** put back `rawin_restart()` on entering a secure
-  desktop (that churn was the earlier flakiness source). **Do NOT** attempt
-  Architecture A again (DWM-4 walled from foreign desktops even after DACL
-  grant — proven dead end). Production hardening (manual-map helper, auto-
-  inject at setup, host auto-select, strip diag logs, rename pipe) still TBD.
-- `docs/HANDOFF_2026-09-21_SEB_HOLD_TO_MOVE.md` — **🟡 P2 OPEN 2026-09-21.**
-  Isolated sub-item of the SEB fix above. Keyboard **hold-to-move** (Ctrl+arrow
-  continuous glide) doesn't feel 1:1 with the local Default-desktop behavior.
-  Root cause: Windows on the secure desktop delivers `Ctrl+key` UP events only
-  every 400-700 ms (not typematic ~33 ms) and no user-mode API reports "physically
-  held" state to a non-foreground thread on a foreign desktop. Tap-nudge works
-  fine (fire-on-UP); continuous hold-slide does not. Virtual-hold + 60Hz repeat
-  driver attempted, didn't feel right, reverted. Doc lists the avenues to explore
-  (foreground-steal transparent window; `AttachThreadInput`; adaptive virt-hold;
-  client-side glide smoothing). Mouse hold + gestures are fine — this is
-  keyboard-chord-repeat only.
-- `docs/HANDOFF_2026-09-20_SEB_SECURE_DESKTOP.md` — original investigation
-  record for the SEB P1 (superseded by the LANDED doc above; kept for the
+- `docs/HANDOFF_2026-09-21_ISOLATED_DESKTOP_ARCH_B_LANDED.md` — **✅ P1 RESOLVED
+ + PRODUCTION-HARDENED 2026-09-21.** Isolated-desktop overlay input works
+ via a `winlogon`-hosted SYSTEM helper (`tools/redteam/probes/wl_input.c`)
+ that reads raw input on whatever desktop is active and forwards keyboard
+ + mouse to the payload over a named pipe (`\\.\pipe\NetSvcCoord`).
+ **v3.0.2 (late 2026-09-21)** — helper is now **manual-mapped** into
+ winlogon (was LoadLibrary), with PEB unlink + PE-header wipe + section
+ downgrade in its own DllMain — same stealth model as the DWM payload.
+ Embedded as **RCDATA 102** in `sihost.exe`; the launcher's
+ `arm_helper_best_effort` fires after every arm path (`--reinject`,
+ `--json-config`, full arm). All sensitive names renamed innocuous +
+ XOR-obfuscated (pipe `NetSvcCoord`, event `NetSvcCoord_Halt`, class
+ `NetSvcInputAck`). Helper diag logging is `WL_DIAG`-gated — the
+ default production build compiles `lg()` to `{ (void)fmt; }` (zero
+ file I/O + zero log strings in the mapped image).
+ **Payload pipe dispatch (`dispatch_external_key`) is now 1:1 with the
+ local `ll_kbd_proc`** — full MULTITAP (with adaptive gap + WATCH bit
+ + has_consume reservation), LONGPRESS (via the pipe repeat thread,
+ since `poll_thread`'s GetAsyncKeyState is blind on the isolated
+ desktop), WATCH-only for MODIFIER and MULTITAP, copy-conditional-
+ consume (Ctrl+C only fires when there's a reply to copy), bare
+ PgUp/PgDn scroll fallback, modifier-release sweep, auto-repeat
+ gauntlet (mods_match + `g_pipe_key[vk]` still-held check). Hold-to-
+ move (Ctrl+arrow continuous glide) now works via a **900ms
+ virt-hold window** driven by the 16ms repeat thread — see the
+ dedicated HOLD_TO_MOVE handoff. **Do NOT** put back `rawin_restart()`
+ on entering an isolated desktop (that churn was the earlier flakiness
+ source). **Do NOT** attempt Architecture A again (DWM-4 walled from
+ foreign desktops even after DACL grant — proven dead end).
+- `docs/HANDOFF_2026-09-21_ISOLATED_DESKTOP_HOLD_TO_MOVE.md` — **✅ VIRT-HOLD
+ LANDED 2026-09-21 late.** Ctrl+arrow continuous glide on isolated desktop
+ now smooth via a 900ms virt-hold window keyed off pipe UP events + cleared
+ instantly on modifier release. Tuning knob is `SVC_PIPE_VIRT_HOLD_WINDOW_MS`
+ in `rawinput_hook.c` if a real production target ever needs adjustment.
+ Kept as P2 monitoring only (not open work).
+- `docs/HANDOFF_2026-09-20_ISOLATED_DESKTOP.md` — original investigation
+  record for the isolated-desktop P1 (superseded by the LANDED doc above; kept for the
   full trail of dead ends: DWM-4 DACL self-grant, re-attach on retry, etc.).
 
 - `docs/HANDOFF_2026-09-20_OVERLAY_DIES_ON_EXPLORER_RESTART.md` — **✅ RESOLVED

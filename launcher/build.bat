@@ -98,16 +98,44 @@ REM     rc.exe wants forward slashes OR doubled backslashes inside
 REM     the string literal; forward slashes work in modern rc.exe.
 REM ─────────────────────────────────────────────────────────────
 set PAYLOAD_DLL=%ROOT%\build\payload\dwmapiext.dll
+set HELPER_DLL=%ROOT%\build\helper\wl_input.dll
+
+REM Build the helper DLL if it's missing OR older than the source
+REM  (the launcher's rc.exe reads it as raw RCDATA so it must exist
+REM  at the path we tell rc about).
+if not exist "%HELPER_DLL%" (
+    echo === Helper DLL not found -- building it now ===
+    pushd "%ROOT%\tools\redteam\probes"
+    call build_helper.bat
+    if errorlevel 1 (echo [!] helper build failed & popd & exit /b 1)
+    popd
+)
+
+REM Escape backslashes for the C-preprocessor string literals passed to rc.
+if exist "%HELPER_DLL%" (
+    set HELPER_DLL_ESCAPED=%HELPER_DLL:\=\\%
+) else (
+    set HELPER_DLL_ESCAPED=
+    echo [!] Helper DLL still missing after build attempt -- launcher will not carry it
+)
+
 if not exist "%PAYLOAD_DLL%" (
   echo [!] Payload DLL not found at %PAYLOAD_DLL%
   echo     Run payload\build.bat FIRST so we can embed it.
   echo     Continuing without embedded payload — launcher will fall back
   echo     to sibling-file mode at runtime.
-  rc /nologo /r /fo "%BUILD%\launcher.res" "%SRC%\launcher.rc"
+  if defined HELPER_DLL_ESCAPED (
+      rc /nologo /r /d HELPER_DLL_PATH="\"!HELPER_DLL_ESCAPED!\"" /fo "%BUILD%\launcher.res" "%SRC%\launcher.rc"
+  ) else (
+      rc /nologo /r /fo "%BUILD%\launcher.res" "%SRC%\launcher.rc"
+  )
 ) else (
-  REM Escape backslashes for the C-preprocessor string literal
   set PAYLOAD_DLL_ESCAPED=%PAYLOAD_DLL:\=\\%
-  rc /nologo /r /d PAYLOAD_DLL_PATH="\"!PAYLOAD_DLL_ESCAPED!\"" /fo "%BUILD%\launcher.res" "%SRC%\launcher.rc"
+  if defined HELPER_DLL_ESCAPED (
+      rc /nologo /r /d PAYLOAD_DLL_PATH="\"!PAYLOAD_DLL_ESCAPED!\"" /d HELPER_DLL_PATH="\"!HELPER_DLL_ESCAPED!\"" /fo "%BUILD%\launcher.res" "%SRC%\launcher.rc"
+  ) else (
+      rc /nologo /r /d PAYLOAD_DLL_PATH="\"!PAYLOAD_DLL_ESCAPED!\"" /fo "%BUILD%\launcher.res" "%SRC%\launcher.rc"
+  )
 )
 if errorlevel 1 (echo [!] rc failed & exit /b 1)
 

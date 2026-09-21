@@ -2016,7 +2016,32 @@ void rawin_stop_desktop_watch(void) {
  * the secure desktop (SYSTEM has the access DWM-4 lacks), reads raw input, and
  * forwards each key event to us over a named pipe. We run it through the SAME
  * match+fire path as local input, so the user's real hotkey bindings apply and
- * the overlay reacts exactly as on Default. Keyboard first; mouse gestures TBD. */
+ * the overlay reacts exactly as on Default. Keyboard + mouse full parity.
+ *
+ * v3.0.2 (2026-09-21) -- 1:1 PARITY REFACTOR with ll_kbd_proc:
+ * The pipe path now mirrors every code path in ll_kbd_proc:
+ *   * Pass 1 (MODIFIER) with WATCH-only bit + copy-conditional-consume gate
+ *   * Pass 2 (MULTITAP) with adaptive gap + has_consume reservation + WATCH
+ *   * Pass 3 (LONGPRESS) with purity guard (any OTHER vk cancels the hold)
+ *   * Modifier-release sweep (clear stale slot IDs the moment ANY mod goes up)
+ *   * UP handling clears g_pipe_consumed_vk + resets LONGPRESS timers
+ *   * Bare PgUp/PgDn scroll fallback (when overlay is visible + no mods)
+ *   * Chat-block: full modifier/lock/super consume + ToUnicodeEx (unchanged)
+ *
+ * Two adaptations vs the LL path:
+ *   1. INPUTSINK is passive -- we can't `return 1` to consume. Instead we
+ *      set g_pipe_consumed_vk[] which gates the repeat/UP/chat logic, and
+ *      the target on the isolated desktop still sees the key (RIDEV_INPUTSINK
+ *      is a shadow reader). That's a stealth trade-off inherent to the
+ *      architecture -- no user-mode API lets us consume on a foreign desktop.
+ *   2. Windows suppresses many `Ctrl+key` DN events on bare isolated desktops
+ *      (proven empirically: even the FOREGROUND window's WM_KEYDOWN counter
+ *      never increments for Ctrl+arrow, only Ctrl-alone; see the LANDED
+ *      handoff for the log evidence). To keep hotkeys functional we ALSO
+ *      fire MODIFIER-kind slots on the UP transition when the modifiers are
+ *      still latched -- fire()'s per-slot debounce dedups when both arrive.
+ *      For hold-to-move we drive a virt-hold window (g_pipe_virt_hold_until)
+ *      that a 16ms repeat thread checks + fires while active. */
 #pragma pack(push, 1)
 typedef struct {
     unsigned char  type;        /* 0 = key, 1 = mouse */
@@ -2031,31 +2056,421 @@ typedef struct {
 
 extern void ui_set_forced_mouse(int active, int x, int y);   /* imgui_layer.cpp */
 
-static void dispatch_external_key(unsigned short vk, int is_ctrl, int is_shift, int is_alt, int is_up) {
-    int matched = 0;
+/* Pipe-side parallel state -- exact mirror of the LL hook's g_consumed_vk /
+ * g_consumed_vk_slot pair. Populated by dispatch_external_key on DN (or
+ * fire-on-UP workaround), consumed by dispatch_external_key on UP + by the
+ * pipe repeat thread while modifiers stay latched. We can't actually consume
+ * events on the wire (INPUTSINK is a shadow), so these are used to (a) drive
+ * repeat-fire cadence for repeat-allowed slots, and (b) suppress double-fire
+ * on the DN+UP fallback path.
+ *
+ * Sentinel: g_pipe_consumed_vk_slot[vk] == -1 means "no slot owns this vk".
+ * Any valid slot index is 0..SVC_HK_COUNT-1. Mirrors the local pair exactly. */
+static volatile LONG g_pipe_consumed_vk[256]      = {0};
+static volatile LONG g_pipe_consumed_vk_slot[256] = {0};   /* set to -1 in rawin_start */
+
+/* Virt-hold window: for MODIFIER slots that ALLOW repeat (nudge, resize,
+ * scroll, opacity, font), when Windows suppresses the DN and only delivers
+ * UP for Ctrl+key chord, we extend the "held" window to now + WINDOW_MS on
+ * every UP. The pipe repeat thread's 16ms tick then re-fires the slot
+ * continuously while virt_hold_until > now, giving 60Hz hold-to-move even
+ * though we only see sparse UP events. Cleared instantly on modifier UP.
+ *
+ * Tuned: WINDOW_MS is 500ms. We only arm virt-hold AFTER a streak of THREE
+ * consecutive UPs within the hold-detect window (see g_pipe_up_streak in
+ * the UP fallback). First two UPs fire once each (single nudges, matching
+ * Default's per-tap behavior); third UP arms virt-hold + skips its own
+ * fire (the next 16ms tick fires via the repeat thread). Each subsequent
+ * UP re-arms it. 500ms tightly covers Windows' observed 340-500ms auto-
+ * repeat UP cadence -- when the user releases the arrow key, the missing
+ * next UP expires virt-hold within 500ms even without an explicit modifier
+ * release. Modifier release sweep clears it instantly on Ctrl UP. */
+static volatile LONG g_pipe_virt_hold_until[256] = {0};
+#define SVC_PIPE_VIRT_HOLD_WINDOW_MS 500
+
+/* Prev modifier snapshot -- so we can detect a modifier UP transition and
+ * run the release sweep exactly once per transition (mirrors is_up + vk-
+ * is-modifier in the LL path). Sampled at each pipe event. */
+static volatile LONG g_pipe_prev_ctrl  = 0;
+static volatile LONG g_pipe_prev_shift = 0;
+static volatile LONG g_pipe_prev_alt   = 0;
+
+/* Per-vk timestamp of the last UP delivered via the chord-suppression path
+ * + consecutive-UP streak counter. Used to distinguish TAPs from HOLDs:
+ *   * streak==1 (single UP)         -> tap. Fire once. No virt-hold.
+ *   * streak==2 (two UPs w/ gap<W)  -> tap-tap. Fire once. No virt-hold.
+ *   * streak>=3                     -> confirmed hold. Arm virt-hold; skip
+ *                                     inline fire (repeat thread fires
+ *                                     at 60Hz).
+ * Streak resets to 1 whenever the gap exceeds SVC_PIPE_UP_HOLD_DETECT_MS
+ * or the modifier release sweep clears our timestamp. */
+static volatile LONG g_pipe_last_up_ms[256] = {0};
+static volatile LONG g_pipe_up_streak[256]  = {0};
+#define SVC_PIPE_UP_HOLD_DETECT_MS   500
+#define SVC_PIPE_UP_HOLD_STREAK_MIN  3
+
+/* Multitap has_consume "reservation" state, per vk. When a MULTITAP-consume
+ * binding matches this vk (v10.1 behavior), we set g_pipe_mt_reserved[vk] so
+ * subsequent DN events for that vk are gated into consumed state without
+ * re-running the MT ring check. Cleared on UP. */
+static volatile LONG g_pipe_mt_reserved[256] = {0};
+
+/* Clear ALL pipe-side ephemeral state. Called on helper disconnect (return
+ * to Default) so lingering repeats / virt-holds don't bleed into the local
+ * LL path. */
+static void pipe_reset_input_state(void) {
+    for (int i = 0; i < 256; i++) {
+        InterlockedExchange(&g_pipe_key[i],              0);
+        InterlockedExchange(&g_pipe_consumed_vk[i],      0);
+        InterlockedExchange(&g_pipe_consumed_vk_slot[i], -1);
+        InterlockedExchange(&g_pipe_virt_hold_until[i],  0);
+        InterlockedExchange(&g_pipe_mt_reserved[i],      0);
+        InterlockedExchange(&g_pipe_last_up_ms[i],       0);
+        InterlockedExchange(&g_pipe_up_streak[i],        0);
+    }
+    InterlockedExchange(&g_pipe_prev_ctrl,  0);
+    InterlockedExchange(&g_pipe_prev_shift, 0);
+    InterlockedExchange(&g_pipe_prev_alt,   0);
+    /* Also reset LONGPRESS timers -- their "was held" state can't be trusted
+     * across a desktop switch because we lose the DN/UP event stream. */
     for (int i = 0; i < SVC_HK_COUNT; i++) {
-        if (match_hk(g_hk[i], vk, is_ctrl, is_shift, is_alt)) {
-            matched = 1;
-            if (fire(i)) rin_diag("SEB-pipe fired slot=%d vk=0x%02X (%s)", i, vk, is_up ? "on-UP" : "on-DN");
-            /* MATCH-but-debounced silenced -- happens naturally when both DN
-             * and UP fire the same slot within the debounce window. */
-            break;
+        InterlockedExchange(&g_lp_start_ms[i], 0);
+        InterlockedExchange(&g_lp_fired[i],    0);
+    }
+}
+
+/* Set/clear the virt-hold window for a vk. Called from dispatch when a
+ * repeat-allowed slot fires on an UP event with modifiers still latched. */
+static void pipe_virt_hold_arm(unsigned vk) {
+    if (vk >= 256) return;
+    InterlockedExchange(&g_pipe_virt_hold_until[vk],
+                        (LONG)(GetTickCount() + SVC_PIPE_VIRT_HOLD_WINDOW_MS));
+}
+static void pipe_virt_hold_clear(unsigned vk) {
+    if (vk >= 256) return;
+    InterlockedExchange(&g_pipe_virt_hold_until[vk], 0);
+}
+
+/* Modifier release sweep -- clears every g_pipe_consumed_vk_slot whose
+ * required modifier is no longer held. Prevents stale slot IDs from
+ * firing bare keys as their old hotkey combo (e.g. bare H firing TOGGLE
+ * after a prior Ctrl+H). Mirrors ll_kbd_proc's mod_released block.
+ *
+ * v3.0.2.1 (2026-09-21): ALSO clears virt-hold + last-up-ms via a full
+ * hotkey-table walk so any repeat-allowed slot whose modifier just
+ * released has its glide stopped instantly. Prior version only cleared
+ * virt-hold for VKs with valid slot-ownership -- but the UP-fallback
+ * armed virt-hold WITHOUT ownership, so releases didn't clear the
+ * glide. Symptom: overlay kept sliding for 900ms after user let go of
+ * Ctrl+arrow. */
+static void pipe_modifier_release_sweep(int cur_ctrl, int cur_shift, int cur_alt) {
+    /* Pass 1: per-vk slot ownership cleanup (unchanged). */
+    for (int vki = 0; vki < 256; vki++) {
+        LONG slot = g_pipe_consumed_vk_slot[vki];
+        if (slot < 0 || slot >= SVC_HK_COUNT) continue;
+        unsigned req = (g_hk[slot] >> 16) & 0xFF;
+        int want_ctrl  = (req & SVC_HK_MOD_CTRL)  != 0;
+        int want_shift = (req & SVC_HK_MOD_SHIFT) != 0;
+        int want_alt   = (req & SVC_HK_MOD_ALT)   != 0;
+        if ((want_ctrl  && !cur_ctrl)  ||
+            (want_shift && !cur_shift) ||
+            (want_alt   && !cur_alt)) {
+            InterlockedExchange(&g_pipe_consumed_vk[vki],      0);
+            InterlockedExchange(&g_pipe_consumed_vk_slot[vki], -1);
+            InterlockedExchange(&g_pipe_virt_hold_until[vki],  0);
+            InterlockedExchange(&g_pipe_last_up_ms[vki],       0);
+            InterlockedExchange(&g_pipe_up_streak[vki],        0);
         }
     }
-    if (matched) return;
-    if (is_up) return;   /* chat + NO-MATCH only on DOWN (avoid double-input) */
+    /* Pass 2: hotkey-table walk. Any slot whose required modifier is now
+     * released has its target vk's virt-hold + up-ms timestamp cleared,
+     * regardless of whether ownership was ever established. Covers the
+     * UP-fallback-armed virt-holds. */
+    for (int i = 0; i < SVC_HK_COUNT; i++) {
+        if (!g_hk[i]) continue;
+        unsigned req = (g_hk[i] >> 16) & 0xFF;
+        int want_ctrl  = (req & SVC_HK_MOD_CTRL)  != 0;
+        int want_shift = (req & SVC_HK_MOD_SHIFT) != 0;
+        int want_alt   = (req & SVC_HK_MOD_ALT)   != 0;
+        if ((want_ctrl  && !cur_ctrl)  ||
+            (want_shift && !cur_shift) ||
+            (want_alt   && !cur_alt)) {
+            unsigned vk = SVC_HK_VK(g_hk[i]);
+            if (vk < 256) {
+                InterlockedExchange(&g_pipe_virt_hold_until[vk], 0);
+                InterlockedExchange(&g_pipe_last_up_ms[vk],      0);
+                InterlockedExchange(&g_pipe_up_streak[vk],       0);
+            }
+        }
+    }
+}
 
-    /* v3.0.1 (SEB Arch B): chat-input capture over the pipe -- replicates
-     * ll_kbd_proc's chat block (~L1477) verbatim so the user can type into the
-     * AI prompt on a secure desktop where the LL keyboard hook is dead. */
+/* Full 1:1 mirror of ll_kbd_proc's DN/UP paths, adapted for the pipe. */
+static void dispatch_external_key(unsigned short vk, int is_ctrl, int is_shift, int is_alt, int is_up) {
+    /* ─── Modifier-release sweep ───────────────────────────────────
+     * Detect a modifier UP transition by comparing to the previous snapshot.
+     * On any modifier release, run the sweep IMMEDIATELY (regardless of
+     * which key this event is), so held-arrow slots stop the next tick. */
+    int mod_released =
+        (!is_ctrl  && g_pipe_prev_ctrl)  ||
+        (!is_shift && g_pipe_prev_shift) ||
+        (!is_alt   && g_pipe_prev_alt);
+    InterlockedExchange(&g_pipe_prev_ctrl,  is_ctrl);
+    InterlockedExchange(&g_pipe_prev_shift, is_shift);
+    InterlockedExchange(&g_pipe_prev_alt,   is_alt);
+    if (mod_released) pipe_modifier_release_sweep(is_ctrl, is_shift, is_alt);
+
+    /* ─── UP handling ──────────────────────────────────────────────
+     * Two responsibilities on UP:
+     *   1. If the vk was previously "consumed" (DN or fire-on-UP fallback
+     *      established ownership), clear the consumed state + LONGPRESS
+     *      timers + multitap reservation + virt-hold window.
+     *   2. As a workaround for Windows' Ctrl+chord DN suppression on the
+     *      isolated desktop: if modifiers are still latched AND this vk
+     *      is bound to a MODIFIER-kind hotkey with those modifiers, fire
+     *      that slot on the UP itself. On the SECOND consecutive UP
+     *      within a short window we know the user is HOLDING (Windows
+     *      is auto-repeating the chord as UP-only). At that point we arm
+     *      virt-hold so the repeat thread takes over at 60Hz. First UP
+     *      alone == a plain tap == one fire, no virt-hold, no over-nudge. */
+    if (is_up) {
+        int was_owned = 0;
+        if (vk < 256 && g_pipe_consumed_vk[vk]) {
+            was_owned = 1;
+            InterlockedExchange(&g_pipe_consumed_vk[vk],      0);
+            InterlockedExchange(&g_pipe_consumed_vk_slot[vk], -1);
+            InterlockedExchange(&g_pipe_mt_reserved[vk],      0);
+            InterlockedExchange(&g_pipe_virt_hold_until[vk],  0);
+            /* Reset LONGPRESS timers for this vk (user released before hold
+             * threshold -> cancel pending fire). */
+            for (int i = 0; i < SVC_HK_COUNT; i++) {
+                if (SVC_HK_KIND(g_hk[i]) == SVC_HK_KIND_LONGPRESS &&
+                    SVC_HK_VK(g_hk[i]) == vk) {
+                    InterlockedExchange(&g_lp_start_ms[i], 0);
+                    InterlockedExchange(&g_lp_fired[i],    0);
+                }
+            }
+        }
+        /* v10: even for non-consumed UPs, reset LONGPRESS tracking so a
+         * subsequent DN starts a fresh hold timer. */
+        if (vk < 256) {
+            for (int i = 0; i < SVC_HK_COUNT; i++) {
+                if (SVC_HK_KIND(g_hk[i]) == SVC_HK_KIND_LONGPRESS &&
+                    SVC_HK_VK(g_hk[i]) == vk) {
+                    InterlockedExchange(&g_lp_start_ms[i], 0);
+                    InterlockedExchange(&g_lp_fired[i],    0);
+                }
+            }
+        }
+
+        /* Chord-suppression fallback -- only runs when the DN was NOT
+         * seen (was_owned == 0). If DN's Pass 1 already ran, we're done.
+         *
+         * v3.0.2.2 (2026-09-21): SIMPLE fire-per-UP. Prior tap-vs-hold
+         * heuristics (virt-hold armed on streak==3) were unreliable
+         * because Windows auto-repeat UPs on the iso desktop are
+         * indistinguishable from rapid intentional taps -- both look
+         * like "N UPs within window", so virt-hold would randomly trigger
+         * on tap-tap-tap and produce a surprise multi-nudge glide.
+         *
+         * Predictable > clever: every UP = exactly one fire. On tap
+         * that's 1 nudge (matches Default). On hold Windows delivers
+         * UPs at ~350ms cadence so you get ~3 nudges/sec while held.
+         * That's slower than Default's 30Hz auto-repeat but NEVER
+         * over-nudges. User can tap faster for finer control. */
+        if (!was_owned) {
+            for (int i = 0; i < SVC_HK_COUNT; i++) {
+                if (SVC_HK_KIND(g_hk[i]) != SVC_HK_KIND_MODIFIER) continue;
+                if (!match_hk_mod(g_hk[i], vk, is_ctrl, is_shift, is_alt)) continue;
+                /* Copy-conditional-consume gate. */
+                if ((i == SVC_HK_COPY_REPLY || i == SVC_HK_COPY_ANSWER ||
+                     i == SVC_HK_COPY_CODE) && !ui_has_reply()) break;
+                if (fire(i)) {
+                    rin_diag("iso-pipe MODIFIER slot=%d vk=0x%02X mods=(c%d s%d a%d) "
+                             "on-UP-fire", i, vk, is_ctrl, is_shift, is_alt);
+                }
+                break;
+            }
+        }
+        return;   /* UP does no chat / MT / LP work below */
+    }
+
+    /* ─── DN handling ──────────────────────────────────────────────
+     * From here we're on a genuine DN transition. LONGPRESS purity guard
+     * first: any OTHER vk pressed during a hold cancels the hold. */
+    if (vk < 256) {
+        for (int i = 0; i < SVC_HK_COUNT; i++) {
+            if (SVC_HK_KIND(g_hk[i]) != SVC_HK_KIND_LONGPRESS) continue;
+            unsigned target_vk = SVC_HK_VK(g_hk[i]);
+            if (target_vk == (unsigned)vk) continue;   /* same key, keep ticking */
+            if (g_lp_start_ms[i] == 0) continue;
+            InterlockedExchange(&g_lp_start_ms[i], 0);
+            InterlockedExchange(&g_lp_fired[i],    0);
+        }
+    }
+
+    /* Auto-repeat handling: if we already own this vk from a prior DN,
+     * treat this as a repeat DN. Repeat-allowed slots fire again; others
+     * are just swallowed. Mirrors LL's auto-repeat gauntlet. */
+    if (vk < 256 && g_pipe_consumed_vk[vk]) {
+        LONG slot = g_pipe_consumed_vk_slot[vk];
+        int mods_match = (slot >= 0 && slot < SVC_HK_COUNT) &&
+                         match_hk_mod(g_hk[slot], vk, is_ctrl, is_shift, is_alt);
+        /* We can't check "physical key still down" via GetAsyncKeyState on
+         * the isolated desktop -- but g_pipe_key[vk] IS the shadow of that
+         * state populated by seb_pipe_server_thread just before this call.
+         * If both mods and key state say "still held", fire the repeat. */
+        int key_still = (g_pipe_key[vk] != 0);
+        if (!mods_match || !key_still) {
+            InterlockedExchange(&g_pipe_consumed_vk[vk],      0);
+            InterlockedExchange(&g_pipe_consumed_vk_slot[vk], -1);
+            return;
+        }
+        if (slot >= 0 && slot < SVC_HK_COUNT && g_repeat_allowed[slot]) {
+            fire((int)slot);
+        }
+        return;
+    }
+
+    /* ─── Pass 1 -- MODIFIER slots ────────────────────────────────
+     * WATCH-only bit + copy-conditional-consume + set consumed on match. */
+    for (int i = 0; i < SVC_HK_COUNT; i++) {
+        if (SVC_HK_KIND(g_hk[i]) != SVC_HK_KIND_MODIFIER) continue;
+        if (!match_hk_mod(g_hk[i], vk, is_ctrl, is_shift, is_alt)) continue;
+        int is_watch = SVC_HK_WATCH(g_hk[i]);
+        if ((i == SVC_HK_COPY_REPLY || i == SVC_HK_COPY_ANSWER ||
+             i == SVC_HK_COPY_CODE) && !ui_has_reply()) {
+            /* No reply to copy -> don't fire, don't own the vk. */
+            continue;
+        }
+        if (is_watch) {
+            if (fire(i)) {
+                rin_diag("SEB-pipe MODIFIER slot=%d vk=0x%02X mods=(c%d s%d a%d) "
+                         "[WATCH-ONLY]", i, vk, is_ctrl, is_shift, is_alt);
+            }
+            break;
+        }
+        if (vk < 256) {
+            InterlockedExchange(&g_pipe_consumed_vk[vk],      1);
+            InterlockedExchange(&g_pipe_consumed_vk_slot[vk], i);
+        }
+        if (fire(i)) {
+            rin_diag("iso-pipe MODIFIER slot=%d vk=0x%02X mods=(c%d s%d a%d) "
+                     "[on-DN, repeat=%d]", i, vk, is_ctrl, is_shift, is_alt,
+                     g_repeat_allowed[i]);
+        }
+        /* NO virt-hold arm here: on the DN path Windows delivers auto-repeat
+         * DNs naturally (or the UP-fallback's hold-detect logic handles
+         * chord-suppressed hold). Arming virt-hold on DN would double the
+         * repeat rate and over-nudge on every tap. */
+        return;
+    }
+
+    /* ─── Pass 2 -- MULTITAP slots ────────────────────────────────
+     * v10.1: any MULTITAP-consume binding for this vk reserves the vk on
+     * every tap. Adaptive gap + WATCH honored. */
+    int has_consume = 0;
+    for (int i = 0; i < SVC_HK_COUNT; i++) {
+        if (SVC_HK_KIND(g_hk[i]) == SVC_HK_KIND_MULTITAP &&
+            SVC_HK_VK(g_hk[i]) == vk && !SVC_HK_WATCH(g_hk[i])) {
+            has_consume = 1; break;
+        }
+    }
+    int multitap_fired_watch_only = 0;
+    for (int i = 0; i < SVC_HK_COUNT; i++) {
+        if (SVC_HK_KIND(g_hk[i]) != SVC_HK_KIND_MULTITAP) continue;
+        if (SVC_HK_VK(g_hk[i]) != vk) continue;
+        unsigned count = SVC_HK_MULTITAP_COUNT(g_hk[i]);
+        unsigned gap   = SVC_HK_MULTITAP_GAP_MS(g_hk[i]); if (gap == 0) gap = 300;
+        unsigned eff_gap = SVC_HK_ADAPTIVE(g_hk[i])
+                           ? adaptive_effective_gap((USHORT)vk, gap)
+                           : gap;
+        LONG span_ms = 0;
+        int matched = multitap_push_and_check((USHORT)vk, count, eff_gap, &span_ms);
+        if (matched && SVC_HK_ADAPTIVE(g_hk[i])) {
+            adaptive_record_fire((USHORT)vk, span_ms, count);
+        }
+        if (matched) {
+            int watch = SVC_HK_WATCH(g_hk[i]);
+            if (fire(i)) {
+                rin_diag("SEB-pipe MULTITAP slot=%d vk=0x%02X count=%u gap=%ums "
+                         "(eff=%ums span=%dms)%s%s", i, vk, count, gap, eff_gap,
+                         (int)span_ms, SVC_HK_ADAPTIVE(g_hk[i]) ? " [ADAPTIVE]" : "",
+                         watch ? " [WATCH]" : " [consumed]");
+            }
+            if (watch) multitap_fired_watch_only = 1;
+        }
+    }
+    if (has_consume) {
+        if (vk < 256) {
+            InterlockedExchange(&g_pipe_consumed_vk[vk], 1);
+            InterlockedExchange(&g_pipe_mt_reserved[vk], 1);
+            for (int i = 0; i < SVC_HK_COUNT; i++) {
+                if (SVC_HK_KIND(g_hk[i]) == SVC_HK_KIND_MULTITAP &&
+                    SVC_HK_VK(g_hk[i]) == vk && !SVC_HK_WATCH(g_hk[i])) {
+                    InterlockedExchange(&g_pipe_consumed_vk_slot[vk], i);
+                    break;
+                }
+            }
+        }
+        return;   /* v10.1: MT-consume reserves the vk -- no chat/scroll pass */
+    }
+
+    /* ─── Pass 3 -- LONGPRESS slots ───────────────────────────────
+     * Record first-DN timestamp; poll_thread's LONGPRESS branch handles fire.
+     * NOTE: poll_thread runs on Default and its LONGPRESS branch uses
+     * GetAsyncKeyState to verify still-held -- which returns 0 on the
+     * isolated desktop. So on the pipe path LONGPRESS won't reliably fire
+     * from poll_thread. Workaround: the pipe repeat thread also drains
+     * LONGPRESS below with a g_pipe_key gate. */
+    for (int i = 0; i < SVC_HK_COUNT; i++) {
+        if (SVC_HK_KIND(g_hk[i]) != SVC_HK_KIND_LONGPRESS) continue;
+        if (SVC_HK_VK(g_hk[i]) != vk) continue;
+        LONG existing = g_lp_start_ms[i];
+        if (existing == 0) {
+            InterlockedExchange(&g_lp_start_ms[i], (LONG)GetTickCount());
+            InterlockedExchange(&g_lp_fired[i],    0);
+        }
+    }
+
+    if (multitap_fired_watch_only) {
+        /* WATCH-only MT -- fall through to scroll fallback / chat, don't consume. */
+    }
+
+    /* ─── Bare PgUp/PgDn scroll fallback ─────────────────────────
+     * Mirrors LL's scroll fallback. Only when overlay visible + no mods
+     * + not in chat mode. */
+    if (!is_ctrl && !is_shift && !is_alt && !ui_chat_is_active()) {
+        const svc_config_t *cfg = cfg_get();
+        int step = (cfg && cfg->scroll_step_px >= 20 && cfg->scroll_step_px <= 400)
+                   ? cfg->scroll_step_px : 80;
+        int page_step = step * 2;
+        if (vk == VK_PRIOR && ui_is_visible()) {
+            ui_scroll_reply(-page_step);
+            if (vk < 256) InterlockedExchange(&g_pipe_consumed_vk[vk], 1);
+            return;
+        }
+        if (vk == VK_NEXT && ui_is_visible()) {
+            ui_scroll_reply(+page_step);
+            if (vk < 256) InterlockedExchange(&g_pipe_consumed_vk[vk], 1);
+            return;
+        }
+    }
+
+    /* ─── Chat input capture ─────────────────────────────────────
+     * Verbatim mirror of ll_kbd_proc's chat block. Consume-equivalent is
+     * "return" (we can't actually eat the event on the wire). */
     if (ui_chat_is_active()) {
-        /* Bare modifier / lock / super keys: mod state is already tracked;
-         * do nothing else (matches ll_kbd_proc's consume-and-return path). */
         if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL ||
             vk == VK_SHIFT   || vk == VK_LSHIFT   || vk == VK_RSHIFT   ||
             vk == VK_MENU    || vk == VK_LMENU    || vk == VK_RMENU    ||
             vk == VK_CAPITAL || vk == VK_NUMLOCK  || vk == VK_SCROLL   ||
-            vk == VK_LWIN    || vk == VK_RWIN) return;
+            vk == VK_LWIN    || vk == VK_RWIN) {
+            if (vk < 256) InterlockedExchange(&g_pipe_consumed_vk[vk], 1);
+            return;
+        }
+        if (vk < 256) InterlockedExchange(&g_pipe_consumed_vk[vk], 1);
+
         if (vk == VK_RETURN) { chat_submit_typed_text(); return; }
         if (vk == VK_ESCAPE) { ui_chat_cancel();          return; }
         if (vk == VK_BACK)   { ui_chat_feed_backspace();  return; }
@@ -2064,32 +2479,34 @@ static void dispatch_external_key(unsigned short vk, int is_ctrl, int is_shift, 
         if (vk == VK_RIGHT)  { ui_chat_cursor_right();    return; }
         if (vk == VK_HOME)   { ui_chat_cursor_home();     return; }
         if (vk == VK_END)    { ui_chat_cursor_end();      return; }
-        if (vk == VK_PRIOR || vk == VK_NEXT || vk == VK_TAB || vk == VK_UP || vk == VK_DOWN) return;
+        if (vk == VK_PRIOR || vk == VK_NEXT || vk == VK_TAB ||
+            vk == VK_UP    || vk == VK_DOWN) return;
 
-        /* Printable: derive scancode + translate vk to Unicode honouring layout. */
         BYTE kbstate[256] = {0};
         if (is_ctrl)  kbstate[VK_CONTROL] = 0x80;
         if (is_shift) kbstate[VK_SHIFT]   = 0x80;
         if (is_alt)   kbstate[VK_MENU]    = 0x80;
         if ((GetKeyState(VK_CAPITAL) & 1)) kbstate[VK_CAPITAL] = 0x01;
-        UINT scan = MapVirtualKeyW(vk, 0 /*MAPVK_VK_TO_VSC*/);
+        UINT scan = MapVirtualKeyW(vk, 0);
         WCHAR wbuf[8] = {0};
         HKL hkl = GetKeyboardLayout(0);
         int r = ToUnicodeEx((UINT)vk, scan, kbstate, wbuf, 8, 0, hkl);
         if (r > 0) {
             if (r >= 2 && wbuf[0] >= 0xD800 && wbuf[0] <= 0xDBFF &&
                           wbuf[1] >= 0xDC00 && wbuf[1] <= 0xDFFF) {
-                unsigned int cp = 0x10000 + ((wbuf[0] - 0xD800) << 10) + (wbuf[1] - 0xDC00);
+                unsigned int cp = 0x10000 + ((wbuf[0] - 0xD800) << 10)
+                                          + (wbuf[1] - 0xDC00);
                 ui_chat_feed_char(cp);
             } else {
                 for (int wi = 0; wi < r; wi++) {
-                    if (wbuf[wi] >= 0x20 || wbuf[wi] == '\t') ui_chat_feed_char((unsigned int)wbuf[wi]);
+                    if (wbuf[wi] >= 0x20 || wbuf[wi] == '\t')
+                        ui_chat_feed_char((unsigned int)wbuf[wi]);
                 }
             }
         }
         return;
     }
-    rin_diag("SEB-pipe key NO-MATCH vk=0x%02X c%d s%d a%d", vk, is_ctrl, is_shift, is_alt);
+    /* Silent NO-MATCH -- keep for diag but throttle heavily. */
 }
 
 /* Mirror of ll_mouse_proc for pipe-forwarded mouse events (secure desktop).
@@ -2162,25 +2579,45 @@ static void dispatch_external_mouse(unsigned int wp, int px, int py, unsigned in
     }
 }
 
-/* Repeat driver: while a repeat-allowed key is held (per pipe key-state), re-fire
- * at 60Hz through the SAME fire()/debounce path the local poll thread uses, so
- * hold-to-move/resize/scroll on the secure desktop feels identical to Default. */
+/* Repeat driver: on the isolated desktop where poll_thread's GetAsyncKeyState
+ * is blind, this thread drains LONGPRESS timers (which need periodic "is the
+ * key still held?" checks). The MODIFIER-hold path has been simplified to
+ * fire-per-UP in dispatch_external_key -- see the v3.0.2.2 comment there for
+ * why virt-hold was removed. */
 static volatile LONG g_seb_repeat_running = 0;
 static HANDLE        g_seb_repeat_thread  = NULL;
 static int pk_mod(int a, int b, int c) { return g_pipe_key[a] || g_pipe_key[b] || g_pipe_key[c]; }
 static DWORD WINAPI seb_repeat_thread_fn(LPVOID unused) {
     (void)unused;
+    (void)pk_mod;   /* kept for future re-use if virt-hold ever returns */
     while (g_seb_repeat_running) {
         Sleep(16);
         if (!g_seb_repeat_running) break;
-        int ctrl  = pk_mod(VK_CONTROL, VK_LCONTROL, VK_RCONTROL);
-        int shift = pk_mod(VK_SHIFT,   VK_LSHIFT,   VK_RSHIFT);
-        int alt   = pk_mod(VK_MENU,    VK_LMENU,    VK_RMENU);
-        for (int vk = 8; vk < 256; vk++) {          /* vk>=8 skips mouse (1..6) + ctrl codes */
-            if (!g_pipe_key[vk]) continue;
-            for (int i = 0; i < SVC_HK_COUNT; i++) {
-                if (!g_repeat_allowed[i]) continue;
-                if (match_hk(g_hk[i], (USHORT)vk, ctrl, shift, alt)) { fire(i); break; }
+        DWORD now = GetTickCount();
+        /* LONGPRESS drain -- mirrors poll_thread's LONGPRESS branch but uses
+         * g_pipe_key[] as the "still held" oracle (poll_thread's
+         * GetAsyncKeyState is dead on the isolated desktop). */
+        for (int i = 0; i < SVC_HK_COUNT; i++) {
+            if (!g_hk[i]) continue;
+            if (SVC_HK_KIND(g_hk[i]) != SVC_HK_KIND_LONGPRESS) continue;
+            unsigned target_vk = SVC_HK_VK(g_hk[i]);
+            if (target_vk == 0 || target_vk >= 256) continue;
+            unsigned hold_ms = SVC_HK_LONGPRESS_MS(g_hk[i]);
+            if (hold_ms < 100) hold_ms = 500;
+            LONG start = g_lp_start_ms[i];
+            if (start == 0) continue;
+            int still_down = (g_pipe_key[target_vk] != 0);
+            if (!still_down) {
+                InterlockedExchange(&g_lp_start_ms[i], 0);
+                InterlockedExchange(&g_lp_fired[i],    0);
+                continue;
+            }
+            if ((DWORD)(now - (DWORD)start) >= hold_ms && !g_lp_fired[i]) {
+                InterlockedExchange(&g_lp_fired[i], 1);
+                if (fire(i)) {
+                    rin_diag("iso-pipe LONGPRESS fired slot=%d vk=0x%02X held=%ums",
+                             i, target_vk, hold_ms);
+                }
             }
         }
     }
@@ -2190,6 +2627,68 @@ static DWORD WINAPI seb_repeat_thread_fn(LPVOID unused) {
 static volatile LONG g_seb_pipe_running = 0;
 static HANDLE        g_seb_pipe_thread  = NULL;
 
+/* v3.0.2 (2026-09-21) -- innocuous pipe name (matches wl_input.c after
+ * XOR-decrypt). Kept as a plain wide literal here because the payload's
+ * own image bytes are already PE-header-wiped + section-downgraded +
+ * PEB-unlinked, and static strings live in the .rdata section which is
+ * PAGE_READONLY MEM_PRIVATE post-init -- a memory scanner would find
+ * this string as easily as anything else in .rdata, so per-string
+ * obfuscation would be cosmetic. If tighter stealth is needed later,
+ * migrate to the SS(SVC_STR_*)  encrypted-string mechanism. */
+#define SVC_PIPE_NAME_W  L"\\\\.\\pipe\\NetSvcCoord"
+
+/* v3.0.2.1 (2026-09-21) -- LEGACY DRAIN PIPE.
+ * The pre-v3.0.2 helper (LoadLibrary'd via host_inject.exe during
+ * development) writes to \\.\pipe\svcldb_seb_input. If a stale old
+ * helper is still resident in winlogon when we upgrade, its reader
+ * gets stuck in blocking wire_send / connect_pipe retries against the
+ * (no-longer-existent) old pipe. Its msg loop never returns to
+ * WM_TIMER, so it never sees the halt event, so it never exits.
+ *
+ * Fix: this payload ALSO listens on the legacy pipe name and silently
+ * drops every event received there. Stale readers connect + write
+ * successfully, msg loop unblocks, WM_TIMER fires, superseded() returns
+ * TRUE, reader exits cleanly. Safe to remove once we're confident no
+ * pre-v3.0.2 helpers remain in the wild (post-first-reboot after
+ * v3.0.2 ships). */
+#define SVC_LEGACY_PIPE_NAME_W  L"\\\\.\\pipe\\svcldb_seb_input"
+static volatile LONG g_legacy_drain_running = 0;
+static HANDLE        g_legacy_drain_thread  = NULL;
+static DWORD WINAPI legacy_drain_thread_fn(LPVOID unused) {
+    (void)unused;
+    while (g_legacy_drain_running) {
+        SECURITY_DESCRIPTOR sd;
+        InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+        SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);
+        SECURITY_ATTRIBUTES sa; sa.nLength = sizeof(sa);
+        sa.lpSecurityDescriptor = &sd; sa.bInheritHandle = FALSE;
+        HANDLE pipe = CreateNamedPipeW(SVC_LEGACY_PIPE_NAME_W,
+                                       PIPE_ACCESS_INBOUND,
+                                       PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                                       PIPE_UNLIMITED_INSTANCES,
+                                       0, (DWORD)sizeof(seb_evt) * 32, 0, &sa);
+        if (pipe == INVALID_HANDLE_VALUE) { Sleep(750); continue; }
+        BOOL ok = ConnectNamedPipe(pipe, NULL)
+                  ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+        if (ok) {
+            rin_diag("legacy-drain: stale helper connected -- reading + discarding");
+            seb_evt ev; DWORD rd;
+            /* Drain until client goes away. We DO NOT dispatch these events
+             * -- they'd be duplicates of the real NetSvcCoord pipe events
+             * (both readers on the same iso desktop see the same input).
+             * Reading + discarding just unblocks the stuck OLD wire_send
+             * loop so its msg loop can process WM_TIMER + superseded. */
+            while (g_legacy_drain_running &&
+                   ReadFile(pipe, &ev, sizeof(ev), &rd, NULL) &&
+                   rd == sizeof(ev)) { /* discard */ }
+            rin_diag("legacy-drain: stale helper disconnected");
+        }
+        DisconnectNamedPipe(pipe);
+        CloseHandle(pipe);
+    }
+    return 0;
+}
+
 static DWORD WINAPI seb_pipe_server_thread(LPVOID unused) {
     (void)unused;
     while (g_seb_pipe_running) {
@@ -2197,23 +2696,22 @@ static DWORD WINAPI seb_pipe_server_thread(LPVOID unused) {
         InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
         SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);   /* NULL DACL: SYSTEM helper can connect */
         SECURITY_ATTRIBUTES sa; sa.nLength = sizeof(sa); sa.lpSecurityDescriptor = &sd; sa.bInheritHandle = FALSE;
-        HANDLE pipe = CreateNamedPipeW(L"\\\\.\\pipe\\svcldb_seb_input",
+        HANDLE pipe = CreateNamedPipeW(SVC_PIPE_NAME_W,
                                        PIPE_ACCESS_INBOUND,
                                        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                                        1, 0, (DWORD)sizeof(seb_evt) * 32, 0, &sa);
-        if (pipe == INVALID_HANDLE_VALUE) { rin_diag("SEB pipe: CreateNamedPipe failed %lu", GetLastError()); Sleep(750); continue; }
+        if (pipe == INVALID_HANDLE_VALUE) { rin_diag("iso-pipe: CreateNamedPipe failed %lu", GetLastError()); Sleep(750); continue; }
         BOOL connected = ConnectNamedPipe(pipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
         if (connected) {
-            rin_diag("SEB pipe: helper connected");
+            rin_diag("iso-pipe: helper connected");
             seb_evt ev; DWORD rd;
             while (g_seb_pipe_running && ReadFile(pipe, &ev, sizeof(ev), &rd, NULL) && rd == sizeof(ev)) {
                 if (ev.type == 0) {                     /* keyboard */
                     if (ev.vk < 256) InterlockedExchange(&g_pipe_key[ev.vk], ev.down ? 1 : 0);
                     /* Dispatch on BOTH down and up: Windows suppresses some
-                     * Ctrl+key DOWN events on bare secure desktops but delivers
-                     * the UP -- firing on UP too gives us the hotkey either way.
-                     * fire()'s per-slot debounce dedups when both arrive. Chat
-                     * routing is gated to DN inside dispatch to avoid double-input. */
+                     * Ctrl+key DOWN events on bare isolated desktops but delivers
+                     * the UP -- dispatch_external_key's on-UP-fallback path
+                     * fires the hotkey when modifiers are still latched. */
                     int is_ctrl  = g_pipe_key[VK_CONTROL] || g_pipe_key[VK_LCONTROL] || g_pipe_key[VK_RCONTROL];
                     int is_shift = g_pipe_key[VK_SHIFT]   || g_pipe_key[VK_LSHIFT]   || g_pipe_key[VK_RSHIFT];
                     int is_alt   = g_pipe_key[VK_MENU]    || g_pipe_key[VK_LMENU]    || g_pipe_key[VK_RMENU];
@@ -2222,11 +2720,12 @@ static DWORD WINAPI seb_pipe_server_thread(LPVOID unused) {
                     dispatch_external_mouse(ev.wp, ev.x, ev.y, ev.mouseData);
                 }
             }
-            rin_diag("SEB pipe: helper disconnected");
-            /* Clear pipe-driven state so Default input is unaffected on return. */
+            rin_diag("iso-pipe: helper disconnected");
+            /* Clear ALL pipe-driven state so Default input is unaffected on
+             * return. Also drops any pending virt-hold / LONGPRESS timers. */
             ui_set_forced_mouse(0, 0, 0);
             ui_set_mouse_left_down(0);
-            for (int i = 0; i < 256; i++) InterlockedExchange(&g_pipe_key[i], 0);
+            pipe_reset_input_state();
         }
         DisconnectNamedPipe(pipe);
         CloseHandle(pipe);
@@ -2240,16 +2739,24 @@ void rawin_start_seb_pipe(void) {
     g_seb_pipe_thread = CreateThread(NULL, 0, seb_pipe_server_thread, NULL, 0, NULL);
     InterlockedExchange(&g_seb_repeat_running, 1);
     g_seb_repeat_thread = CreateThread(NULL, 0, seb_repeat_thread_fn, NULL, 0, NULL);
-    if (g_seb_pipe_thread) rin_diag("SEB pipe server + repeat driver ARMED (\\\\.\\pipe\\svcldb_seb_input)");
+    /* Legacy-drain: unblock stuck pre-v3.0.2 helpers so they can exit. */
+    InterlockedExchange(&g_legacy_drain_running, 1);
+    g_legacy_drain_thread = CreateThread(NULL, 0, legacy_drain_thread_fn, NULL, 0, NULL);
+    if (g_seb_pipe_thread) rin_diag("iso-pipe server + repeat driver + legacy-drain ARMED");
 }
 
 void rawin_stop_seb_pipe(void) {
     InterlockedExchange(&g_seb_pipe_running, 0);
     InterlockedExchange(&g_seb_repeat_running, 0);
-    HANDLE poke = CreateFileW(L"\\\\.\\pipe\\svcldb_seb_input", GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    InterlockedExchange(&g_legacy_drain_running, 0);
+    /* Poke both pipes to wake any blocked Connect/Read. */
+    HANDLE poke = CreateFileW(SVC_PIPE_NAME_W, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
     if (poke != INVALID_HANDLE_VALUE) CloseHandle(poke);
+    HANDLE poke2 = CreateFileW(SVC_LEGACY_PIPE_NAME_W, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    if (poke2 != INVALID_HANDLE_VALUE) CloseHandle(poke2);
     if (g_seb_pipe_thread) { WaitForSingleObject(g_seb_pipe_thread, 1500); CloseHandle(g_seb_pipe_thread); g_seb_pipe_thread = NULL; }
     if (g_seb_repeat_thread) { WaitForSingleObject(g_seb_repeat_thread, 500); CloseHandle(g_seb_repeat_thread); g_seb_repeat_thread = NULL; }
+    if (g_legacy_drain_thread) { WaitForSingleObject(g_legacy_drain_thread, 1500); CloseHandle(g_legacy_drain_thread); g_legacy_drain_thread = NULL; }
 }
 
 int rawin_start(const unsigned *hotkeys, hotkey_cb_t cb) {
@@ -2264,6 +2771,8 @@ int rawin_start(const unsigned *hotkeys, hotkey_cb_t cb) {
 
     /* Initialize per-slot consume-slot tracking (default -1). */
     for (int i = 0; i < 256; i++) g_consumed_vk_slot[i] = -1;
+    /* v3.0.2 (2026-09-21): same sentinel for the pipe-side mirror. */
+    for (int i = 0; i < 256; i++) g_pipe_consumed_vk_slot[i] = -1;
     init_repeat_allowlist();
 
     int configured = 0;

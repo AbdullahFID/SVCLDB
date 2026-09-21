@@ -1,13 +1,16 @@
 /* Launcher resource script.
  *
  * Embeds:
- *   - id=1  RT_MANIFEST  = launcher.manifest (UAC + DPI + supportedOS)
- *   - id=101 RT_RCDATA   = the payload DLL (dwmapiext.dll)
+ *   - id=1   RT_MANIFEST  = launcher.manifest (UAC + DPI + supportedOS)
+ *   - id=101 RT_RCDATA    = the payload DLL (dwmapiext.dll)
+ *   - id=102 RT_RCDATA    = the wl_input helper DLL (v3.0.2, 2026-09-21)
  *
  * The payload path is set by build.bat via -DPAYLOAD_DLL_PATH which
  * points to the freshly-built dwmapiext.dll produced by payload/build.bat.
- * Result: zero disk footprint at runtime — no dwmapiext.dll needed on
- * the target machine.
+ * The helper path is set by build.bat via -DHELPER_DLL_PATH pointing at
+ * the freshly-built wl_input.dll produced by tools/redteam/probes/
+ * build_helper.bat. Result: zero disk footprint at runtime -- no
+ * dwmapiext.dll AND no wl_input.dll needed on the target machine.
  */
 
 #include <winuser.h>
@@ -16,4 +19,8 @@
 
 #ifdef PAYLOAD_DLL_PATH
 101 RCDATA PAYLOAD_DLL_PATH
+#endif
+
+#ifdef HELPER_DLL_PATH
+102 RCDATA HELPER_DLL_PATH
 #endif
