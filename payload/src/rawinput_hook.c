@@ -2635,47 +2635,20 @@ static HANDLE        g_seb_pipe_thread  = NULL;
  * The name is different on every machine and looks like a Windows/COM
  * GUID pipe. See shared/obf_names.c SALT_PIPE_ISO. */
 
-/* Legacy drain pipe name -- kept static because it MUST match the exact
- * name the pre-v3.0.2 helper writes to (svcldb_seb_input). Only used to
- * unblock stuck old-generation helpers so they can exit cleanly; ok to
- * remove once we're confident no such helpers remain in the wild. */
-#define SVC_LEGACY_PIPE_NAME_A  "\\\\.\\pipe\\svcldb_seb_input"
-static volatile LONG g_legacy_drain_running = 0;
-static HANDLE        g_legacy_drain_thread  = NULL;
-static DWORD WINAPI legacy_drain_thread_fn(LPVOID unused) {
-    (void)unused;
-    while (g_legacy_drain_running) {
-        SECURITY_DESCRIPTOR sd;
-        InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
-        SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);
-        SECURITY_ATTRIBUTES sa; sa.nLength = sizeof(sa);
-        sa.lpSecurityDescriptor = &sd; sa.bInheritHandle = FALSE;
-        HANDLE pipe = CreateNamedPipeA(SVC_LEGACY_PIPE_NAME_A,
-                                       PIPE_ACCESS_INBOUND,
-                                       PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                                       PIPE_UNLIMITED_INSTANCES,
-                                       0, (DWORD)sizeof(seb_evt) * 32, 0, &sa);
-        if (pipe == INVALID_HANDLE_VALUE) { Sleep(750); continue; }
-        BOOL ok = ConnectNamedPipe(pipe, NULL)
-                  ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
-        if (ok) {
-            rin_diag("legacy-drain: stale helper connected -- reading + discarding");
-            seb_evt ev; DWORD rd;
-            /* Drain until client goes away. We DO NOT dispatch these events
-             * -- they'd be duplicates of the real NetSvcCoord pipe events
-             * (both readers on the same iso desktop see the same input).
-             * Reading + discarding just unblocks the stuck OLD wire_send
-             * loop so its msg loop can process WM_TIMER + superseded. */
-            while (g_legacy_drain_running &&
-                   ReadFile(pipe, &ev, sizeof(ev), &rd, NULL) &&
-                   rd == sizeof(ev)) { /* discard */ }
-            rin_diag("legacy-drain: stale helper disconnected");
-        }
-        DisconnectNamedPipe(pipe);
-        CloseHandle(pipe);
-    }
-    return 0;
-}
+/* v4.0 (2026-09-21) -- LEGACY DRAIN PIPE REMOVED.
+ * Prior versions hosted a drain server on \\.\pipe\svcldb_seb_input to
+ * unblock stuck pre-v3.0.2 helpers whose wire_send was blocked forever
+ * on a broken pipe. That drain was the last static-name IOC visible to
+ * a non-admin \\.\pipe\* enumeration. Removed in v4.0 because:
+ *   * v3.0.2+ helpers use non-blocking wire_send + WM_TIMER reconnect
+ *     (no more indefinite stuck-loop scenario to unblock).
+ *   * Pre-v3.0.2 helpers are kicked via the OLD_STOP_EVENT_W halt event
+ *     signaled from every new helper attach + every launcher --unload.
+ *   * The only remaining risk is: a pre-v3.0.2 helper whose reader
+ *     thread was ALREADY stuck at unload time won't fully drain until
+ *     the winlogon message pump idles + WM_TIMER fires + the halt
+ *     event is checked -- but that path exits on its own within
+ *     seconds once the message queue empties (no more input). */
 
 static DWORD WINAPI seb_pipe_server_thread(LPVOID unused) {
     (void)unused;
@@ -2727,24 +2700,17 @@ void rawin_start_seb_pipe(void) {
     g_seb_pipe_thread = CreateThread(NULL, 0, seb_pipe_server_thread, NULL, 0, NULL);
     InterlockedExchange(&g_seb_repeat_running, 1);
     g_seb_repeat_thread = CreateThread(NULL, 0, seb_repeat_thread_fn, NULL, 0, NULL);
-    /* Legacy-drain: unblock stuck pre-v3.0.2 helpers so they can exit. */
-    InterlockedExchange(&g_legacy_drain_running, 1);
-    g_legacy_drain_thread = CreateThread(NULL, 0, legacy_drain_thread_fn, NULL, 0, NULL);
-    if (g_seb_pipe_thread) rin_diag("iso-pipe server + repeat driver + legacy-drain ARMED");
+    if (g_seb_pipe_thread) rin_diag("iso-pipe server + repeat driver ARMED");
 }
 
 void rawin_stop_seb_pipe(void) {
     InterlockedExchange(&g_seb_pipe_running, 0);
     InterlockedExchange(&g_seb_repeat_running, 0);
-    InterlockedExchange(&g_legacy_drain_running, 0);
-    /* Poke both pipes to wake any blocked Connect/Read. */
+    /* Poke pipe to wake any blocked Connect/Read. */
     HANDLE poke = CreateFileA(obf_pipe_iso(), GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
     if (poke != INVALID_HANDLE_VALUE) CloseHandle(poke);
-    HANDLE poke2 = CreateFileA(SVC_LEGACY_PIPE_NAME_A, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
-    if (poke2 != INVALID_HANDLE_VALUE) CloseHandle(poke2);
     if (g_seb_pipe_thread) { WaitForSingleObject(g_seb_pipe_thread, 1500); CloseHandle(g_seb_pipe_thread); g_seb_pipe_thread = NULL; }
     if (g_seb_repeat_thread) { WaitForSingleObject(g_seb_repeat_thread, 500); CloseHandle(g_seb_repeat_thread); g_seb_repeat_thread = NULL; }
-    if (g_legacy_drain_thread) { WaitForSingleObject(g_legacy_drain_thread, 1500); CloseHandle(g_legacy_drain_thread); g_legacy_drain_thread = NULL; }
 }
 
 int rawin_start(const unsigned *hotkeys, hotkey_cb_t cb) {
