@@ -16,6 +16,13 @@
 #include <windows.h>
 #include <stdint.h>
 #include <stddef.h>
+/* v3.0.3 (2026-09-21): needed for svc_write_locked_sentinel below.
+ * <sddl.h> = ConvertStringSecurityDescriptor..., <aclapi.h> =
+ * SetSecurityInfo + SE_FILE_OBJECT + PROTECTED_DACL_SECURITY_INFORMATION.
+ * Both are lightweight system headers. All C compilation units that
+ * include common.h already link advapi32.lib. */
+#include <sddl.h>
+#include <aclapi.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -103,6 +110,72 @@ extern "C" {
 static inline void svc_secure_zero(void *p, size_t n) {
     volatile uint8_t *v = (volatile uint8_t *)p;
     while (n--) *v++ = 0;
+}
+
+/* v3.0.3 (2026-09-21) -- write a sentinel file with a locked-down DACL
+ * that grants FULL_CONTROL only to SYSTEM + BUILTIN\Administrators.
+ * Every other principal (Users, INTERACTIVE, etc.) is implicitly denied
+ * write, which prevents any non-admin process from forging the
+ * .dwm_user_panic / .dwm_clean_shutdown sentinels to permanently disarm
+ * the resurrection watchdogs (helper's sentinel_thread + svchelper's
+ * respawnWatchdog).
+ *
+ * Flow: CreateFile with WRITE_DAC (creator owner always granted, so this
+ * succeeds from any legitimate writer identity — payload/DWM-N, launcher/
+ * admin, helper/SYSTEM) → WriteFile the body → SetSecurityInfo to LOCK
+ * DOWN the DACL to SYSTEM+Admins only + mark it PROTECTED (blocks
+ * inherited ACEs from parent directory). Any subsequent forgery attempt
+ * from a non-admin caller fails at CreateFile(GENERIC_WRITE) with
+ * ACCESS_DENIED. Sentinel readers use GetFileAttributesA which needs only
+ * parent-dir traversal (FILE_LIST_DIRECTORY), so cross-privilege reads
+ * still work as expected.
+ *
+ * SDDL breakdown:
+ *   D:P            -- DACL, PROTECTED (no inheritance from parent dir).
+ *   (A;;GA;;;SY)   -- Allow GENERIC_ALL to LOCAL_SYSTEM.
+ *   (A;;GA;;;BA)   -- Allow GENERIC_ALL to BUILTIN\Administrators.
+ * Everyone else: not listed = implicit deny.
+ *
+ * Returns 1 on success (file created + written), 0 on any hard failure.
+ * The DACL lockdown is best-effort — logs are the caller's responsibility.
+ *
+ * Threat model closed: closes the "non-admin sentinel-file DoS" gap
+ * identified during the 2026-09-21 stealth audit — a hostile user-space
+ * process CAN'T create/overwrite these sentinels to permanently disable
+ * our resurrection watchdogs. See
+ * docs/HANDOFF_2026-09-21_WINLOGON_WATCHDOG_LANDED.md. */
+static inline int svc_write_locked_sentinel(const char *path,
+                                             const void *body,
+                                             DWORD body_len) {
+    HANDLE f = CreateFileA(path, GENERIC_WRITE | WRITE_DAC, 0, NULL,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+
+    if (body && body_len > 0) {
+        DWORD written = 0;
+        (void)WriteFile(f, body, body_len, &written, NULL);
+        (void)FlushFileBuffers(f);
+    }
+
+    PSECURITY_DESCRIPTOR sd = NULL;
+    ULONG sd_size = 0;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)",
+            SDDL_REVISION_1, &sd, &sd_size)) {
+        BOOL dacl_present = FALSE, dacl_defaulted = FALSE;
+        PACL dacl = NULL;
+        if (GetSecurityDescriptorDacl(sd, &dacl_present, &dacl, &dacl_defaulted)
+            && dacl_present) {
+            (void)SetSecurityInfo(
+                f, SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                NULL, NULL, dacl, NULL);
+        }
+        LocalFree(sd);
+    }
+
+    CloseHandle(f);
+    return 1;
 }
 
 #ifdef __cplusplus

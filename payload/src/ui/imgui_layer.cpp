@@ -590,6 +590,60 @@ static DWORD            g_progman_pid          = 0;   /* owning explorer PID of 
  * was flaky (it raced the compose thread). */
 static volatile LONG    g_needs_client_reinit  = 0;
 
+/* v3.6.1 (P0 explorer-stays-dead fix, 2026-09-21):
+ * Query the image basename of `pid`. Returns:
+ *   +1  == definitively IS explorer.exe (proof)
+ *   -1  == definitively is NOT explorer.exe (proof)
+ *    0  == indeterminate (OpenProcess failed / query failed / freshly-
+ *          spawned process before its DACL settles)
+ *
+ * The caller (ensure_fake_hwnd_valid) rejects ONLY on -1. Rejecting on
+ * indeterminate (0) is a false-negative trap that permanently rejects
+ * legitimate fresh explorer.exe pids -- observed live 2026-09-21 when
+ * a freshly-spawned explorer at pid 9544 got rejected 1.5s after start
+ * because PROCESS_QUERY_LIMITED_INFORMATION transiently failed on it.
+ *
+ * Empirical repro of the +1/-1 win case (2026-09-21 with
+ * AutoRestartShell=0 held): killing explorer.exe left a RuntimeBroker.exe
+ * (pid 15636) with a WorkerW-class window that FindWindowA("WorkerW",
+ * NULL) matched. Old code accepted it, ran the full teardown+reinit
+ * against RuntimeBroker's HWND, fired the canonical "ImGui READY --
+ * overlay should render this frame" log line, but pixels went to a
+ * surface DWM wasn't scanning out. Overlay silently invisible while
+ * every diag marker screamed "recovered". Fix: reject on definitive -1
+ * only, so RuntimeBroker is caught but a fresh explorer isn't.
+ *
+ * PROCESS_QUERY_LIMITED_INFORMATION is *usually* granted on user-session
+ * processes from DWM's SYSTEM-adjacent context, but the handle-table
+ * DACL settles a few 100ms after CreateProcess -- until then OpenProcess
+ * can fail spuriously. Fresh-boot explorer + first-time-launch explorer
+ * both hit this. */
+static int is_process_explorer_ternary(DWORD pid) {
+    if (pid == 0) return -1;   /* NULL owner: definitely not a shell */
+    HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hp) return 0;         /* indeterminate: transient DACL race */
+    wchar_t path[MAX_PATH]; DWORD sz = MAX_PATH;
+    BOOL ok = QueryFullProcessImageNameW(hp, 0, path, &sz);
+    CloseHandle(hp);
+    if (!ok || sz == 0) return 0;   /* indeterminate: query failed */
+    /* Extract basename (last component after '\' or '/'). */
+    const wchar_t *base = path;
+    for (DWORD i = 0; i < sz; i++) {
+        if (path[i] == L'\\' || path[i] == L'/') base = &path[i + 1];
+    }
+    /* Case-insensitive compare to L"explorer.exe". */
+    static const wchar_t kExplorer[] = L"explorer.exe";
+    int i = 0;
+    while (base[i] && kExplorer[i]) {
+        wchar_t a = base[i], b = kExplorer[i];
+        if (a >= L'A' && a <= L'Z') a = (wchar_t)(a - L'A' + L'a');
+        if (b >= L'A' && b <= L'Z') b = (wchar_t)(b - L'A' + L'a');
+        if (a != b) return -1;
+        i++;
+    }
+    return (base[i] == 0 && kExplorer[i] == 0) ? +1 : -1;
+}
+
 /* Progman-recovery: fired every frame from ui_present_frame. If our
  * fake HWND is null or destroyed, teardown ImGui-Win32 backend, refind
  * Progman, reinit. Throttled to once per ~500ms so we're not calling
@@ -608,12 +662,98 @@ static bool ensure_fake_hwnd_valid(void) {
     }
     g_last_progman_check = now;
     HWND newh = FindWindowA("Progman", "Program Manager");
-    if (!newh) {
-        /* Fallback: try WorkerW (behind-desktop worker windows). */
-        newh = FindWindowA("WorkerW", NULL);
-    }
+    /* v3.6.1 (2026-09-21): dropped the FindWindowA("WorkerW", NULL)
+     * fallback. Empirically it was the phantom-leak source -- UWP
+     * broker processes (RuntimeBroker.exe, ShellExperienceHost) carry
+     * WorkerW-class windows that satisfied the fallback probe after
+     * the real shell died. Progman + "Program Manager" title is
+     * uniquely explorer's shell window (registered by the explorer
+     * runtime; no other process is documented to use that class+title
+     * pair). If Progman is gone, the shell is gone -- wait 200ms for
+     * the next poll rather than falling back to a class that's not
+     * uniquely ours. The ternary owner-check below is defense-in-depth
+     * for the pathological case where something DOES spoof Progman. */
     DWORD newpid = 0;
     if (newh) GetWindowThreadProcessId(newh, &newpid);
+    /* v3.6.1: reject ONLY on definitive proof (-1) that the owner is
+     * not explorer.exe. Indeterminate (0) = transient OpenProcess race
+     * on freshly-spawned explorer whose handle DACL hasn't settled;
+     * observed live 2026-09-21 when new explorer at pid 9544 got
+     * false-rejected 1.5s after start. Treating indeterminate as
+     * "trust the HWND" keeps recovery from stalling forever on that
+     * transient. */
+    if (newh) {
+        int owner_check = is_process_explorer_ternary(newpid);
+        if (owner_check == -1) {
+            static DWORD s_last_rejected_pid = 0;
+            if (newpid != s_last_rejected_pid) {
+                diag("[RECOVERY] rejecting phantom Progman hwnd=%p owner_pid=%lu "
+                     "(definitively NOT explorer.exe) -- waiting for real shell",
+                     newh, (unsigned long)newpid);
+                s_last_rejected_pid = newpid;
+            }
+            newh = NULL;
+            newpid = 0;
+        }
+    }
+
+    /* v3.6.2 (2026-09-21) -- ISO-DESKTOP TEARDOWN REGRESSION FIX.
+     *
+     * If Progman is missing AND the active input desktop is NOT Default,
+     * we're on an isolated/secure desktop (SEB, custom proctor desktop,
+     * our test probe, etc.) where there LEGITIMATELY is no Progman.
+     * Don't treat that as a shell restart -- tearing down the ImGui-Win32
+     * backend + calling ui_reinit() + rawin_restart() mid-iso-session drops
+     * pipe events in flight, resets overlay position (visible to the user
+     * as "snap backwards" during drag), and can miss hotkeys during the
+     * ~350ms rebuild window.
+     *
+     * REGRESSION SOURCE: v3.6.1 (this file) dropped the
+     * FindWindowA("WorkerW", NULL) fallback. Pre-v3.6.1, that fallback
+     * accidentally papered over this bug because iso desktops usually
+     * have SOME WorkerW-class window that satisfied the probe, so newh
+     * ended up non-NULL and the reinit branch didn't fire. Post-v3.6.1,
+     * newh is genuinely NULL on iso, and my code triggered the full
+     * teardown+reinit every time the user switched to iso.
+     *
+     * Live-observed 2026-09-21 06:22 via desktop_switch.cpp probe:
+     * slot table redump mid-iso-session, Ctrl+arrow hotkeys broken,
+     * overlay drag position snapped back periodically. SEB happened to
+     * work only because SEB's secure desktop has more windows around
+     * that satisfied the pre-fix WorkerW fallback -- but that was luck,
+     * not correctness.
+     *
+     * FIX: preserve current state (return cached HWND value) when Progman
+     * is gone AND we're on a non-Default input desktop. When the user
+     * returns to Default, either the real Progman reappears (normal
+     * path handles it) or we transition to actual "shell dead" cleanly.
+     * Only add the OpenInputDesktop query on the newh==NULL slow path
+     * so hot-path (Progman found) is unchanged. */
+    if (!newh) {
+        HDESK cur = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+        if (cur) {
+            char dname[64] = {0}; DWORD need = 0;
+            BOOL got = GetUserObjectInformationA(cur, UOI_NAME,
+                                                  dname, sizeof(dname), &need);
+            CloseDesktop(cur);
+            if (got && lstrcmpiA(dname, "Default") != 0) {
+                static char s_last_iso_desk[64] = {0};
+                if (lstrcmpiA(dname, s_last_iso_desk) != 0) {
+                    lstrcpynA(s_last_iso_desk, dname, sizeof(s_last_iso_desk));
+                    diag("[RECOVERY] input desktop '%s' (non-Default) + Progman absent "
+                         "(expected on iso) -- preserving state, no teardown",
+                         dname);
+                }
+                /* Keep g_fake_hwnd + g_progman_pid unchanged. Backend stays
+                 * initialized. On return to Default, either the real Progman
+                 * comes back (accepted by the normal path above) or newh is
+                 * still NULL on Default (real shell death) and the reinit
+                 * fires correctly. */
+                return g_fake_hwnd != NULL;
+            }
+        }
+    }
+
     /* Shell restart if the HWND changed, OR the owning explorer PID changed
      * (HWND reuse), OR our cached HWND went invalid. */
     BOOL restarted = (newh != g_fake_hwnd) || (newpid != g_progman_pid) ||
@@ -638,6 +778,16 @@ static bool ensure_fake_hwnd_valid(void) {
          * swapchain fresh from the CURRENT layer + rebuild ImGui. Fully
          * in-process, no worker thread, no process spawn (OnVUE-safe). */
         InterlockedExchange(&g_needs_client_reinit, 1);
+    } else if (!g_fake_hwnd && newh) {
+        /* v3.6.1 (2026-09-21): silent-recovery diag. Backend was already
+         * torn down (we transitioned to "no shell" earlier), and now a
+         * fresh Progman appears. The main render body's
+         * `!g_win32_backend_inited` branch will re-init ImGui-Win32 on the
+         * next frame. Log so the recovery is traceable -- without this,
+         * "shell came back" is silent and it looks like the payload
+         * stayed dead in the tail. */
+        diag("[RECOVERY] shell resumed: fresh Progman %p(pid %lu) -- backend rebuild next frame",
+             newh, (unsigned long)newpid);
     }
     g_fake_hwnd   = newh;
     g_progman_pid = newpid;

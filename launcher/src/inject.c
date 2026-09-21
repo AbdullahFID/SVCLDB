@@ -538,6 +538,47 @@ static int manual_map_from_bytes(HANDLE hProc, const BYTE *sourceBytes,
      * separately by inject_helper_signal_unload(). */
     if (!skip_payload_teardown) wait_for_payload_teardown();
 
+    /* v3.0.3 (2026-09-21): clear both user-intent sentinels at the start
+     * of any payload arm path (--reinject / --json-config / --quiet).
+     *
+     * WHY:
+     *   .dwm_user_panic          -- written by SVC_HK_KILL_ALL hotkey
+     *                               (Ctrl+Shift+Alt+K) AND by the helper's
+     *                               emergency kill (Ctrl+Shift+Alt+Q).
+     *   .dwm_clean_shutdown      -- written by sihost --unload's teardown.
+     *
+     * Both files signal to every downstream watchdog (svchelper's
+     * respawnWatchdog + helper's sentinel_thread) that the user
+     * INTENTIONALLY brought the payload down and doesn't want it
+     * auto-revived. But when a user (or admin script) then explicitly
+     * runs `sihost --reinject` or `sihost --quiet`, that IS an override
+     * -- the very act of running arm means "I want it up again."
+     *
+     * Pre-fix, the sentinels persisted across --unload/--reinject cycles.
+     * After my --unload during Layer 2+3 testing at 04:53:02 AM, the
+     * .dwm_clean_shutdown file lingered, and the helper's sentinel_thread
+     * (correctly!) refused to respawn explorer/payload for the entire
+     * subsequent test window. Reproduced live 2026-09-21 05:22:37 --
+     * `sentinel: user sentinel present -- skipping resurrection tick`.
+     *
+     * svchelper's Electron-side arm() already deletes both sentinels
+     * (ui/src/main.js respawnWatchdog.arm() -- delete .dwm_clean_shutdown
+     * + .dwm_user_panic). This mirrors that behavior for the CLI arm
+     * paths so behavior is identical regardless of who kicked the arm.
+     *
+     * GATED on !skip_payload_teardown so helper-only injections don't
+     * touch payload-side sentinels. */
+    if (!skip_payload_teardown) {
+        /* Use SVC_INSTALL_DIR macro (defined in shared/common.h) for
+         * consistency with the rest of the launcher; the string is
+         * already in .rdata via log_secure.c + main.c uses, so this
+         * is stylistic parity, not a fresh leak. */
+        DeleteFileA(SVC_INSTALL_DIR "\\.dwm_clean_shutdown");
+        DeleteFileA(SVC_INSTALL_DIR "\\.dwm_user_panic");
+        slog_writef("launcher.log",
+                    "arm: cleared user-intent sentinels (clean + panic)");
+    }
+
     /* Historically the sweep reclaimed leaked payload regions from prior
      * `--unload` cycles that couldn't self-free (payload's peb_unlink
      * defeats `FreeLibraryAndExitThread`'s LDR lookup, so the image

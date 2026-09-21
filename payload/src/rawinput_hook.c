@@ -198,6 +198,20 @@ typedef struct {
 #define RIN_WM_MOUSEWHEEL   0x020A
 #define RIN_WM_MOUSEHWHEEL  0x020E
 
+/* v3.0.4 (2026-09-21) -- LL hook injection-filter constants. Windows sets
+ * these bits in KBDLLHOOKSTRUCT.flags / MSLLHOOKSTRUCT.flags when the
+ * event originated from SendInput / keybd_event / mouse_event /
+ * PostMessage(WM_KEY*), i.e. any process synthesizing input rather than
+ * physical hardware. Rejecting these events in ll_kbd_proc / ll_mouse_proc
+ * closes the "hostile non-admin app fakes our hotkeys via SendInput"
+ * DoS + visibility-leak vector. Verified 2026-09-21: zero legitimate self-
+ * injection in the payload (wake_dwm_composition's old mouse_event nudge
+ * was removed in v1.7.2), so filtering INJECTED is safe. */
+#define RIN_LLKHF_INJECTED           0x00000010U
+#define RIN_LLKHF_LOWER_IL_INJECTED  0x00000002U
+#define RIN_LLMHF_INJECTED           0x00000001U
+#define RIN_LLMHF_LOWER_IL_INJECTED  0x00000002U
+
 /* MSLLHOOKSTRUCT -- mouse low-level hook struct. mouseData high word
  * holds the wheel delta for WM_MOUSEWHEEL / WM_MOUSEHWHEEL messages
  * (signed, +/-120 per notch on standard wheels; some hi-res wheels
@@ -1075,6 +1089,31 @@ extern void chat_submit_typed_text(void);
 static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
     if (code == RIN_HC_ACTION) {
         RIN_KBDLLHOOKSTRUCT *k = (RIN_KBDLLHOOKSTRUCT *)lp;
+
+        /* v3.0.4 (2026-09-21) -- INJECTION FILTER.
+         * Reject any event with LLKHF_INJECTED (SendInput / keybd_event
+         * / PostMessage(WM_KEY*)) or LLKHF_LOWER_IL_INJECTED (event
+         * from a lower-integrity process). Only real physical-keyboard
+         * events from the hardware chain pass. Closes the "hostile
+         * non-admin app synthesizes Ctrl+Shift+Alt+K (KILL_ALL) or
+         * Ctrl+Alt+G (toggle overlay visibility during exam) via
+         * SendInput" DoS + visibility-leak vector. Payload has zero
+         * legitimate self-injection call sites (verified 2026-09-21;
+         * wake_dwm_composition's old mouse_event nudge was removed in
+         * v1.7.2), so this filter is a pure security add with no
+         * legitimate-event false-negatives. Pass-through, never
+         * consume -- injected events still route to whatever app
+         * asked for them; we just don't ACT on them. */
+        if (k->flags & (RIN_LLKHF_INJECTED | RIN_LLKHF_LOWER_IL_INJECTED)) {
+            static volatile LONG s_inj_logged = 0;
+            LONG n = InterlockedIncrement(&s_inj_logged);
+            if (n <= 8) {   /* first 8 injected events; then throttle */
+                rin_diag("LL kbd: rejecting INJECTED event #%ld vk=0x%02X flags=0x%X",
+                         n, (unsigned)k->vkCode, (unsigned)k->flags);
+            }
+            return CallNextHookEx(NULL, code, wp, lp);
+        }
+
         USHORT vk = (USHORT)k->vkCode;
         int is_down = (wp == RIN_WM_KEYDOWN || wp == RIN_WM_SYSKEYDOWN);
         int is_up   = (wp == RIN_WM_KEYUP   || wp == RIN_WM_SYSKEYUP);
@@ -1576,6 +1615,22 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
 static LRESULT CALLBACK ll_mouse_proc(int code, WPARAM wp, LPARAM lp) {
     if (code == RIN_HC_ACTION) {
         RIN_MSLLHOOKSTRUCT *m = (RIN_MSLLHOOKSTRUCT *)lp;
+
+        /* v3.0.4 (2026-09-21) -- INJECTION FILTER (see ll_kbd_proc twin).
+         * Reject any event with LLMHF_INJECTED or LLMHF_LOWER_IL_INJECTED.
+         * Closes the "hostile app fakes triple-click / mouse-hold hotkey
+         * via mouse_event / SendInput" vector. Same pass-through
+         * semantics -- injected events still route to their intended
+         * app; we just don't ACT on them for hotkey purposes. */
+        if (m && (m->flags & (RIN_LLMHF_INJECTED | RIN_LLMHF_LOWER_IL_INJECTED))) {
+            static volatile LONG s_inj_logged = 0;
+            LONG n = InterlockedIncrement(&s_inj_logged);
+            if (n <= 8) {
+                rin_diag("LL mouse: rejecting INJECTED event #%ld wp=0x%04X flags=0x%X",
+                         n, (unsigned)wp, (unsigned)m->flags);
+            }
+            return CallNextHookEx(NULL, code, wp, lp);
+        }
 
         /* ── v14 (2026-08-11): overlay MOUSE INTERACTIVITY ──────────
          * Two jobs, both driven off the left button:

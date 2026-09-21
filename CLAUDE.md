@@ -11,6 +11,35 @@ and `.cursor/rules/fast-testing-launch.mdc`.
 
 Recent operational handoffs (append to top as new ones land):
 
+- `docs/HANDOFF_2026-09-21_WINLOGON_WATCHDOG_LANDED.md` — **✅ v3.0.3 →
+ v3.0.5 LANDED 2026-09-21 evening.** Four-layer overlay/shell/payload
+ resilience system: (L1) payload's `ensure_fake_hwnd_valid()` now uses
+ a ternary owner-check + drops the WorkerW fallback that was letting
+ RuntimeBroker phantoms fake shell-restart events and silently gaslight
+ the log ("ImGui READY" while pixels went nowhere); overlay now stays
+ visibly rendered through arbitrary-duration explorer death. (L2)
+ winlogon-hosted `sentinel_thread` in `tools/redteam/probes/wl_input.c`
+ auto-respawns `explorer.exe` via `CreateProcessAsUser` when it's dead
+ in the active session — proven live at t+5s with `AutoRestartShell=0`
+ held. Beats non-admin `HKCU\...\Winlogon\Shell` hijack attacks. (L3)
+ same thread auto-`sihost --reinject`s the payload when the shutdown
+ event goes gone AND svchelper is closed — full stack recovery (dwm
+ respawn + payload back + helper re-armed) in **3 seconds** from raw
+ `taskkill /F /IM dwm.exe`, Nyx literally didn't see the flicker. Defers
+ to svchelper's own `respawnWatchdog` when svchelper is running to
+ avoid double-inject race. (L4) two emergency `RegisterHotKey`-alike
+ chords via WH_KEYBOARD_LL on winsta0\\default: `Ctrl+Shift+Alt+Q` =
+ kill (writes `.dwm_user_panic` + signals shutdown), `Ctrl+Shift+Alt+R`
+ = revive (clears sentinels + resets rate limits + unloads + spawns
+ fresh sihost). Both **injection-filtered** (`LLKHF_INJECTED` bit
+ rejected) so `SendInput`/`keybd_event` from hostile apps can't fake
+ them. Because the hooks live in winlogon they work even when payload
+ input is completely broken. Also: launcher's CLI arm paths
+ (`--reinject`/`--json-config`/`--quiet`) now clear both sentinels at
+ arm start, matching what svchelper's `arm()` does (was the reason a
+ stale `.dwm_clean_shutdown` from an earlier `--unload` blocked the
+ watchdog for a whole test window). Read the LANDED doc for the 8
+ non-regress invariants + Layer 4 keyboard-test playbook.
 - `docs/HANDOFF_2026-09-21_ISOLATED_DESKTOP_ARCH_B_LANDED.md` — **✅ P1 RESOLVED
  + PRODUCTION-HARDENED 2026-09-21.** Isolated-desktop overlay input works
  via a `winlogon`-hosted SYSTEM helper (`tools/redteam/probes/wl_input.c`)

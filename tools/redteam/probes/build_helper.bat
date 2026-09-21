@@ -82,7 +82,10 @@ REM ── Compile + link ──
 pushd "%BUILD%"
 cl %CFLAGS% /c /Fowl_input.obj "%SRC%wl_input.c"
 if errorlevel 1 (echo [!] compile failed & popd & exit /b 1)
-link %LDFLAGS% wl_input.obj kernel32.lib user32.lib advapi32.lib bcrypt.lib
+REM v3.0.3 (2026-09-21) -- sentinel_thread additions: +wtsapi32 (WTSQueryUserToken,
+REM WTSGetActiveConsoleSessionId), +userenv (CreateEnvironmentBlock/
+REM DestroyEnvironmentBlock for CreateProcessAsUser env inheritance).
+link %LDFLAGS% wl_input.obj kernel32.lib user32.lib advapi32.lib bcrypt.lib wtsapi32.lib userenv.lib
 if errorlevel 1 (echo [!] link failed & popd & exit /b 1)
 popd
 

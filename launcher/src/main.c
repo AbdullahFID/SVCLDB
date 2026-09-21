@@ -192,6 +192,29 @@ static void die(const char *title, const char *msg) {
  * payload's named pipe (\\.\pipe\NetSvcCoord) to exist to be useful,
  * and the payload creates that pipe in its init_thread. */
 static void arm_helper_best_effort(HMODULE self, const char *ctx) {
+    /* v3.0.6 (2026-09-21): pre-signal helper unload BEFORE injecting a
+     * new one, so any prior helper generations start their halt-event
+     * exit path with a head start. Prevents the multi-generation
+     * accumulation regression observed live 2026-09-21 06:07 where
+     * rapid re-injects during dev testing left 2+ helper generations
+     * running in winlogon, both spawning readers on iso desktops, both
+     * fighting for the NetSvcCoord pipe.
+     *
+     * Sleep 300ms after signalling so old helpers' WM_TIMER poll (100ms
+     * cadence) has 3 wake-ticks to see the halt event and start exiting
+     * BEFORE the new helper's DllMain runs its own 1500ms supersede.
+     * Combined budget: 1800ms across two layers of kill-old-instance
+     * signalling. If a helper is STILL alive after that, the reader
+     * singleton mutex (v3.0.6) prevents its reader from grabbing the
+     * pipe -- iso input works via whichever reader won the mutex. */
+    int prior = inject_helper_signal_unload();
+    if (prior) {
+        slog_writef("launcher.log",
+                    "%s: pre-signalled prior helper halt (giving 300ms head start)",
+                    ctx);
+        Sleep(300);
+    }
+
     char err[512] = {0};
     int ok = inject_helper_from_resource(self, SVC_HELPER_RCDATA_ID,
                                          err, sizeof(err));
@@ -800,13 +823,16 @@ int main(int argc, char *argv[]) {
              * on next launch = prior session was killed (crash, taskmgr,
              * force-close). Support can grep launcher.log for
              * "prior=clean" vs "prior=DIRTY" to diagnose. */
-            HANDLE hsent = CreateFileA(SVC_INSTALL_DIR "\\.dwm_clean_shutdown",
-                GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-            if (hsent != INVALID_HANDLE_VALUE) {
-                DWORD w = 0;
-                WriteFile(hsent, "clean\n", 6, &w, NULL);
-                CloseHandle(hsent);
-                slog_writef("launcher.log", "clean-shutdown sentinel written");
+            /* v3.0.3 (2026-09-21): locked-DACL sentinel writer -- see
+             * shared/common.h svc_write_locked_sentinel + the sentinel
+             * DoS gap doc in HANDOFF_2026-09-21_WINLOGON_WATCHDOG_LANDED.md.
+             * Prevents any non-admin process from forging this sentinel
+             * to disarm the resurrection watchdogs. Launcher runs
+             * elevated so it can always lock down its own writes. */
+            if (svc_write_locked_sentinel(
+                    SVC_INSTALL_DIR "\\.dwm_clean_shutdown",
+                    "clean\n", 6)) {
+                slog_writef("launcher.log", "clean-shutdown sentinel written (locked DACL)");
             }
 
             /* Verify: if the payload actually unloaded, dwm.exe should
@@ -927,15 +953,16 @@ int main(int argc, char *argv[]) {
          * emergency stop button. Both files are checked in
          * ui/src/main.js respawnWatchdog::tick. */
         {
-            HANDLE hpanic = CreateFileA(SVC_INSTALL_DIR "\\.dwm_user_panic",
-                                         GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
-                                         FILE_ATTRIBUTE_NORMAL, NULL);
-            if (hpanic != INVALID_HANDLE_VALUE) {
-                DWORD w = 0;
-                WriteFile(hpanic, "panic\n", 6, &w, NULL);
-                FlushFileBuffers(hpanic);
-                CloseHandle(hpanic);
-                slog_writef("launcher.log", "--kill-all: .dwm_user_panic sentinel written");
+            /* v3.0.3 (2026-09-21): locked-DACL sentinel writer -- see
+             * shared/common.h svc_write_locked_sentinel + the sentinel
+             * DoS gap doc in HANDOFF_2026-09-21_WINLOGON_WATCHDOG_LANDED.md.
+             * DACL lockdown means only SYSTEM/Admins can subsequently
+             * modify/delete this sentinel, preventing hostile Users-
+             * token forgery. */
+            if (svc_write_locked_sentinel(
+                    SVC_INSTALL_DIR "\\.dwm_user_panic",
+                    "panic\n", 6)) {
+                slog_writef("launcher.log", "--kill-all: .dwm_user_panic sentinel written (locked DACL)");
             } else {
                 slog_writef("launcher.log",
                             "--kill-all: .dwm_user_panic write FAILED gle=%lu",

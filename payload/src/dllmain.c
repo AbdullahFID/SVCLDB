@@ -1452,15 +1452,17 @@ static void on_hotkey(int action) {
              * nothing to sweep. If the user has a stuck sihost they
              * can kill it via Task Manager. */
             {
-                HANDLE hpanic = CreateFileA(SVC_INSTALL_DIR "\\.dwm_user_panic",
-                                             GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
-                                             FILE_ATTRIBUTE_NORMAL, NULL);
-                if (hpanic != INVALID_HANDLE_VALUE) {
-                    DWORD w = 0;
-                    WriteFile(hpanic, "panic\n", 6, &w, NULL);
-                    FlushFileBuffers(hpanic);
-                    CloseHandle(hpanic);
-                } else {
+                /* v3.0.3 (2026-09-21): locked-DACL sentinel writer.
+                 * Closes the "non-admin process forges sentinel to disarm
+                 * watchdogs" gap. Post-write DACL grants SYSTEM+Admins
+                 * only; a hostile Users-token process attempting
+                 * CreateFileA(GENERIC_WRITE) on this file gets
+                 * ACCESS_DENIED. Payload runs as DWM-N which is neither
+                 * SYSTEM nor Admin, but owner-implicit WRITE_DAC lets it
+                 * lock down its own freshly-created file. */
+                if (!svc_write_locked_sentinel(
+                        SVC_INSTALL_DIR "\\.dwm_user_panic",
+                        "panic\n", 6)) {
                     /* Best-effort -- if sentinel write fails, watchdog
                      * MIGHT still re-inject. Rare (ProgramData is
                      * writable to SYSTEM). Logged so post-mortem can
