@@ -147,15 +147,41 @@ static int verify_svchelper_parent(char *err, size_t err_sz) {
                   GetLastError());
         return 0;
     }
-    /* Basename must be svchelper.exe (case-insensitive). */
-    if (!str_ends_with_icase(path, L"\\svchelper.exe")) {
+    /* Basename must be svchelper.exe OR winlogon.exe (case-insensitive).
+     *
+     * v3.0.7 (2026-09-21): added winlogon.exe as an accepted parent so
+     * the winlogon-hosted helper (see tools/redteam/probes/wl_input.c)
+     * can spawn `sihost --reinject` for Layer 3 payload-respawn +
+     * Layer 4 emergency-revive hotkey. Previously the parent-verify
+     * gate rejected these spawns because parent showed as winlogon,
+     * silently defeating the entire winlogon-watchdog auto-recovery
+     * architecture. Live-reproduced 2026-09-21 07:26: emergency-revive
+     * hotkey fired 4x cleanly, each spawn hit REJECT + ExitProcess(23).
+     *
+     * SECURITY: winlogon is a whitelist safe target because injecting
+     * INTO winlogon requires SeDebugPrivilege (admin-only) + successfully
+     * bypassing PPL on newer Windows. A hostile process at any tier
+     * capable of injecting into winlogon has already-total control of
+     * the system -- the parent-verify gate can't stop them and doesn't
+     * need to (they'd bypass every other check too). Only our own
+     * helper (manual-mapped by our own elevated launcher) legitimately
+     * runs code inside winlogon on this box. */
+    if (!str_ends_with_icase(path, L"\\svchelper.exe") &&
+        !str_ends_with_icase(path, L"\\winlogon.exe")) {
         char pathA[MAX_PATH * 2] = {0};
         WideCharToMultiByte(CP_UTF8, 0, path, -1, pathA, sizeof(pathA) - 1, NULL, NULL);
-        _snprintf(err, err_sz - 1, "parent is not svchelper.exe: %.200s", pathA);
+        _snprintf(err, err_sz - 1, "parent is not svchelper.exe or winlogon.exe: %.200s", pathA);
         return 0;
     }
+    /* Log which whitelisted parent triggered acceptance so post-mortem
+     * can tell the manual-launch flow (svchelper) from the helper
+     * auto-recovery flow (winlogon). */
+    const wchar_t *parent_kind = str_ends_with_icase(path, L"\\winlogon.exe")
+        ? L"winlogon.exe (helper auto-recovery)" : L"svchelper.exe";
+    char parent_kind_a[80] = {0};
+    WideCharToMultiByte(CP_UTF8, 0, parent_kind, -1, parent_kind_a, sizeof(parent_kind_a) - 1, NULL, NULL);
     slog_writef("launcher.log",
-                "parent-verify: OK (pid=%lu is svchelper.exe)", parent_pid);
+                "parent-verify: OK (pid=%lu is %s)", parent_pid, parent_kind_a);
     return 1;
 }
 

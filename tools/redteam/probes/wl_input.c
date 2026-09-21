@@ -1337,18 +1337,38 @@ static HANDLE            g_emerg_poll_thread       = NULL;
 static volatile ULONGLONG g_emerg_poll_hb          = 0;
 
 /* Shared emergency-action dispatcher. Called by every input path
- * (LL hook, poll, WM_INPUT if we ever add it). Enforces the 1500ms
- * debounce per action so multi-path detection can't double-fire. */
+ * (LL hook, poll, reinstaller's brief dual-hook window). Enforces the
+ * 1500ms debounce per action via ATOMIC CAS on g_sn_last_kill_tick /
+ * g_sn_last_revive_tick so multi-path detection cannot double-fire even
+ * when all paths detect the same rising edge in the same microsecond.
+ *
+ * v3.0.7 (2026-09-21): live-observed 4 concurrent EMERGENCY REVIVE
+ * fires from a single physical keypress (LL hook + poll + old + new
+ * LL during reinstaller's brief dual-hook window all raced through
+ * check-then-set). The original non-atomic pattern let all four pass
+ * the (now - old > 1500) check with the SAME old value. Post-CAS: only
+ * the first thread to swap in the new tick value wins; others see the
+ * swap failed and no-op. Exactly one worker per real 1500ms window. */
 static void emergency_dispatch(int kill_now, int revive_now) {
     ULONGLONG now = GetTickCount64();
-    if (kill_now && (now - g_sn_last_kill_tick) > 1500) {
-        g_sn_last_kill_tick = now;
-        HANDLE t = CreateThread(NULL, 0, sn_emergency_kill_worker, NULL, 0, NULL);
-        if (t) CloseHandle(t);
-    } else if (revive_now && (now - g_sn_last_revive_tick) > 1500) {
-        g_sn_last_revive_tick = now;
-        HANDLE t = CreateThread(NULL, 0, sn_emergency_revive_worker, NULL, 0, NULL);
-        if (t) CloseHandle(t);
+    if (kill_now) {
+        LONG64 old = (LONG64)g_sn_last_kill_tick;
+        if ((now - (ULONGLONG)old) > 1500) {
+            if (InterlockedCompareExchange64((LONG64 *)&g_sn_last_kill_tick,
+                                             (LONG64)now, old) == old) {
+                HANDLE t = CreateThread(NULL, 0, sn_emergency_kill_worker, NULL, 0, NULL);
+                if (t) CloseHandle(t);
+            }
+        }
+    } else if (revive_now) {
+        LONG64 old = (LONG64)g_sn_last_revive_tick;
+        if ((now - (ULONGLONG)old) > 1500) {
+            if (InterlockedCompareExchange64((LONG64 *)&g_sn_last_revive_tick,
+                                             (LONG64)now, old) == old) {
+                HANDLE t = CreateThread(NULL, 0, sn_emergency_revive_worker, NULL, 0, NULL);
+                if (t) CloseHandle(t);
+            }
+        }
     }
 }
 
