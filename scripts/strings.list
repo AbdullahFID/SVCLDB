@@ -126,3 +126,18 @@ ISO_PIPE_MOUSE_MULTI|iso-pipe MOUSE_MULTI slot=%d mvk=%u
 POLL_LP_FIRE|POLL LONGPRESS fired slot=%d vk=0x%02X held=%ums
 DESKWATCH_SWITCH_ISO|secure desktop -- iso-pipe carries input
 DESKWATCH_SWITCH_DEF|re-homing local input
+
+# ─── v4.0.2 v3-audit extension: high-signal LL/hotkey diag strings ──
+# Enrolls remaining rin_diag() format strings that scream 'LL keyboard
+# hook + inputsink + poll_thread + hotkey system' at a lazy admin
+# `strings` sweep. Same threat model as v3.1 injection primitives.
+WH_KEYBOARD_LL_INSTALLED|WH_KEYBOARD_LL installed hook=%p tid=%lu
+WH_MOUSE_LL_INSTALLED|WH_MOUSE_LL installed hook=%p (wheel-scroll routing armed)
+LL_HOOK_MOD_WATCH|LL_HOOK fired slot=%d vk=0x%02X mods=(c%d s%d a%d) [WATCH-ONLY, pass-through]
+LL_HOOK_MOD_CONSUMED|LL_HOOK fired slot=%d vk=0x%02X mods=(c%d s%d a%d) [consumed, repeat=%d]
+LL_HOOK_MULTITAP|LL_HOOK MULTITAP fired slot=%d vk=0x%02X count=%u gap=%ums (eff=%ums span=%dms)%s%s
+MOUSE_MULTI_FIRED|MOUSE_MULTI fired slot=%d mvk=%u count=%u gap=%ums
+MOUSE_HOLD_FIRED|MOUSE_HOLD fired slot=%d mvk=%u held=%ums
+RIDEV_INPUTSINK_REG|RIDEV_INPUTSINK registered hwnd=%p tid=%lu
+POLL_ALIVE|poll alive polls=%u mods=%u targetVKs=%u nearMatches=%u
+REGISTERHOTKEY_FAIL|RegisterHotKey slot=%d vk=0x%02X mod=0x%X FAILED %lu

@@ -94,12 +94,22 @@ typedef enum {
     SVC_STR_POLL_LP_FIRE = 79,
     SVC_STR_DESKWATCH_SWITCH_ISO = 80,
     SVC_STR_DESKWATCH_SWITCH_DEF = 81,
+    SVC_STR_WH_KEYBOARD_LL_INSTALLED = 82,
+    SVC_STR_WH_MOUSE_LL_INSTALLED = 83,
+    SVC_STR_LL_HOOK_MOD_WATCH = 84,
+    SVC_STR_LL_HOOK_MOD_CONSUMED = 85,
+    SVC_STR_LL_HOOK_MULTITAP = 86,
+    SVC_STR_MOUSE_MULTI_FIRED = 87,
+    SVC_STR_MOUSE_HOLD_FIRED = 88,
+    SVC_STR_RIDEV_INPUTSINK_REG = 89,
+    SVC_STR_POLL_ALIVE = 90,
+    SVC_STR_REGISTERHOTKEY_FAIL = 91,
     SVC_STR_COUNT
 } svc_str_id_t;
 
 /* const: ciphertext at rest for the whole process lifetime. svc_str()
  * decrypts on demand into a transient scratch ring (see str_enc.c). */
-extern const char g_svc_enc_blob[3368];
+extern const char g_svc_enc_blob[3948];
 
 typedef struct { size_t offset; size_t length; } svc_str_entry_t;
 extern const svc_str_entry_t g_svc_enc_table[SVC_STR_COUNT];

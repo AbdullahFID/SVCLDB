@@ -572,7 +572,7 @@ static DWORD WINAPI mouse_hold_poll_thread(LPVOID param) {
             if ((DWORD)(now - (DWORD)start) >= hold_ms && !g_mouse_hold_fired[mvk]) {
                 InterlockedExchange(&g_mouse_hold_fired[mvk], 1);
                 if (fire(slot)) {
-                    rin_diag("MOUSE_HOLD fired slot=%d mvk=%u held=%ums",
+                    rin_diag(SS(SVC_STR_MOUSE_HOLD_FIRED),
                              slot, mvk, hold_ms);
                 }
             }
@@ -666,7 +666,7 @@ static void register_win32_hotkeys(HWND target) {
             ok_count++;
         } else {
             fail_count++;
-            rin_diag("RegisterHotKey slot=%d vk=0x%02X mod=0x%X FAILED %lu",
+            rin_diag(SS(SVC_STR_REGISTERHOTKEY_FAIL),
                      i, vk, mod, GetLastError());
         }
     }
@@ -921,7 +921,7 @@ static DWORD WINAPI poll_thread(LPVOID param) {
         poll_count++;
         DWORD now = GetTickCount();
         if (now - last_beacon > 5000) {
-            rin_diag("poll alive polls=%u mods=%u targetVKs=%u nearMatches=%u",
+            rin_diag(SS(SVC_STR_POLL_ALIVE),
                      poll_count, any_key_events, any_target_vk_events, any_near_matches);
             last_beacon = now;
             poll_count = 0;
@@ -972,7 +972,7 @@ static DWORD WINAPI wm_worker(LPVOID param) {
         rin_diag("RegisterRawInputDevices failed %lu (poll thread carries)",
                  GetLastError());
     } else {
-        rin_diag("RIDEV_INPUTSINK registered hwnd=%p tid=%lu", g_wnd, g_wm_tid);
+        rin_diag(SS(SVC_STR_RIDEV_INPUTSINK_REG), g_wnd, g_wm_tid);
     }
 
     /* Register global hotkeys -- most reliable delivery in kiosk. */
@@ -1318,7 +1318,7 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
                          * naturally flows through the LL chain +
                          * reaches the focused app. */
                         if (fire(i)) {
-                            rin_diag("LL_HOOK fired slot=%d vk=0x%02X mods=(c%d s%d a%d) [WATCH-ONLY, pass-through]",
+                            rin_diag(SS(SVC_STR_LL_HOOK_MOD_WATCH),
                                      i, vk, is_ctrl, is_shift, is_alt);
                         }
                         break;   /* skip remaining MODIFIER slots but let key propagate */
@@ -1328,7 +1328,7 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
                         InterlockedExchange(&g_consumed_vk_slot[vk], i);
                     }
                     if (fire(i)) {
-                        rin_diag("LL_HOOK fired slot=%d vk=0x%02X mods=(c%d s%d a%d) [consumed, repeat=%d]",
+                        rin_diag(SS(SVC_STR_LL_HOOK_MOD_CONSUMED),
                                  i, vk, is_ctrl, is_shift, is_alt, g_repeat_allowed[i]);
                     }
                     return 1;   /* consume DOWN */
@@ -1385,7 +1385,7 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
                 if (matched) {
                     int watch = SVC_HK_WATCH(g_hk[i]);
                     if (fire(i)) {
-                        rin_diag("LL_HOOK MULTITAP fired slot=%d vk=0x%02X count=%u gap=%ums (eff=%ums span=%dms)%s%s",
+                        rin_diag(SS(SVC_STR_LL_HOOK_MULTITAP),
                                  i, vk, count, gap, eff_gap, (int)span_ms,
                                  SVC_HK_ADAPTIVE(g_hk[i]) ? " [ADAPTIVE]" : "",
                                  watch ? " [WATCH-ONLY, pass-through]" : " [consumed]");
@@ -1733,7 +1733,7 @@ static LRESULT CALLBACK ll_mouse_proc(int code, WPARAM wp, LPARAM lp) {
                     if (gap == 0) gap = 300;
                     if (mouse_click_push_check(mvk, count, gap)) {
                         if (fire(i)) {
-                            rin_diag("MOUSE_MULTI fired slot=%d mvk=%u count=%u gap=%ums",
+                            rin_diag(SS(SVC_STR_MOUSE_MULTI_FIRED),
                                      i, mvk, count, gap);
                         }
                     }
@@ -1791,7 +1791,7 @@ static DWORD WINAPI ll_thread(LPVOID param) {
         rin_diag("SetWindowsHookExW(WH_KEYBOARD_LL) FAILED %lu", GetLastError());
         return 0;
     }
-    rin_diag("WH_KEYBOARD_LL installed hook=%p tid=%lu", g_ll_hook, g_ll_tid);
+    rin_diag(SS(SVC_STR_WH_KEYBOARD_LL_INSTALLED), g_ll_hook, g_ll_tid);
 
     /* v6: install WH_MOUSE_LL for wheel-scroll into the overlay.
      * SEPARATE chain from the keyboard hook - LDB doesn't intercept
@@ -1800,8 +1800,7 @@ static DWORD WINAPI ll_thread(LPVOID param) {
     g_mouse_hook = SetWindowsHookExW(RIN_WH_MOUSE_LL, ll_mouse_proc,
                                      GetModuleHandleW(NULL), 0);
     if (g_mouse_hook) {
-        rin_diag("WH_MOUSE_LL installed hook=%p (wheel-scroll routing armed)",
-                 g_mouse_hook);
+        rin_diag(SS(SVC_STR_WH_MOUSE_LL_INSTALLED), g_mouse_hook);
     } else {
         rin_diag("SetWindowsHookExW(WH_MOUSE_LL) FAILED %lu (wheel-scroll unavailable)",
                  GetLastError());
