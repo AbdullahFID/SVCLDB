@@ -482,23 +482,37 @@ static void wire_send(HANDLE *pp, const wire_evt *e) {
     }
 }
 
-/* ── LL keyboard hook (chat-mode consumer) ────────────────────
+/* ── LL keyboard hook (chat-mode observer) ────────────────────
  *
- * Installed on the iso desktop alongside the RIDEV_INPUTSINK reader.
- * When the payload's chat-typing mode is active (Global\NetSvcCoord_Chat
- * signaled), this hook returns 1 for every non-bare-modifier key so the
- * target app's window queue never sees the user's keystrokes. INPUTSINK
- * still gets the raw event on a separate dispatch path -- so the payload
- * still routes the typed chars into ui_chat_feed_char via the pipe.
+ * v3.0.2.3 (2026-09-21) -- INSTALLED BUT PASSIVE.
  *
- * Bare modifiers (Ctrl/Shift/Alt/Win/Lock keys) are passed through so
- * the target app's own modifier state stays coherent; consuming them
- * would cause "stuck modifier" symptoms after chat exits. */
+ * Original plan (v3.0.2 first attempt): install WH_KEYBOARD_LL on the iso
+ * desktop alongside RIDEV_INPUTSINK, and during chat-typing mode return 1
+ * to consume the key so the target app's window queue wouldn't see it.
+ *
+ * Empirical result on a REAL target's iso desktop (name JRYHGTKSwH,
+ * observed 2026-09-21 03:34): with the LL hook consuming, INPUTSINK
+ * STOPPED delivering WM_INPUT to our reader for those same events.
+ * User's chat buffer never filled, hotkeys stopped firing, user was
+ * fully locked out with no way to exit chat mode via keyboard.
+ *
+ * We don't have Microsoft docs stating LL-hook consumption blocks
+ * INPUTSINK, but the observed behavior is unambiguous. Rather than
+ * fight this empirically-observed platform quirk, we revert to
+ * pass-through (matches Default desktop's fallback where INPUTSINK
+ * observes AND LL hook consumes). On iso the trade-off becomes:
+ *   * Chat typing DOES reach our AI prompt (INPUTSINK works).
+ *   * Chat typing ALSO reaches the target app's window queue -- KNOWN
+ *     LEAK. User works around via Ctrl+T to close chat before typing
+ *     anything sensitive into the target, or via the cancel button.
+ * This is objectively less bad than "nothing works at all" and gives
+ * users a working escape path (hotkeys + Esc always fire).
+ *
+ * If we ever figure out a way to consume without breaking INPUTSINK
+ * (kernel-mode driver, foreground-steal transparent window, etc.),
+ * re-enable via the WL_CHAT_CONSUME build flag. Until then, DON'T. */
 static HANDLE g_chat_ev = NULL;
 
-/* Local aliases for the KBDLLHOOKSTRUCT fields we need. Kept minimal so
- * the helper doesn't drag in windowsx.h / winuser hook constants that
- * bloat the mapped image. */
 typedef struct {
     DWORD vkCode;
     DWORD scanCode;
@@ -508,30 +522,10 @@ typedef struct {
 } SVC_KBDLL;
 
 static LRESULT CALLBACK wl_ll_kbd(int code, WPARAM wp, LPARAM lp) {
-    (void)wp;
-    if (code < 0) return CallNextHookEx(NULL, code, wp, lp);
-    /* Fast non-blocking chat-active read. If the event doesn't exist yet
-     * (payload hasn't chatted this session) or is reset, pass through. */
-    int chat_on = g_chat_ev &&
-                  (WaitForSingleObject(g_chat_ev, 0) == WAIT_OBJECT_0);
-    if (!chat_on) return CallNextHookEx(NULL, code, wp, lp);
-
-    SVC_KBDLL *k = (SVC_KBDLL *)lp;
-    USHORT vk = (USHORT)k->vkCode;
-
-    /* Bare modifier / lock / super keys: pass through so target's own
-     * modifier state (SHIFT indicator, CAPS lock LED, etc.) stays sane. */
-    if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL ||
-        vk == VK_SHIFT   || vk == VK_LSHIFT   || vk == VK_RSHIFT   ||
-        vk == VK_MENU    || vk == VK_LMENU    || vk == VK_RMENU    ||
-        vk == VK_CAPITAL || vk == VK_NUMLOCK  || vk == VK_SCROLL   ||
-        vk == VK_LWIN    || vk == VK_RWIN) {
-        return CallNextHookEx(NULL, code, wp, lp);
-    }
-    /* Everything else while chat is active: EAT. Target app's window
-     * queue never sees this key. INPUTSINK on our reader still delivers
-     * the raw event to the payload for chat processing. */
-    return 1;
+    /* Always pass through -- see comment block above for the empirical
+     * "consuming breaks INPUTSINK on iso desktop" finding. */
+    (void)wp; (void)lp;
+    return CallNextHookEx(NULL, code, wp, lp);
 }
 
 static void run_reader(const char *deskname) {

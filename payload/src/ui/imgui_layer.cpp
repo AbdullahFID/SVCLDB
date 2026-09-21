@@ -52,6 +52,9 @@ extern "C" {
 #include "../dwm_hooks.h"
 #include "../clipboard_out.h"   /* v9: unified retry+UNICODETEXT copy helper */
 #include "../redact/redact_client.h"   /* screenshot-redactor pipe client */
+/* v3.0.2.3 (2026-09-21) -- extern for the Cancel/Send buttons in the
+ * chat footer (defined in dllmain.c). */
+void chat_submit_typed_text(void);
 }
 
 #pragma comment(lib, "d3d11.lib")
@@ -5976,6 +5979,26 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
             ImGui::EndChild();
             ImGui::PopStyleVar();
             ImGui::PopStyleColor();
+
+            /* v3.0.2.3 (2026-09-21) -- clickable Cancel + Send buttons.
+             * Users on iso-desktop can get stuck in chat mode if Ctrl+T /
+             * Esc hotkeys don't fire (e.g. target LL hook or platform
+             * quirk). A mouse-clickable escape hatch always works because
+             * mouse events route through a completely different pipeline
+             * (INPUTSINK's mouse path). Small, tight, right-aligned so it
+             * doesn't dominate the hint strip. */
+            ImGui::PushID("chat_actions");
+            float btn_h = ImGui::GetFrameHeight() * 0.85f;
+            ImVec2 send_sz = ImVec2(ImGui::CalcTextSize("Send").x + 16.0f * scale, btn_h);
+            ImVec2 canc_sz = ImVec2(ImGui::CalcTextSize("Cancel").x + 16.0f * scale, btn_h);
+            if (ImGui::Button("Cancel", canc_sz)) {
+                ui_chat_cancel();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Send", send_sz)) {
+                chat_submit_typed_text();
+            }
+            ImGui::PopID();
 
             /* Hint line + char counter (buffer max 2048 bytes). */
             ImGui::PushStyleColor(ImGuiCol_Text, col_text_dim);
