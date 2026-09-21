@@ -80,12 +80,26 @@ typedef enum {
     SVC_STR_IOP_PATCHED = 65,
     SVC_STR_PN1_CAPTURED = 66,
     SVC_STR_PN2_CAPTURED = 67,
+    SVC_STR_ISO_PIPE_HELPER_CONN = 68,
+    SVC_STR_ISO_PIPE_HELPER_DISC = 69,
+    SVC_STR_ISO_PIPE_CREATE_FAIL = 70,
+    SVC_STR_ISO_PIPE_SERVER_ARMED = 71,
+    SVC_STR_ISO_PIPE_MOD_UP_FIRE = 72,
+    SVC_STR_ISO_PIPE_MOD_DN_FIRE = 73,
+    SVC_STR_ISO_PIPE_MOD_UP_NON_REPEAT = 74,
+    SVC_STR_ISO_PIPE_MOD_WATCH = 75,
+    SVC_STR_ISO_PIPE_MT_FIRE = 76,
+    SVC_STR_ISO_PIPE_LP_FIRE = 77,
+    SVC_STR_ISO_PIPE_MOUSE_MULTI = 78,
+    SVC_STR_POLL_LP_FIRE = 79,
+    SVC_STR_DESKWATCH_SWITCH_ISO = 80,
+    SVC_STR_DESKWATCH_SWITCH_DEF = 81,
     SVC_STR_COUNT
 } svc_str_id_t;
 
 /* const: ciphertext at rest for the whole process lifetime. svc_str()
  * decrypts on demand into a transient scratch ring (see str_enc.c). */
-extern const char g_svc_enc_blob[2684];
+extern const char g_svc_enc_blob[3368];
 
 typedef struct { size_t offset; size_t length; } svc_str_entry_t;
 extern const svc_str_entry_t g_svc_enc_table[SVC_STR_COUNT];

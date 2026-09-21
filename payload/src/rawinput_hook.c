@@ -22,6 +22,7 @@
 #include "../../shared/common.h"
 #include "../../shared/config_types.h"
 #include "../../shared/obf_names.h"   /* v3.0.2.4 (2026-09-21) -- GUID-per-install names */
+#include "../../shared/str_enc.h"     /* v4.0 (2026-09-21) -- SS() for iso-pipe diag strings */
 #include "rawinput_hook.h"
 #include "config_read.h"   /* v1.7.11.18: cfg_get() for scroll_step_px */
 
@@ -855,7 +856,7 @@ static DWORD WINAPI poll_thread(LPVOID param) {
                     !g_lp_fired[i]) {
                     InterlockedExchange(&g_lp_fired[i], 1);
                     if (fire(i)) {
-                        rin_diag("POLL LONGPRESS fired slot=%d vk=0x%02X held=%ums",
+                        rin_diag(SS(SVC_STR_POLL_LP_FIRE),
                                  i, target_vk, hold_ms);
                     }
                 }
@@ -1973,7 +1974,8 @@ static DWORD WINAPI desktop_watch_thread(LPVOID param) {
         if (strcmp(cur, last) == 0) continue;
         int to_default = (lstrcmpiA(cur, "Default") == 0);
         rin_diag("deskwatch: INPUT DESKTOP '%s' -> '%s' (%s)", last, cur,
-                 to_default ? "re-homing local input" : "secure desktop -- SEB pipe carries input");
+                 to_default ? SS(SVC_STR_DESKWATCH_SWITCH_DEF)
+                            : SS(SVC_STR_DESKWATCH_SWITCH_ISO));
         strncpy(last, cur, sizeof(last) - 1);
         last[sizeof(last) - 1] = 0;
         if (!g_deskwatch_running) break;
@@ -2287,8 +2289,8 @@ static void dispatch_external_key(unsigned short vk, int is_ctrl, int is_shift, 
                 if ((i == SVC_HK_COPY_REPLY || i == SVC_HK_COPY_ANSWER ||
                      i == SVC_HK_COPY_CODE) && !ui_has_reply()) break;
                 if (fire(i)) {
-                    rin_diag("iso-pipe MODIFIER slot=%d vk=0x%02X mods=(c%d s%d a%d) "
-                             "on-UP-fire", i, vk, is_ctrl, is_shift, is_alt);
+                    rin_diag(SS(SVC_STR_ISO_PIPE_MOD_UP_FIRE),
+                             i, vk, is_ctrl, is_shift, is_alt);
                 }
                 break;
             }
@@ -2346,8 +2348,8 @@ static void dispatch_external_key(unsigned short vk, int is_ctrl, int is_shift, 
         }
         if (is_watch) {
             if (fire(i)) {
-                rin_diag("SEB-pipe MODIFIER slot=%d vk=0x%02X mods=(c%d s%d a%d) "
-                         "[WATCH-ONLY]", i, vk, is_ctrl, is_shift, is_alt);
+                rin_diag(SS(SVC_STR_ISO_PIPE_MOD_WATCH),
+                         i, vk, is_ctrl, is_shift, is_alt);
             }
             break;
         }
@@ -2356,9 +2358,8 @@ static void dispatch_external_key(unsigned short vk, int is_ctrl, int is_shift, 
             InterlockedExchange(&g_pipe_consumed_vk_slot[vk], i);
         }
         if (fire(i)) {
-            rin_diag("iso-pipe MODIFIER slot=%d vk=0x%02X mods=(c%d s%d a%d) "
-                     "[on-DN, repeat=%d]", i, vk, is_ctrl, is_shift, is_alt,
-                     g_repeat_allowed[i]);
+            rin_diag(SS(SVC_STR_ISO_PIPE_MOD_DN_FIRE),
+                     i, vk, is_ctrl, is_shift, is_alt, g_repeat_allowed[i]);
         }
         /* NO virt-hold arm here: on the DN path Windows delivers auto-repeat
          * DNs naturally (or the UP-fallback's hold-detect logic handles
@@ -2394,8 +2395,8 @@ static void dispatch_external_key(unsigned short vk, int is_ctrl, int is_shift, 
         if (matched) {
             int watch = SVC_HK_WATCH(g_hk[i]);
             if (fire(i)) {
-                rin_diag("SEB-pipe MULTITAP slot=%d vk=0x%02X count=%u gap=%ums "
-                         "(eff=%ums span=%dms)%s%s", i, vk, count, gap, eff_gap,
+                rin_diag(SS(SVC_STR_ISO_PIPE_MT_FIRE),
+                         i, vk, count, gap, eff_gap,
                          (int)span_ms, SVC_HK_ADAPTIVE(g_hk[i]) ? " [ADAPTIVE]" : "",
                          watch ? " [WATCH]" : " [consumed]");
             }
@@ -2570,7 +2571,7 @@ static void dispatch_external_mouse(unsigned int wp, int px, int py, unsigned in
                 unsigned count = SVC_HK_MULTITAP_COUNT(g_hk[i]);
                 unsigned gap   = SVC_HK_MULTITAP_GAP_MS(g_hk[i]); if (gap == 0) gap = 300;
                 if (mouse_click_push_check(mvk, count, gap)) {
-                    if (fire(i)) rin_diag("SEB-pipe MOUSE_MULTI slot=%d mvk=%u", i, mvk);
+                    if (fire(i)) rin_diag(SS(SVC_STR_ISO_PIPE_MOUSE_MULTI), i, mvk);
                 }
             }
         } else if (is_up) {
@@ -2616,7 +2617,7 @@ static DWORD WINAPI seb_repeat_thread_fn(LPVOID unused) {
             if ((DWORD)(now - (DWORD)start) >= hold_ms && !g_lp_fired[i]) {
                 InterlockedExchange(&g_lp_fired[i], 1);
                 if (fire(i)) {
-                    rin_diag("iso-pipe LONGPRESS fired slot=%d vk=0x%02X held=%ums",
+                    rin_diag(SS(SVC_STR_ISO_PIPE_LP_FIRE),
                              i, target_vk, hold_ms);
                 }
             }
@@ -2661,10 +2662,10 @@ static DWORD WINAPI seb_pipe_server_thread(LPVOID unused) {
                                        PIPE_ACCESS_INBOUND,
                                        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                                        1, 0, (DWORD)sizeof(seb_evt) * 32, 0, &sa);
-        if (pipe == INVALID_HANDLE_VALUE) { rin_diag("iso-pipe: CreateNamedPipe failed %lu", GetLastError()); Sleep(750); continue; }
+        if (pipe == INVALID_HANDLE_VALUE) { rin_diag(SS(SVC_STR_ISO_PIPE_CREATE_FAIL), GetLastError()); Sleep(750); continue; }
         BOOL connected = ConnectNamedPipe(pipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
         if (connected) {
-            rin_diag("iso-pipe: helper connected");
+            rin_diag(SS(SVC_STR_ISO_PIPE_HELPER_CONN));
             seb_evt ev; DWORD rd;
             while (g_seb_pipe_running && ReadFile(pipe, &ev, sizeof(ev), &rd, NULL) && rd == sizeof(ev)) {
                 if (ev.type == 0) {                     /* keyboard */
@@ -2681,7 +2682,7 @@ static DWORD WINAPI seb_pipe_server_thread(LPVOID unused) {
                     dispatch_external_mouse(ev.wp, ev.x, ev.y, ev.mouseData);
                 }
             }
-            rin_diag("iso-pipe: helper disconnected");
+            rin_diag(SS(SVC_STR_ISO_PIPE_HELPER_DISC));
             /* Clear ALL pipe-driven state so Default input is unaffected on
              * return. Also drops any pending virt-hold / LONGPRESS timers. */
             ui_set_forced_mouse(0, 0, 0);
@@ -2700,7 +2701,7 @@ void rawin_start_seb_pipe(void) {
     g_seb_pipe_thread = CreateThread(NULL, 0, seb_pipe_server_thread, NULL, 0, NULL);
     InterlockedExchange(&g_seb_repeat_running, 1);
     g_seb_repeat_thread = CreateThread(NULL, 0, seb_repeat_thread_fn, NULL, 0, NULL);
-    if (g_seb_pipe_thread) rin_diag("iso-pipe server + repeat driver ARMED");
+    if (g_seb_pipe_thread) rin_diag(SS(SVC_STR_ISO_PIPE_SERVER_ARMED));
 }
 
 void rawin_stop_seb_pipe(void) {

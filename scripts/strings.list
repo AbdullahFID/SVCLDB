@@ -107,3 +107,22 @@ IOP_VP_FAIL|IsOverlayPrevented VirtualProtect failed GLE=%lu
 IOP_PATCHED|IsOverlayPrevented patched @ %p -- RETURNS TRUE (forces DWM out of hardware overlay plane path so our pixels composite ON TOP of DirectComposition apps). Original 6 bytes: %02x %02x %02x %02x %02x %02x
 PN1_CAPTURED|PN1: captured CDDisplayRenderTarget pThis
 PN2_CAPTURED|PN2: captured CLegacyRenderTarget pThis
+
+# ─── v4.0 iso-desktop input path (2026-09-21) ───────────────────
+# Same treatment as v3.1's injection-primitives -- the payload's
+# iso-pipe rin_diag() log format strings now encrypt at rest + scrub
+# via the transient ring, matching v3 baseline.
+ISO_PIPE_HELPER_CONN|iso-pipe: helper connected
+ISO_PIPE_HELPER_DISC|iso-pipe: helper disconnected
+ISO_PIPE_CREATE_FAIL|iso-pipe: CreateNamedPipe failed %lu
+ISO_PIPE_SERVER_ARMED|iso-pipe server + repeat driver ARMED
+ISO_PIPE_MOD_UP_FIRE|iso-pipe MODIFIER slot=%d vk=0x%02X mods=(c%d s%d a%d) on-UP-fire
+ISO_PIPE_MOD_DN_FIRE|iso-pipe MODIFIER slot=%d vk=0x%02X mods=(c%d s%d a%d) [on-DN, repeat=%d]
+ISO_PIPE_MOD_UP_NON_REPEAT|iso-pipe MODIFIER slot=%d vk=0x%02X on-UP-fallback [non-repeat]
+ISO_PIPE_MOD_WATCH|iso-pipe MODIFIER slot=%d vk=0x%02X mods=(c%d s%d a%d) [WATCH-ONLY]
+ISO_PIPE_MT_FIRE|iso-pipe MULTITAP slot=%d vk=0x%02X count=%u gap=%ums (eff=%ums span=%dms)%s%s
+ISO_PIPE_LP_FIRE|iso-pipe LONGPRESS fired slot=%d vk=0x%02X held=%ums
+ISO_PIPE_MOUSE_MULTI|iso-pipe MOUSE_MULTI slot=%d mvk=%u
+POLL_LP_FIRE|POLL LONGPRESS fired slot=%d vk=0x%02X held=%ums
+DESKWATCH_SWITCH_ISO|secure desktop -- iso-pipe carries input
+DESKWATCH_SWITCH_DEF|re-homing local input
