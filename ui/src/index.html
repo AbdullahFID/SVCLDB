@@ -366,6 +366,224 @@
           </div>
         </div>
 
+        <!-- ═══ v15 (2026-09-22): AutoSolver + Agent Mode ═══
+             Writes C:\ProgramData\WinAudioSvc\autosolver.json, which the LIVE
+             injected payload hot-reloads within ~1.5s (no re-inject needed). -->
+        <div class="settings-card" id="autosolver-card">
+          <h3>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9z"/></svg>
+            AutoSolver &amp; Agent
+            <span style="margin-left:auto;font-weight:500;font-size:11px;color:var(--fg3);text-transform:none;letter-spacing:0">Point-and-solve, hands-free</span>
+          </h3>
+
+          <div class="as-howto">
+            <b>How it works:</b> land on a question, then <b>hold Left-Click for ~2s</b> (anywhere).
+            The overlay snapshots the screen, solves it, and shows the answer in a tiny
+            capture-proof <b>dot</b>. Turn on <b>Auto-click</b> below and it also moves the mouse
+            and clicks/type the answer in for you (humanized). It never presses Next / Submit.
+            <br><span class="as-howto-dim">Works with this window closed &mdash; only the injected overlay needs to be running.</span>
+          </div>
+
+          <!-- Master enable -->
+          <div class="ans-toggle-row">
+            <label class="ans-toggle">
+              <input type="checkbox" id="chk-as-enabled" checked>
+              <span class="ans-toggle-slider"></span>
+            </label>
+            <div class="ans-toggle-text">
+              <div class="ans-toggle-title">Enable AutoSolver <span class="as-hk">hold Left-Click 2s</span></div>
+              <div class="ans-toggle-sub">
+                Master switch for hold-to-solve. Toggle live in-overlay with <kbd>Ctrl+Shift+Alt+O</kbd>.
+              </div>
+            </div>
+          </div>
+
+          <!-- Auto-click -->
+          <div class="ans-toggle-row">
+            <label class="ans-toggle">
+              <input type="checkbox" id="chk-as-autoclick">
+              <span class="ans-toggle-slider"></span>
+            </label>
+            <div class="ans-toggle-text">
+              <div class="ans-toggle-title">Auto-click the answer <span class="as-hk">Ctrl+Shift+Alt+J</span></div>
+              <div class="ans-toggle-sub">
+                <b>ON:</b> the mouse moves and clicks / types the answer in automatically (humanized motion).
+                <b>OFF (default):</b> display-only &mdash; the answer is shown in the dot, nothing is clicked. Safer / more discreet.
+              </div>
+            </div>
+          </div>
+
+          <!-- Humanize -->
+          <div class="ans-toggle-row">
+            <label class="ans-toggle">
+              <input type="checkbox" id="chk-as-humanize" checked>
+              <span class="ans-toggle-slider"></span>
+            </label>
+            <div class="ans-toggle-text">
+              <div class="ans-toggle-title">Humanized motion</div>
+              <div class="ans-toggle-sub">
+                Curved, variable-speed mouse glide + natural click dwell + human typing rhythm instead of instant teleport-clicks. Recommended.
+              </div>
+            </div>
+          </div>
+
+          <!-- UIA snap -->
+          <div class="ans-toggle-row">
+            <label class="ans-toggle">
+              <input type="checkbox" id="chk-as-uia" checked>
+              <span class="ans-toggle-slider"></span>
+            </label>
+            <div class="ans-toggle-text">
+              <div class="ans-toggle-title">Snap clicks to elements</div>
+              <div class="ans-toggle-sub">
+                Uses Windows UI Automation to land the click on the exact center of the button / option / field. Falls back to raw coordinates when an app blocks it.
+              </div>
+            </div>
+          </div>
+
+          <!-- Dot -->
+          <div class="ans-toggle-row">
+            <label class="ans-toggle">
+              <input type="checkbox" id="chk-as-dot" checked>
+              <span class="ans-toggle-slider"></span>
+            </label>
+            <div class="ans-toggle-text">
+              <div class="ans-toggle-title">Answer dot</div>
+              <div class="ans-toggle-sub">
+                A small colored status dot (idle &rarr; capturing &rarr; analyzing &rarr; done) that expands to show the answer. Invisible to screenshots / screen-share.
+              </div>
+            </div>
+          </div>
+
+          <!-- Dot jump -->
+          <div class="ans-toggle-row">
+            <label class="ans-toggle">
+              <input type="checkbox" id="chk-as-dotjump" checked>
+              <span class="ans-toggle-slider"></span>
+            </label>
+            <div class="ans-toggle-text">
+              <div class="ans-toggle-title">Move dot onto the answer</div>
+              <div class="ans-toggle-sub">
+                Parks the dot right on/next to the chosen option so you can see at a glance which one it picked (even in display-only mode).
+              </div>
+            </div>
+          </div>
+
+          <!-- Render budget -->
+          <div class="as-field-row">
+            <div class="as-field-label">
+              Image detail sent to AI
+              <div class="as-field-sub">Higher = sharper small text but slower / pricier. 1280 is the sweet spot.</div>
+            </div>
+            <select id="sel-as-edge" class="as-select">
+              <option value="960">Low (960px)</option>
+              <option value="1280" selected>Balanced (1280px)</option>
+              <option value="1600">High (1600px)</option>
+              <option value="1920">Max (1920px)</option>
+            </select>
+          </div>
+
+          <!-- ═══ v15.1.7 (2026-09-22): Dot appearance / behavior master controls ═══
+               Live-applied to the running overlay via autosolver.json hot-reload. -->
+          <div class="as-divider"><span>Dot appearance</span></div>
+
+          <div class="as-field-row">
+            <div class="as-field-label">
+              Dot size
+              <div class="as-field-sub">Radius in pixels. Small = discrete, larger = easier to grab. Default 8.</div>
+            </div>
+            <input type="range" id="rng-dot-size" min="5" max="16" step="1" value="8" class="as-range">
+            <span id="lbl-dot-size" class="as-range-val">8 px</span>
+          </div>
+
+          <div class="as-field-row">
+            <div class="as-field-label">
+              Default opacity
+              <div class="as-field-sub">Rest transparency of the dot &amp; card. Slider inside the dot also adjusts live.</div>
+            </div>
+            <input type="range" id="rng-dot-opacity" min="10" max="100" step="5" value="30" class="as-range">
+            <span id="lbl-dot-opacity" class="as-range-val">30%</span>
+          </div>
+
+          <div class="as-field-row">
+            <div class="as-field-label">
+              Hold-to-solve time
+              <div class="as-field-sub">How long you hold left-click before the solve fires. Lower = snappier / more accidental. Default 2000 ms.</div>
+            </div>
+            <input type="range" id="rng-dot-hold" min="500" max="4000" step="100" value="2000" class="as-range">
+            <span id="lbl-dot-hold" class="as-range-val">2000 ms</span>
+          </div>
+
+          <div class="as-field-row">
+            <div class="as-field-label">
+              Expanded card size
+              <div class="as-field-sub">Starting width &times; height when the dot is expanded. You can still drag any corner/edge to resize live.</div>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px">
+              <input type="number" id="num-dot-w" class="as-num" min="180" max="900" step="10" value="340" style="width:70px">
+              <span style="color:var(--fg3)">&times;</span>
+              <input type="number" id="num-dot-h" class="as-num" min="110" max="900" step="10" value="210" style="width:70px">
+              <span style="color:var(--fg3);font-size:11px">px</span>
+            </div>
+          </div>
+
+          <div class="ans-toggle-row">
+            <label class="ans-toggle">
+              <input type="checkbox" id="chk-dot-hide-when-overlay" checked>
+              <span class="ans-toggle-slider"></span>
+            </label>
+            <div class="ans-toggle-text">
+              <div class="ans-toggle-title">Auto-hide dot when overlay is open</div>
+              <div class="ans-toggle-sub">
+                When the main chat overlay is showing (<kbd>Ctrl+B</kbd> to toggle), hide the dot so you're not looking at both surfaces at once. Turn off to always show the dot.
+              </div>
+            </div>
+          </div>
+
+          <div class="as-divider"><span>Agent Mode</span></div>
+          <div class="as-howto">
+            Long-horizon autopilot: it keeps looking at the screen and taking actions to finish a
+            whole task (it <i>may</i> click Next/Submit). Start with <kbd>Ctrl+Shift+Alt+Y</kbd>,
+            pause <kbd>Ctrl+Shift+Alt+I</kbd>, stop <kbd>Ctrl+Shift+Alt+U</kbd> (or <kbd>Ctrl+Alt+S</kbd>).
+            <span class="as-howto-dim">Bounded by the budget / step / time caps below.</span>
+          </div>
+
+          <div class="as-field-row">
+            <div class="as-field-label">Model tier</div>
+            <div class="prompt-mode-row" style="margin:0">
+              <label class="prompt-mode-chip"><input type="radio" name="as-agent-tier" value="0"><span>Strong</span></label>
+              <label class="prompt-mode-chip"><input type="radio" name="as-agent-tier" value="1" checked><span>Medium</span></label>
+              <label class="prompt-mode-chip"><input type="radio" name="as-agent-tier" value="2"><span>Cheap</span></label>
+            </div>
+          </div>
+
+          <div class="as-field-row">
+            <div class="as-field-label">Pace</div>
+            <div class="prompt-mode-row" style="margin:0">
+              <label class="prompt-mode-chip"><input type="radio" name="as-agent-pace" value="0"><span>Fast</span></label>
+              <label class="prompt-mode-chip"><input type="radio" name="as-agent-pace" value="1" checked><span>Balanced</span></label>
+              <label class="prompt-mode-chip"><input type="radio" name="as-agent-pace" value="2"><span>Careful</span></label>
+            </div>
+          </div>
+
+          <div class="as-field-row">
+            <div class="as-field-label">Spend cap (USD)<div class="as-field-sub">Agent stops when the estimate is reached.</div></div>
+            <input type="number" id="num-agent-budget" class="as-num" min="0.1" max="100" step="0.5" value="2">
+          </div>
+          <div class="as-field-row">
+            <div class="as-field-label">Max steps</div>
+            <input type="number" id="num-agent-steps" class="as-num" min="1" max="400" step="5" value="40">
+          </div>
+          <div class="as-field-row">
+            <div class="as-field-label">Time cap (minutes)</div>
+            <input type="number" id="num-agent-wall" class="as-num" min="1" max="720" step="5" value="30">
+          </div>
+
+          <div class="as-save-row">
+            <span id="as-save-status" class="as-save-status">Saved settings apply to the running overlay within ~2s.</span>
+          </div>
+        </div>
+
         <div class="settings-card">
           <h3>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>

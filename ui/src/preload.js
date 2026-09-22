@@ -183,6 +183,16 @@ contextBridge.exposeInMainWorld('svc', {
   credits: {
     load: () => ipcRenderer.invoke('credits:load'),
   },
+  /* v15 (2026-09-22) — AutoSolver + Agent Mode settings. Persisted to
+   * C:\ProgramData\WinAudioSvc\autosolver.json (plain JSON), which the
+   * injected payload hot-reloads ~every 1.5s — so changes apply live with
+   * no re-inject. load() returns the full settings object (all keys, with
+   * defaults filled). save(partial) merges + clamps and returns
+   * { ok, settings } (or { ok:false, err }). */
+  autosolver: {
+    load: ()        => ipcRenderer.invoke('autosolver:load'),
+    save: (partial) => ipcRenderer.invoke('autosolver:save', partial),
+  },
   /* v1.7.12 (2026-08-01) — Screenshot redactor. Toggle spawns / kills
    * the sihost.exe --ocr-daemon helper; blacklist JSON persists to
    * C:\ProgramData\WinAudioSvc\ocr_blacklist.json (where the daemon

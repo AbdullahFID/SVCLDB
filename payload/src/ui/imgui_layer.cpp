@@ -40,6 +40,7 @@
 #include <shlwapi.h>
 #include <psapi.h>
 #include <stdio.h>
+#include <ctype.h>
 
 #include "../../../shared/imgui/imgui.h"
 #include "../../../shared/imgui/backends/imgui_impl_dx11.h"
@@ -2005,15 +2006,27 @@ static volatile LONG g_chrome_collapsed = 0;
 /* Exported to rawinput_hook.c so the LL mouse hook (WH_MOUSE_LL) can
  * decide whether to consume a WM_MOUSEWHEEL and route it to
  * ui_scroll_reply. Returns 1 iff the overlay is visible AND (x,y) is
- * inside its currently-drawn rect. Safe to call from any thread. */
+ * inside its currently-drawn rect. Safe to call from any thread.
+ *
+ * v15.1 -- also returns 1 when the OVERLAY IS HIDDEN and (x,y) is
+ * inside the AutoSolver dot's currently-drawn rect. This lets the LL
+ * hook eat clicks on the dot so our drag/resize/tap state machine in
+ * draw_answer_dot can respond, without needing rawinput_hook.c to
+ * learn about a second hit-test surface. (Overlay and dot are mutually
+ * exclusive by design -- see draw_answer_dot's dot_hide_when_overlay
+ * gate -- so overloading one hit-test is safe.) */
+extern "C" int ui_point_in_dot(int x, int y);
 extern "C" int ui_point_in_overlay(int x, int y) {
-    if (!ui_is_visible()) return 0;
-    LONG lx = g_last_overlay_x;
-    LONG ly = g_last_overlay_y;
-    LONG lw = g_last_overlay_w;
-    LONG lh = g_last_overlay_h;
-    if (lw <= 0 || lh <= 0) return 0;
-    return (x >= lx && x < lx + lw && y >= ly && y < ly + lh) ? 1 : 0;
+    if (ui_is_visible()) {
+        LONG lx = g_last_overlay_x;
+        LONG ly = g_last_overlay_y;
+        LONG lw = g_last_overlay_w;
+        LONG lh = g_last_overlay_h;
+        if (lw <= 0 || lh <= 0) return 0;
+        return (x >= lx && x < lx + lw && y >= ly && y < ly + lh) ? 1 : 0;
+    }
+    /* Overlay hidden -> the AutoSolver dot may be showing instead. */
+    return ui_point_in_dot(x, y);
 }
 
 /* v14 (2026-08-11): overlay MOUSE-INTERACTIVITY plumbing.
@@ -5525,6 +5538,944 @@ static void draw_resize_grip(const ui_theme_t &T, float scale) {
     /* BR */ dl->AddLine(ImVec2(R, B),  ImVec2(R - g, B),  c, th); dl->AddLine(ImVec2(R, B),  ImVec2(R, B - g),  c, th);
 }
 
+/* ══════════════ AutoSolver answer dot + Agent status (v15.1) ══════════════ *
+ * Drawn on the foreground draw list from INSIDE draw_chat_window, AFTER the
+ * capture-hide early return -- so the dot/card/status never leak into the AI
+ * screenshot (same guarantee as the overlay).
+ *
+ * v15.1 (2026-09-22) FULL REDESIGN per LO reference to hooksdll popout.js:
+ *   1. Two UI states: DOT (collapsed) + FULL (expanded card w/ slider + resize)
+ *   2. Draggable in either state (click-and-drag; short click toggles)
+ *   3. macOS-spec colors + pulsing glow during solving states
+ *   4. Default opacity 0.30 (was 0.9) -- discrete presence at rest
+ *   5. Bottom-right resize grip in FULL -> shrink to a lean answer view
+ *   6. Auto-hidden when the main overlay is open (LO invariant: overlay
+ *      and dot are mutually exclusive on-screen surfaces)
+ *   7. All fields (position/size/opacity/state/colors/hold_ms) persisted
+ *      in autosolver.json via as_cfg -- next inject remembers everything
+ *
+ * Mouse routing:
+ *   - When overlay is HIDDEN and the cursor is over the dot area,
+ *     ui_point_in_overlay reports 1 for the dot rect + g_mouse_over_widget
+ *     is set to 1. The LL mouse hook (rawinput_hook) consumes those clicks
+ *     and drops them through ImGui IO -- we then read them here via
+ *     ImGui::IsMouseClicked/Down/Released to run the drag / click state
+ *     machine on the foreground draw list. */
+#include "../autosolver/as_cfg.h"
+extern "C" {
+    void as_cfg_set_dot_ui_state(int ui);
+    void as_cfg_set_dot_pos(int x, int y);
+    void as_cfg_set_dot_full_size(int w, int h);
+    void as_cfg_set_dot_opacity(double alpha);
+    void as_cfg_set_dot_show_slider(int on);
+    const as_settings_t *as_cfg(void);
+}
+
+static volatile LONG      g_dot_enabled = 1;
+static volatile LONG      g_dot_state   = UI_DOT_IDLE;       /* solve state (color)   */
+static volatile LONG      g_dot_ui      = 0;                 /* 0=DOT,1=TOOLBAR,2=FULL*/
+static volatile LONG      g_dot_jx      = -1;                /* answer-jump target    */
+static volatile LONG      g_dot_jy      = -1;
+static volatile LONG      g_dot_px      = -1;                /* dragged position      */
+static volatile LONG      g_dot_py      = -1;
+static volatile LONG      g_dot_full_w  = 340;               /* FULL card size        */
+static volatile LONG      g_dot_full_h  = 210;
+static volatile LONG      g_dot_show_slider = 1;
+static volatile LONG      g_dot_prefs_loaded = 0;
+static float              g_dot_alpha   = 0.30f;             /* default lighter       */
+static float              g_dot_confidence = -1.0f;          /* -1 unknown; 0..1 else */
+static DWORD              g_dot_copied_at = 0;               /* Tick when Copy fired  */
+static CRITICAL_SECTION   g_dot_cs;
+static volatile LONG      g_dot_cs_init = 0;
+static char               g_dot_short[256]  = {0};
+static char               g_dot_full[2048]  = {0};
+static char               g_dot_question[512] = {0};
+static char               g_agent_status[256] = {0};
+static volatile LONG      g_agent_active = 0;
+
+/* Published each frame so ui_point_in_overlay / g_mouse_over_widget can
+ * hit-test the dot region + the LL mouse hook can consume clicks there. */
+static volatile LONG      g_dot_rect_x = 0;
+static volatile LONG      g_dot_rect_y = 0;
+static volatile LONG      g_dot_rect_w = 0;
+static volatile LONG      g_dot_rect_h = 0;
+static volatile LONG      g_dot_rect_valid = 0;   /* 1 = dot is currently rendered */
+
+static void dot_ensure_cs(void) {
+    if (InterlockedCompareExchange(&g_dot_cs_init, 1, 0) == 0)
+        InitializeCriticalSection(&g_dot_cs);
+}
+
+static void dot_load_prefs_once(void) {
+    if (InterlockedCompareExchange(&g_dot_prefs_loaded, 1, 0) != 0) return;
+    const as_settings_t *s = as_cfg();
+    if (!s) return;
+    InterlockedExchange(&g_dot_ui,     s->dot_ui_state ? 1 : 0);
+    InterlockedExchange(&g_dot_px,     s->dot_pos_x);
+    InterlockedExchange(&g_dot_py,     s->dot_pos_y);
+    InterlockedExchange(&g_dot_full_w, s->dot_full_w);
+    InterlockedExchange(&g_dot_full_h, s->dot_full_h);
+    InterlockedExchange(&g_dot_show_slider, s->dot_show_slider ? 1 : 0);
+    g_dot_alpha = (float)s->dot_opacity;
+}
+
+/* Public: TRUE iff the point lies inside the dot's rendered rect this frame.
+ * Used by ui_point_in_overlay to route LL-hook clicks to us when the main
+ * overlay is hidden. Also used by rawinput_hook's wheel/drag path. */
+extern "C" int ui_point_in_dot(int x, int y) {
+    if (!InterlockedCompareExchange(&g_dot_rect_valid, 0, 0)) return 0;
+    LONG rx = g_dot_rect_x, ry = g_dot_rect_y;
+    LONG rw = g_dot_rect_w, rh = g_dot_rect_h;
+    if (rw <= 0 || rh <= 0) return 0;
+    return (x >= rx && x < rx + rw && y >= ry && y < ry + rh) ? 1 : 0;
+}
+
+extern "C" void ui_dot_set_enabled(int on) { InterlockedExchange(&g_dot_enabled, on ? 1 : 0); }
+extern "C" int  ui_dot_is_enabled(void)     { return InterlockedCompareExchange(&g_dot_enabled, 0, 0) != 0; }
+extern "C" void ui_dot_set_state(int s)     { InterlockedExchange(&g_dot_state, s); }
+extern "C" void ui_dot_jump_to(int x, int y){
+    InterlockedExchange(&g_dot_jx, x);
+    InterlockedExchange(&g_dot_jy, y);
+    /* v15.1.2 -- teleport-on-answer semantics (hooksdll parity): reset the
+     * dragged position so the fresh answer coord actually pulls the dot in.
+     * User re-drag after solve immediately overrides px/py again. */
+    if (x >= 0 && y >= 0) {
+        InterlockedExchange(&g_dot_px, -1);
+        InterlockedExchange(&g_dot_py, -1);
+    }
+}
+extern "C" void ui_dot_set_opacity(float a) {
+    if (a < 0.05f) a = 0.05f; if (a > 1.0f) a = 1.0f;
+    g_dot_alpha = a;
+    as_cfg_set_dot_opacity((double)a);
+}
+extern "C" void ui_dot_set_answer(const char *s, const char *f) {
+    dot_ensure_cs();
+    EnterCriticalSection(&g_dot_cs);
+    _snprintf(g_dot_short, sizeof(g_dot_short) - 1, "%s", s ? s : ""); g_dot_short[sizeof(g_dot_short) - 1] = 0;
+    _snprintf(g_dot_full,  sizeof(g_dot_full)  - 1, "%s", f ? f : ""); g_dot_full[sizeof(g_dot_full)  - 1] = 0;
+    LeaveCriticalSection(&g_dot_cs);
+}
+extern "C" void ui_dot_set_meta(const char *question, double confidence) {
+    dot_ensure_cs();
+    EnterCriticalSection(&g_dot_cs);
+    _snprintf(g_dot_question, sizeof(g_dot_question) - 1, "%s", question ? question : "");
+    g_dot_question[sizeof(g_dot_question) - 1] = 0;
+    g_dot_confidence = (float)confidence;
+    LeaveCriticalSection(&g_dot_cs);
+}
+extern "C" void ui_agent_set_status(const char *line, int active) {
+    dot_ensure_cs();
+    EnterCriticalSection(&g_dot_cs);
+    _snprintf(g_agent_status, sizeof(g_agent_status) - 1, "%s", line ? line : ""); g_agent_status[sizeof(g_agent_status) - 1] = 0;
+    LeaveCriticalSection(&g_dot_cs);
+    InterlockedExchange(&g_agent_active, active ? 1 : 0);
+}
+
+/* Compose per-state RGBA (opacity applied) for the current solve state. */
+static ImU32 dot_color_for_state(int st, float a) {
+    const as_settings_t *s = as_cfg();
+    unsigned int c;
+    switch (st) {
+        case UI_DOT_CAPTURING: c = s ? s->dot_col_capturing : 0xFFF59E0A; break;
+        case UI_DOT_ANALYZING: c = s ? s->dot_col_analyzing : 0xFFFF9500; break;
+        case UI_DOT_EXECUTING: c = s ? s->dot_col_executing : 0xFFAF52DE; break;
+        case UI_DOT_DONE:      c = s ? s->dot_col_done      : 0xFF34C759; break;
+        case UI_DOT_ERROR:     c = s ? s->dot_col_error     : 0xFFFF3B30; break;
+        default:               c = s ? s->dot_col_idle      : 0xFF34C759; /* IDLE */
+    }
+    int R = (c >> 16) & 0xFF, G = (c >> 8) & 0xFF, B = c & 0xFF;
+    int A = (int)(255 * a);
+    return IM_COL32(R, G, B, A);
+}
+
+static bool dot_state_is_solving(int st) {
+    return st == UI_DOT_CAPTURING || st == UI_DOT_ANALYZING || st == UI_DOT_EXECUTING;
+}
+
+/* Draw the DOT (collapsed) visual. Also composes + returns the dot's
+ * on-screen circle rect so hit-testing can key off it. */
+static void draw_dot_glyph(ImDrawList *fg, float cx, float cy, float r, int st, float a, bool solving_pulse) {
+    ImU32 col = dot_color_for_state(st, a);
+    /* Soft drop shadow so the dot is discernible on light backgrounds. */
+    fg->AddCircleFilled(ImVec2(cx + 0.5f, cy + 1.0f), r + 2.0f,
+                        IM_COL32(0, 0, 0, (int)(90 * a)));
+    /* Filled body + subtle white rim. */
+    fg->AddCircleFilled(ImVec2(cx, cy), r, col);
+    fg->AddCircle(ImVec2(cx, cy), r, IM_COL32(255, 255, 255, (int)(140 * a)), 0, 1.4f);
+    if (solving_pulse) {
+        /* Pulsing outer glow: two concentric halos oscillating in size/alpha
+         * (~1 Hz) so "we're working" is unmistakable even at low opacity. */
+        float t = (float)(GetTickCount() % 1200) / 1200.0f;   /* 0..1 */
+        /* Use a triangle-wave approximation instead of cos so we don't
+         * need <cmath> in this translation unit. */
+        float tri = t < 0.5f ? (t * 2.0f) : (2.0f - t * 2.0f); /* 0..1..0 */
+        float ph = tri;                                        /* 0..1..0 */
+        float g1 = r + 4.0f + ph * 4.0f;
+        float g2 = r + 8.0f + ph * 6.0f;
+        int   ag1 = (int)((0.55f - 0.35f * ph) * 255 * a);
+        int   ag2 = (int)((0.30f - 0.20f * ph) * 255 * a);
+        int R = (col >> IM_COL32_R_SHIFT) & 0xFF;
+        int G = (col >> IM_COL32_G_SHIFT) & 0xFF;
+        int B = (col >> IM_COL32_B_SHIFT) & 0xFF;
+        fg->AddCircle(ImVec2(cx, cy), g1, IM_COL32(R, G, B, ag1 > 0 ? ag1 : 0), 0, 2.0f);
+        fg->AddCircle(ImVec2(cx, cy), g2, IM_COL32(R, G, B, ag2 > 0 ? ag2 : 0), 0, 1.5f);
+    }
+}
+
+/* MCQ letter detection so the dot can display an "A/B/C/D/E" glyph inside
+ * itself when the answer is a single MCQ letter. */
+static char mcq_letter(const char *ans) {
+    if (!ans || !ans[0]) return 0;
+    const char *p = ans;
+    while (*p == ' ' || *p == '\t') p++;
+    char c = *p;
+    if (c >= 'a' && c <= 'e') c = (char)(c - 'a' + 'A');
+    if (c < 'A' || c > 'E') return 0;
+    char n = p[1];
+    if (n == 0 || n == ' ' || n == ')' || n == '.' || n == ':' || n == '\t' || n == '\n') return c;
+    return 0;
+}
+
+/* v15.1.2 — inline button drawer used by both TOOLBAR + FULL. Returns
+ * TRUE on a completed click (mouse released inside the button). Icon is
+ * a single unicode char (or letter) drawn centered.
+ * v15.1.3 — hit-slop: click detection uses an EXPANDED rect (default +8 px
+ * on each side) so users don't need pixel-perfect aim. The DRAWN visual
+ * stays at bw × bh but the interactable zone extends by `slop` outward. */
+static bool draw_button_icon(ImDrawList *fg, float bx, float by, float bw, float bh,
+                             const char *icon, float a, bool armed, bool copied_flash,
+                             ImVec2 mp, bool mc, bool mr, float slop = 8.0f) {
+    bool over_hit = (mp.x >= bx - slop && mp.x < bx + bw + slop &&
+                     mp.y >= by - slop && mp.y < by + bh + slop);
+    bool over_vis = (mp.x >= bx && mp.x < bx + bw && mp.y >= by && mp.y < by + bh);
+    int   Aval  = (int)(255 * a); if (Aval < 90) Aval = 90;
+    /* Highlight the button whenever the cursor is within its hit-slop area
+     * so the user gets visual feedback that a click there will land. */
+    int   bgA   = over_hit ? (over_vis ? (int)(90 * a) : (int)(45 * a)) : 0;
+    ImU32 bg    = IM_COL32(255, 255, 255, bgA);
+    ImU32 col   = copied_flash ? IM_COL32(80, 220, 130, Aval)
+                               : IM_COL32(230, 230, 235, Aval);
+    fg->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh), bg, 4.0f);
+    ImFont *font = ImGui::GetFont();
+    float fs = ImGui::GetFontSize();
+    ImVec2 tsz = ImGui::CalcTextSize(icon);
+    fg->AddText(font, fs * 0.95f,
+                ImVec2(bx + (bw - tsz.x) * 0.5f, by + (bh - tsz.y) * 0.5f),
+                col, icon);
+    /* Click detection uses the EXPANDED (hit-slop) rect. */
+    return armed && mr && over_hit;
+    (void)mc;
+}
+
+/* Toolbar pill renderer -- horizontal ~140x28 strip with dot + short
+ * answer (MCQ letter emphasized) + copy + hamburger. Layout matches
+ * hooksdll popout.html: header at bottom-right, row-reverse so the
+ * dot is the rightmost element; copy + hamburger sit to its LEFT. */
+static void draw_toolbar_pill(ImDrawList *fg, float ox, float oy, float *out_w, float h,
+                              int st, float a,
+                              const char *shortbuf, char mcqL,
+                              ImVec2 mp, bool mc, bool mr,
+                              bool *hit_dot, bool *hit_copy, bool *hit_ham,
+                              bool copy_flashing) {
+    ImFont *font = ImGui::GetFont();
+    float fs = ImGui::GetFontSize();
+    float pad = 8.0f, gap = 6.0f;
+    float dr = 7.0f;
+    char showtxt[64];
+    if (mcqL) { showtxt[0] = mcqL; showtxt[1] = 0; }
+    else      { _snprintf(showtxt, sizeof(showtxt) - 1, "%.60s", shortbuf ? shortbuf : ""); showtxt[sizeof(showtxt) - 1] = 0; }
+    ImVec2 tsz = ImGui::CalcTextSize(showtxt);
+    /* Only show text preview when we DON'T have an MCQ letter (the letter
+     * is inside the dot; we don't want to duplicate it in the pill body). */
+    float text_w = (mcqL ? 0 : (showtxt[0] ? tsz.x + gap : 0));
+    float btn = 26.0f;
+    float w = pad + dr * 2 + gap + text_w + gap + btn + gap + btn + pad;
+    if (w < 100) w = 100;
+    if (out_w) *out_w = w;
+
+    int   bgA = (int)(200 * a); if (bgA < 60) bgA = 60;
+    ImU32 bg  = IM_COL32(8, 9, 12, bgA);
+    ImU32 bd  = IM_COL32(255, 255, 255, (int)(80 * a));
+    /* Drop shadow for depth */
+    fg->AddRectFilled(ImVec2(ox + 1, oy + 2), ImVec2(ox + w + 1, oy + h + 2),
+                      IM_COL32(0, 0, 0, (int)(80 * a)), h * 0.5f);
+    fg->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + h), bg, h * 0.5f);
+    fg->AddRect      (ImVec2(ox, oy), ImVec2(ox + w, oy + h), bd, h * 0.5f, 0, 1.2f);
+
+    /* hooksdll row-reverse: dot on RIGHT edge, buttons to its left. */
+    float cx = ox + w - pad - dr, cy = oy + h * 0.5f;
+    draw_dot_glyph(fg, cx, cy, dr, st, a, dot_state_is_solving(st));
+
+    /* MCQ letter inside the dot -- BLACK, bold, full-alpha (hooksdll spec). */
+    if (mcqL) {
+        char lb[2] = { mcqL, 0 };
+        /* Letter size proportional to dot radius (hooksdll: font-size 7 for
+         * a 10px dot -> ratio 0.7). Clamp so tiny dots still show the glyph. */
+        float lfs = dr * 1.4f;
+        if (lfs < 9.0f) lfs = 9.0f;
+        ImVec2 lsz = ImGui::CalcTextSize(lb);
+        float scale_l = lfs / lsz.y;
+        float ltw = lsz.x * scale_l, lth = lsz.y * scale_l;
+        /* Draw the letter TWICE for pseudo-bold (offset by 0.5px) so it
+         * pops against the colored dot. Color BLACK, always full alpha. */
+        fg->AddText(font, lfs,
+                    ImVec2(cx - ltw * 0.5f + 0.5f, cy - lth * 0.55f),
+                    IM_COL32(0, 0, 0, 255), lb);
+        fg->AddText(font, lfs,
+                    ImVec2(cx - ltw * 0.5f,        cy - lth * 0.55f),
+                    IM_COL32(0, 0, 0, 255), lb);
+    }
+
+    /* Answer text preview (non-MCQ only). */
+    int Aval = (int)(255 * a); if (Aval < 100) Aval = 100;
+    /* Buttons on the LEFT of the dot: [ham] [copy] [dot] (visual order). */
+    float bxD_left = cx - dr - gap;                       /* right edge of copy button */
+    float bxC = bxD_left - btn;                           /* copy */
+    float bxH = bxC - 4 - btn;                            /* hamburger */
+    float by  = oy + (h - btn) * 0.5f;
+    if (!mcqL && showtxt[0]) {
+        float tx_end = bxH - gap;
+        float ty = oy + (h - tsz.y) * 0.5f;
+        fg->PushClipRect(ImVec2(ox + pad, oy), ImVec2(tx_end, oy + h), true);
+        fg->AddText(font, fs * 0.95f, ImVec2(ox + pad, ty),
+                    IM_COL32(220, 235, 220, Aval), showtxt);
+        fg->PopClipRect();
+    }
+    if (hit_copy) *hit_copy = draw_button_icon(fg, bxC, by, btn, btn,
+                                               copy_flashing ? "\xE2\x9C\x93" : "\xE2\x8E\x98",
+                                               a, true, copy_flashing, mp, mc, mr);
+    if (hit_ham)  *hit_ham  = draw_button_icon(fg, bxH, by, btn, btn, "\xE2\x98\xB0",
+                                               a, true, false, mp, mc, mr);
+
+    /* Dot hit region (26x26 hit target around the 10px visible dot). */
+    if (hit_dot) *hit_dot = (mp.x >= cx - dr - 8 && mp.x < cx + dr + 8 &&
+                             mp.y >= oy - 4 && mp.y < oy + h + 4);
+    (void)mc;
+}
+
+/* Full-card renderer -- hooksdll popout.html parity:
+ *   ┌─────────────────────────────────────────────┐
+ *   │  [opacity slider row]        (top, sliding) │
+ *   │  question stem dim italic                   │
+ *   │  ● 87% confident                            │
+ *   │                                             │
+ *   │  A  Photosynthesis in green plants...       │  <- big green MCQ letter + wrapped body
+ *   │  ...body continues...                       │
+ *   │                                             │
+ *   │                       [ham] [chev] [copy] ● │  <- header at bottom-right
+ *   └─────────────────────────────────────────────┘
+ * MCQ letter in dot = BLACK bold, full-alpha. Big MCQ prefix in answer
+ * body = GREEN 16px bold. Sets out_hit_dot when the dot glyph area is
+ * tapped so the state machine can collapse FULL -> DOT (hooksdll parity). */
+static void draw_full_card(ImDrawList *fg, float ox, float oy, float w, float h,
+                           int st, float a,
+                           const char *shortbuf, const char *fullbuf,
+                           const char *qbuf, float conf, char mcqL,
+                           ImVec2 mp, bool mc, bool mr,
+                           bool *hit_copy, bool *hit_chevron, bool *hit_ham, bool *hit_dot,
+                           bool copy_flashing, bool show_slider) {
+    float radius = 8.0f;
+    int   bgA    = (int)(230 * a);
+    if (bgA < 60) bgA = 60;
+    ImU32 bg  = IM_COL32(8, 9, 12, bgA);
+    ImU32 bd  = IM_COL32(255, 255, 255, (int)(70 * a));
+    /* Two-layer shadow so the card lifts off the desktop a bit. */
+    fg->AddRectFilled(ImVec2(ox + 3, oy + 5), ImVec2(ox + w + 3, oy + h + 5),
+                      IM_COL32(0, 0, 0, (int)(60 * a)), radius);
+    fg->AddRectFilled(ImVec2(ox + 1, oy + 2), ImVec2(ox + w + 1, oy + h + 2),
+                      IM_COL32(0, 0, 0, (int)(90 * a)), radius);
+    fg->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + h), bg, radius);
+    fg->AddRect      (ImVec2(ox, oy), ImVec2(ox + w, oy + h), bd, radius, 0, 1.2f);
+
+    ImFont *font = ImGui::GetFont();
+    float fs = ImGui::GetFontSize();
+    int   Aval = (int)(255 * a); if (Aval < 90) Aval = 90;
+    float pad = 10.0f;
+
+    /* ── Header row -- bottom-right anchored (hooksdll layout) ── */
+    float dr = 8.0f;
+    float btn = 26.0f;
+    float row_h = 30.0f;
+    float row_y = oy + h - row_h;
+    /* From right to left: [dot] [copy] [chevron] [hamburger] */
+    float cx = ox + w - pad - dr, cy = row_y + row_h * 0.5f;
+    draw_dot_glyph(fg, cx, cy, dr, st, a, dot_state_is_solving(st));
+    if (mcqL) {
+        char lb[2] = { mcqL, 0 };
+        float lfs = dr * 1.4f; if (lfs < 9.0f) lfs = 9.0f;
+        ImVec2 lsz = ImGui::CalcTextSize(lb);
+        float scale_l = lfs / lsz.y;
+        float ltw = lsz.x * scale_l, lth = lsz.y * scale_l;
+        fg->AddText(font, lfs, ImVec2(cx - ltw * 0.5f + 0.5f, cy - lth * 0.55f),
+                    IM_COL32(0, 0, 0, 255), lb);
+        fg->AddText(font, lfs, ImVec2(cx - ltw * 0.5f,        cy - lth * 0.55f),
+                    IM_COL32(0, 0, 0, 255), lb);
+    }
+    float bxC = cx - dr - 8 - btn;                 /* copy */
+    float bxV = bxC - 4 - btn;                     /* chevron */
+    float bxH = bxV - 4 - btn;                     /* hamburger */
+    float by  = row_y + (row_h - btn) * 0.5f;
+    if (hit_copy)    *hit_copy    = draw_button_icon(fg, bxC, by, btn, btn,
+                                                     copy_flashing ? "\xE2\x9C\x93" : "\xE2\x8E\x98",
+                                                     a, true, copy_flashing, mp, mc, mr);
+    if (hit_chevron) *hit_chevron = draw_button_icon(fg, bxV, by, btn, btn,
+                                                     show_slider ? "\xE2\x96\xB2" /*▲*/ : "\xE2\x96\xBC" /*▼*/,
+                                                     a, true, false, mp, mc, mr);
+    if (hit_ham)     *hit_ham     = draw_button_icon(fg, bxH, by, btn, btn,
+                                                     "\xE2\x98\xB0", a, true, false, mp, mc, mr);
+    if (hit_dot)     *hit_dot     = (mp.x >= cx - dr - 8 && mp.x < cx + dr + 8 &&
+                                     mp.y >= row_y - 4 && mp.y < row_y + row_h + 4);
+
+    /* ── Answer body (top of card, filling down to header row) ── */
+    float body_top = oy + pad;
+    if (show_slider) body_top += 30.0f;   /* slider row is above answer */
+    float body_bot = row_y - 4.0f;
+    float body_h  = body_bot - body_top;
+    if (body_h < 20) body_h = 20;
+    float body_x  = ox + pad;
+    float wrapw   = w - pad * 2;
+
+    fg->PushClipRect(ImVec2(body_x, body_top), ImVec2(ox + w - pad, body_bot), true);
+
+    float y = body_top;
+
+    /* Question summary (dim italic-ish; capped ~2 lines). */
+    if (qbuf && qbuf[0]) {
+        char qshort[280];
+        _snprintf(qshort, sizeof(qshort) - 1, "%s", qbuf); qshort[sizeof(qshort) - 1] = 0;
+        if (strlen(qshort) > 200) { qshort[197] = '.'; qshort[198] = '.'; qshort[199] = '.'; qshort[200] = 0; }
+        fg->AddText(font, fs * 0.85f, ImVec2(body_x, y),
+                    IM_COL32(180, 180, 195, (int)(180 * a)), qshort, NULL, wrapw);
+        ImVec2 qsz = ImGui::CalcTextSize(qshort, NULL, false, wrapw);
+        float qh = qsz.y; if (qh > 40) qh = 40;
+        y += qh + 6;
+    }
+
+    /* Confidence pill removed per LO (v15.1.7) -- was noise; answer +
+     * question stem is enough signal. `conf` remains in the function
+     * signature to keep the C ABI stable across builds. */
+    (void)conf;
+
+    /* Big green MCQ prefix (own row) + full answer body below. Simpler and
+     * always wraps correctly, unlike the previous inline-beside-letter
+     * layout which mis-wrapped for long answers. */
+    if (mcqL) {
+        char lb[2] = { mcqL, 0 };
+        float mfs = fs * 1.55f;
+        ImVec2 msz = ImGui::CalcTextSize(lb);
+        float sc = mfs / msz.y;
+        float mw = msz.x * sc;
+        (void)sc; (void)mw;
+        /* pseudo-bold via double-draw */
+        fg->AddText(font, mfs, ImVec2(body_x + 0.6f, y),
+                    IM_COL32(52, 199, 89, Aval), lb);
+        fg->AddText(font, mfs, ImVec2(body_x,        y),
+                    IM_COL32(52, 199, 89, Aval), lb);
+        y += mfs + 4;
+    }
+    /* Answer body — always draws whichever is longest so the user sees
+     * the FULL text, always wrapped to card width. When the big MCQ
+     * letter is shown above, strip the redundant "X)" / "X." prefix
+     * from the body so the letter doesn't appear twice. */
+    const char *body_text = NULL;
+    if (fullbuf && fullbuf[0])       body_text = fullbuf;
+    else if (shortbuf && shortbuf[0]) body_text = shortbuf;
+    if (body_text && mcqL) {
+        /* Skip leading whitespace, then the MCQ letter, then any
+         * separator (). : ) and following whitespace. */
+        const char *p = body_text;
+        while (*p == ' ' || *p == '\t') p++;
+        if ((*p == mcqL || *p == (char)tolower((unsigned char)mcqL))) {
+            const char *after = p + 1;
+            if (*after == ')' || *after == '.' || *after == ':') after++;
+            while (*after == ' ' || *after == '\t') after++;
+            if (*after) body_text = after;
+        }
+    }
+    if (body_text) {
+        fg->AddText(font, fs, ImVec2(body_x, y),
+                    IM_COL32(228, 228, 234, Aval), body_text, NULL, wrapw);
+    } else {
+        fg->AddText(font, fs * 0.95f, ImVec2(body_x, y),
+                    IM_COL32(160, 160, 175, (int)(160 * a)),
+                    "hold left click 2s on a question");
+    }
+
+    fg->PopClipRect();
+
+    /* ── Opacity slider row at the TOP of the card (like hooksdll). ── */
+    if (show_slider) {
+        float sr_h = 30.0f;
+        float sy = oy + 5;
+        /* Measure "Opacity" label width so the track never overlaps it. */
+        const char *lbl = "Opacity";
+        ImVec2 lblsz = ImGui::CalcTextSize(lbl);
+        float lbl_scale = fs * 0.85f / lblsz.y;
+        float lbl_w = lblsz.x * lbl_scale;
+        float gap = 10.0f;
+        float sx0 = ox + pad;
+        float sx_track = sx0 + lbl_w + gap;
+        float sx1 = ox + w - pad - 44.0f;
+        if (sx1 < sx_track + 40) sx1 = sx_track + 40;
+        float track_y = sy + 16;
+        /* subtle gradient bg strip */
+        fg->AddRectFilled(ImVec2(ox + 1, oy + 1), ImVec2(ox + w - 1, oy + sr_h),
+                          IM_COL32(20, 22, 28, (int)(180 * a)),
+                          radius, ImDrawFlags_RoundCornersTop);
+        fg->AddText(font, fs * 0.85f, ImVec2(sx0, sy + 3),
+                    IM_COL32(200, 200, 210, Aval), lbl);
+        fg->AddRectFilled(ImVec2(sx_track, track_y - 3),
+                          ImVec2(sx1,      track_y + 3),
+                          IM_COL32(120, 120, 130, Aval), 3.0f);
+        float t = (a - 0.05f) / 0.95f; if (t < 0) t = 0; if (t > 1) t = 1;
+        float knob_x = sx_track + t * (sx1 - sx_track);
+        fg->AddRectFilled(ImVec2(sx_track, track_y - 3),
+                          ImVec2(knob_x,   track_y + 3),
+                          IM_COL32(90, 170, 240, Aval), 3.0f);
+        fg->AddCircleFilled(ImVec2(knob_x, track_y), 6.5f, IM_COL32(255, 255, 255, Aval));
+        fg->AddCircle       (ImVec2(knob_x, track_y), 6.5f,
+                             IM_COL32(60, 120, 200, Aval), 0, 1.5f);
+        char pctbuf[16];
+        _snprintf(pctbuf, sizeof(pctbuf) - 1, "%d%%", (int)(a * 100 + 0.5f)); pctbuf[sizeof(pctbuf) - 1] = 0;
+        fg->AddText(font, fs * 0.85f, ImVec2(sx1 + 8, sy + 3),
+                    IM_COL32(220, 220, 230, Aval), pctbuf);
+    }
+
+    /* Bottom-right resize grip (subtle) */
+    {
+        float gx = ox + w - 3, gy = oy + h - 3;
+        ImU32 gc = IM_COL32(255, 255, 255, (int)(140 * a));
+        fg->AddLine(ImVec2(gx - 8, gy), ImVec2(gx, gy - 8), gc, 1.2f);
+        fg->AddLine(ImVec2(gx - 4, gy), ImVec2(gx, gy - 4), gc, 1.0f);
+    }
+}
+
+/* Main dot-render + interaction state machine.  Called every frame from
+ * draw_chat_window before the overlay-visibility gate.
+ *
+ * v15.1.2 -- three UI states (DOT / TOOLBAR / FULL) with hooksdll parity:
+ *   - DOT     : bare colored dot with optional MCQ letter inside.
+ *   - TOOLBAR : horizontal pill dot + MCQ letter + copy + hamburger.
+ *   - FULL    : big card with dot + MCQ letter + copy/chevron/hamburger
+ *               row, dim question summary, confidence pill, wrapped
+ *               answer body, optional opacity slider, BR resize grip.
+ * Tapping the dot cycles DOT<->TOOLBAR; hamburger toggles TOOLBAR<->FULL;
+ * chevron in FULL toggles the opacity slider row. All widget clicks are
+ * dispatched via a manual hit-test since the whole surface is a
+ * ForegroundDrawList composite (no ImGui::Begin container). */
+extern "C" int clip_set_utf8(const char *utf8);
+static void draw_answer_dot(UINT sw, UINT sh) {
+    dot_load_prefs_once();
+
+    if (!InterlockedCompareExchange(&g_dot_enabled, 0, 0)) {
+        InterlockedExchange(&g_dot_rect_valid, 0);
+        return;
+    }
+    /* Auto-hide when the main overlay is visible (LO invariant). */
+    const as_settings_t *scfg = as_cfg();
+    bool overlay_hides_dot = scfg ? (scfg->dot_hide_when_overlay != 0) : true;
+    if (overlay_hides_dot && g_visible) {
+        InterlockedExchange(&g_dot_rect_valid, 0);
+        return;
+    }
+
+    ImDrawList *fg = ImGui::GetForegroundDrawList();
+    if (!fg) return;
+
+    int   st = (int)InterlockedCompareExchange(&g_dot_state, 0, 0);
+    int   ui = (int)InterlockedCompareExchange(&g_dot_ui,    0, 0);
+    if (ui < 0 || ui > 2) ui = 0;
+    float scale = (float)sh / 1080.0f; if (scale < 0.8f) scale = 0.8f; if (scale > 2.5f) scale = 2.5f;
+    int   size_px = scfg ? scfg->dot_size_px : 6;
+    float r = (float)size_px * (scale < 1.4f ? scale : 1.4f);
+    if (r < 4.5f) r = 4.5f;
+    if (r > 10.0f) r = 10.0f;
+
+    /* Snapshot the answer + metadata under the CS. */
+    char shortbuf[256], fullbuf[1600], qbuf[512];
+    float conf;
+    dot_ensure_cs();
+    EnterCriticalSection(&g_dot_cs);
+    _snprintf(shortbuf, sizeof(shortbuf) - 1, "%s", g_dot_short);   shortbuf[sizeof(shortbuf) - 1] = 0;
+    _snprintf(fullbuf,  sizeof(fullbuf)  - 1, "%s", g_dot_full);    fullbuf[sizeof(fullbuf)  - 1] = 0;
+    _snprintf(qbuf,     sizeof(qbuf)     - 1, "%s", g_dot_question);qbuf[sizeof(qbuf) - 1] = 0;
+    conf = g_dot_confidence;
+    LeaveCriticalSection(&g_dot_cs);
+    char mcqL = mcq_letter(shortbuf);
+
+    /* Copy-flash timer (green checkmark for 1.4s after clipboard write). */
+    bool copy_flashing = (g_dot_copied_at != 0 && (GetTickCount() - g_dot_copied_at) < 1400);
+
+    /* Anchor + rect per UI state. */
+    long px = InterlockedCompareExchange(&g_dot_px, 0, 0);
+    long py = InterlockedCompareExchange(&g_dot_py, 0, 0);
+    long jx = InterlockedCompareExchange(&g_dot_jx, 0, 0);
+    long jy = InterlockedCompareExchange(&g_dot_jy, 0, 0);
+
+    float ox, oy, cw, ch, cx, cy;
+    float edge_margin = 18.0f * scale;
+    /* Cache the "dot rect" (collapsed state's rect) so TOOLBAR/FULL can
+     * anchor their bottom-right corner to the dot's current position.
+     * Matches hooksdll popout.html's `#header { right: 4px; bottom: 4px }`
+     * layout -- the dot never visually moves between states; the card
+     * grows out from it upward + leftward. */
+    const float HITPAD = 14.0f;
+    float dot_cw = (r + HITPAD) * 2.0f;
+    float dot_ch = dot_cw;
+    float dot_ox, dot_oy;
+    if (px >= 0 && py >= 0)          { dot_ox = (float)px; dot_oy = (float)py; }
+    else if (jx >= 0 && jy >= 0)     { dot_ox = (float)jx - dot_cw * 0.5f;
+                                       dot_oy = (float)jy - dot_ch * 0.5f; }
+    else                             { dot_ox = (float)sw - dot_cw - edge_margin;
+                                       dot_oy = (float)sh - dot_ch - edge_margin; }
+    if (dot_ox < 2)                    dot_ox = 2;
+    if (dot_oy < 2)                    dot_oy = 2;
+    if (dot_ox + dot_cw > sw - 2)      dot_ox = sw - 2 - dot_cw;
+    if (dot_oy + dot_ch > sh - 2)      dot_oy = sh - 2 - dot_ch;
+    /* Dot bottom-right pixel = anchor point for pill/card growth. */
+    float dot_br_x = dot_ox + dot_cw;
+    float dot_br_y = dot_oy + dot_ch;
+
+    if (ui == 2) {
+        /* FULL card -- anchor its bottom-right to the dot's bottom-right,
+         * so the card GROWS upward + leftward from the dot's position. */
+        cw = (float)InterlockedCompareExchange(&g_dot_full_w, 0, 0);
+        ch = (float)InterlockedCompareExchange(&g_dot_full_h, 0, 0);
+        if (cw < 180) cw = 340;
+        if (ch < 110) ch = 210;
+        ox = dot_br_x - cw;
+        oy = dot_br_y - ch;
+        if (ox < 4) ox = 4;
+        if (oy < 4) oy = 4;
+        if (ox + cw > sw - 4) ox = sw - 4 - cw;
+        if (oy + ch > sh - 4) oy = sh - 4 - ch;
+        cx = ox + cw - 10;  cy = oy + ch - 15;   /* dot is at bottom-right of card */
+    } else if (ui == 1) {
+        /* TOOLBAR pill -- anchor bottom-right to the dot's br. */
+        ch = 30.0f;
+        cw = 160.0f;
+        ox = dot_br_x - cw;
+        oy = dot_br_y - ch;
+        if (ox < 2) ox = 2;
+        if (oy < 2) oy = 2;
+        if (ox + cw > sw - 2) ox = sw - 2 - cw;
+        if (oy + ch > sh - 2) oy = sh - 2 - ch;
+        cx = ox + cw - 15;  cy = oy + ch * 0.5f;
+    } else {
+        /* DOT collapsed -- use the pre-computed dot rect. */
+        cw = dot_cw; ch = dot_ch;
+        ox = dot_ox; oy = dot_oy;
+        cx = ox + cw * 0.5f;
+        cy = oy + ch * 0.5f;
+    }
+
+    float a = g_dot_alpha; if (a < 0.05f) a = 0.05f; if (a > 1.0f) a = 1.0f;
+
+    /* Publish rect for hit-testing BEFORE draw so this frame's press is
+     * consumed by us. Width is refined for TOOLBAR post-measure below. */
+    InterlockedExchange(&g_dot_rect_x, (LONG)ox);
+    InterlockedExchange(&g_dot_rect_y, (LONG)oy);
+    InterlockedExchange(&g_dot_rect_w, (LONG)cw);
+    InterlockedExchange(&g_dot_rect_h, (LONG)ch);
+    InterlockedExchange(&g_dot_rect_valid, 1);
+
+    /* ── Interaction state ──── */
+    enum { DR_NONE=0, DR_MOVE=1, DR_RESIZE=2, DR_SLIDER=3, DR_BTN=4 };
+    static int   drag_mode = DR_NONE;
+    static int   drag_resize_edges = 0;   /* bitfield: 1=L 2=T 4=R 8=B */
+    static float drag_start_mx=0, drag_start_my=0;
+    static int   drag_start_x=0,  drag_start_y=0;
+    static int   drag_start_w=0,  drag_start_h=0;
+    static bool  drag_committed = false;
+    const  float DRAG_THRESHOLD = 3.0f;
+
+    ImVec2 mp = ImGui::GetMousePos();
+    bool   md = ImGui::IsMouseDown(0);
+    bool   mc = ImGui::IsMouseClicked(0);
+    bool   mr = ImGui::IsMouseReleased(0);
+    bool   hover = (mp.x >= ox && mp.x < ox + cw && mp.y >= oy && mp.y < oy + ch);
+    if (hover || drag_mode != DR_NONE) InterlockedExchange(&g_mouse_over_widget, 1);
+
+    /* Resize hit -- FULL only. All 4 edges + 3 corners (TL/TR/BL) with a
+     * 12-px outer gutter for generous grabbing. The BR corner is
+     * reserved for the DOT glyph + surrounding tap/drag zone -- resizing
+     * there would fight the dot's move+tap gestures. */
+    int in_edges = 0;
+    const float EDGE_GUTTER = 12.0f;
+    if (ui == 2) {
+        if (mp.x >= ox - EDGE_GUTTER && mp.x < ox + EDGE_GUTTER)           in_edges |= 1;   /* L */
+        if (mp.y >= oy - EDGE_GUTTER && mp.y < oy + EDGE_GUTTER)           in_edges |= 2;   /* T */
+        if (mp.x >= ox + cw - EDGE_GUTTER && mp.x < ox + cw + EDGE_GUTTER) in_edges |= 4;   /* R */
+        if (mp.y >= oy + ch - EDGE_GUTTER && mp.y < oy + ch + EDGE_GUTTER) in_edges |= 8;   /* B */
+        /* Interior cursor -> not resize. */
+        if (mp.x > ox + EDGE_GUTTER && mp.x < ox + cw - EDGE_GUTTER &&
+            mp.y > oy + EDGE_GUTTER && mp.y < oy + ch - EDGE_GUTTER) in_edges = 0;
+        /* Dot exclusion zone: a 40-px square around the dot glyph at the
+         * card's BR. Clicks here belong to the DOT (tap-to-collapse /
+         * MOVE), never resize -- fixes the "grabbing the BR corner
+         * spazms the app between move+resize" bug LO reported. */
+        float dot_cx = ox + cw - 10, dot_cy = oy + ch - 15;
+        if (mp.x >= dot_cx - 22 && mp.x <= dot_cx + 22 &&
+            mp.y >= dot_cy - 22 && mp.y <= dot_cy + 22) in_edges = 0;
+    }
+    bool in_grip = in_edges != 0;
+
+    /* Slider hit region -- lives at the TOP of the FULL card (matches
+     * draw_full_card). Only the track/knob area triggers slider drag;
+     * empty parts of the slider row fall through to MOVE. */
+    bool show_slider = (InterlockedCompareExchange(&g_dot_show_slider, 0, 0) != 0);
+    bool in_slider_track = false;
+    if (ui == 2 && show_slider) {
+        float pad_sl = 10.0f;
+        float lbl_w  = 48.0f;                 /* matches DR_SLIDER math */
+        float sy = oy + 5.0f;
+        float track_y = sy + 16.0f;
+        float sx_track = ox + pad_sl + lbl_w + 10.0f;
+        float sx1 = ox + cw - pad_sl - 44.0f;
+        /* Vertical slop ±10 px so misses just above/below the 6-px thick
+         * track still count. Horizontal slop -8/+8 for endpoint grabs. */
+        if (mp.y >= track_y - 10 && mp.y <= track_y + 10 &&
+            mp.x >= sx_track - 8 && mp.x <= sx1 + 8)
+            in_slider_track = true;
+    }
+    bool in_slider = in_slider_track;
+
+    /* Button hit zones (approximation used by the arm-DR_BTN check; the
+     * real click gate is inside draw_*_pill/card via the mp/mc/mr args,
+     * where the buttons themselves apply an 8-px hit-slop). Header row
+     * is at the BOTTOM of the FULL card now (hooksdll parity). */
+    float btn = 26.0f;
+    const float BTN_SLOP = 10.0f;
+    bool in_btn_area = false;
+    if (ui == 1) {
+        /* TOOLBAR: buttons on the LEFT of the dot (rightmost), so hit area
+         * is left of the dot. Dot is at cx = ox + cw - pad - dr. */
+        float btn_area_right = ox + cw - 8 - 7 - 6;   /* just left of the dot */
+        if (mp.x >= btn_area_right - btn * 2 - 12 - BTN_SLOP && mp.x < btn_area_right + BTN_SLOP &&
+            mp.y >= oy - BTN_SLOP && mp.y < oy + ch + BTN_SLOP) in_btn_area = true;
+    } else if (ui == 2) {
+        /* FULL: three buttons on the bottom row, left of the dot. Header
+         * row is at (oy + ch - 30) with buttons roughly at row_y+2. */
+        float row_y = oy + ch - 30.0f;
+        float cx_dot = ox + cw - 10 - 8;
+        if (mp.x >= cx_dot - btn * 3 - 24 - BTN_SLOP && mp.x < cx_dot + BTN_SLOP &&
+            mp.y >= row_y - BTN_SLOP && mp.y < row_y + 30 + BTN_SLOP) in_btn_area = true;
+    }
+
+    /* Arm drag on down inside our rect */
+    if (drag_mode == DR_NONE && mc && hover) {
+        drag_start_mx = mp.x; drag_start_my = mp.y;
+        /* MOVE uses g_dot_px/py (the DOT'S persistent position) as its
+         * anchor, NOT the current visual ox/oy of the pill/card.  In
+         * TOOLBAR/FULL the card is drawn at (dot_br_x - cw, dot_br_y - ch)
+         * -- if we captured `ox` here and later wrote `g_dot_px = ox+dx`,
+         * the next frame's dot would move to what USED to be the card's
+         * top-left, snapping card+dot into wildly wrong positions. Always
+         * anchor MOVE to the DOT rect. */
+        drag_start_x  = (int)dot_ox;
+        drag_start_y  = (int)dot_oy;
+        drag_start_w  = (int)cw; drag_start_h = (int)ch;
+        drag_committed = false;
+        if      (in_grip)     { drag_mode = DR_RESIZE; drag_resize_edges = in_edges; }
+        else if (in_slider)   { drag_mode = DR_SLIDER; drag_committed = true; }
+        else if (in_btn_area) drag_mode = DR_BTN;
+        else                  drag_mode = DR_MOVE;
+    }
+    if (drag_mode != DR_NONE && md) {
+        float dx = mp.x - drag_start_mx;
+        float dy = mp.y - drag_start_my;
+        if (!drag_committed &&
+            (dx > DRAG_THRESHOLD || dx < -DRAG_THRESHOLD ||
+             dy > DRAG_THRESHOLD || dy < -DRAG_THRESHOLD)) {
+            /* If we were armed on a button and moved, degrade to a MOVE
+             * (drag beats a tap). */
+            if (drag_mode == DR_BTN) drag_mode = DR_MOVE;
+            drag_committed = true;
+        }
+        if (drag_committed) {
+            if (drag_mode == DR_MOVE) {
+                /* Move the DOT's persistent position (bottom-right of card
+                 * follows automatically since card is anchored to it). */
+                int nx = drag_start_x + (int)dx;
+                int ny = drag_start_y + (int)dy;
+                int dw = (int)dot_cw, dh = (int)dot_ch;
+                if (nx < 0) nx = 0; if (ny < 0) ny = 0;
+                if (nx + dw > (int)sw - 1) nx = (int)sw - 1 - dw;
+                if (ny + dh > (int)sh - 1) ny = (int)sh - 1 - dh;
+                InterlockedExchange(&g_dot_px, nx);
+                InterlockedExchange(&g_dot_py, ny);
+            } else if (drag_mode == DR_RESIZE) {
+                /* Any-edge/corner resize: compute new box, then re-anchor
+                 * the dot's bottom-right so it stays where the user grabbed. */
+                int new_x = drag_start_x, new_y = drag_start_y;
+                int new_w = drag_start_w, new_h = drag_start_h;
+                if (drag_resize_edges & 1) {                 /* left edge */
+                    new_x = drag_start_x + (int)dx;
+                    new_w = drag_start_w - (int)dx;
+                }
+                if (drag_resize_edges & 2) {                 /* top edge */
+                    new_y = drag_start_y + (int)dy;
+                    new_h = drag_start_h - (int)dy;
+                }
+                if (drag_resize_edges & 4) {                 /* right edge */
+                    new_w = drag_start_w + (int)dx;
+                }
+                if (drag_resize_edges & 8) {                 /* bottom edge */
+                    new_h = drag_start_h + (int)dy;
+                }
+                if (new_w < 200) { if (drag_resize_edges & 1) new_x -= (200 - new_w); new_w = 200; }
+                if (new_h < 130) { if (drag_resize_edges & 2) new_y -= (130 - new_h); new_h = 130; }
+                if (new_w > (int)sw - 20) new_w = (int)sw - 20;
+                if (new_h > (int)sh - 20) new_h = (int)sh - 20;
+                InterlockedExchange(&g_dot_full_w, new_w);
+                InterlockedExchange(&g_dot_full_h, new_h);
+                /* Because FULL anchors bottom-right to the dot position, and
+                 * the DOT position is (dot_ox, dot_oy), an R/B edge resize
+                 * needs to bump the persisted dot position so the card's
+                 * bottom-right stays glued to the user's cursor.
+                 * v15.1.7 SPAZM FIX: base the new dot position on the
+                 * DRAG-START snapshot, not the live g_dot_px. Reading
+                 * live g_dot_px each frame compounded dx (frame 2 added
+                 * dx on top of a value that already had the prior frame's
+                 * dx applied), which manifested as the card/dot flying
+                 * off the screen mid-drag. */
+                if (drag_resize_edges & 4) {
+                    InterlockedExchange(&g_dot_px, (LONG)(drag_start_x + (int)dx));
+                }
+                if (drag_resize_edges & 8) {
+                    InterlockedExchange(&g_dot_py, (LONG)(drag_start_y + (int)dy));
+                }
+            } else if (drag_mode == DR_SLIDER && ui == 2) {
+                /* Slider drag: computes opacity from cursor x on the track.
+                 * Track spans [sx_track .. sx1] where sx_track = pad +
+                 * measured "Opacity" label width + 10-gap. Approx here to
+                 * keep hit-vs-render in sync (label ~ 45px at 0.85*fs). */
+                float pad_sl = 10.0f;
+                float lbl_w  = 48.0f;
+                float sx_track = ox + pad_sl + lbl_w + 10.0f;
+                float sx1 = ox + cw - pad_sl - 44.0f;
+                float t   = (mp.x - sx_track) / (sx1 - sx_track);
+                if (t < 0) t = 0; if (t > 1) t = 1;
+                g_dot_alpha = 0.05f + t * 0.95f;
+            }
+        }
+    }
+
+    /* Render the surface AFTER interaction so buttons can consume the
+     * up-click this frame. */
+    bool hit_copy = false, hit_ham = false, hit_chevron = false, hit_dot_toolbar = false, hit_dot_full = false;
+    if (ui == 2) {
+        draw_full_card(fg, ox, oy, cw, ch, st, a,
+                       shortbuf, fullbuf, qbuf, conf, mcqL,
+                       mp, mc, mr, &hit_copy, &hit_chevron, &hit_ham, &hit_dot_full,
+                       copy_flashing, show_slider);
+    } else if (ui == 1) {
+        float tw = cw;
+        draw_toolbar_pill(fg, ox, oy, &tw, ch, st, a,
+                          shortbuf, mcqL, mp, mc, mr,
+                          &hit_dot_toolbar, &hit_copy, &hit_ham,
+                          copy_flashing);
+        /* re-publish width if it grew/shrank + reposition to keep dot's
+         * bottom-right glued to the anchor. */
+        if ((LONG)tw != InterlockedCompareExchange(&g_dot_rect_w, 0, 0)) {
+            /* Grow leftward: keep br fixed */
+            ox = dot_br_x - tw;
+            cw = tw;
+            if (ox < 2) ox = 2;
+            InterlockedExchange(&g_dot_rect_x, (LONG)ox);
+            InterlockedExchange(&g_dot_rect_w, (LONG)cw);
+        }
+    } else {
+        draw_dot_glyph(fg, cx, cy, r, st, a, dot_state_is_solving(st));
+        if (mcqL) {
+            char lb[2] = { mcqL, 0 };
+            ImFont *font = ImGui::GetFont();
+            /* Hooksdll spec: BLACK bold monospace letter at ~font-size 7 for
+             * a 10px dot (ratio 0.7). Full alpha so the letter stays
+             * readable even at very low dot opacity. Draw twice for
+             * pseudo-bold since our ImGui font isn't bold-weight variant. */
+            float lfs = r * 1.4f; if (lfs < 9.0f) lfs = 9.0f;
+            ImVec2 lsz = ImGui::CalcTextSize(lb);
+            float sc = lfs / lsz.y;
+            float lw = lsz.x * sc, lh = lsz.y * sc;
+            fg->AddText(font, lfs,
+                        ImVec2(cx - lw * 0.5f + 0.5f, cy - lh * 0.55f),
+                        IM_COL32(0, 0, 0, 255), lb);
+            fg->AddText(font, lfs,
+                        ImVec2(cx - lw * 0.5f,        cy - lh * 0.55f),
+                        IM_COL32(0, 0, 0, 255), lb);
+        }
+    }
+
+    /* Commit drag / handle taps / button clicks on release. */
+    if (drag_mode != DR_NONE && mr) {
+        int  was_committed = drag_committed;
+        int  was_mode      = drag_mode;
+        drag_mode = DR_NONE;
+        drag_committed = false;
+        if (was_committed) {
+            if (was_mode == DR_MOVE) {
+                long cur_x = InterlockedCompareExchange(&g_dot_px, 0, 0);
+                long cur_y = InterlockedCompareExchange(&g_dot_py, 0, 0);
+                as_cfg_set_dot_pos((int)cur_x, (int)cur_y);
+            }
+            if (was_mode == DR_RESIZE) as_cfg_set_dot_full_size((int)cw, (int)ch);
+            if (was_mode == DR_SLIDER) as_cfg_set_dot_opacity((double)g_dot_alpha);
+        } else {
+            /* Was a tap. Priority: button clicks first, then dot area. */
+            if (hit_copy) {
+                if (fullbuf[0]) clip_set_utf8(fullbuf);
+                else if (shortbuf[0]) clip_set_utf8(shortbuf);
+                g_dot_copied_at = GetTickCount();
+            } else if (hit_chevron && ui == 2) {
+                int ns = show_slider ? 0 : 1;
+                InterlockedExchange(&g_dot_show_slider, ns);
+                as_cfg_set_dot_show_slider(ns);
+            } else if (hit_ham) {
+                /* toolbar <-> full */
+                ui = (ui == 2) ? 1 : 2;
+                InterlockedExchange(&g_dot_ui, ui);
+                as_cfg_set_dot_ui_state(ui);
+            } else if (hit_dot_full || hit_dot_toolbar) {
+                /* hooksdll parity: tap on dot glyph in ANY state collapses
+                 * (or from DOT expands to TOOLBAR). Explicit dot-hit takes
+                 * priority over the general "tap in FULL body" no-op. */
+                ui = (ui == 0) ? 1 : 0;
+                InterlockedExchange(&g_dot_ui, ui);
+                as_cfg_set_dot_ui_state(ui);
+            } else if (ui == 0) {
+                /* tap on collapsed dot -> toolbar (hooksdll) */
+                ui = 1;
+                InterlockedExchange(&g_dot_ui, ui);
+                as_cfg_set_dot_ui_state(ui);
+            }
+            /* Note: tap on FULL body outside a button / dot area = no-op. */
+        }
+    }
+}
+
+static void draw_agent_status(UINT sw, UINT sh) {
+    if (!InterlockedCompareExchange(&g_agent_active, 0, 0)) return;
+    ImDrawList *fg = ImGui::GetForegroundDrawList();
+    if (!fg) return;
+    char line[256];
+    dot_ensure_cs();
+    EnterCriticalSection(&g_dot_cs);
+    _snprintf(line, sizeof(line) - 1, "%s", g_agent_status); line[sizeof(line) - 1] = 0;
+    LeaveCriticalSection(&g_dot_cs);
+    if (!line[0]) return;
+    float scale = (float)sh / 1080.0f; if (scale < 0.75f) scale = 0.75f; if (scale > 2.5f) scale = 2.5f;
+    float fs = ImGui::GetFontSize();
+    ImVec2 sz = ImGui::CalcTextSize(line);
+    float pad = 7.0f * scale;
+    float w = sz.x + pad * 2, h = sz.y + pad * 2;
+    float x0 = (sw - w) * 0.5f, y0 = 10.0f * scale;
+    fg->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + w, y0 + h), IM_COL32(20, 20, 26, 235), 6 * scale);
+    fg->AddRect(ImVec2(x0, y0), ImVec2(x0 + w, y0 + h), IM_COL32(180, 110, 255, 200), 6 * scale, 0, 1.5f);
+    fg->AddText(ImGui::GetFont(), fs, ImVec2(x0 + pad, y0 + pad), IM_COL32(230, 220, 255, 255), line);
+}
+
 static void draw_chat_window(UINT screen_w, UINT screen_h) {
     /* If a capture is pending, skip drawing so the layer texture stays
      * app-only. The capture path in ui_present_frame ALSO defers the
@@ -5532,6 +6483,11 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
      * multiple frames have composed without our overlay and prior
      * overlay pixels have been overwritten by the underlying app. */
     if (g_hide_frames_for_capture > 0) return;
+
+    /* AutoSolver dot + Agent status -- capture-stealth (drawn after the hide
+     * gate above), independent of the chat overlay's visibility. */
+    draw_answer_dot(screen_w, screen_h);
+    draw_agent_status(screen_w, screen_h);
 
     /* v1.7.11.8 REVERTED (2026-07-25) -- fullscreen dirty-touch quad
      * showed as visible "dim dance" per LO test AND did not fix Chrome
@@ -6886,9 +7842,17 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
         /* v14: publish whether the cursor is over an interactive widget,
          * so the LL mouse hook yields a press to ImGui (slider/buttons/
          * combo) instead of window-dragging. Valid here -- all items for
-         * the frame have been submitted by draw_chat_window. */
-        InterlockedExchange(&g_mouse_over_widget,
-            (ImGui::IsAnyItemHovered() || ImGui::IsAnyItemActive()) ? 1 : 0);
+         * the frame have been submitted by draw_chat_window.
+         * v15.1 -- OR in the AutoSolver dot's hover state so clicks over
+         * the dot don't get eaten as overlay-drag. */
+        {
+            POINT _p; int over_dot = 0;
+            if (GetCursorPos(&_p)) over_dot = ui_point_in_dot(_p.x, _p.y);
+            InterlockedExchange(&g_mouse_over_widget,
+                (over_dot ||
+                 ImGui::IsAnyItemHovered() ||
+                 ImGui::IsAnyItemActive()) ? 1 : 0);
+        }
         /* v1.7.11.10 -- bind RTV RIGHT BEFORE Render (chaosium43 order). */
         ctx->OMSetRenderTargets(1, bind, nullptr);
         ImGui::Render();

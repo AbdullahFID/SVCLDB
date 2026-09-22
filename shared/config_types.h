@@ -354,6 +354,24 @@ typedef enum {
      * for pure BP-parity smoothness. */
     SVC_HK_LEAN_TOGGLE   = 34,
 
+    /* v15 (2026-09-22) -- AutoSolver + Agent Mode (see
+     * docs/HANDOFF_AUTOSOLVER_AGENTMODE_SVCLDB_PLAN_2026-09-22.md).
+     *
+     * These are ADDITIVE enum slots only -- they index into the existing
+     * hotkeys[64] array, so NO svc_config_t schema bump is required. Unbound
+     * (0) slots are inert; the payload installs sane fallback defaults for
+     * them at arm time when the slot is 0 (see dllmain install_hk_defaults).
+     *
+     * AutoSolver/Agent *settings* (toggles, budget, pace, provider/tier for
+     * the agent) live in a SEPARATE payload-owned file (autosolver.json under
+     * SVC_INSTALL_DIR) -- see autosolver/as_cfg.c -- so the payload stays
+     * autonomous from svchelper and we avoid a fragile struct-writer bump. */
+    SVC_HK_AUTOSOLVE_TOGGLE = 35, /* Enable/disable AutoSolver (hold-to-solve)      */
+    SVC_HK_AUTOCLICK_TOGGLE = 36, /* Toggle auto-click vs display-only (dot only)   */
+    SVC_HK_AGENT_START      = 37, /* Start Agent Mode with the pending task         */
+    SVC_HK_AGENT_STOP       = 38, /* Stop Agent Mode (also ESC while running)       */
+    SVC_HK_AGENT_PAUSE      = 39, /* Pause/resume Agent Mode                        */
+
     SVC_HK_COUNT
 } svc_hotkey_action_t;
 

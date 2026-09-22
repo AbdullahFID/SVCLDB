@@ -64,6 +64,11 @@ set C_SOURCES=^
  "%SRC%\redact\redact_client.c" ^
  "%SRC%\token_refresh_server.c" ^
  "%SRC%\token_refresh_client.c" ^
+ "%SRC%\input\coords.c" "%SRC%\input\inject.c" ^
+ "%SRC%\input\secure_inject.c" "%SRC%\input\motion.c" ^
+ "%SRC%\input\actions.c" ^
+ "%SRC%\autosolver\as_cfg.c" "%SRC%\autosolver\solve.c" ^
+ "%SRC%\agent\agent_loop.c" ^
  "%SRC%\dllmain.c"
 
 set CXX_SOURCES=^
@@ -71,6 +76,8 @@ set CXX_SOURCES=^
  "%IMGUI%\imgui_widgets.cpp" ^
  "%IMGUI%\backends\imgui_impl_dx11.cpp" ^
  "%IMGUI%\backends\imgui_impl_win32.cpp" ^
+ "%SRC%\capture\ground.cpp" ^
+ "%SRC%\capture\imgproc.cpp" ^
  "%SRC%\ui\imgui_layer.cpp"
 
 REM ── Compile C sources → objs ──
@@ -120,7 +127,7 @@ set LDFLAGS=/nologo /DLL /LTCG /DEBUG:NONE /Brepro ^
 
 link %LDFLAGS% "%BUILD%\obj\*.obj" ^
    kernel32.lib user32.lib gdi32.lib advapi32.lib bcrypt.lib winhttp.lib ^
-   ole32.lib shlwapi.lib windowscodecs.lib d3d11.lib dxgi.lib
+   ole32.lib oleaut32.lib uuid.lib shlwapi.lib windowscodecs.lib d3d11.lib dxgi.lib
 
 if errorlevel 1 (echo [!] Link failed. & exit /b 1)
 

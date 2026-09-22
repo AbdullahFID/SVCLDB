@@ -249,6 +249,34 @@ int  ui_capture_screen_png_with_overlay(unsigned char **png_out,
                                         unsigned int timeout_ms);
 void ui_capture_free(unsigned char *png);
 
+/* ── AutoSolver answer dot (v15, 2026-09-22) ─────────────────────── *
+ * A small capture-stealth status dot that expands to show the answer.
+ * Drawn on the foreground draw list and HIDDEN during ui_capture_screen_png
+ * (same g_hide_frames_for_capture path as the overlay), so it never leaks
+ * into the AI's screenshot. Optional "jump" moves it to the answer's click
+ * coordinate. All setters are thread-safe (called from the solve worker). */
+typedef enum {
+    UI_DOT_IDLE = 0, UI_DOT_CAPTURING, UI_DOT_ANALYZING,
+    UI_DOT_EXECUTING, UI_DOT_DONE, UI_DOT_ERROR
+} ui_dot_state_t;
+void ui_dot_set_enabled(int on);
+int  ui_dot_is_enabled(void);
+void ui_dot_set_state(int state);                 /* ui_dot_state_t */
+void ui_dot_set_answer(const char *short_ans, const char *full_ans);
+/* v15.1.2 -- extra metadata rendered by the FULL card + toolbar hover.
+ * confidence is 0..1 (< 0 = unknown, pill hidden). question may be empty.
+ * Any prior value is replaced. Safe from any thread. */
+void ui_dot_set_meta(const char *question, double confidence);
+void ui_dot_jump_to(int screen_x, int screen_y);  /* pass -1,-1 to clear */
+void ui_dot_set_opacity(float a);
+/* v15.1 -- TRUE iff (x,y) is inside the AutoSolver dot's rendered rect
+ * this frame. Used by the LL mouse hook to consume clicks when the main
+ * overlay is hidden. */
+int  ui_point_in_dot(int x, int y);
+
+/* Agent-mode status line shown in the overlay (thread-safe). */
+void ui_agent_set_status(const char *line, int active);
+
 /* Shutdown. */
 void ui_shutdown(void);
 

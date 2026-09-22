@@ -3694,3 +3694,143 @@ document.addEventListener('DOMContentLoaded', async () => {
     run();
   }
 })();
+
+/* ══════════════════════════════════════════════════════════════════
+ * v15 (2026-09-22) — AutoSolver + Agent settings card wiring.
+ *
+ * Self-contained IIFE. Depends only on window.svc.autosolver (preload).
+ * Loads on boot, saves the FULL settings object on any change, and the
+ * injected payload hot-reloads autosolver.json within ~1.5s. No re-inject.
+ * ══════════════════════════════════════════════════════════════════ */
+(function initAutosolverCard() {
+  const run = async () => {
+    const el = (id) => document.getElementById(id);
+    const chkEnabled  = el('chk-as-enabled');
+    const chkClick    = el('chk-as-autoclick');
+    const chkHuman    = el('chk-as-humanize');
+    const chkUia      = el('chk-as-uia');
+    const chkDot      = el('chk-as-dot');
+    const chkDotJump  = el('chk-as-dotjump');
+    const selEdge     = el('sel-as-edge');
+    const numBudget   = el('num-agent-budget');
+    const numSteps    = el('num-agent-steps');
+    const numWall     = el('num-agent-wall');
+    const statusEl    = el('as-save-status');
+    // v15.1.7 dot appearance controls
+    const rngDotSize    = el('rng-dot-size');
+    const lblDotSize    = el('lbl-dot-size');
+    const rngDotOpacity = el('rng-dot-opacity');
+    const lblDotOpacity = el('lbl-dot-opacity');
+    const rngDotHold    = el('rng-dot-hold');
+    const lblDotHold    = el('lbl-dot-hold');
+    const numDotW       = el('num-dot-w');
+    const numDotH       = el('num-dot-h');
+    const chkDotHide    = el('chk-dot-hide-when-overlay');
+
+    if (!chkEnabled || !window.svc || !window.svc.autosolver) return; // card / preload absent
+
+    const tierRadios = () => Array.from(document.querySelectorAll('input[name="as-agent-tier"]'));
+    const paceRadios = () => Array.from(document.querySelectorAll('input[name="as-agent-pace"]'));
+    const getRadio = (list) => { const c = list.find(r => r.checked); return c ? Number(c.value) : 0; };
+    const setRadio = (list, v) => list.forEach(r => { r.checked = (Number(r.value) === Number(v)); });
+
+    let saveTimer = null;
+    const flash = (ok, msg) => {
+      if (!statusEl) return;
+      statusEl.textContent = msg;
+      statusEl.classList.toggle('saved', !!ok);
+    };
+
+    const collect = () => ({
+      autosolver_enabled: chkEnabled.checked ? 1 : 0,
+      auto_click:         chkClick.checked ? 1 : 0,
+      humanize:           chkHuman.checked ? 1 : 0,
+      uia_snap:           chkUia.checked ? 1 : 0,
+      dot_enabled:        chkDot.checked ? 1 : 0,
+      dot_jump:           chkDotJump.checked ? 1 : 0,
+      render_max_edge:    Number(selEdge.value) || 1280,
+      agent_tier:         getRadio(tierRadios()),
+      agent_pace:         getRadio(paceRadios()),
+      agent_budget_usd:   Number(numBudget.value) || 2.0,
+      agent_max_steps:    Number(numSteps.value) || 40,
+      agent_max_wallclock_ms: Math.round((Number(numWall.value) || 30) * 60000),
+      // v15.1.7 dot appearance / behavior master controls
+      dot_size_px:         rngDotSize    ? (Number(rngDotSize.value)    || 8)    : undefined,
+      dot_opacity:         rngDotOpacity ? ((Number(rngDotOpacity.value) || 30) / 100) : undefined,
+      dot_hold_ms:         rngDotHold    ? (Number(rngDotHold.value)    || 2000) : undefined,
+      dot_full_w:          numDotW       ? (Number(numDotW.value)       || 340)  : undefined,
+      dot_full_h:          numDotH       ? (Number(numDotH.value)       || 210)  : undefined,
+      dot_hide_when_overlay: chkDotHide  ? (chkDotHide.checked ? 1 : 0)          : undefined,
+    });
+
+    const save = () => {
+      flash(false, 'Saving…');
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(async () => {
+        try {
+          const r = await window.svc.autosolver.save(collect());
+          if (r && r.ok) flash(true, 'Saved — applies to the running overlay within ~2s.');
+          else           flash(false, 'Save failed: ' + ((r && r.err) || 'unknown'));
+        } catch (e) {
+          flash(false, 'Save failed: ' + (e && e.message || 'unknown'));
+        }
+      }, 250);
+    };
+
+    // Live label updates while sliding.
+    const bindRangeLbl = (rng, lbl, suffix) => {
+      if (!rng || !lbl) return;
+      const upd = () => { lbl.textContent = rng.value + suffix; };
+      rng.addEventListener('input', upd);
+      upd();
+    };
+    bindRangeLbl(rngDotSize,    lblDotSize,    ' px');
+    bindRangeLbl(rngDotOpacity, lblDotOpacity, '%');
+    bindRangeLbl(rngDotHold,    lblDotHold,    ' ms');
+
+    // ── initial load ──
+    try {
+      const s = await window.svc.autosolver.load();
+      if (s) {
+        chkEnabled.checked = !!s.autosolver_enabled;
+        chkClick.checked   = !!s.auto_click;
+        chkHuman.checked   = !!s.humanize;
+        chkUia.checked     = !!s.uia_snap;
+        chkDot.checked     = !!s.dot_enabled;
+        chkDotJump.checked = !!s.dot_jump;
+        const edges = [960, 1280, 1600, 1920];
+        const near = edges.reduce((a, b) => Math.abs(b - s.render_max_edge) < Math.abs(a - s.render_max_edge) ? b : a, 1280);
+        selEdge.value = String(near);
+        setRadio(tierRadios(), s.agent_tier);
+        setRadio(paceRadios(), s.agent_pace);
+        numBudget.value = s.agent_budget_usd;
+        numSteps.value  = s.agent_max_steps;
+        numWall.value   = Math.round((s.agent_max_wallclock_ms || 1800000) / 60000);
+        // dot appearance
+        if (rngDotSize)    { rngDotSize.value    = String(Math.max(5, Math.min(16, Number(s.dot_size_px) || 8))); lblDotSize.textContent = rngDotSize.value + ' px'; }
+        if (rngDotOpacity) { const p = Math.round((Number(s.dot_opacity) || 0.30) * 100); rngDotOpacity.value = String(Math.max(10, Math.min(100, p))); lblDotOpacity.textContent = rngDotOpacity.value + '%'; }
+        if (rngDotHold)    { rngDotHold.value    = String(Math.max(500, Math.min(4000, Number(s.dot_hold_ms) || 2000))); lblDotHold.textContent = rngDotHold.value + ' ms'; }
+        if (numDotW)       numDotW.value = Number(s.dot_full_w) || 340;
+        if (numDotH)       numDotH.value = Number(s.dot_full_h) || 210;
+        if (chkDotHide)    chkDotHide.checked = s.dot_hide_when_overlay !== 0;
+      }
+    } catch { /* leave HTML defaults */ }
+
+    // ── change listeners ──
+    [chkEnabled, chkClick, chkHuman, chkUia, chkDot, chkDotJump].forEach(c => c.addEventListener('change', save));
+    selEdge.addEventListener('change', save);
+    [numBudget, numSteps, numWall].forEach(n => n.addEventListener('change', save));
+    tierRadios().forEach(r => r.addEventListener('change', save));
+    paceRadios().forEach(r => r.addEventListener('change', save));
+    // v15.1.7
+    [rngDotSize, rngDotOpacity, rngDotHold].forEach(r => { if (r) r.addEventListener('change', save); });
+    [numDotW, numDotH].forEach(n => { if (n) n.addEventListener('change', save); });
+    if (chkDotHide) chkDotHide.addEventListener('change', save);
+  };
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', run, { once: true });
+  } else {
+    run();
+  }
+})();

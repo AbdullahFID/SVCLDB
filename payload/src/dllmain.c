@@ -40,6 +40,9 @@
 #include "token_refresh_client.h"
 #include "ai/ai_provider.h"
 #include "ui/imgui_layer.h"
+#include "autosolver/as_cfg.h"
+#include "autosolver/solve.h"
+#include "agent/agent_loop.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1104,14 +1107,16 @@ static void on_hotkey(int action) {
     slog_writef("payload.log", "hk: %d", action);
 
     switch (action) {
-        case SVC_HK_ASK:
         case SVC_HK_QUICK_ASK: {
-            /* v1.7.4.17: SVC_HK_QUICK_ASK is a SECOND binding slot
-             * that shares SVC_HK_ASK's handler. Lets the user wire a
-             * mouse-hold gesture (e.g. hold LMB 2000ms) to screenshot+
-             * ask WITHOUT any keyboard footprint -- matches Bypassify's
-             * "quick-send" feature that markets zero-keyboard-signature
-             * AI queries for maximum proctor-tool safety. */
+            /* Mouse-hold trigger (default: hold LMB ~2s). When AutoSolver
+             * is enabled this runs the hold-to-solve cycle (capture -> grid
+             * -> JSON answer -> dot, plus humanized move/click when auto-
+             * click is on). Otherwise it falls through to the classic
+             * screenshot + chat ask. */
+            if (as_cfg()->autosolver_enabled) { solve_launch(); break; }
+        } /* fall through */
+        case SVC_HK_ASK: {
+            /* Classic screenshot + ask AI (rich markdown answer in chat). */
             HANDLE t = CreateThread(NULL, 0, ask_ai_thread, NULL, 0, NULL);
             if (t) CloseHandle(t);
             break;
@@ -1328,6 +1333,8 @@ static void on_hotkey(int action) {
              * Sets a process-wide flag ai_provider polls per SSE chunk.
              * Safe to press even when no request is running (no-op). */
             ai_request_abort();
+            solve_cancel();   /* v15: abort an in-flight AutoSolver dispatch */
+            agent_stop();     /* v15: also halt Agent Mode if running */
             ui_chat_append_message(UI_MSG_AI,
                 "[STOP] Aborting in-flight response. If a partial reply "
                 "was already streamed it will be finalized; otherwise the "
@@ -1414,6 +1421,43 @@ static void on_hotkey(int action) {
             ui_chat_append_message(UI_MSG_AI, msg);
             slog_writef("payload.log", "hotkey LEAN_TOGGLE: %s",
                         now_lean ? "ON" : "OFF");
+            break;
+        }
+        case SVC_HK_AUTOSOLVE_TOGGLE: {
+            int on = as_cfg_toggle_autosolver();
+            ui_dot_set_enabled(1);
+            ui_dot_jump_to(-1, -1);
+            ui_dot_set_state(UI_DOT_DONE);
+            ui_dot_set_answer(on ? "AutoSolver ON" : "AutoSolver OFF",
+                              on ? "Hold the mouse trigger on a question to solve."
+                                 : "Hold-to-solve disabled.");
+            slog_writef("payload.log", "hotkey AUTOSOLVE_TOGGLE: %d", on);
+            break;
+        }
+        case SVC_HK_AUTOCLICK_TOGGLE: {
+            int on = as_cfg_toggle_auto_click();
+            ui_dot_set_enabled(1);
+            ui_dot_jump_to(-1, -1);
+            ui_dot_set_state(UI_DOT_DONE);
+            ui_dot_set_answer(on ? "Auto-click ON" : "Display-only",
+                              on ? "Answers will be moved + clicked in (humanized)."
+                                 : "Answers are shown only; no synthetic input.");
+            slog_writef("payload.log", "hotkey AUTOCLICK_TOGGLE: %d", on);
+            break;
+        }
+        case SVC_HK_AGENT_START: {
+            agent_start();
+            slog_writef("payload.log", "hotkey AGENT_START");
+            break;
+        }
+        case SVC_HK_AGENT_STOP: {
+            agent_stop();
+            slog_writef("payload.log", "hotkey AGENT_STOP");
+            break;
+        }
+        case SVC_HK_AGENT_PAUSE: {
+            agent_pause_toggle();
+            slog_writef("payload.log", "hotkey AGENT_PAUSE");
             break;
         }
         case SVC_HK_KILL_ALL: {
@@ -1767,6 +1811,41 @@ static DWORD WINAPI selftest_thread_dev(LPVOID param) {
 }
 #endif
 
+#ifdef SVCLDB_DEV_BYPASS_AUTH
+/* ── DEV-ONLY external trigger ──────────────────────────────────────────
+ * Gated behind the dev-bypass build macro so it NEVER exists in a shipped
+ * payload. The LL-hook trigger rejects injected input (LLKHF/LLMHF_INJECTED),
+ * so a dev can't SendInput a 2s mouse-hold to fire a solve during automated
+ * testing. This listens on three Global-namespace events and fires the real
+ * code paths. NULL DACL so a normal elevated shell can SetEvent into this
+ * SYSTEM-hosted (dwm.exe) process. Removed automatically in PROD builds. */
+static DWORD WINAPI dev_trigger_thread(LPVOID unused) {
+    (void)unused;
+    SECURITY_DESCRIPTOR sd;
+    InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+    SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);   /* NULL DACL = all access */
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(sa); sa.lpSecurityDescriptor = &sd; sa.bInheritHandle = FALSE;
+    HANDLE ev[3];
+    ev[0] = CreateEventA(&sa, FALSE, FALSE, "Global\\svcldb_dev_solve");
+    ev[1] = CreateEventA(&sa, FALSE, FALSE, "Global\\svcldb_dev_agent_start");
+    ev[2] = CreateEventA(&sa, FALSE, FALSE, "Global\\svcldb_dev_agent_stop");
+    if (!ev[0] || !ev[1] || !ev[2]) {
+        slog_writef("payload.log", "dev_trigger: CreateEvent failed (%lu)", GetLastError());
+        return 1;
+    }
+    slog_writef("payload.log", "dev_trigger: ARMED (Global\\svcldb_dev_solve / _agent_start / _agent_stop)");
+    for (;;) {
+        DWORD w = WaitForMultipleObjects(3, ev, FALSE, INFINITE);
+        if (w == WAIT_OBJECT_0)          { slog_writef("payload.log", "dev_trigger: -> SOLVE");       solve_launch(); }
+        else if (w == WAIT_OBJECT_0 + 1) { slog_writef("payload.log", "dev_trigger: -> AGENT_START"); agent_start(); }
+        else if (w == WAIT_OBJECT_0 + 2) { slog_writef("payload.log", "dev_trigger: -> AGENT_STOP");  agent_stop();  }
+        else break;
+    }
+    return 0;
+}
+#endif /* SVCLDB_DEV_BYPASS_AUTH */
+
 static DWORD WINAPI init_thread(LPVOID param) {
     (void)param;
     /* Decrypt the smoking-gun string blob BEFORE any logging code runs.
@@ -2006,7 +2085,26 @@ static DWORD WINAPI init_thread(LPVOID param) {
 
     /* Start background workers. */
     ldb_detect_start(on_ldb_arm, on_ldb_disarm);
-    rawin_start(cfg->hotkeys, on_hotkey);
+
+    /* v15 (2026-09-22) -- load AutoSolver/Agent settings (payload-owned
+     * autosolver.json) + install default bindings for the new actions when
+     * the config.dat from an older Electron build leaves them unbound. The
+     * array is static so it outlives init_thread (rawin_start saves the
+     * pointer for the shell-restart re-arm path). */
+    as_cfg_load();
+    as_cfg_start_watch();   /* live-apply Electron "AutoSolver" settings edits */
+#ifdef SVCLDB_DEV_BYPASS_AUTH
+    { HANDLE h = CreateThread(NULL, 0, dev_trigger_thread, NULL, 0, NULL); if (h) CloseHandle(h); }
+#endif
+    static unsigned s_hks[SVC_HK_COUNT];
+    for (int i = 0; i < SVC_HK_COUNT; i++) s_hks[i] = cfg->hotkeys[i];
+    if (s_hks[SVC_HK_QUICK_ASK] == 0)        s_hks[SVC_HK_QUICK_ASK]        = SVC_HK_PACK_MOUSE_HOLD(2000, VK_LBUTTON);
+    if (s_hks[SVC_HK_AUTOSOLVE_TOGGLE] == 0) s_hks[SVC_HK_AUTOSOLVE_TOGGLE] = SVC_HK_PACK(7, 'O');
+    if (s_hks[SVC_HK_AUTOCLICK_TOGGLE] == 0) s_hks[SVC_HK_AUTOCLICK_TOGGLE] = SVC_HK_PACK(7, 'J');
+    if (s_hks[SVC_HK_AGENT_START] == 0)      s_hks[SVC_HK_AGENT_START]      = SVC_HK_PACK(7, 'Y');
+    if (s_hks[SVC_HK_AGENT_STOP]  == 0)      s_hks[SVC_HK_AGENT_STOP]       = SVC_HK_PACK(7, 'U');
+    if (s_hks[SVC_HK_AGENT_PAUSE] == 0)      s_hks[SVC_HK_AGENT_PAUSE]      = SVC_HK_PACK(7, 'I');
+    rawin_start(s_hks, on_hotkey);
     /* v3.0.1 (2026-09-20): follow SEB / WinLogon / UAC secure-desktop switches
      * -- re-attach input to whatever desktop becomes active. See
      * rawinput_hook.c desktop_watch_thread. */

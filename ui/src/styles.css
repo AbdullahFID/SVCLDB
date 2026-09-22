@@ -2554,3 +2554,64 @@ body.bg-paused, body.bg-paused * {
   }
 }
 
+/* ═══ v15 (2026-09-22) AutoSolver & Agent settings card ═══ */
+.as-howto {
+  font-size: 12px; line-height: 1.55; color: var(--fg2);
+  background: rgba(34, 211, 238, 0.06);
+  border: 1px solid var(--border-h);
+  border-radius: 10px; padding: 12px 14px; margin: 4px 0 16px;
+}
+.as-howto b { color: var(--cyan-light); font-weight: 600; }
+.as-howto-dim { color: var(--fg3); }
+.as-hk {
+  margin-left: 8px; font-size: 10px; font-weight: 600; letter-spacing: .2px;
+  color: var(--cyan-light); background: rgba(34, 211, 238, 0.10);
+  border: 1px solid var(--border-h); border-radius: 6px; padding: 1px 7px;
+  text-transform: none; vertical-align: middle;
+}
+.as-field-row {
+  display: flex; align-items: center; gap: 14px;
+  padding: 11px 0; border-top: 1px solid var(--border);
+}
+.as-field-label { flex: 1; font-size: 13px; color: var(--fg2); font-weight: 500; }
+.as-field-sub { font-size: 11px; color: var(--fg3); font-weight: 400; margin-top: 3px; }
+.as-select, .as-num {
+  background: var(--bg2); color: var(--fg2);
+  border: 1px solid var(--border-h); border-radius: 8px;
+  padding: 7px 10px; font-size: 12px; min-width: 120px;
+}
+.as-num { width: 96px; min-width: 0; text-align: right; }
+.as-select:focus, .as-num:focus { outline: none; border-color: var(--cyan-light); }
+.as-divider {
+  display: flex; align-items: center; gap: 12px;
+  margin: 20px 0 10px; color: var(--fg3);
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .8px;
+}
+.as-divider::before, .as-divider::after {
+  content: ""; flex: 1; height: 1px; background: var(--border);
+}
+.as-save-row { margin-top: 14px; }
+.as-save-status { font-size: 11px; color: var(--fg3); }
+.as-save-status.saved { color: var(--cyan-light); }
+
+/* v15.1.7 -- range slider for the dot appearance section */
+.as-range {
+  flex: 1; min-width: 120px; max-width: 220px;
+  -webkit-appearance: none; appearance: none;
+  height: 6px; background: var(--bg2); border-radius: 99px;
+  outline: none; border: 1px solid var(--border-h);
+}
+.as-range::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--cyan-light);
+  border: 2px solid var(--bg2);
+  box-shadow: 0 1px 3px rgba(0,0,0,.4);
+  cursor: pointer;
+}
+.as-range::-webkit-slider-thumb:hover { background: #7dd3fc; }
+.as-range-val {
+  font-variant-numeric: tabular-nums;
+  color: var(--fg2); font-size: 12px; min-width: 60px; text-align: right;
+}
+

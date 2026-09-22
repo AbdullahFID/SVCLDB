@@ -1401,6 +1401,126 @@ ipcMain.handle('system-prompt:load',  async ()          => loadSystemPrompt());
 ipcMain.handle('system-prompt:save',  async (_e, obj)   => saveSystemPrompt(obj));
 ipcMain.handle('system-prompt:clear', async ()          => { clearSystemPrompt(); return true; });
 
+// ═══════════════════════════════════════════════════════════════════════
+// AutoSolver + Agent Mode settings (v15, 2026-09-22)
+//
+// The payload owns this file (C:\ProgramData\WinAudioSvc\autosolver.json) and
+// hot-reloads it ~every 1.5s (payload/src/autosolver/as_cfg.c watcher), so a
+// change here applies to the LIVE injected payload with NO re-inject. Plain
+// JSON on purpose — as_cfg.c reads it with json_get_bool/num (no crypto).
+// Keys MUST match as_settings_t exactly.
+// ═══════════════════════════════════════════════════════════════════════
+const AUTOSOLVER_JSON = () => path.join(SVC_INSTALL_DIR, 'autosolver.json');
+
+const AUTOSOLVER_DEFAULTS = {
+  autosolver_enabled: 1,   // master enable for hold-to-solve
+  auto_click:         0,   // 0 = display-only (STEALTH default), 1 = move+click
+  humanize:           1,   // Sigma-Lognormal motion + human dwell
+  uia_snap:           1,   // snap clicks to UI element center
+  dot_enabled:        1,   // show the capture-stealth answer dot
+  dot_jump:           1,   // move the dot onto the chosen answer
+  render_max_edge:    1280, // downscale long-edge budget sent to the model
+  agent_tier:         1,   // 0 strong, 1 medium, 2 cheap
+  agent_budget_usd:   2.0,
+  agent_max_steps:    40,
+  agent_max_wallclock_ms: 30 * 60 * 1000,
+  agent_pace:         1,   // 0 fast, 1 balanced, 2 careful
+  // v15.1.4 payload-owned dot state
+  dot_opacity:        0.30,
+  dot_size_px:        8,
+  dot_ui_state:       0,   // 0 collapsed dot, 1 toolbar pill, 2 full card
+  dot_pos_x:          -1,  // -1 = auto (bottom-right)
+  dot_pos_y:          -1,
+  dot_full_w:         340,
+  dot_full_h:         210,
+  dot_show_slider:    1,
+  dot_hold_ms:        2000,
+  dot_hide_when_overlay: 1,
+  dot_col_idle:       0xFF34C759,
+  dot_col_capturing:  0xFFF59E0A,
+  dot_col_analyzing:  0xFFFF9500,
+  dot_col_executing:  0xFFAF52DE,
+  dot_col_done:       0xFF34C759,
+  dot_col_error:      0xFFFF3B30,
+};
+
+function _clampNum(v, lo, hi, dflt) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return dflt;
+  return Math.min(hi, Math.max(lo, n));
+}
+
+function loadAutosolver() {
+  const out = { ...AUTOSOLVER_DEFAULTS };
+  try {
+    const raw = fs.readFileSync(AUTOSOLVER_JSON(), 'utf8');
+    const j = JSON.parse(raw);
+    for (const k of Object.keys(AUTOSOLVER_DEFAULTS)) {
+      if (j[k] === undefined || j[k] === null) continue;
+      if (typeof AUTOSOLVER_DEFAULTS[k] === 'number' && !Number.isFinite(Number(j[k]))) continue;
+      out[k] = j[k];
+    }
+  } catch { /* missing/corrupt -> defaults (matches payload behavior) */ }
+  return out;
+}
+
+function saveAutosolver(partial) {
+  // Merge partial over current on-disk state, coerce/clamp, write plain JSON.
+  const cur = loadAutosolver();
+  const m = { ...cur, ...(partial || {}) };
+  const rec = {
+    autosolver_enabled: m.autosolver_enabled ? 1 : 0,
+    auto_click:         m.auto_click ? 1 : 0,
+    humanize:           m.humanize ? 1 : 0,
+    uia_snap:           m.uia_snap ? 1 : 0,
+    dot_enabled:        m.dot_enabled ? 1 : 0,
+    dot_jump:           m.dot_jump ? 1 : 0,
+    render_max_edge:    Math.round(_clampNum(m.render_max_edge, 640, 4096, 1280)),
+    agent_tier:         Math.round(_clampNum(m.agent_tier, 0, 3, 1)),
+    agent_budget_usd:   _clampNum(m.agent_budget_usd, 0.1, 100.0, 2.0),
+    agent_max_steps:    Math.round(_clampNum(m.agent_max_steps, 1, 400, 40)),
+    agent_max_wallclock_ms: Math.round(_clampNum(m.agent_max_wallclock_ms, 60000, 12 * 60 * 60 * 1000, 30 * 60 * 1000)),
+    agent_pace:         Math.round(_clampNum(m.agent_pace, 0, 2, 1)),
+    // ── v15.1.4 (2026-09-22): payload-owned dot state (position, size,
+    //   UI state, per-state color overrides). The payload writes these
+    //   on drag/resize/expand/opacity-slide; we must PRESERVE them here
+    //   or every settings tweak from the renderer would wipe them.
+    dot_opacity:            _clampNum(m.dot_opacity, 0.05, 1.0, 0.30),
+    dot_size_px:            Math.round(_clampNum(m.dot_size_px, 6, 24, 8)),
+    dot_ui_state:           Math.round(_clampNum(m.dot_ui_state, 0, 2, 0)),
+    dot_pos_x:              (Number.isFinite(Number(m.dot_pos_x)) ? Math.round(Number(m.dot_pos_x)) : -1),
+    dot_pos_y:              (Number.isFinite(Number(m.dot_pos_y)) ? Math.round(Number(m.dot_pos_y)) : -1),
+    dot_full_w:             Math.round(_clampNum(m.dot_full_w, 180, 900, 340)),
+    dot_full_h:             Math.round(_clampNum(m.dot_full_h, 110, 900, 210)),
+    dot_show_slider:        m.dot_show_slider ? 1 : 0,
+    dot_hold_ms:            Math.round(_clampNum(m.dot_hold_ms, 200, 5000, 2000)),
+    dot_hide_when_overlay:  (m.dot_hide_when_overlay === undefined || m.dot_hide_when_overlay === null) ? 1 : (m.dot_hide_when_overlay ? 1 : 0),
+    // Per-state colors (packed 0xAARRGGBB). 0 -> payload picks the built-in.
+    dot_col_idle:           _preserveUint(m.dot_col_idle,      0xFF34C759),
+    dot_col_capturing:      _preserveUint(m.dot_col_capturing, 0xFFF59E0A),
+    dot_col_analyzing:      _preserveUint(m.dot_col_analyzing, 0xFFFF9500),
+    dot_col_executing:      _preserveUint(m.dot_col_executing, 0xFFAF52DE),
+    dot_col_done:           _preserveUint(m.dot_col_done,      0xFF34C759),
+    dot_col_error:          _preserveUint(m.dot_col_error,     0xFFFF3B30),
+  };
+  try { if (!fs.existsSync(SVC_INSTALL_DIR)) fs.mkdirSync(SVC_INSTALL_DIR, { recursive: true }); } catch {}
+  try {
+    fs.writeFileSync(AUTOSOLVER_JSON(), JSON.stringify(rec, null, 2), 'utf8');
+    return { ok: true, settings: rec };
+  } catch (e) {
+    return { ok: false, err: e.message, settings: rec };
+  }
+}
+
+function _preserveUint(v, dflt) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return dflt;
+  return Math.floor(n) >>> 0;   // coerce to uint32
+}
+
+ipcMain.handle('autosolver:load', async () => loadAutosolver());
+ipcMain.handle('autosolver:save', async (_e, partial) => saveAutosolver(partial));
+
 /* Legacy single-key IPC shims — keep so a stale renderer bundle still
  * loads without ReferenceErrors. Prefer api-keys:* going forward. */
 ipcMain.handle('api-key:load',  async ()      => {

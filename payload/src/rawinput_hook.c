@@ -25,6 +25,8 @@
 #include "../../shared/str_enc.h"     /* v4.0 (2026-09-21) -- SS() for iso-pipe diag strings */
 #include "rawinput_hook.h"
 #include "config_read.h"   /* v1.7.11.18: cfg_get() for scroll_step_px */
+#include "autosolver/as_cfg.h"   /* v15.1 (2026-09-22) -- always-on LMB-hold trigger */
+#include "autosolver/solve.h"    /* v15.1 -- direct solve_launch() bypassing hotkey slots */
 
 #include <stdio.h>
 #include <stdarg.h>
@@ -558,13 +560,58 @@ static int fire(int slot) {
 
 /* v1.7.4: mouse-hold poll thread -- checks per-mvk hold durations every
  * 20ms and fires MOUSE_HOLD slots when their hold_ms elapses. Simpler
- * than driving from LL callbacks (which must return fast). */
+ * than driving from LL callbacks (which must return fast).
+ *
+ * v15.1 (2026-09-22): ALSO runs an always-on autosolver LMB-hold trigger
+ * that fires solve_launch() regardless of the SVC_HK_QUICK_ASK slot's
+ * current binding. LO's config had QUICK_ASK bound to triple-middle-click
+ * (a legit prior preference), so the "hold LMB 2s to autosolve" muscle-
+ * memory was silently disabled until we made this trigger independent of
+ * the hotkey table. Gated purely on as_cfg->autosolver_enabled. The
+ * threshold is user-tunable via as_cfg->dot_hold_ms. */
 static DWORD WINAPI mouse_hold_poll_thread(LPVOID param) {
     (void)param;
     rin_diag("mouse_hold_poll: thread started");
+    /* Per-vk state for the always-on autosolver hold (independent of the
+     * SVC_HK_KIND_MOUSE_HOLD slot machinery so a rebinding of QUICK_ASK
+     * doesn't turn it off). */
+    static LONG as_hold_start = 0;
+    static LONG as_hold_fired = 0;
     while (g_mouse_hold_running) {
         Sleep(20);
         DWORD now = GetTickCount();
+
+        /* Always-on autosolver LMB-hold */
+        {
+            const as_settings_t *asc = as_cfg();
+            int as_enabled = asc && asc->autosolver_enabled;
+            unsigned hold_ms = asc ? (unsigned)asc->dot_hold_ms : 2000;
+            if (hold_ms < 200)  hold_ms = 200;
+            if (hold_ms > 5000) hold_ms = 5000;
+            int lmb_down = ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0)
+                           || g_pipe_key[VK_LBUTTON];
+            if (!lmb_down) {
+                if (as_hold_start) InterlockedExchange(&as_hold_start, 0);
+                if (as_hold_fired) InterlockedExchange(&as_hold_fired, 0);
+            } else if (as_enabled) {
+                if (as_hold_start == 0) {
+                    /* Only arm if we own the initial press: mouse_down_tick
+                     * for LMB is already set by the LL hook. Use its value
+                     * so the hold measures from the actual physical press,
+                     * not from when this thread noticed. */
+                    LONG t = g_mouse_down_tick[VK_LBUTTON];
+                    InterlockedExchange(&as_hold_start, t ? t : (LONG)now);
+                }
+                if (!as_hold_fired && as_hold_start &&
+                    (DWORD)(now - (DWORD)as_hold_start) >= hold_ms) {
+                    InterlockedExchange(&as_hold_fired, 1);
+                    rin_diag("autosolver: LMB-hold fired (%ums >= %ums)",
+                             (unsigned)(now - (DWORD)as_hold_start), hold_ms);
+                    solve_launch();
+                }
+            }
+        }
+
         for (int slot = 0; slot < SVC_HK_COUNT; slot++) {
             if (!g_hk[slot]) continue;
             if (SVC_HK_KIND(g_hk[slot]) != SVC_HK_KIND_MOUSE_HOLD) continue;
@@ -1693,14 +1740,18 @@ static LRESULT CALLBACK ll_mouse_proc(int code, WPARAM wp, LPARAM lp) {
                         return 1;
                     }
                 }
-                if (ui_is_visible() &&
-                    ui_point_in_overlay((int)m->pt.x, (int)m->pt.y)) {
+                /* v15.1: ui_point_in_overlay now returns 1 for the overlay
+                 * rect when visible OR the AutoSolver dot rect when the
+                 * overlay is hidden. Drop the redundant ui_is_visible()
+                 * gate so dot clicks also reach the widget/drag path. */
+                if (ui_point_in_overlay((int)m->pt.x, (int)m->pt.y)) {
                     press_consumed = 1;
                     if (ui_mouse_over_widget()) {
-                        /* let ImGui handle it (widget) -- no window drag */
+                        /* let ImGui handle it (widget or dot drag) -- no
+                         * overlay window drag */
                         rin_diag("overlay: WIDGET press @ (%ld,%ld)",
                                  (long)m->pt.x, (long)m->pt.y);
-                    } else {
+                    } else if (ui_is_visible()) {
                         drag_active = 1;
                         drag_last_x = (int)m->pt.x;
                         drag_last_y = (int)m->pt.y;
@@ -2583,9 +2634,14 @@ static void dispatch_external_mouse(unsigned int wp, int px, int py, unsigned in
     } else if (wp == RIN_WM_LBUTTONDOWN) {
         int gc = ui_is_visible() ? ui_point_in_resize_grip(px, py) : 0;
         if (gc) { resize_corner = gc; press_consumed = 1; drag_last_x = px; drag_last_y = py; ui_resize_begin(); }
-        else if (ui_is_visible() && ui_point_in_overlay(px, py)) {
+        else if (ui_point_in_overlay(px, py)) {
+            /* v15.1 -- ui_point_in_overlay returns 1 for the overlay OR
+             * the AutoSolver dot rect. Overlay-drag only when the overlay
+             * itself is visible; dot clicks go through the widget path. */
             press_consumed = 1;
-            if (!ui_mouse_over_widget()) { drag_active = 1; drag_last_x = px; drag_last_y = py; }
+            if (ui_is_visible() && !ui_mouse_over_widget()) {
+                drag_active = 1; drag_last_x = px; drag_last_y = py;
+            }
         }
     } else if (wp == RIN_WM_LBUTTONUP) {
         drag_active = 0; resize_corner = 0; press_consumed = 0;
@@ -2867,14 +2923,24 @@ coll_scan_done:
             break;
         }
     }
-    if (any_mouse_hold) {
+    /* v15.1 (2026-09-22) -- ALSO start the poll thread when the autosolver
+     * is enabled, because the always-on LMB-hold trigger for solve_launch()
+     * lives inside it (independent of any SVC_HK_KIND_MOUSE_HOLD slot). */
+    int need_hold_poll = any_mouse_hold;
+    {
+        const as_settings_t *asc = as_cfg();
+        if (asc && asc->autosolver_enabled) need_hold_poll = 1;
+    }
+    if (need_hold_poll) {
         InterlockedExchange(&g_mouse_hold_running, 1);
         g_mouse_hold_thread = CreateThread(NULL, 0, mouse_hold_poll_thread, NULL, 0, NULL);
         if (!g_mouse_hold_thread) {
             rin_diag("CreateThread(mouse_hold_poll) FAILED %lu", GetLastError());
             InterlockedExchange(&g_mouse_hold_running, 0);
         } else {
-            rin_diag("mouse-hold hotkey support ARMED");
+            rin_diag("mouse-hold poll ARMED (any_mouse_hold=%d autosolver=%d)",
+                     any_mouse_hold,
+                     (as_cfg() && as_cfg()->autosolver_enabled) ? 1 : 0);
         }
     }
 
