@@ -6268,6 +6268,24 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
     (void)pCtx;
     if (!pLayer) return;
 
+    /* v3.1 (2026-09-21) -- POST-Windows-update compose-degraded guard.
+     * If the canary tripped (Present detour was installed but DWM
+     * never called it, indicating compose path shifted to something
+     * we don't hook), short-circuit here. We're being called via
+     * SOME code path but the primary Present isn't the driver -- best
+     * to leave every downstream vtable walk / ImGui state alone
+     * rather than risk touching stale/wrong dwmcore state. Zero
+     * render this session; but dwm.exe stays alive, rawinput +
+     * hotkeys still work. */
+    if (hooks_compose_degraded()) {
+        static volatile LONG s_once = 0;
+        if (InterlockedCompareExchange(&s_once, 1, 0) == 0) {
+            diag("ui_present_frame: NO-OP (hooks_compose_degraded==1) -- "
+                 "overlay render pipeline quiesced");
+        }
+        return;
+    }
+
     /* v3.4 (P0 explorer-restart fix, BP-1:1): full client teardown + rebuild on
      * shell restart, done HERE on the compose thread (not a worker -> no race).
      * ensure_fake_hwnd_valid set this when Progman changed. ui_reinit() releases

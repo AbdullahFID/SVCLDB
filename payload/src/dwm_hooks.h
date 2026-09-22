@@ -122,6 +122,12 @@ void hooks_burst_wake(int frames_per_pump, int duration_ms, int interval_ms);
 /* True if hooks are installed AND not in shutdown mode. */
 int  hooks_is_active(void);
 
+/* v3.1 (2026-09-21) -- True if Post-Windows-update crash-loop guard
+ * tripped. Set by present_fire_canary_thread when COverlayContext::
+ * Present detour isn't firing (compose path shifted / hook silently
+ * dead). ui_present_frame should short-circuit if this returns 1. */
+int  hooks_compose_degraded(void);
+
 /* Wake via ghost window movement (LDB-safe).
  *
  * Creates + owns a hidden fullscreen invisible window (class name

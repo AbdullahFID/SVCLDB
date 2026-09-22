@@ -342,6 +342,13 @@ static void hook_crash_bump(void *target, const char *label) {
  * writes to encrypted slog) but hook_integrity_thread below calls it. */
 static void hook_diag(const char *fmt, ...);
 
+/* v3.1 (2026-09-21) -- Post-Windows-update degraded-mode flag.
+ * Full definition + accessor + canary thread live further down (near
+ * hooks_install) because they reference g_present_calls / g_stop_draw
+ * which are defined AFTER this early forward-decl block. */
+static volatile LONG g_compose_degraded = 0;
+int hooks_compose_degraded(void) { return g_compose_degraded ? 1 : 0; }
+
 /* Hook integrity monitor. Every 10s, walk the registry and verify the
  * first byte at each target is `0xE9` (MinHook's JMP rel32 trampoline
  * head). If any hook shows a non-`0xE9` first byte, an anti-cheat has
@@ -1142,6 +1149,48 @@ static BOOL svcldb_capture_active(void) {
  * If we ever need this observability back, git log the file -- the
  * Detour_AddDirtyRect_* bodies are preserved in the pre-removal commit. */
 
+/* v3.1 (2026-09-21) -- Present-fire canary thread.
+ *
+ * Sleeps + samples g_present_calls at 2s, 5s, 10s, 30s post-install.
+ * Verifies DWM is actually invoking our COverlayContext::Present detour.
+ * If it never does within 2s of hooks_install, log LOUD warning +
+ * set g_compose_degraded so ui_present_frame short-circuits.
+ * Zero corrective action -- observability + safe quiesce only.
+ *
+ * Placement: HERE (not near forward decls) because it references
+ * g_present_calls / g_stop_draw which are defined above near
+ * Detour_COverlayContextPresent. */
+static DWORD WINAPI present_fire_canary_thread(LPVOID unused) {
+    (void)unused;
+    struct { DWORD ms; int alert; } steps[] = {
+        {2000, 1}, {3000, 0}, {5000, 0}, {20000, 1}, {0, 0}
+    };
+    for (int i = 0; steps[i].ms; i++) {
+        for (DWORD slept = 0; slept < steps[i].ms; slept += 100) {
+            if (g_stop_draw) return 0;
+            Sleep(100);
+        }
+        LONG n = g_present_calls;
+        if (n == 0 && steps[i].alert) {
+            InterlockedExchange(&g_compose_degraded, 1);
+            hook_diag("PRESENT PATH INACTIVE @ T+%lu ms -- "
+                      "COverlayContext::Present hook installed but DWM is "
+                      "NOT calling it. Compose path may have shifted post-"
+                      "Windows-update. Setting g_compose_degraded=1 -- overlay "
+                      "will NOT render this session. Payload stays loaded "
+                      "for rawinput/hotkey use so keep-alive is minimal.",
+                      (unsigned long)steps[i].ms);
+        } else if (n > 0 && i > 0) {
+            InterlockedExchange(&g_compose_degraded, 0);
+            hook_diag("Present fired count=%ld at T+%lu ms -- compose "
+                      "path is healthy",
+                      (long)n, (unsigned long)steps[i].ms);
+            return 0;
+        }
+    }
+    return 0;
+}
+
 /* ── Public API ── */
 
 int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
@@ -1245,46 +1294,57 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
      * consistency. Trail-clearing is handled by our RedrawWindow
      * cascade in imgui_layer.cpp instead. */
     if (off->forceFullDirty) {
-        /* v1.7.11.14 (2026-07-25) -- WPT-TRACE-DRIVEN FIX.
+        /* v1.7.11.14 (2026-07-25) -- WPT-TRACE-DRIVEN patch to force
+         * dwmcore into "always full-dirty compose" mode. See BP RE
+         * writeup for original rationale. Byte in .rdata resolved by
+         * chaosium43-style `SymFromName(dwmcore!Force
+         * FullDirtyRendering)` -> patch first byte from 0x00 -> 0x01.
          *
-         * WPT trace comparison of BP vs svcldb (2026-07-25) shows BP
-         * triggers ~42,500 Dwm-Core `ETWGUID_VISUAL_RENDERCONTENT`
-         * (event 115) + `Dx_Flip_Consumed` (event 182) events per 13
-         * seconds = ~3269/sec = ~55 per vsync. We trigger ~0. That is
-         * DWM's "render all visuals every frame" full-dirty compose
-         * mode -- the exact mechanism BP uses to eliminate Chrome
-         * trails.
+         * v3.1 (2026-09-21) -- SEMANTIC-CHANGE GUARD (post-KB5124008/
+         * KB5129195 crash-loop). Windows 11 25H2 build 26200.9457
+         * ships a new dwmcore where the resolved byte's initial value
+         * is 0x34 (not 0x00). Same symbol name, different data layout
+         * -- the field's type/purpose changed. Blindly setting it to
+         * 0x01 corrupts dwmcore state -> DWM AVs inside its own
+         * compositor a few minutes later.
          *
-         * Prior v1.7.11.4 patched at `forceFullDirty - 0x60` (copied
-         * from BP's 0x3fd7b9 offset which was `ForceFullDirtyRendering
-         * function RVA - 0x60`). But chaosium43's dumper.cpp line 341
-         * shows the CORRECT resolution is `SymFromName(dwmcore!Force
-         * FullDirtyRendering)` returns the FLAG BYTE ADDRESS DIRECTLY.
-         * On current Windows, our PDB-resolved `off->forceFullDirty`
-         * IS the flag byte -- no -0x60 needed.
-         *
-         * Patch at the DIRECT address. If this is the correct flag on
-         * current Windows, DWM enters full-dirty compose mode -> all
-         * visuals re-render every frame -> Chrome trails vanish. */
+         * FIX: only apply patch when the original byte is a valid
+         * bool (0x00 or 0x01). Any other value = symbol resolution
+         * landed on a re-purposed field, skip patch entirely. Chrome
+         * trailing behavior degrades gracefully (v11.2.2 removed
+         * this patch outright once already -- we survived without
+         * it) but DWM stays alive. */
         BYTE *ffd_flag = (BYTE *)dwmcore + off->forceFullDirty;
-        DWORD old_prot = 0;
-        if (VirtualProtect(ffd_flag, 1, PAGE_EXECUTE_READWRITE, &old_prot)) {
-            g_ffd_saved_byte = ffd_flag[0];
-            g_ffd_patch_addr = ffd_flag;
-            ffd_flag[0] = 1;
-            DWORD tmp = 0;
-            VirtualProtect(ffd_flag, 1, old_prot, &tmp);
-            FlushInstructionCache(GetCurrentProcess(), ffd_flag, 1);
-            g_ffd_patched = TRUE;
+        BYTE orig_byte = 0xFF;
+        __try { orig_byte = ffd_flag[0]; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { orig_byte = 0xFF; }
+
+        if (orig_byte != 0x00 && orig_byte != 0x01) {
             slog_writef("payload.log",
-                "ForceFullDirty flag @ %p patched DIRECT: 0x%02X -> 0x01 "
-                "(WPT-trace-driven -- chaosium43 dumper.cpp:341 pattern, forces "
-                "DWM full-dirty compose mode = expect 3000+/sec RENDERCONTENT events)",
-                ffd_flag, g_ffd_saved_byte);
+                "ForceFullDirty flag @ %p SKIPPED patch: original byte 0x%02X "
+                "is not a bool (0x00/0x01) -- dwmcore layout changed post-Windows"
+                " update, patching would corrupt state. Chrome trailing may "
+                "return but DWM stays stable.",
+                ffd_flag, orig_byte);
         } else {
-            slog_writef("payload.log",
-                "ForceFullDirty flag VirtualProtect FAILED gle=%lu",
-                GetLastError());
+            DWORD old_prot = 0;
+            if (VirtualProtect(ffd_flag, 1, PAGE_EXECUTE_READWRITE, &old_prot)) {
+                g_ffd_saved_byte = ffd_flag[0];
+                g_ffd_patch_addr = ffd_flag;
+                ffd_flag[0] = 1;
+                DWORD tmp = 0;
+                VirtualProtect(ffd_flag, 1, old_prot, &tmp);
+                FlushInstructionCache(GetCurrentProcess(), ffd_flag, 1);
+                g_ffd_patched = TRUE;
+                slog_writef("payload.log",
+                    "ForceFullDirty flag @ %p patched DIRECT: 0x%02X -> 0x01 "
+                    "(bool-guarded, dwmcore-layout-safe)",
+                    ffd_flag, g_ffd_saved_byte);
+            } else {
+                slog_writef("payload.log",
+                    "ForceFullDirty flag VirtualProtect FAILED gle=%lu",
+                    GetLastError());
+            }
         }
     }
 
@@ -1449,34 +1509,102 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
      * Patch: `mov eax, 1; ret` = `B8 01 00 00 00 C3` (6 bytes).
      * Full 32-bit return so ANY caller convention sees TRUE, not
      * just the low byte. Matches semantics of BP's detour when their
-     * shutdown_flag == 0 (their active state). */
+     * shutdown_flag == 0 (their active state).
+     *
+     * v3.1 (2026-09-21) -- POST-Windows-update PROLOGUE-SHAPE GUARD.
+     * On Windows 11 26200.9457+ (KB5124008/KB5129195 family) Microsoft
+     * rewrote `IsOverlayPrevented` from a trivial one-instruction
+     * getter (`8A 81 28 01 00 00` = `mov al, [rcx+128]`) to a much
+     * larger function whose FIRST 6 bytes are `FF 15 XX XX XX XX` =
+     * `call qword [rip+X]` -- an indirect call to a critical
+     * initializer whose return value gates the rest of the function.
+     *
+     * Old byte-patch (overwrite bytes 0..5 with `mov eax,1; ret`)
+     * SKIPS that call entirely. The initializer's side-effects don't
+     * happen; other dwmcore code paths that depend on that state
+     * eventually AV.
+     *
+     * FIX: detect the new prologue shape. If new (`FF 15 ...`), patch
+     * starting at OFFSET 6 (the byte AFTER the call, currently a NOP
+     * for padding). We still return TRUE, but the initial call and
+     * its side effects execute first. Function tail (test eax; conditional
+     * branch) never runs but the important initializer does.
+     *
+     * If old prologue (`8A 81 ...`), fall through to legacy offset-0 patch.
+     * Any other unrecognized prologue: SKIP entirely (safer to let
+     * IsOverlayPrevented behave natively than to guess). */
     if (off->isOverlayPrevented) {
         BYTE *iop = (BYTE *)dwmcore + off->isOverlayPrevented;
-        DWORD old_prot = 0;
-        if (VirtualProtect(iop, 8, PAGE_EXECUTE_READWRITE, &old_prot)) {
-            g_iop_saved_bytes[0] = iop[0];
-            g_iop_saved_bytes[1] = iop[1];
-            g_iop_saved_bytes[2] = iop[2];
-            g_iop_saved_bytes[3] = iop[3];
-            g_iop_saved_bytes[4] = iop[4];
-            g_iop_saved_bytes[5] = iop[5];
-            g_iop_patch_addr     = iop;
-            iop[0] = 0xB8;  /* mov eax, imm32 */
-            iop[1] = 0x01;  /* imm32 = 1 (TRUE) */
-            iop[2] = 0x00;
-            iop[3] = 0x00;
-            iop[4] = 0x00;
-            iop[5] = 0xC3;  /* ret */
-            DWORD tmp = 0;
-            VirtualProtect(iop, 8, old_prot, &tmp);
-            FlushInstructionCache(GetCurrentProcess(), iop, 8);
-            g_iop_patched = TRUE;
-            slog_writef("payload.log", SS(SVC_STR_IOP_PATCHED),
-                        iop, g_iop_saved_bytes[0], g_iop_saved_bytes[1], g_iop_saved_bytes[2],
-                        g_iop_saved_bytes[3], g_iop_saved_bytes[4], g_iop_saved_bytes[5]);
+        BYTE fp[8] = {0};
+        BOOL readable = FALSE;
+        __try { for (int i = 0; i < 8; i++) fp[i] = iop[i]; readable = TRUE; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { readable = FALSE; }
+
+        if (!readable) {
+            slog_writef("payload.log",
+                "IsOverlayPrevented @ %p UNREADABLE -- skipping patch", iop);
         } else {
-            slog_writef("payload.log", SS(SVC_STR_IOP_VP_FAIL),
-                        GetLastError());
+            /* Prologue shape detection:
+             *   Old getter form: fp[0]=0x8A fp[1]=0x81            (mov al, [rcx+imm32])
+             *   Old getter form: fp[0]=0x0F fp[1]=0xB6            (movzx eax, byte [...])
+             *   Old getter form: fp[0]=0x8B fp[1]=0x01            (mov eax, [rcx])
+             *   New CFG form   : fp[0]=0xFF fp[1]=0x15            (call qword [rip+imm32])
+             *   New CET form   : fp[0]=0xF3 fp[1]=0x0F fp[2]=0x1E fp[3]=0xFA (endbr64) -> old getter after
+             */
+            int patch_off = -1;
+            const char *shape = "unknown";
+            if (fp[0] == 0xFF && fp[1] == 0x15) {
+                /* NEW form: skip past 6-byte call + preserve subsequent
+                 * padding bytes. Land the 6-byte return stub at offset 6. */
+                patch_off = 6;
+                shape = "NEW-CFG-CALL (post-KB5124008): patching at offset 6 to preserve initial call side-effects";
+            } else if (fp[0] == 0xF3 && fp[1] == 0x0F && fp[2] == 0x1E && fp[3] == 0xFA) {
+                /* CET endbr64 (4 bytes) then original getter -- patch AFTER endbr64. */
+                patch_off = 4;
+                shape = "CET-ENDBR64: patching at offset 4 to preserve endbr64";
+            } else if (fp[0] == 0x8A || fp[0] == 0x0F || fp[0] == 0x8B) {
+                /* Old getter form -- safe to patch at offset 0 (entire
+                 * function was just a getter, no init side-effects). */
+                patch_off = 0;
+                shape = "OLD-GETTER: patching at offset 0 (legacy path)";
+            } else {
+                slog_writef("payload.log",
+                    "IsOverlayPrevented @ %p UNKNOWN prologue shape "
+                    "(first 8 bytes: %02X %02X %02X %02X %02X %02X %02X %02X) -- "
+                    "SKIPPING patch. DWM's native overlay-plane behavior "
+                    "will be used; DirectComposition apps may render on top "
+                    "of our overlay but DWM stays stable.",
+                    iop, fp[0], fp[1], fp[2], fp[3], fp[4], fp[5], fp[6], fp[7]);
+            }
+
+            if (patch_off >= 0) {
+                BYTE *iop_patch = iop + patch_off;
+                DWORD old_prot = 0;
+                if (VirtualProtect(iop_patch, 8, PAGE_EXECUTE_READWRITE, &old_prot)) {
+                    for (int i = 0; i < 6; i++) g_iop_saved_bytes[i] = iop_patch[i];
+                    g_iop_patch_addr = iop_patch;
+                    iop_patch[0] = 0xB8;  /* mov eax, imm32 */
+                    iop_patch[1] = 0x01;  /* imm32 = 1 (TRUE) */
+                    iop_patch[2] = 0x00;
+                    iop_patch[3] = 0x00;
+                    iop_patch[4] = 0x00;
+                    iop_patch[5] = 0xC3;  /* ret */
+                    DWORD tmp = 0;
+                    VirtualProtect(iop_patch, 8, old_prot, &tmp);
+                    FlushInstructionCache(GetCurrentProcess(), iop_patch, 8);
+                    g_iop_patched = TRUE;
+                    slog_writef("payload.log",
+                        "IsOverlayPrevented patched @ %p (base=%p +0x%X) "
+                        "shape=[%s]. Original 6 bytes at patch site: "
+                        "%02X %02X %02X %02X %02X %02X",
+                        iop_patch, iop, patch_off, shape,
+                        g_iop_saved_bytes[0], g_iop_saved_bytes[1], g_iop_saved_bytes[2],
+                        g_iop_saved_bytes[3], g_iop_saved_bytes[4], g_iop_saved_bytes[5]);
+                } else {
+                    slog_writef("payload.log", SS(SVC_STR_IOP_VP_FAIL),
+                                GetLastError());
+                }
+            }
         }
     } else {
         slog_write("payload.log", SS(SVC_STR_IOP_NOT_IN_BLOB));
@@ -1520,6 +1648,28 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
         hook_diag("hook integrity monitor armed (%ld hooks registered)",
                   (long)g_hook_reg_count);
     }
+
+    /* v3.1 (2026-09-21) -- Present-fire canary thread.
+     *
+     * Post-Windows-update crash-loop diagnosis (KB5124008 / KB5129195,
+     * build 26200.9457) showed a state where hooks install SUCCESS
+     * per logs but `COverlayContext::Present` never fires -- DWM's
+     * compose path shifted to a different function, our hook is
+     * effectively dead, and we run silent until DWM AVs on some
+     * other state we corrupted.
+     *
+     * This canary just measures Present fire count at T+2s / T+10s /
+     * T+30s. If still 0 at T+2s, log LOUD warning + set the "compose
+     * path degraded" flag. Payload stays loaded (rawinput + hotkeys
+     * still work) but ui_present_frame becomes a no-op safeguard.
+     *
+     * No corrective action -- just observability. The FIX for
+     * "compose path moved" requires re-RE'ing dwmcore on that build,
+     * which is separate work. What matters HERE is: if we detect the
+     * degraded state, we STOP being ambiguous about it -- log
+     * screams, ship-block flag flies, future inject attempts can
+     * short-circuit into no-hook mode. */
+    CreateThread(NULL, 0, present_fire_canary_thread, NULL, 0, NULL);
 
     hook_diag(SS(SVC_STR_HK_INSTALL_SUCCESS));
     return 1;

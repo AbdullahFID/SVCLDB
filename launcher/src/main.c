@@ -628,6 +628,72 @@ static void resolve_beside_me(const char *name, char *out, size_t outsize) {
     out[outsize - 1] = 0;
 }
 
+/* v3.1 (2026-09-21) -- dwmcore.dll fingerprint for offsets.blob
+ * staleness detection. Reads PE header IMAGE_FILE_HEADER.TimeDateStamp
+ * (4 bytes) which changes any time Microsoft rebuilds the DLL.
+ * Cheap: opens dwmcore, reads first 4KB, extracts the 4-byte stamp.
+ * Returns 0 on failure. */
+static DWORD dwmcore_time_date_stamp(void) {
+    HANDLE h = CreateFileA("C:\\Windows\\System32\\dwmcore.dll",
+                           GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    BYTE buf[4096];
+    DWORD n = 0;
+    BOOL ok = ReadFile(h, buf, sizeof(buf), &n, NULL);
+    CloseHandle(h);
+    if (!ok || n < 512) return 0;
+    /* IMAGE_DOS_HEADER.e_lfanew at 0x3C */
+    DWORD nt_off = *(DWORD *)(buf + 0x3C);
+    if (nt_off + 8 > n) return 0;
+    /* NT sig 'PE\0\0' (4 bytes), then IMAGE_FILE_HEADER whose
+     * TimeDateStamp is at offset 4. */
+    if (buf[nt_off] != 'P' || buf[nt_off + 1] != 'E') return 0;
+    if (nt_off + 4 + 4 + 4 > n) return 0;
+    return *(DWORD *)(buf + nt_off + 4 + 4);
+}
+
+/* Path of the sidecar file storing the dwmcore signature the current
+ * offsets.blob was resolved against. */
+static void offsets_sig_path(char *out, size_t out_sz) {
+    _snprintf(out, out_sz - 1, "%s\\%s.sig",
+              SVC_INSTALL_DIR, SVC_OFFSETS_BLOB);
+    out[out_sz - 1] = 0;
+}
+
+static DWORD offsets_sig_read(void) {
+    char path[MAX_PATH];
+    offsets_sig_path(path, sizeof(path));
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    DWORD sig = 0, n = 0;
+    ReadFile(h, &sig, sizeof(sig), &n, NULL);
+    CloseHandle(h);
+    return (n == sizeof(sig)) ? sig : 0;
+}
+
+static void offsets_sig_write(DWORD sig) {
+    char path[MAX_PATH];
+    offsets_sig_path(path, sizeof(path));
+    HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0;
+    WriteFile(h, &sig, sizeof(sig), &w, NULL);
+    CloseHandle(h);
+}
+
+/* Returns 1 if offsets.blob is stale (dwmcore has been rebuilt since
+ * last resolve), 0 if fresh, -1 if we can't determine. */
+static int offsets_blob_needs_refresh(void) {
+    DWORD cur = dwmcore_time_date_stamp();
+    if (cur == 0) return -1;   /* couldn't read dwmcore header */
+    DWORD saved = offsets_sig_read();
+    if (saved == 0) return 1;  /* no cached sig -> definitely refresh */
+    return (cur != saved) ? 1 : 0;
+}
+
 static int run_resolver(char *err, size_t err_sz) {
     char resolver[MAX_PATH];
     resolve_beside_me(SVC_RESOLVER_EXE, resolver, sizeof(resolver));
@@ -663,8 +729,43 @@ static int run_resolver(char *err, size_t err_sz) {
         err[err_sz - 1] = 0;
         return 0;
     }
-    slog_writef("launcher.log", "resolver ok (exit=%lu)", exit_code);
+    /* v3.1 (2026-09-21) -- stamp the dwmcore signature next to the blob
+     * so future arms know if it needs re-running. */
+    DWORD stamp = dwmcore_time_date_stamp();
+    if (stamp) offsets_sig_write(stamp);
+    slog_writef("launcher.log",
+                "resolver ok (exit=%lu, dwmcore-stamp=0x%08lx)",
+                exit_code, (unsigned long)stamp);
     return 1;
+}
+
+/* Auto-refresh offsets.blob if dwmcore has been rebuilt since last
+ * resolve. Called from every arm path (--reinject, --json-config,
+ * full arm). Safe to skip on failure -- the payload has a sig-scan
+ * fallback for the essentials. */
+static void auto_refresh_offsets_if_stale(const char *caller) {
+    int stale = offsets_blob_needs_refresh();
+    if (stale != 1) {
+        if (stale == 0) {
+            slog_writef("launcher.log",
+                        "%s: offsets.blob fresh (dwmcore unchanged)", caller);
+        }
+        return;
+    }
+    slog_writef("launcher.log",
+                "%s: dwmcore signature CHANGED (Windows update?) -- "
+                "auto-re-running resolver to refresh offsets.blob",
+                caller);
+    char rerr[512] = {0};
+    if (!run_resolver(rerr, sizeof(rerr))) {
+        slog_writef("launcher.log",
+                    "%s: auto-resolver FAILED: %s (continuing; payload will "
+                    "use stale RVAs -- overlay may not render this session)",
+                    caller, rerr);
+    } else {
+        slog_writef("launcher.log",
+                    "%s: offsets.blob refreshed successfully", caller);
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -1058,7 +1159,14 @@ int main(int argc, char *argv[]) {
         /* Wipe from stack -- cfg.access_token + api_key are highly sensitive. */
         svc_secure_zero(&cfg, sizeof(cfg));
 
-        /* Resolver -- best effort (payload has sig-scan fallback). */
+        /* Resolver -- best effort (payload has sig-scan fallback).
+         *
+         * v3.1 (2026-09-21) -- --json-config already runs the resolver
+         * unconditionally (Electron hand-off path re-runs full arm every
+         * time), so the offsets.blob is fresh by the time we exit.
+         * offsets_sig_write() inside run_resolver() also stamps the
+         * dwmcore signature, so subsequent --reinject calls see a
+         * matching stamp and skip the extra resolve. */
         char rerr[512] = {0};
         if (!run_resolver(rerr, sizeof(rerr))) {
             slog_writef("launcher.log", "--json-config: resolver warn: %s", rerr);
@@ -1120,6 +1228,18 @@ int main(int argc, char *argv[]) {
             ExitProcess(3);
         }
         slog_writef("launcher.log", "--reinject: begin");
+
+        /* v3.1 (2026-09-21) -- POST-Windows-update auto-heal.
+         *
+         * If dwmcore.dll's TimeDateStamp has changed since offsets.blob
+         * was last resolved (i.e., Windows installed an update that
+         * replaced dwmcore), our RVAs are stale + hooks would land on
+         * WRONG addresses -> DWM crash + no overlay. Auto-re-run
+         * resolver here to refresh. Adds ~1s on the FIRST arm post-
+         * update; subsequent arms are the usual <100ms fast path.
+         * Best-effort: on failure we still try to inject (payload has
+         * sig-scan fallback for the essentials). */
+        auto_refresh_offsets_if_stale("--reinject");
 
         /* Leftover-payload heal: if payload is somehow still loaded from
          * a prior cycle, signal cooperative unload first. */

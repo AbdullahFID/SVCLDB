@@ -1010,6 +1010,12 @@ static const char SN_SVCHELPER_x[14] = {
     XCHAR('p'), XCHAR('e'), XCHAR('r'), XCHAR('.'), XCHAR('e'), XCHAR('x'),
     XCHAR('e'), 0
 };
+/* "dwm.exe" (7 chars + NUL) -- v3.1.0 crash-loop firewall observes
+ * dwm.exe pid churn to auto-panic if our re-injects are crashing DWM. */
+static const char SN_DWM_x[8] = {
+    XCHAR('d'), XCHAR('w'), XCHAR('m'), XCHAR('.'), XCHAR('e'), XCHAR('x'),
+    XCHAR('e'), 0
+};
 
 /* Widen + decode helper -- decodes the XOR-encoded ASCII byte array into
  * a wchar_t buffer for use with the *W process-enum APIs. Wide buffer
@@ -1065,6 +1071,135 @@ static void sn_rate_reset(sn_rate_t *r) {
     for (int i = 0; i < 3; i++) r->spawn_ticks[i] = 0;
     r->idx = 0;
     r->backoff_until = 0;
+}
+
+/* Forward decl: sn_find_process_in_session is defined further down.
+ * The firewall block below calls it via sn_find_dwm_pid(). */
+static int sn_find_process_in_session(const wchar_t *image_base, DWORD session,
+                                       DWORD *out_pid);
+
+/* v3.1.0 (2026-09-21) -- CRASH-LOOP FIREWALL.
+ *
+ * Motivation: on the KB5124008/KB5129195-family Windows 11 update,
+ * the payload's byte-patches on dwmcore.dll silently corrupt dwmcore
+ * state -> dwm.exe AV within seconds of inject. sentinel_thread
+ * previously re-armed the payload the moment it saw the shutdown
+ * event go dead, without regard to whether that re-arm CAUSED the
+ * dead. Result: fast crash loop, user's screen flickering black
+ * every ~5 seconds, only stoppable via emergency hotkey OR manual
+ * sihost --unload from a shell that can grab focus.
+ *
+ * Firewall: track dwm.exe pid history. Any time we observe dwm.exe
+ * with a NEW pid (i.e. Windows respawned it), stamp the tick.
+ * Before doing a re-inject, count "DWM pid changes in last 90s".
+ * If >= FIREWALL_MAX_DWM_CHURN, we've clearly been the cause of a
+ * crash loop -> auto-write .dwm_user_panic sentinel with a
+ * diagnostic body + suspend re-inject for FIREWALL_BACKOFF_MS. */
+#define FIREWALL_MAX_DWM_CHURN     3       /* 3 pid changes in window = crash loop */
+#define FIREWALL_WINDOW_MS         (90 * 1000)
+#define FIREWALL_BACKOFF_MS        (30 * 60 * 1000)   /* 30 min */
+#define FIREWALL_PID_HISTORY_SIZE  8
+
+static ULONGLONG g_fw_dwm_change_ticks[FIREWALL_PID_HISTORY_SIZE] = {0};
+static DWORD     g_fw_last_dwm_pid = 0;
+static ULONGLONG g_fw_backoff_until = 0;
+static int       g_fw_tripped = 0;
+
+/* Find dwm.exe pid in session (returns 0 if not present). */
+static DWORD sn_find_dwm_pid(DWORD session) {
+    wchar_t wname[16];
+    for (int i = 0; i < 16; i++) wname[i] = 0;
+    x_decode_w(wname, 16, SN_DWM_x, sizeof(SN_DWM_x));
+    DWORD pid = 0;
+    (void)sn_find_process_in_session(wname, session, &pid);
+    return pid;
+}
+
+/* Observe dwm.exe pid; if it changed since last observation, stamp
+ * the change tick. Idempotent; safe to call every sentinel tick. */
+static void fw_observe_dwm(DWORD session) {
+    DWORD cur = sn_find_dwm_pid(session);
+    if (!cur) return;   /* DWM transiently absent -- don't count as churn */
+    if (g_fw_last_dwm_pid == 0) {
+        g_fw_last_dwm_pid = cur;
+        return;
+    }
+    if (cur != g_fw_last_dwm_pid) {
+        ULONGLONG now = GetTickCount64();
+        /* Find oldest slot, replace it. */
+        int oldest = 0; ULONGLONG oldest_tick = g_fw_dwm_change_ticks[0];
+        for (int i = 1; i < FIREWALL_PID_HISTORY_SIZE; i++) {
+            if (g_fw_dwm_change_ticks[i] < oldest_tick) {
+                oldest = i; oldest_tick = g_fw_dwm_change_ticks[i];
+            }
+        }
+        g_fw_dwm_change_ticks[oldest] = now;
+        lg("firewall: dwm pid change observed %lu -> %lu (slot=%d)",
+           g_fw_last_dwm_pid, cur, oldest);
+        g_fw_last_dwm_pid = cur;
+    }
+}
+
+/* Count DWM pid changes within the firewall window. */
+static int fw_count_recent_churn(void) {
+    ULONGLONG now = GetTickCount64();
+    ULONGLONG cutoff = (now > FIREWALL_WINDOW_MS) ? (now - FIREWALL_WINDOW_MS) : 0;
+    int n = 0;
+    for (int i = 0; i < FIREWALL_PID_HISTORY_SIZE; i++) {
+        if (g_fw_dwm_change_ticks[i] > cutoff) n++;
+    }
+    return n;
+}
+
+/* Trip the firewall: write panic sentinel with reason + arm backoff.
+ * After trip, ALL re-inject paths bail (sn_sentinels_present() returns
+ * TRUE thanks to the panic file). Manual clear = sihost --unload. */
+static void fw_trip(const char *reason) {
+    if (g_fw_tripped) return;   /* idempotent */
+    g_fw_tripped = 1;
+    g_fw_backoff_until = GetTickCount64() + FIREWALL_BACKOFF_MS;
+
+    char buf[64];
+    x_decode(buf, SN_SENT_PANIC_x, sizeof(SN_SENT_PANIC_x));
+
+    /* Write the panic sentinel with a distinctive body so support can
+     * tell it was auto-tripped by the firewall (vs the user hitting
+     * the Ctrl+Shift+Alt+Q emergency panic hotkey which writes "1"). */
+    HANDLE f = CreateFileA(buf, GENERIC_WRITE | WRITE_DAC, 0, NULL,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f != INVALID_HANDLE_VALUE) {
+        char body[256];
+        int bn = wsprintfA(body,
+            "AUTO-PANIC v3.1.0 firewall trip: %s. dwm.exe churn observed. "
+            "Payload re-inject suspended for %d minutes to prevent further "
+            "DWM crashes. Clear this file + run `sihost --unload` then "
+            "review payload.log to diagnose.\r\n",
+            reason ? reason : "unknown",
+            FIREWALL_BACKOFF_MS / 60000);
+        DWORD w = 0;
+        WriteFile(f, body, bn, &w, NULL);
+        FlushFileBuffers(f);
+
+        /* Lock the DACL: SYSTEM + Admins only. */
+        PSECURITY_DESCRIPTOR sd = NULL;
+        ULONG sd_size = 0;
+        if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
+                "D:P(A;;GA;;;SY)(A;;GA;;;BA)",
+                SDDL_REVISION_1, &sd, &sd_size)) {
+            BOOL dacl_present = FALSE, dacl_defaulted = FALSE;
+            PACL dacl = NULL;
+            if (GetSecurityDescriptorDacl(sd, &dacl_present, &dacl,
+                                          &dacl_defaulted) && dacl_present) {
+                (void)SetSecurityInfo(f, SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    NULL, NULL, dacl, NULL);
+            }
+            LocalFree(sd);
+        }
+        CloseHandle(f);
+    }
+    lg("firewall: TRIPPED (%s) -- panic sentinel written, re-inject suspended %d min",
+       reason ? reason : "unknown", FIREWALL_BACKOFF_MS / 60000);
 }
 
 /* Sentinels present? (user hit panic or clean-quit; do NOT resurrect) */
@@ -1250,6 +1385,13 @@ static DWORD WINAPI sn_emergency_revive_worker(LPVOID unused) {
     sn_delete_sentinels();
     sn_rate_reset(&g_sn_shell);
     sn_rate_reset(&g_sn_payload);
+    /* v3.1.0 (2026-09-21) -- also reset the crash-loop firewall so
+     * a user-triggered revive isn't blocked by prior auto-panic. */
+    for (int i = 0; i < FIREWALL_PID_HISTORY_SIZE; i++) g_fw_dwm_change_ticks[i] = 0;
+    g_fw_last_dwm_pid = 0;
+    g_fw_backoff_until = 0;
+    g_fw_tripped = 0;
+    lg("EMERGENCY REVIVE: crash-loop firewall state cleared");
     /* Unload any existing payload first so --reinject gets a clean slate. */
     if (sn_is_payload_alive()) {
         lg("EMERGENCY REVIVE: existing payload alive -- signalling unload first");
@@ -1592,6 +1734,13 @@ static DWORD WINAPI sentinel_thread(LPVOID unused) {
         DWORD session = WTSGetActiveConsoleSessionId();
         if (session == 0xFFFFFFFF) continue;
 
+        /* v3.1.0 (2026-09-21) -- Observe dwm.exe pid each tick so the
+         * crash-loop firewall has a signal to reason about. Cheap
+         * (~1 process-enum per 5s). Must run BEFORE the sentinel
+         * presence check so we keep tracking even after the firewall
+         * trips (helpful post-mortem in wl_input.log). */
+        fw_observe_dwm(session);
+
         /* Honor user intent -- either sentinel present == don't touch. */
         if (sn_sentinels_present()) {
             if ((tick_count % 12) == 0)   /* log every ~60 s to avoid spam */
@@ -1628,8 +1777,29 @@ static DWORD WINAPI sentinel_thread(LPVOID unused) {
         }
         if (!g_sn_confirmed_alive) continue;   /* never armed -> nothing to revive */
 
+        /* v3.1.0 (2026-09-21) -- CRASH-LOOP FIREWALL GATE.
+         *
+         * Before doing a re-inject, count how many dwm.exe pid
+         * changes we've observed in the last 90 seconds. If it's
+         * >= FIREWALL_MAX_DWM_CHURN (currently 3), Windows is
+         * respawning DWM faster than a healthy environment ever
+         * would -- almost certainly BECAUSE of our previous re-inject
+         * corrupting dwmcore state. Trip the firewall (writes the
+         * panic sentinel + arms a 30-minute backoff) and skip this
+         * re-inject. Subsequent ticks see the sentinel and no-op
+         * naturally. */
+        int churn = fw_count_recent_churn();
+        if (churn >= FIREWALL_MAX_DWM_CHURN) {
+            char reason[128];
+            wsprintfA(reason, "dwm pid changed %d times in last %d sec",
+                      churn, FIREWALL_WINDOW_MS / 1000);
+            fw_trip(reason);
+            continue;   /* now that panic file exists, next tick's sn_sentinels_present() will bail */
+        }
+
         if (sn_rate_check_and_stamp(&g_sn_payload)) {
-            lg("sentinel: payload gone (was alive), svchelper absent -- --reinject");
+            lg("sentinel: payload gone (was alive), svchelper absent -- "
+               "--reinject (dwm-churn=%d in last 90s)", churn);
             if (sn_spawn_sihost_reinject()) {
                 /* Force re-confirmation so a doomed reinject doesn't keep retrying. */
                 InterlockedExchange(&g_sn_confirmed_alive, 0);

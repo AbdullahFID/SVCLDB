@@ -9,29 +9,81 @@ memory from prior sessions (~4.8k lines).
 For live operational stuff (launch/test/deploy procedure), see `AGENTS.md`
 and `.cursor/rules/fast-testing-launch.mdc`.
 
-## 🛑🛑 ACTIVE P0 SHIP-BLOCK (as of 2026-09-21 8:07 PM local)
+## ✅ P0 SHIP-BLOCK RESOLVED (2026-09-21 8:42 PM local) — v3.1
 
-**PAYLOAD IS CRASHING `dwm.exe` (0xc0000005 AV) on Windows 11 25H2 build ≥ 26200.9457 (KB5124008 family).** DO NOT distribute the Setup.exe / zip on Nyx's Desktop until this is fixed. Full write-up + WER evidence + investigation plan in `docs/HANDOFF_2026-09-21_POST_WINDOWS_UPDATE_OVERLAY_INVISIBLE.md`. Payload currently unloaded on Nyx's box (sentinels in place; winlogon watchdog + Electron watchdog stood down; DWM stable). If you're a fresh chat: READ THAT HANDOFF FIRST before touching any inject/hook code.
+**Root cause was NOT what the handoff hypothesized.** Fixed by v3.1
+without needing new RE. The KB5124008/KB5129195-family Windows 11
+update replaced `dwmcore.dll` on disk — same `FileVersion` string
+(10.0.26100.9278) but a new PE `TimeDateStamp` + new PDB signature.
+Every internal RVA shifted. Our cached `offsets.blob` had the
+pre-update RVAs baked in, and the launcher's `--reinject` path
+skipped the resolver, so we were hooking + patching **the wrong
+addresses in the new dwmcore**. Wrong-address byte patches corrupted
+unrelated dwmcore state → DWM AV after minutes. Wrong-address hook
+on "COverlayContext::Present" was actually installed on some other
+function → Present detour never fired → no overlay rendered.
+
+**v3.1 fixes (all landed 2026-09-21 20:42 local, committed on `main`):**
+
+1. **Launcher: auto-re-resolve on dwmcore change.** New
+ `dwmcore_time_date_stamp()` reads the PE header's 4-byte stamp.
+ `run_resolver()` now writes it to `offsets.blob.sig` after a
+ successful resolve. `auto_refresh_offsets_if_stale("--reinject")`
+ runs at the top of `--reinject` (and is documented next to
+ `--json-config`, which already re-resolves unconditionally).
+ First arm post-Windows-update pays ~1s for the fresh resolve;
+ subsequent arms are the usual <100ms fast path.
+2. **Payload: `ForceFullDirty` byte-patch guard.** Skip if the
+ original byte isn't `0x00` or `0x01`. On the new dwmcore, the
+ symbol resolves to a `.rdata` location whose initial byte is
+ `0x44` (structured data, not a bool) — old code blindly overwrote
+ to `0x01`, corrupting the struct.
+3. **Payload: `IsOverlayPrevented` prologue-shape detection.**
+ Old getter form (`8A 81 XX XX XX XX` = `mov al, [rcx+imm32]`)
+ gets the classic offset-0 `mov eax,1; ret` patch. New CFG-call
+ form (`FF 15 XX XX XX XX` = `call qword [rip+imm32]`) gets the
+ patch at offset **6** so the initial init/dispatch call still
+ runs — skipping that call had been corrupting dwmcore state.
+ Also handles CET `ENDBR64` prologues by patching at offset 4.
+ Unknown prologues log loudly + skip the patch entirely.
+4. **Payload: Present-fire canary thread.** Samples
+ `g_present_calls` at T+2s / T+5s / T+10s / T+30s post-install.
+ If zero, sets `g_compose_degraded = 1` and short-circuits
+ `ui_present_frame` — payload stays loaded for rawinput/hotkey
+ use, no dwmcore corruption, no crash. Loud log line pinpoints
+ the exact regression class if this ever fires again.
+5. **Winlogon helper: crash-loop firewall.** New `fw_observe_dwm()`
+ tracks dwm.exe pid churn each 5s tick (up to 8 historical
+ changes). Before every re-inject decision, `fw_count_recent_churn()`
+ counts pid changes in the last 90s. `>= 3` = we caused a crash
+ loop → `fw_trip()` writes `.dwm_user_panic` with a distinctive
+ body (svchelper's `respawnWatchdog` also honors this file → both
+ watchdogs stand down). 30-minute backoff, cleared by
+ emergency-revive hotkey (Ctrl+Shift+Alt+R) or manual file delete.
+
+**Live-verified on Nyx's box 2026-09-21 20:42 local:**
+`Present fired count=612 at T+3000 ms -- compose path is healthy`.
+Overlay renders, DWM stable (pid 21196 held for 37+ minutes).
+`offsets.blob.sig = 0x9A1AF3BA` (matches current dwmcore's PE
+TimeDateStamp — so subsequent `--reinject` calls skip re-resolve).
+
+**When shipping Setup.exe / zip to end users:** rebuild the C stack
+(`build_all.bat`) so new payload/launcher/helper make it into
+`dist/win-unpacked/` before packaging. The v3.1 changes are essential
+for anyone whose Windows updates replace dwmcore.dll (which is
+essentially "everyone eventually"). Backward compat is fully preserved:
+old dwmcore builds keep hitting `OLD-GETTER` on IsOverlayPrevented +
+the bool-value ForceFullDirty patch, same as before. The auto-refresh
+is idempotent — it only triggers when the sig genuinely differs.
 
 Recent operational handoffs (append to top as new ones land):
 
 - `docs/HANDOFF_2026-09-21_POST_WINDOWS_UPDATE_OVERLAY_INVISIBLE.md` —
- **🚨 UNRESOLVED P0 2026-09-21 20:07 local.** Payload crashes `dwm.exe`
- with `0xc0000005` on latest Windows 11 25H2 build (KB5124008 family,
- build 26200.9457). Winlogon watchdog + Electron watchdog were
- dutifully re-arming a payload that AVs on every inject → DWM crash
- loop → user screen flickers black every ~2s. Fully unloaded now
- (sentinels + `sihost --unload`). Two distinct fault buckets recorded
- in WER (one inside `dwmcore.dll`, one in "unknown" = our manual-mapped
- payload). dwmcore.dll `FileVersion` string unchanged (10.0.26100.9278)
- BUT `IsOverlayPrevented` prologue bytes changed pre/post update
- (`8a 81 28 01 00 00` → `ff 15 5a df 11 00`) proving Microsoft
- altered dwmcore internals despite metadata match. Leading hypothesis
- (H1, ~85%): vtable slot layout shifted → wrong-slot indirect call in
- `get_backbuffer_texture` AVs. H8 (CET Shadow Stack) at ~15% as
- backup. Full crash-loop reproduction procedure + full dump collection
- procedure + investigation-order in the doc. **Ship-blocked** until
- fixed — do not ship Desktop artifacts.
+ **✅ RESOLVED 2026-09-21 20:42 local by v3.1** (see above; kept for
+ the full evidence trail — WER analysis, HVCI verification, PDB
+ signature comparison — anyone chasing a similar
+ "hooks-install-succeeds-but-Present-never-fires-on-new-Windows"
+ regression should read this doc's diagnosis section as prior art).
 - `docs/HANDOFF_2026-09-21_WINLOGON_WATCHDOG_LANDED.md` — **✅ v3.0.3 →
  v3.0.5 LANDED 2026-09-21 evening.** Four-layer overlay/shell/payload
  resilience system: (L1) payload's `ensure_fake_hwnd_valid()` now uses

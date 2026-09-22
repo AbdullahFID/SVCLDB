@@ -1,5 +1,45 @@
 # 🚨🚨 P0 HANDOFF — Payload CRASHES DWM after Windows 11 25H2 KB5124008 update (2026-09-21 night)
 
+## ✅ RESOLVED 2026-09-21 20:42 local by v3.1 — READ THIS FIRST
+
+Root cause was **NOT** vtable-slot shift (H1) or CET (H8). It was
+**stale `offsets.blob`**: the KB5129195-family update replaced
+`dwmcore.dll` on disk (same `FileVersion` string, new PE
+`TimeDateStamp` + new PDB GUID → every internal RVA shifted), and
+`--reinject` skipped the resolver so we were hooking + patching the
+**wrong addresses in the new dwmcore**. Wrong-address byte patches
+corrupted unrelated dwmcore state → DWM AV after minutes. Wrong-address
+`COverlayContext::Present` hook was installed on a completely
+unrelated function → Present detour never fired → no overlay rendered.
+Silent-and-eventually-fatal was the reason black-box debugging kept
+producing "hooks_install: SUCCESS" while pixels went nowhere and DWM
+kept crashing without our detour being called.
+
+**Verified via `dbh.exe` against current dwmcore PDB:**
+- `COverlayContext::Present`: pre-update RVA `0x231000`, post-update `0x22DD10`
+- `IsOverlayPrevented`: pre `0x1EE600`, post `0x1EB470`
+- `ForceFullDirtyRendering`: pre `0x3FD819`, post `0x40E9C9`
+- (every symbol had shifted by different amounts)
+
+**v3.1 shipped fixes (all landed 2026-09-21 20:42 local):** see
+`CLAUDE.md` "P0 SHIP-BLOCK RESOLVED" block for the definitive list —
+auto-re-resolve on dwmcore-stamp change, `ForceFullDirty` bool guard,
+`IsOverlayPrevented` prologue-shape detection (old-getter / new-CFG-
+call / CET-endbr64), Present-fire canary in payload, DWM-pid-churn
+crash-loop firewall in winlogon helper.
+
+**Live verification on Nyx's box:** `Present fired count=612 at T+3000
+ms -- compose path is healthy`, overlay rendered, DWM stable pid 21196
+held 37+ minutes.
+
+Everything below this line is the ORIGINAL handoff, kept verbatim for
+the full trail of dead-end hypotheses (they were all wrong — the
+answer was the boring one). Prior art for anyone chasing
+"hooks-install-succeeds-but-Present-never-fires-on-new-Windows"
+regressions in the future.
+
+---
+
 **Status:** UNRESOLVED + WORSE THAN INITIALLY REPORTED. Payload does not just fail to render — it **actively crashes `dwm.exe` with `0xc0000005` access violations** shortly after inject. Winlogon watchdog then dutifully re-injects → crash again → respawn loop. **Payload must stay UNLOADED on this Windows build until fixed.** Real regression from Windows update, not user error.
 
 **Branch/HEAD when written:** `main` at commit `4d2a1a9` (this handoff doc). All fixes from tonight's session already committed + pushed.
