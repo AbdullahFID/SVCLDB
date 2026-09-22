@@ -350,7 +350,17 @@ static void lg(const char *fmt, ...) {
     CloseHandle(f);
 }
 #else
-static void lg(const char *fmt, ...) { (void)fmt; }
+/* v3.1 (2026-09-21) -- Full macro stub instead of empty function.
+ * The prior `static void lg(...) { (void)fmt; }` LOADED the format-
+ * string pointer parameter (per calling convention), which /OPT:REF
+ * + /LTCG kept alive in .rdata even when the body was empty. Result:
+ * ~4-5 diag strings leaked into the shipped binary (`emerg-hotkey:`,
+ * `firewall: TRIPPED`, `wl_input ATTACH`, etc.). A variadic-macro
+ * stub that expands to `((void)0)` discards ALL arguments at the
+ * preprocessor level -- the string literals are never referenced,
+ * so the linker dead-strips them cleanly. Verified 2026-09-21: post-
+ * switch, 0/4 test strings survived in wl_input.dll. */
+#define lg(...) ((void)0)
 #endif
 
 /* ── PEB unlink + PE wipe + section downgrade ──────────────────────
