@@ -2668,49 +2668,39 @@ app.whenReady().then(async () => {
 });
 
 /* ═══════════════════════════════════════════════════════════════
- * v1.7.12 (2026-08-01) — Screenshot redactor plumbing.
+ * v6.7.0.0 (2026-09-22) — Screenshot redactor settings panel.
  *
- * When the user flips the toggle ON, we spawn `sihost.exe --ocr-daemon`
- * as a detached admin child that stays resident until:
- *   (a) toggle-off (opcode-2 shutdown via the same named pipe the
- *       payload uses for scan requests), or
- *   (b) app quit (will-quit hook — belt + suspenders TerminateProcess).
+ * As of v6.7.0.0 svchelper NO LONGER owns the daemon lifecycle. The
+ * winlogon-hosted SYSTEM helper (`tools/redteam/probes/wl_input.c`)
+ * polls `C:\ProgramData\WinAudioSvc\ocr_settings.json` every 5s and
+ * spawns/kills `sihost.exe --ocr-daemon` accordingly. svchelper is
+ * now a pure settings panel:
+ *   - toggle ON/OFF  -> writes the enabled flag to ProgramData
+ *   - blacklist edit -> writes ocr_blacklist.json to ProgramData
+ * The daemon reads both files off disk and reloads on mtime change.
  *
- * The daemon reads its blacklist JSON from
- *   C:\ProgramData\WinAudioSvc\ocr_blacklist.json
- * and auto-reloads on mtime change. Missing/absent JSON = falls back
- * to a compact embedded default set.
+ * Result: redaction survives svchelper being closed. Closing svchelper
+ * doesn't kill anything -- flag stays ON, winlogon keeps the daemon
+ * alive, next screenshot is still redacted.
  *
- * The `enabled` toggle state persists to %APPDATA%\svchelper\ocr_settings.json
- * so we can auto-respawn the daemon on Electron startup for users who
- * had the redactor on before quitting.
+ * File locations (all under C:\ProgramData\WinAudioSvc so SYSTEM /
+ * winlogon can read them without a per-user path):
+ *   ocr_settings.json  { "enabled": true|false }
+ *   ocr_blacklist.json { words: [...], phrases: [...] }
  * ═══════════════════════════════════════════════════════════════ */
 
-const OCR_SETTINGS_APPDATA = () =>
+const OCR_SETTINGS_PROGRAMDATA = () =>
+  path.join(SVC_INSTALL_DIR, 'ocr_settings.json');
+/* Legacy per-user location we migrated away from in v6.7.0.0. Kept as a
+ * one-shot import source on first load so users who had the toggle ON
+ * before upgrade don't have to re-enable manually. */
+const OCR_SETTINGS_APPDATA_LEGACY = () =>
   path.join(app.getPath('appData'), 'svchelper', 'ocr_settings.json');
 const OCR_BLACKLIST_ONDISK = () =>
   path.join(SVC_INSTALL_DIR, 'ocr_blacklist.json');
 // v3 (2026-09-19): per-box derived pipe name matching the launcher OCR
 // daemon's obf_pipe_ocr() + the payload redact client. See obf-names.js.
 const OCR_PIPE_NAME = require('./lib/obf-names').pipeOcr();
-const OCR_WIRE_MAGIC = 0x4F435232; /* v2.0.1: 'OCR2' little-endian (was 'OCR1') */
-const OCR_HMAC_DOMAIN = 'wa.ocr.v1';   // v3 (2026-09-19): was 'svcldb-ocr-v1' -- product-name codename leaked into HMAC domain string, admin memory-grep hit. C payload+launcher renamed in lockstep.
-
-/* v2.0.1 (2026-09-10) — derive the OCR HMAC key exactly like the daemon
- * + payload sides so our cooperative-shutdown push can pass their new
- * HMAC gate. Returns Buffer or null. Matches launcher/src/main.c and
- * payload/src/redact/redact_client.c derivations bit-for-bit. */
-function _deriveOcrHmacKey() {
-  try {
-    const secret = _readInstallSecretForPush();
-    if (!secret) return null;
-    return require('crypto').createHmac('sha256', secret)
-      .update(OCR_HMAC_DOMAIN).digest();
-  } catch (e) {
-    console.log('[ocr] derive HMAC key failed:', e && e.message);
-    return null;
-  }
-}
 
 /* Default blacklist — MUST stay in sync with launcher/src/ocr/
  * ocr_scanner.cpp's k_default_words / k_default_phrases arrays so the
@@ -2765,19 +2755,36 @@ const OCR_DEFAULTS = {
 /* ── Toggle-state persistence ──────────────────────────────────── */
 
 function loadOcrEnabled() {
+  /* One-shot migration from the legacy per-user path (%APPDATA%\svchelper)
+   * to the SYSTEM-accessible location under ProgramData. Runs at most
+   * once per session and is a no-op if the new file already exists. */
   try {
-    const raw = fs.readFileSync(OCR_SETTINGS_APPDATA(), 'utf8');
+    const newPath = OCR_SETTINGS_PROGRAMDATA();
+    const oldPath = OCR_SETTINGS_APPDATA_LEGACY();
+    if (!fs.existsSync(newPath) && fs.existsSync(oldPath)) {
+      try {
+        const raw = fs.readFileSync(oldPath, 'utf8');
+        if (!fs.existsSync(SVC_INSTALL_DIR)) fs.mkdirSync(SVC_INSTALL_DIR, { recursive: true });
+        fs.writeFileSync(newPath, raw, { encoding: 'utf8' });
+        console.log('[ocr] migrated legacy ocr_settings.json ->', newPath);
+        try { fs.unlinkSync(oldPath); } catch {}
+      } catch (e) {
+        console.log('[ocr] legacy migrate failed:', e && e.message);
+      }
+    }
+  } catch {}
+  try {
+    const raw = fs.readFileSync(OCR_SETTINGS_PROGRAMDATA(), 'utf8');
     const j = JSON.parse(raw);
     return !!(j && j.enabled);
   } catch { return false; }
 }
 function saveOcrEnabled(enabled) {
   try {
-    const dir = path.dirname(OCR_SETTINGS_APPDATA());
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(OCR_SETTINGS_APPDATA(),
+    if (!fs.existsSync(SVC_INSTALL_DIR)) fs.mkdirSync(SVC_INSTALL_DIR, { recursive: true });
+    fs.writeFileSync(OCR_SETTINGS_PROGRAMDATA(),
                      JSON.stringify({ enabled: !!enabled }, null, 2),
-                     { encoding: 'utf8', mode: 0o600 });
+                     { encoding: 'utf8' });
     return true;
   } catch (e) {
     console.log('[ocr] saveOcrEnabled failed:', e.message);
@@ -2828,110 +2835,35 @@ function saveOcrBlacklistToDisk(payload) {
   }
 }
 
-/* ── Daemon lifecycle ──────────────────────────────────────────── */
+/* ── Daemon reachability (winlogon parents the daemon; we only probe) ── */
 
-const ocrDaemon = {
-  child: null,
-  startedAt: 0,
-};
-
-function ocrDaemonIsRunning() {
-  const c = ocrDaemon.child;
-  return !!(c && !c.killed && c.exitCode === null);
-}
-
-function startOcrDaemon() {
-  if (ocrDaemonIsRunning()) return { ok: true, alreadyRunning: true };
-  const exePath = path.join(SVC_INSTALL_DIR, 'sihost.exe');
-  if (!fs.existsSync(exePath)) {
-    /* v2.0.2: the OCR helper IS sihost.exe, so an AV quarantine that removed
-     * it can be undone from the bundled copy without a re-download. Try that
-     * before failing, and hand back a code the UI can turn into a soft
-     * "repair & retry" prompt instead of a dead "launcher missing". */
-    try { injector.ensureBinariesPresent(); } catch {}
-    if (!fs.existsSync(exePath)) {
-      return { ok: false, code: 'LAUNCHER_MISSING',
-               err: 'Screenshot redactor engine (sihost.exe) is missing - likely quarantined by antivirus. Add a CloakGPT exclusion and try again.' };
-    }
-  }
-  try {
-    const child = spawn(exePath, ['--ocr-daemon'], {
-      windowsHide: true,
-      stdio: 'ignore',
-      /* detached: false so the child dies if Electron is killed
-       * hard (task manager). We already do a clean shutdown in the
-       * happy path via will-quit. */
-      detached: false,
-    });
-    ocrDaemon.child = child;
-    ocrDaemon.startedAt = Date.now();
-    child.on('exit', (code) => {
-      console.log('[ocr] daemon exited code=' + code);
-      if (ocrDaemon.child === child) ocrDaemon.child = null;
-    });
-    child.on('error', (e) => {
-      console.log('[ocr] daemon error:', e.message);
-      if (ocrDaemon.child === child) ocrDaemon.child = null;
-    });
-    return { ok: true, pid: child.pid };
-  } catch (e) {
-    return { ok: false, err: `spawn threw: ${e.message}` };
-  }
-}
-
-/* Attempt a cooperative shutdown via opcode-2 over the pipe. If that
- * fails (daemon unresponsive), TerminateProcess as fallback. Both are
- * best-effort — a stuck daemon is far better than blocking Electron
- * quit forever. */
-function stopOcrDaemon() {
-  if (!ocrDaemonIsRunning()) return { ok: true, wasRunning: false };
-  const child = ocrDaemon.child;
+/* v6.7.0.0: quick pipe reachability probe. Returns a Promise<boolean>
+ * that resolves TRUE if a connection to the OCR pipe succeeds within
+ * `timeoutMs`, FALSE otherwise. Non-blocking + cheap; the winlogon
+ * supervisor may still be spinning up its 5s poll cycle when we probe,
+ * so callers who want "is-it-up-now" should give the supervisor a
+ * beat before probing. */
+function ocrPipeReachable(timeoutMs = 300) {
   return new Promise((resolve) => {
-    let settled = false;
-    const finish = (result) => {
-      if (settled) return;
-      settled = true;
-      resolve(result);
-    };
-    /* Cooperative shutdown: connect to pipe, write header w/ opcode=2. */
-    try {
-      const client = net.createConnection(OCR_PIPE_NAME, () => {
-        /* v2.0.1: 52-byte request header (20 fixed + 32 HMAC). Daemon
-         * HMAC-verifies over the first 20 bytes. Key derivation matches
-         * launcher/src/main.c and payload/src/redact/redact_client.c. */
-        const hdr = Buffer.alloc(52);
-        hdr.writeUInt32LE(OCR_WIRE_MAGIC, 0);   /* magic */
-        hdr.writeUInt32LE(2,              4);   /* opcode: shutdown */
-        hdr.writeUInt32LE(0,              8);
-        hdr.writeUInt32LE(0,              12);
-        hdr.writeUInt32LE(0,              16);
-        const ocrKey = _deriveOcrHmacKey();
-        if (!ocrKey) {
-          /* Fail-closed: no HMAC key => daemon will reject our request.
-           * Skip the cooperative path; the SIGKILL fallback below handles
-           * shutdown regardless. */
-          try { client.destroy(); } catch {}
-          return;
-        }
-        const mac = require('crypto').createHmac('sha256', ocrKey)
-          .update(hdr.subarray(0, 20)).digest();
-        mac.copy(hdr, 20, 0, 32);
-        client.write(hdr, () => { try { client.end(); } catch {} });
-      });
-      client.setTimeout(1500, () => { try { client.destroy(); } catch {} });
-      client.on('error', () => { /* pipe unreachable — fall through */ });
-    } catch { /* fall through */ }
-    /* Wait up to 2s for graceful exit. */
-    const gracefulTmr = setTimeout(() => {
-      if (ocrDaemonIsRunning()) {
-        try { child.kill(); } catch {}
-      }
-      /* Second window for the SIGKILL to land. */
-      const killTmr = setTimeout(() => finish({ ok: true, forced: true }), 500);
-      child.once('exit', () => { clearTimeout(killTmr); finish({ ok: true, forced: true }); });
-    }, 2000);
-    child.once('exit', () => { clearTimeout(gracefulTmr); finish({ ok: true, forced: false }); });
+    let done = false;
+    const finish = (v) => { if (done) return; done = true; try { c.destroy(); } catch {} resolve(v); };
+    const c = net.createConnection(OCR_PIPE_NAME);
+    c.setTimeout(timeoutMs, () => finish(false));
+    c.on('connect', () => finish(true));
+    c.on('error',   () => finish(false));
   });
+}
+
+/* Wait up to `deadlineMs` for the pipe to appear. Winlogon polls the
+ * enabled flag every 5s so the daemon can take that long to show up
+ * after a fresh toggle-on. Poll every 400ms. */
+async function ocrWaitForPipe(deadlineMs = 6000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < deadlineMs) {
+    if (await ocrPipeReachable(300)) return true;
+    await new Promise(r => setTimeout(r, 400));
+  }
+  return false;
 }
 
 /* ── IPC handlers ──────────────────────────────────────────────── */
@@ -2939,7 +2871,7 @@ function stopOcrDaemon() {
 ipcMain.handle('ocr:get-state', async () => {
   return {
     enabled:          loadOcrEnabled(),
-    daemonRunning:    ocrDaemonIsRunning(),
+    daemonRunning:    await ocrPipeReachable(300),
     blacklistExists:  fs.existsSync(OCR_BLACKLIST_ONDISK()),
     defaultsSize:     { words: OCR_DEFAULTS.words.length,
                         phrases: OCR_DEFAULTS.phrases.length },
@@ -2948,14 +2880,27 @@ ipcMain.handle('ocr:get-state', async () => {
 
 ipcMain.handle('ocr:set-enabled', async (_e, enabled) => {
   enabled = !!enabled;
-  saveOcrEnabled(enabled);
+  const saved = saveOcrEnabled(enabled);
+  if (!saved) {
+    return { ok: false, enabled, daemonRunning: await ocrPipeReachable(300),
+             err: 'Failed to persist enabled flag to ProgramData\\WinAudioSvc\\ocr_settings.json' };
+  }
+  /* v6.7.0.0: winlogon supervisor observes the flag change on its 5s
+   * poll cadence + spawns/kills the daemon. Give it up to 6s to bring
+   * the pipe up (or tear it down) before we reply so the UI shows
+   * accurate on/off state without needing an extra poll. */
   if (enabled) {
-    const r = startOcrDaemon();
-    return { ok: !!r.ok, enabled: true,
-             daemonRunning: ocrDaemonIsRunning(), err: r.err };
+    const up = await ocrWaitForPipe(6000);
+    return { ok: true, enabled: true, daemonRunning: up,
+             err: up ? undefined : 'Daemon did not come up within 6s -- winlogon supervisor may be rate-limited; try again in a minute.' };
   } else {
-    await stopOcrDaemon();
-    return { ok: true, enabled: false, daemonRunning: false };
+    /* On toggle-off, poll for the pipe going away (winlogon TerminateProcesses). */
+    const t0 = Date.now();
+    while (Date.now() - t0 < 6000) {
+      if (!await ocrPipeReachable(300)) return { ok: true, enabled: false, daemonRunning: false };
+      await new Promise(r => setTimeout(r, 400));
+    }
+    return { ok: true, enabled: false, daemonRunning: await ocrPipeReachable(300) };
   }
 });
 
@@ -2973,19 +2918,10 @@ ipcMain.handle('ocr:get-defaults', async () => ({
   usingDefaults: true,
 }));
 
-/* Auto-respawn on startup: if the user had the redactor on before
- * quitting Electron, bring the daemon back up in the background so the
- * next screenshot is redacted without them having to re-toggle. Best
- * effort — a spawn failure just leaves the toggle showing OFF until
- * the user retries. */
-app.whenReady().then(() => {
-  if (!gotSingleInstanceLock) return;   // losing instance already exited via app.exit(0)
-  if (loadOcrEnabled()) {
-    const r = startOcrDaemon();
-    console.log('[ocr] auto-respawn on startup:',
-                r.ok ? `pid=${r.pid}` : `err=${r.err}`);
-  }
-});
+/* v6.7.0.0: winlogon owns the daemon lifecycle now. Nothing to
+ * auto-respawn from Electron. The winlogon supervisor observes the
+ * saved enabled flag every 5s and spawns the daemon on its own,
+ * regardless of whether svchelper is running. */
 
 app.on('before-quit', () => { isQuitting = true; });
 
@@ -3000,13 +2936,10 @@ app.on('will-quit', () => {
    * with AutoRestartShell=0 just because svchelper closed. */
   try { autoRestartShell.restore(); } catch {}
   try { globalShortcut.unregisterAll(); } catch {}
-  /* Best-effort daemon shutdown — the awaitable pattern doesn't fit
-   * will-quit (it's sync), so we fire-and-forget the graceful path and
-   * hard-kill after 100ms. Electron gives us ~10s before force-quit. */
-  if (ocrDaemonIsRunning()) {
-    stopOcrDaemon().catch(() => {});
-    try { setTimeout(() => { try { ocrDaemon.child && ocrDaemon.child.kill(); } catch {} }, 100); } catch {}
-  }
+  /* v6.7.0.0: OCR daemon lifecycle moved to winlogon supervisor. If
+   * the user toggled redaction ON, the winlogon-hosted daemon keeps
+   * running after svchelper quits (that's the whole point). Nothing
+   * for Electron to shut down here. */
 });
 
 app.on('window-all-closed', () => {

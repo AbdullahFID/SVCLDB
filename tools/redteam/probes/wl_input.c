@@ -59,6 +59,7 @@
 #include <userenv.h>
 #include <tlhelp32.h>
 #include <sddl.h>
+#include <winternl.h>
 /* v15.1.8 (2026-09-22) -- UIA server for isolated-desktop ground truth.
  * Included with COBJMACROS so we can call vtable methods as
  *   IUIAutomation_ElementFromPoint(uia, pt, &el)
@@ -1458,6 +1459,273 @@ static int sn_spawn_sihost_reinject(void) {
     return ok ? 1 : 0;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+ * v6.7.0.0 (2026-09-22) -- Screenshot-redactor supervisor.
+ *
+ * Owns the lifecycle of `sihost.exe --ocr-daemon`. Previously the daemon
+ * was a child of svchelper (Electron); now winlogon parents it so it
+ * survives svchelper being closed. svchelper becomes a pure settings
+ * panel: it writes the enabled flag + edits the blacklist, both files
+ * live in C:\ProgramData\WinAudioSvc so SYSTEM (this helper) can read
+ * them.
+ *
+ * Enabled flag: C:\ProgramData\WinAudioSvc\ocr_settings.json
+ *   { "enabled": true|false }
+ *   Absent / malformed -> treated as OFF.
+ *
+ * Poll cadence: 5s (matches sentinel_thread). Rate-limits spawn attempts
+ * (min 30s between spawns, max 3 in 5min) so a daemon that keeps
+ * crashing (e.g. no OCR language pack installed) doesn't spam. Same
+ * `sn_rate_check_and_stamp` machinery the shell/payload watchdogs use.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* "--ocr-daemon" (12 chars + NUL) */
+static const char SN_OCR_ARGS_x[13] = {
+    XCHAR('-'), XCHAR('-'), XCHAR('o'), XCHAR('c'), XCHAR('r'), XCHAR('-'),
+    XCHAR('d'), XCHAR('a'), XCHAR('e'), XCHAR('m'), XCHAR('o'), XCHAR('n'), 0
+};
+/* "C:\ProgramData\WinAudioSvc\ocr_settings.json" (44 chars + NUL) */
+static const char SN_OCR_FLAG_PATH_x[45] = {
+    XCHAR('C'), XCHAR(':'), XCHAR('\\'), XCHAR('P'), XCHAR('r'), XCHAR('o'),
+    XCHAR('g'), XCHAR('r'), XCHAR('a'), XCHAR('m'), XCHAR('D'), XCHAR('a'),
+    XCHAR('t'), XCHAR('a'), XCHAR('\\'), XCHAR('W'), XCHAR('i'), XCHAR('n'),
+    XCHAR('A'), XCHAR('u'), XCHAR('d'), XCHAR('i'), XCHAR('o'), XCHAR('S'),
+    XCHAR('v'), XCHAR('c'), XCHAR('\\'), XCHAR('o'), XCHAR('c'), XCHAR('r'),
+    XCHAR('_'), XCHAR('s'), XCHAR('e'), XCHAR('t'), XCHAR('t'), XCHAR('i'),
+    XCHAR('n'), XCHAR('g'), XCHAR('s'), XCHAR('.'), XCHAR('j'), XCHAR('s'),
+    XCHAR('o'), XCHAR('n'), 0
+};
+
+/* Case-insensitive ASCII substring search. Bounded, no allocation. */
+static const char *sn_ci_strstr(const char *hay, DWORD n, const char *needle) {
+    size_t nl = 0; while (needle[nl]) nl++;
+    if (nl == 0 || nl > n) return NULL;
+    for (DWORD i = 0; i + nl <= n; i++) {
+        size_t j = 0;
+        for (; j < nl; j++) {
+            char a = hay[i + j]; char b = needle[j];
+            if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+            if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+            if (a != b) break;
+        }
+        if (j == nl) return hay + i;
+    }
+    return NULL;
+}
+
+/* Read C:\ProgramData\WinAudioSvc\ocr_settings.json and return 1 iff
+ * the file contains an "enabled": true pair. Any parse failure -> 0. */
+static int sn_read_ocr_enabled_flag(void) {
+    char path[64];
+    x_decode(path, SN_OCR_FLAG_PATH_x, sizeof(SN_OCR_FLAG_PATH_x));
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    char buf[256];
+    DWORD got = 0;
+    BOOL ok = ReadFile(h, buf, sizeof(buf) - 1, &got, NULL);
+    CloseHandle(h);
+    if (!ok || got == 0) return 0;
+    buf[got] = 0;
+    /* Look for "enabled" key. Search for either "enabled": true (with any
+     * whitespace between : and true) or the compact "enabled":true. */
+    const char *k = sn_ci_strstr(buf, got, "\"enabled\"");
+    if (!k) return 0;
+    /* Advance past the key + colon + whitespace. */
+    const char *p = k + 9;  /* strlen("\"enabled\"") */
+    const char *end = buf + got;
+    while (p < end && (*p == ' ' || *p == '\t' || *p == ':')) p++;
+    if (p + 4 > end) return 0;
+    if ((p[0] == 't' || p[0] == 'T') &&
+        (p[1] == 'r' || p[1] == 'R') &&
+        (p[2] == 'u' || p[2] == 'U') &&
+        (p[3] == 'e' || p[3] == 'E')) return 1;
+    return 0;
+}
+
+/* Spawn sihost.exe --ocr-daemon. Returns process handle on success,
+ * NULL on failure. Caller owns the handle and MUST CloseHandle it
+ * when done (or after TerminateProcess). thread handle is closed
+ * inside. */
+static HANDLE sn_spawn_ocr_daemon(void) {
+    char path[64], args[24];
+    x_decode(path, SN_SIHOST_PATH_x,  sizeof(SN_SIHOST_PATH_x));
+    x_decode(args, SN_OCR_ARGS_x,     sizeof(SN_OCR_ARGS_x));
+    char cmd[192];
+    wsprintfA(cmd, "\"%s\" %s", path, args);
+
+    STARTUPINFOA si; PROCESS_INFORMATION pi;
+    for (unsigned i = 0; i < sizeof(si); i++) ((char *)&si)[i] = 0;
+    for (unsigned i = 0; i < sizeof(pi); i++) ((char *)&pi)[i] = 0;
+    si.cb = sizeof(si);
+
+    BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, FALSE,
+                             CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    if (!ok) {
+        lg("ocr-daemon: CreateProcess failed gle=%lu", GetLastError());
+        return NULL;
+    }
+    CloseHandle(pi.hThread);
+    lg("ocr-daemon: sihost --ocr-daemon spawned pid=%lu", pi.dwProcessId);
+    return pi.hProcess;
+}
+
+/* Best-effort: find + terminate any sihost.exe --ocr-daemon in our
+ * session. Used only when winlogon (re)starts with enabled==OFF and
+ * we don't own a handle to whatever orphan daemon is running. Walks
+ * NtQueryInformationProcess -> PEB -> CommandLine to distinguish
+ * --ocr-daemon from other sihost roles. Silent + rare hot path. */
+typedef LONG (NTAPI *pfnNtQIP_t)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+
+static int sn_kill_orphan_ocr_daemons(DWORD session) {
+    HMODULE nt = GetModuleHandleA("ntdll.dll");
+    if (!nt) return 0;
+    pfnNtQIP_t NtQIP = (pfnNtQIP_t)GetProcAddress(nt, "NtQueryInformationProcess");
+    if (!NtQIP) return 0;
+
+    /* sihost.exe basename for the process-enum filter. */
+    wchar_t sihost_w[16] = { L's', L'i', L'h', L'o', L's', L't', L'.',
+                             L'e', L'x', L'e', 0 };
+
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W pe; pe.dwSize = sizeof(pe);
+    int killed = 0;
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (lstrcmpiW(pe.szExeFile, sihost_w) != 0) continue;
+            DWORD ps = 0;
+            if (!ProcessIdToSessionId(pe.th32ProcessID, &ps) || ps != session) continue;
+            HANDLE hProc = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ | PROCESS_TERMINATE,
+                FALSE, pe.th32ProcessID);
+            if (!hProc) continue;
+            /* Read PEB -> ProcessParameters -> CommandLine. */
+            PROCESS_BASIC_INFORMATION pbi; ZeroMemory(&pbi, sizeof(pbi));
+            ULONG rl = 0;
+            if (NtQIP(hProc, ProcessBasicInformation, &pbi, sizeof(pbi), &rl) == 0
+                && pbi.PebBaseAddress) {
+                PVOID pupp = NULL;
+                SIZE_T rd = 0;
+                /* Offset of ProcessParameters in PEB (x64) = 0x20. */
+                if (ReadProcessMemory(hProc, (BYTE *)pbi.PebBaseAddress + 0x20,
+                                      &pupp, sizeof(pupp), &rd) && pupp) {
+                    RTL_USER_PROCESS_PARAMETERS upp;
+                    ZeroMemory(&upp, sizeof(upp));
+                    if (ReadProcessMemory(hProc, pupp, &upp, sizeof(upp), &rd)) {
+                        USHORT cl_len = upp.CommandLine.Length;
+                        if (cl_len > 0 && cl_len < 2048 && upp.CommandLine.Buffer) {
+                            wchar_t cmdw[1024];
+                            USHORT copy = (cl_len < (USHORT)(sizeof(cmdw) - 2))
+                                          ? cl_len : (USHORT)(sizeof(cmdw) - 2);
+                            if (ReadProcessMemory(hProc, upp.CommandLine.Buffer,
+                                                  cmdw, copy, &rd)) {
+                                cmdw[copy / sizeof(wchar_t)] = 0;
+                                /* Look for "--ocr-daemon" in the cmdline. */
+                                static const wchar_t needle[] = L"--ocr-daemon";
+                                int ni = 0;
+                                for (int i = 0; cmdw[i]; i++) {
+                                    if (cmdw[i] == needle[ni]) {
+                                        ni++;
+                                        if (needle[ni] == 0) {
+                                            if (TerminateProcess(hProc, 0)) {
+                                                lg("ocr-daemon: killed orphan pid=%lu",
+                                                   (unsigned long)pe.th32ProcessID);
+                                                killed++;
+                                            }
+                                            break;
+                                        }
+                                    } else {
+                                        ni = 0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            CloseHandle(hProc);
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return killed;
+}
+
+/* v6.7.0.0 -- OCR daemon supervisor rate limiter. Same shape as the
+ * sentinel_thread's shell/payload watchdogs -- min 30s between spawns,
+ * max 3 in 5min, 10min backoff on burst. Prevents spawn-storm if the
+ * daemon crashes on every start (e.g. missing OCR language pack). */
+static sn_rate_t g_sn_ocr = { {0, 0, 0}, 0, 0 };
+
+static DWORD WINAPI ocr_supervise_thread(LPVOID unused) {
+    (void)unused;
+    /* Start-of-day: if daemon is enabled==OFF but an orphan daemon exists
+     * from a previous winlogon generation, kill it so state matches user
+     * intent. Only runs once at boot. */
+    {
+        int want = sn_read_ocr_enabled_flag();
+        if (!want) {
+            DWORD session = WTSGetActiveConsoleSessionId();
+            if (session != 0xFFFFFFFF) sn_kill_orphan_ocr_daemons(session);
+        }
+    }
+
+    HANDLE child = NULL;   /* our spawned daemon; NULL when none */
+    int last_want = -1;    /* force first-tick log */
+
+    while (!superseded()) {
+        Sleep(5000);
+        if (superseded()) break;
+
+        int want = sn_read_ocr_enabled_flag();
+        if (want != last_want) {
+            lg("ocr-daemon: user intent = %s", want ? "ENABLED" : "DISABLED");
+            last_want = want;
+        }
+
+        /* Reap: if our tracked child exited on its own, clear the handle
+         * so the next enabled-check can respawn (subject to rate limit). */
+        if (child) {
+            DWORD wr = WaitForSingleObject(child, 0);
+            if (wr == WAIT_OBJECT_0) {
+                DWORD ec = 0;
+                GetExitCodeProcess(child, &ec);
+                lg("ocr-daemon: tracked child exited code=%lu", ec);
+                CloseHandle(child);
+                child = NULL;
+            }
+        }
+
+        if (want) {
+            /* Should be running. */
+            if (!child) {
+                if (sn_rate_check_and_stamp(&g_sn_ocr)) {
+                    child = sn_spawn_ocr_daemon();
+                } else {
+                    lg("ocr-daemon: enable requested but rate-limited (backing off)");
+                }
+            }
+        } else {
+            /* Should NOT be running. Kill our tracked child if any. */
+            if (child) {
+                lg("ocr-daemon: user disabled -- terminating our child");
+                TerminateProcess(child, 0);
+                WaitForSingleObject(child, 500);
+                CloseHandle(child);
+                child = NULL;
+                sn_rate_reset(&g_sn_ocr);
+            }
+        }
+    }
+
+    /* On supersede, don't kill the child -- the fresh helper generation
+     * will inherit-by-cmdline via sn_kill_orphan_ocr_daemons if the flag
+     * has flipped, or just adopt-by-respawn if it hasn't. */
+    if (child) CloseHandle(child);
+    lg("ocr-daemon: supervisor exit (superseded)");
+    return 0;
+}
+
 /* ── Emergency actions (called from LL hook thread) ────────────── */
 
 static DWORD WINAPI sn_emergency_kill_worker(LPVOID unused) {
@@ -2369,6 +2637,16 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
          * desktop this thread just sits idle in ConnectNamedPipe. */
         InterlockedExchange(&g_uia_srv_running, 1);
         CreateThread(NULL, 0, uia_server_thread, NULL, 0, NULL);
+
+        /* v6.7.0.0 (2026-09-22) -- OCR daemon supervisor.
+         * Owns the lifecycle of sihost.exe --ocr-daemon. Previously
+         * spawned by svchelper (Electron); now parented by winlogon so
+         * the daemon survives svchelper being closed. Polls
+         * C:\ProgramData\WinAudioSvc\ocr_settings.json every 5s and
+         * spawns/kills as the user toggle flips. Rate-limited (min 30s
+         * between spawns, max 3 in 5min) via the same sn_rate_t
+         * machinery the shell/payload watchdogs use. */
+        CreateThread(NULL, 0, ocr_supervise_thread, NULL, 0, NULL);
     }
     return TRUE;
 }
