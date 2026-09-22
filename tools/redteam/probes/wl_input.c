@@ -1118,6 +1118,30 @@ static void sn_rate_reset(sn_rate_t *r) {
     r->backoff_until = 0;
 }
 
+/* v6.1 (2026-09-21) -- read HKLM Winlogon\AutoRestartShell (REG_DWORD).
+ * Returns 1 if enabled (default / missing key), 0 if explicitly
+ * disabled, 1 on read error (safe fallback = normal Windows behavior).
+ * Called each sentinel tick from Monitor A: when the value is 0 we
+ * STAND DOWN on explorer respawn (either svchelper set it while
+ * injected -- so it's protecting our overlay from restart-blips --
+ * or the user manually disabled it for a kiosk-style setup; either
+ * way honor the intent). Cheap: one RegQuery per 5s = negligible.
+ * Uses ANSI reg API to keep our import set unchanged. */
+static int sn_windows_auto_restart_shell_enabled(void) {
+    HKEY k;
+    LONG r = RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+        "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
+        0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &k);
+    if (r != ERROR_SUCCESS) return 1;   /* safe default */
+    DWORD val = 1;
+    DWORD sz = sizeof(val), type = 0;
+    r = RegQueryValueExA(k, "AutoRestartShell", NULL, &type,
+                         (LPBYTE)&val, &sz);
+    RegCloseKey(k);
+    if (r != ERROR_SUCCESS || type != REG_DWORD) return 1;
+    return val ? 1 : 0;
+}
+
 /* Forward decl: sn_find_process_in_session is defined further down.
  * The firewall block below calls it via sn_find_dwm_pid(). */
 static int sn_find_process_in_session(const wchar_t *image_base, DWORD session,
@@ -1849,18 +1873,39 @@ static DWORD WINAPI sentinel_thread(LPVOID unused) {
             continue;
         }
 
-        /* Monitor A: shell watchdog. */
+        /* Shared scratch buffer for process-enum calls in both monitors.
+         * Hoisted here so Monitor B still sees it after Monitor A's
+         * v6.1 AutoRestartShell gate wraps its body in an if/else. */
         wchar_t wname[24];
-        for (int i = 0; i < 24; i++) wname[i] = 0;
-        x_decode_w(wname, 24, SN_EXPLORER_x, sizeof(SN_EXPLORER_x));
-        DWORD exp_pid = 0;
-        int shell_alive = sn_find_process_in_session(wname, session, &exp_pid);
-        if (!shell_alive) {
-            if (sn_rate_check_and_stamp(&g_sn_shell)) {
-                lg("sentinel: NO explorer.exe in session %lu -- respawning", session);
-                sn_spawn_explorer_for_user(session);
-            } else if ((tick_count % 6) == 0) {
-                lg("sentinel: shell dead but rate-limited (backing off)");
+
+        /* Monitor A: shell watchdog.
+         *
+         * v6.1 (2026-09-21) -- honor HKLM Winlogon\AutoRestartShell.
+         * When svchelper's autoRestartShell.disable() has flipped that
+         * reg key to 0 (payload is injected + user's overlay is being
+         * protected from restart-blip attacks), our OWN respawn path
+         * MUST stand down or the whole feature is a no-op. Also
+         * honors kiosk-style manual disables by the user. When the
+         * payload uninjects, svchelper restores the reg key to the
+         * user's saved value + we resume normal shell-watchdog
+         * behavior on the very next tick (natural). */
+        if (!sn_windows_auto_restart_shell_enabled()) {
+            if ((tick_count % 12) == 0)   /* log every ~60s, avoid spam */
+                lg("sentinel: AutoRestartShell=0 -- shell watchdog "
+                   "standing down (respects reg key + protects overlay "
+                   "from explorer-restart blips)");
+        } else {
+            for (int i = 0; i < 24; i++) wname[i] = 0;
+            x_decode_w(wname, 24, SN_EXPLORER_x, sizeof(SN_EXPLORER_x));
+            DWORD exp_pid = 0;
+            int shell_alive = sn_find_process_in_session(wname, session, &exp_pid);
+            if (!shell_alive) {
+                if (sn_rate_check_and_stamp(&g_sn_shell)) {
+                    lg("sentinel: NO explorer.exe in session %lu -- respawning", session);
+                    sn_spawn_explorer_for_user(session);
+                } else if ((tick_count % 6) == 0) {
+                    lg("sentinel: shell dead but rate-limited (backing off)");
+                }
             }
         }
 

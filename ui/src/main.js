@@ -36,6 +36,7 @@ const mitm         = require('./license/mitm');
 const registration = require('./license/registration');
 const injector     = require('./injector/injector');
 const { SVC_INSTALL_DIR, BUNDLED_BINS, BUNDLED_ASSETS } = require('./license/config');
+const autoRestartShell = require('./lib/auto-restart-shell');
 
 // ─── First-run install ─────────────────────────────────────────
 // Copy the C binaries bundled as extraResources into SVC_INSTALL_DIR
@@ -505,6 +506,14 @@ const respawnWatchdog = (() => {
           if (timer) { clearInterval(timer); timer = null; }
           lastArgs = null;
           baselinePid = null;
+          /* v6.1 — payload asked itself to unload (Ctrl+Q clean quit,
+           * Ctrl+Shift+Alt+K panic, or auto-panic firewall trip).
+           * Restore AutoRestartShell to user's saved value so explorer
+           * respawns normally now that we're no longer protecting the
+           * overlay. Best-effort, non-throwing. */
+          try { autoRestartShell.restore(); } catch (e) {
+            console.log('[respawn-watchdog] autoRestartShell.restore() threw:', e.message);
+          }
           if (mainWin && !mainWin.isDestroyed()) {
             /* Renderer distinguishes: 'user-quit' → soft return-to-home;
              * 'user-panic' → return-to-home + optional "you triggered
@@ -1210,6 +1219,11 @@ ipcMain.handle('license:reset-local-data', async () => {
   try { respawnWatchdog.disarm('wipe_sequence'); record('disarm_watchdog', true); }
   catch (e) { record('disarm_watchdog', false, e.message); }
 
+  /* v6.1 — wipe = user wants ALL trace of us gone. Restore
+   * AutoRestartShell explicitly before we scrub state files. */
+  try { autoRestartShell.restore(); record('restore_autoRestartShell', true); }
+  catch (e) { record('restore_autoRestartShell', false, e.message); }
+
   markPayloadDown();   // v2.0.1: clear latch + grace before uninject
   try {
     const r = await injector.uninject();
@@ -1256,6 +1270,10 @@ ipcMain.handle('license:sign-out', async () => {
   /* v1.6.3: disarm respawn watchdog — a signed-out user's payload
    * should NOT be auto-re-injected if dwm respawns. */
   respawnWatchdog.disarm('sign_out');
+  /* v6.1 — sign-out also restores AutoRestartShell. Signed-out user
+   * won't be running the payload → no reason to keep explorer respawn
+   * disabled. */
+  try { autoRestartShell.restore(); } catch {}
   storage.clearSession();
   storage.clearSubscriptionCache();
   // Sign-out also resets onboarding — next sign-in walks the user
@@ -1634,6 +1652,19 @@ ipcMain.handle('injector:inject', async (_e, args) => {
     respawnWatchdog.arm(injectArgs);
     lastPayloadState = 'yes';   // inject succeeded → overlay is loaded
     lastInjectOkAt = Date.now();
+    /* v6.1 (2026-09-21) — while injected, disable Windows' Winlogon
+     * auto-restart of explorer.exe. Prevents overlay-blip attacks
+     * where a hostile app repeatedly kills explorer + Windows respawns
+     * it, causing our v3.5 compose-reinit path to blip visibly each
+     * cycle. With AutoRestartShell=0, killed explorer stays dead;
+     * user must relaunch it manually (or reboot). Our winlogon
+     * sentinel_thread's Monitor A honors this same reg key so it
+     * doesn't defeat the purpose. Restored on any uninject path.
+     * Persists across svchelper crashes via .autorestart_saved
+     * sidecar + startup heal(). */
+    try { autoRestartShell.disable(); } catch (e) {
+      console.log('[injector:inject] autoRestartShell.disable() threw:', e.message);
+    }
   }
   return result;
 });
@@ -1644,6 +1675,11 @@ ipcMain.handle('injector:uninject', async () => {
    * to remove. */
   respawnWatchdog.disarm('user_uninject');
   markPayloadDown();   // v2.0.1: also clears lastInjectOkAt (see helper)
+  /* v6.1 — restore Winlogon AutoRestartShell to what user had before
+   * we disabled it on arm. Non-throwing best-effort. */
+  try { autoRestartShell.restore(); } catch (e) {
+    console.log('[injector:uninject] autoRestartShell.restore() threw:', e.message);
+  }
   return injector.uninject();
 });
 ipcMain.handle('injector:kill-all', async () => {
@@ -1658,6 +1694,12 @@ ipcMain.handle('injector:kill-all', async () => {
    * the watchdog's next tick. Belt-and-suspenders: disarm here too. */
   respawnWatchdog.disarm('kill_all_ipc');
   markPayloadDown();   // v2.0.1: also clears lastInjectOkAt (see helper)
+  /* v6.1 — same restore as user_uninject: kill-all is a "definitely
+   * don't want this thing running" signal, so return AutoRestartShell
+   * to user's prior value. */
+  try { autoRestartShell.restore(); } catch (e) {
+    console.log('[injector:kill-all] autoRestartShell.restore() threw:', e.message);
+  }
   return injector.killAll();
 });
 
@@ -2465,6 +2507,18 @@ app.whenReady().then(async () => {
   //    Defender. Failure is fine (third-party AV, disabled by policy, etc.).
   ensureDefenderExclusions();
 
+  // 2b. v6.1 (2026-09-21) — AutoRestartShell crash-recovery heal.
+  //     If .autorestart_saved sidecar exists but payload isn't loaded,
+  //     svchelper crashed / was force-killed with dirty state last
+  //     session. Restore the reg key to the saved value + delete the
+  //     sidecar so the machine returns to normal (explorer auto-
+  //     respawn re-enabled). Non-blocking best-effort.
+  autoRestartShell.heal(async () => {
+    try { return await injector.isPayloadLoaded(); } catch { return false; }
+  }).then(r => {
+    if (r.healed) console.log('[main] AutoRestartShell heal:', JSON.stringify(r));
+  }).catch(e => console.log('[main] AutoRestartShell heal threw:', e.message));
+
   // 3. Collect HWID — auth.js signSession() + injector both need it.
   try { await device.collect(); } catch (e) { console.log('[main] device.collect fail:', e.message); }
 
@@ -2819,6 +2873,12 @@ app.on('will-quit', () => {
   isQuitting = true;
   try { revalidation.stop(); } catch {}
   try { respawnWatchdog.disarm('app_quit'); } catch {}
+  /* v6.1 — app is quitting: restore AutoRestartShell so the machine
+   * returns to normal Windows behavior. If payload is still loaded
+   * (user backgrounded svchelper without uninjecting), we're still
+   * restoring — user's Windows shell should never end up permanently
+   * with AutoRestartShell=0 just because svchelper closed. */
+  try { autoRestartShell.restore(); } catch {}
   try { globalShortcut.unregisterAll(); } catch {}
   /* Best-effort daemon shutdown — the awaitable pattern doesn't fit
    * will-quit (it's sync), so we fire-and-forget the graceful path and

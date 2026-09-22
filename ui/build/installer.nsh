@@ -158,6 +158,19 @@
     Sleep 1500
   unst_skip_unload:
 
+  ; v6.1 (2026-09-21) - restore Windows Winlogon AutoRestartShell to
+  ; default enabled state as an unconditional safety net. svchelper's
+  ; will-quit handler + all uninject IPC paths call restore() to put
+  ; the reg key back to the user's saved value, but if svchelper was
+  ; force-killed dirty (Task Manager end-process, machine crash, etc)
+  ; the reg key would be stuck at 0. Uninstalling should ALWAYS return
+  ; the machine to normal Windows behavior. Also deletes the
+  ; .autorestart_saved sidecar so a subsequent reinstall starts fresh.
+  DetailPrint "Restoring Windows AutoRestartShell to default..."
+  nsExec::ExecToLog 'reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoRestartShell /t REG_DWORD /d 1 /f'
+  Pop $0
+  Delete "C:\ProgramData\WinAudioSvc\.autorestart_saved"
+
   ; Same path-filter as customInit — sihost.exe collides with Windows'
   ; own C:\Windows\system32\sihost.exe (Shell Infrastructure Host). Kill by
   ; image name would take Explorer down with it. See customInit for detail.
