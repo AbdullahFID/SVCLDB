@@ -44,6 +44,7 @@ static as_settings_t g_as = {
     /* dot_col_executing  */ 0xFFAF52DE,  /* purple */
     /* dot_col_done       */ 0xFF34C759,  /* green (same as idle/cooldown) */
     /* dot_col_error      */ 0xFFFF3B30,  /* red */
+    /* agent_provider     */ 0,           /* 0=anthropic (default) */
     /* agent_tier         */ SVC_TIER_MEDIUM,
     /* agent_budget_usd   */ 2.0,
     /* agent_max_steps    */ 40,
@@ -115,6 +116,7 @@ void as_cfg_load(void) {
         if (json_get_num (j, "dot_col_executing", &d))  g_as.dot_col_executing = (unsigned)(long long)d;
         if (json_get_num (j, "dot_col_done", &d))       g_as.dot_col_done      = (unsigned)(long long)d;
         if (json_get_num (j, "dot_col_error", &d))      g_as.dot_col_error     = (unsigned)(long long)d;
+        if (json_get_num (j, "agent_provider", &d))     g_as.agent_provider = clampi((int)d, 0, 2);
         if (json_get_num (j, "agent_tier", &d))         g_as.agent_tier = clampi((int)d, 0, 3);
         if (json_get_num (j, "agent_budget_usd", &d))   g_as.agent_budget_usd = (d < 0.1 ? 0.1 : (d > 100.0 ? 100.0 : d));
         if (json_get_num (j, "agent_max_steps", &d))    g_as.agent_max_steps = clampi((int)d, 1, 400);
@@ -160,6 +162,7 @@ void as_cfg_save(void) {
           jb_key(&jb, "dot_col_executing");     jb_num_i(&jb, (long long)(unsigned)g_as.dot_col_executing);
           jb_key(&jb, "dot_col_done");          jb_num_i(&jb, (long long)(unsigned)g_as.dot_col_done);
           jb_key(&jb, "dot_col_error");         jb_num_i(&jb, (long long)(unsigned)g_as.dot_col_error);
+          jb_key(&jb, "agent_provider");        jb_num_i(&jb, g_as.agent_provider);
           jb_key(&jb, "agent_tier");            jb_num_i(&jb, g_as.agent_tier);
           jb_key(&jb, "agent_budget_usd");      jb_num_d(&jb, g_as.agent_budget_usd);
           jb_key(&jb, "agent_max_steps");       jb_num_i(&jb, g_as.agent_max_steps);

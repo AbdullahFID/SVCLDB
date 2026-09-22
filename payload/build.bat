@@ -69,6 +69,10 @@ set C_SOURCES=^
  "%SRC%\input\actions.c" ^
  "%SRC%\autosolver\as_cfg.c" "%SRC%\autosolver\solve.c" ^
  "%SRC%\agent\agent_loop.c" ^
+ "%SRC%\agent\cu_common.c" ^
+ "%SRC%\agent\cu_anthropic.c" ^
+ "%SRC%\agent\cu_openai.c" ^
+ "%SRC%\agent\cu_gemini.c" ^
  "%SRC%\dllmain.c"
 
 set CXX_SOURCES=^

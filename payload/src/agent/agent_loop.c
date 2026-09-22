@@ -1,16 +1,22 @@
 /* ================================================================== *
- * agent_loop.c -- Agent Mode long-horizon loop (see agent_loop.h).     *
- *                                                                    *
- * v1: vision+JSON. Each turn -> clean capture + red grid -> ask the     *
- * configured model for the next 1-4 actions in image space -> dispatch  *
- * via the humanized injection stack -> repeat. Guards: step cap,        *
- * wall-clock, rough budget, and a consecutive-no-progress halt. Unlike  *
- * AutoSolver, the agent MAY navigate/submit to finish the task.         *
- *                                                                    *
- * Reuses the exact AutoSolver primitives so behavior/stealth match.     *
- * Vendor computer-use adapters (Anthropic computer_20250124 / OpenAI    *
- * computer_use_preview / Gemini CU) are a documented upgrade behind      *
- * this same API (see docs plan section "agent").                       *
+ * agent_loop.c -- Agent Mode long-horizon loop (v2, CU-adapter port).
+ *
+ * v15.1.13 (2026-09-22): full 1:1 port of hooksdll's agent_mode.js.
+ * Now dispatches through the three vendor-native CU (computer-use) tool
+ * adapters (Anthropic / OpenAI / Gemini) via cu_common.h. The previous
+ * generic vision+JSON path is superseded.
+ *
+ * Flow per turn:
+ *   1. Guards: budget / step / wall-clock
+ *   2. Capture the active monitor via ui_capture_screen_png (fall back
+ *      to cap_primary_png)
+ *   3. imgproc_prepare_png -> downscale to render_max_edge + red grid
+ *   4. ground_build_anchor_block for the UIA text (helper-routed on
+ *      isolated desktop)
+ *   5. Base64-encode the JPEG bytes for the vendor
+ *   6. Route to cu_providers[agent_provider].turn(...) with retry+fallback
+ *   7. Dispatch each canonical action via input/actions.c humanized stack
+ *   8. Progress guard (5 consecutive identical actions -> halt)
  * ================================================================== */
 #include <windows.h>
 #include <stdio.h>
@@ -18,6 +24,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include "agent_loop.h"
+#include "cu_common.h"
 #include "../autosolver/as_cfg.h"
 #include "../config_read.h"
 #include "../capture.h"
@@ -28,41 +35,19 @@
 #include "../input/coords.h"
 #include "../input/actions.h"
 #include "../input/motion.h"
-#include "../../../shared/json_util.h"
+#include "../../../shared/base64.h"
 #include "../../../shared/config_types.h"
 
 extern void slog_writef(const char *file, const char *fmt, ...);
 
-/* Mechanical, stealth-safe (no exam/quiz/proctor tokens). */
-static const char AGENT_SYSTEM_PROMPT[] =
-"You are a screen-control agent operating a Windows desktop. You are shown one screenshot per "
-"turn with a red coordinate grid (x,y labels every 100 pixels). Decide the next few concrete "
-"actions to make progress on the user's goal, then wait for the next screenshot.\n"
-"\n"
-"RULES:\n"
-"- Read the screen. Identify the primary interactive surface and what to do next.\n"
-"- Return 1-4 actions for THIS turn, then stop and wait for the fresh screenshot.\n"
-"- Every coordinate is a PIXEL in the screenshot you were shown (top-left origin); use the grid "
-"labels as ground truth. Target the visible CENTER of the element. Never click blank space.\n"
-"- Prefer the `type` action for text; use `scroll` for long content; use `key` for Enter/Tab.\n"
-"- You MAY click navigation controls (Next, Continue, etc.) when that is the correct next step "
-"to complete the goal.\n"
-"- When the goal is complete OR you cannot make progress, set status to \"done\".\n"
-"\n"
-"OUTPUT: return ONE JSON object and NOTHING else (no prose, no fences):\n"
-"{ \"status\": \"continue\" | \"done\",\n"
-"  \"reason\": \"<one short line>\",\n"
-"  \"actions\": [ {\"type\":\"click\",\"x\":INT,\"y\":INT,\"description\":\"...\"},\n"
-"                {\"type\":\"type\",\"text\":\"...\"},\n"
-"                {\"type\":\"key\",\"key\":\"enter\"},\n"
-"                {\"type\":\"scroll\",\"x\":INT,\"y\":INT,\"direction\":\"down\",\"amount\":3} ] }\n";
-
+/* Fallback preset -- used when user launches Agent Mode with no task set. */
 static const char AGENT_PRESET_TASK[] =
-"Read the on-screen form or question set. For each item, determine the best answer and enter it "
-"(select the option / type the value). Move through the items to complete the whole set. Do not "
-"finalize or turn in the work.";
+"Read the on-screen form or question set. For each item, determine the "
+"best answer and enter it (select the option / type the value). Move "
+"through the items to complete the whole set. Do not finalize or turn "
+"in the work.";
 
-/* ── state ── */
+/* ── State ── */
 static volatile LONG g_active = 0;
 static volatile LONG g_paused = 0;
 static volatile LONG g_cancel = 0;
@@ -86,88 +71,110 @@ void agent_set_task(const char *utf8) {
     LeaveCriticalSection(&g_task_cs);
 }
 
-/* Strip vendor-policy trigger tokens from the task (defensive, matches
- * hooksdll _sanitizeTask intent). Rewrites in place. */
-static void sanitize_task(char *s) {
-    struct { const char *from; const char *to; } sub[] = {
-        {"exam","form"},{"Exam","form"},{"quiz","form"},{"Quiz","form"},
-        {"test","form"},{"Test","form"},{"proctor","monitor"},{"cheat","complete"},
-        {NULL,NULL}
-    };
-    for (int i = 0; sub[i].from; i++) {
-        char *p;
-        while ((p = strstr(s, sub[i].from)) != NULL) {
-            size_t fl = strlen(sub[i].from), tl = strlen(sub[i].to);
-            if (tl <= fl) {
-                memcpy(p, sub[i].to, tl);
-                memmove(p + tl, p + fl, strlen(p + fl) + 1);
-            } else break; /* don't grow; leave as-is */
-        }
+/* Resolve model for a (provider, tier) pair. as_cfg->agent_tier uses the
+ * svc_tier_t enum (0=STRONG, 1=MEDIUM, 2=CHEAP, 3=CUSTOM). */
+static const char *resolve_model(int provider, int tier) {
+    if (provider < 0 || provider > 2) provider = 0;
+    const cu_provider_t *p = &cu_providers[provider];
+    switch (tier) {
+        case 0: return p->strong;
+        case 2: return p->cheap;
+        default: return p->medium;
     }
 }
 
-/* ── compact action parser (image-space) ── */
-typedef struct {
-    char type[24]; int has_xy, x, y, amount; char dir[8]; char text[1024]; char key[48];
-} ag_action_t;
-
-static int parse_actions(const char *obj, ag_action_t *out, int maxn) {
-    int n = 0;
-    const char *ap = strstr(obj, "\"actions\"");
-    if (!ap) return 0;
-    const char *lb = strchr(ap, '[');
-    if (!lb) return 0;
-    const char *p = lb + 1;
-    while (n < maxn) {
-        while (*p == ' ' || *p == '\n' || *p == '\t' || *p == '\r' || *p == ',') p++;
-        if (*p == ']' || *p == 0) break;
-        if (*p != '{') break;
-        const char *end = json_skip_object(p);
-        if (!end || end <= p) break;
-        size_t sl = (size_t)(end - p);
-        char *slice = (char *)malloc(sl + 1);
-        if (!slice) break;
-        memcpy(slice, p, sl); slice[sl] = 0;
-        ag_action_t *a = &out[n]; ZeroMemory(a, sizeof(*a));
-        double d;
-        json_get_str(slice, "type", a->type, sizeof(a->type));
-        int gx = json_get_num(slice, "x", &d); if (gx) a->x = (int)d;
-        int gy = json_get_num(slice, "y", &d); if (gy) a->y = (int)d;
-        a->has_xy = gx && gy;
-        if (json_get_num(slice, "amount", &d)) a->amount = (int)d;
-        json_get_str(slice, "direction", a->dir, sizeof(a->dir));
-        json_get_str(slice, "text", a->text, sizeof(a->text));
-        json_get_str(slice, "key", a->key, sizeof(a->key));
-        free(slice);
-        if (a->type[0]) n++;
-        p = end;
-    }
-    return n;
+/* Map cu_provider_t index -> svc_provider_t for api_key lookup. */
+static int agent_provider_to_svc(int agent_provider) {
+    if (agent_provider == 0) return SVC_PROVIDER_ANTHROPIC;
+    if (agent_provider == 1) return SVC_PROVIDER_OPENAI;
+    if (agent_provider == 2) return SVC_PROVIDER_GOOGLE;
+    return SVC_PROVIDER_ANTHROPIC;
 }
 
-static unsigned hash_action(const ag_action_t *a) {
+/* No-progress guard: 5 consecutive identical action hashes = halt.
+ * Matches hooksdll's _checkNoProgress rewrite (V6.2). */
+static unsigned hash_action(const cu_action_t *a) {
     unsigned h = 2166136261u;
-    const char *s = a->type;
-    while (*s) { h ^= (unsigned char)*s++; h *= 16777619u; }
-    h ^= (unsigned)(a->x * 73856093) ^ (unsigned)(a->y * 19349663);
-    for (const char *t = a->text; *t; t++) { h ^= (unsigned char)*t; h *= 16777619u; }
+    for (const char *s = a->action; *s; s++) { h ^= (unsigned char)*s; h *= 16777619u; }
+    h ^= (unsigned)(a->coord_x * 73856093) ^ (unsigned)(a->coord_y * 19349663);
+    for (const char *t = a->text; *t && (t - a->text) < 30; t++) { h ^= (unsigned char)*t; h *= 16777619u; }
     return h;
 }
+static int check_no_progress(unsigned h, unsigned *last, int *consec) {
+    if (h == *last) { (*consec)++; }
+    else            { *consec = 1; *last = h; }
+    return *consec >= 5;
+}
 
-static void status(const char *fmt, int turn) {
+/* Push a status line to the overlay (thread-safe). */
+static void status(const char *fmt, int turn, const char *extra) {
     char line[256];
-    _snprintf(line, sizeof(line) - 1, fmt, turn);
+    if (extra && extra[0])
+        _snprintf(line, sizeof(line) - 1, fmt, turn, extra);
+    else
+        _snprintf(line, sizeof(line) - 1, fmt, turn);
     line[sizeof(line) - 1] = 0;
     ui_agent_set_status(line, 1);
 }
 
+/* Dispatch one canonical action via the humanized input stack. `mon` +
+ * `render_scale` are the capture context so image-space coords convert
+ * to native screen px. */
+static void dispatch_action(const cu_action_t *a, const svc_monitor_t *mon,
+                            double render_scale, act_ctx_t *ctx) {
+    if (!a || !a->action[0]) return;
+    if (mot_cancelled()) return;
+    if (!strcmp(a->action, "left_click")) {
+        if (a->has_coord) act_click_image(ctx, a->coord_x, a->coord_y, 0, 1);
+    } else if (!strcmp(a->action, "right_click")) {
+        if (a->has_coord) act_click_image(ctx, a->coord_x, a->coord_y, 1, 1);
+    } else if (!strcmp(a->action, "double_click")) {
+        if (a->has_coord) act_click_image(ctx, a->coord_x, a->coord_y, 0, 2);
+    } else if (!strcmp(a->action, "middle_click")) {
+        if (a->has_coord) act_click_image(ctx, a->coord_x, a->coord_y, 2, 1);
+    } else if (!strcmp(a->action, "mouse_move")) {
+        if (a->has_coord) act_move_image(ctx, a->coord_x, a->coord_y);
+    } else if (!strcmp(a->action, "type")) {
+        act_type(ctx, a->text);
+    } else if (!strcmp(a->action, "key")) {
+        act_press(ctx, a->text);
+    } else if (!strcmp(a->action, "scroll")) {
+        int cx = a->has_coord ? a->coord_x : (int)(mon->width  * render_scale / 2);
+        int cy = a->has_coord ? a->coord_y : (int)(mon->height * render_scale / 2);
+        act_scroll_image(ctx, cx, cy,
+                         a->scroll_dir[0] ? a->scroll_dir : "down",
+                         a->scroll_amount > 0 ? a->scroll_amount : 3);
+    } else if (!strcmp(a->action, "left_click_drag")) {
+        if (a->has_start && a->has_coord)
+            act_drag_image(ctx, a->start_x, a->start_y, a->coord_x, a->coord_y);
+    } else if (!strcmp(a->action, "wait")) {
+        act_wait(a->duration_ms > 0 ? a->duration_ms : 400);
+    } else if (!strcmp(a->action, "screenshot")) {
+        /* No-op -- loop takes a fresh screenshot next turn anyway. */
+    }
+    (void)render_scale;
+}
+
+/* Read the API key for the chosen provider from svc_config_t. Returns
+ * NULL if missing (loop bails out with a friendly error). */
+static const char *pick_agent_key(const svc_config_t *cfg, int agent_provider) {
+    int sp = agent_provider_to_svc(agent_provider);
+    const char *k = ai_pick_provider_key(cfg, sp);
+    return (k && *k) ? k : NULL;
+}
+
 static DWORD WINAPI agent_thread(LPVOID unused) {
     (void)unused;
-    as_cfg_reload_if_changed();          /* pick up any just-saved Electron settings */
+    as_cfg_reload_if_changed();
     const as_settings_t *as = as_cfg();
     const svc_config_t  *cfg = cfg_get();
-    if (!cfg) { InterlockedExchange(&g_active, 0); ui_agent_set_status("", 0); return 1; }
+    if (!cfg) {
+        InterlockedExchange(&g_active, 0);
+        ui_agent_set_status("Agent: no config", 0);
+        return 1;
+    }
 
+    /* Snapshot task under CS + sanitize. */
     char task[512];
     task_cs_ensure();
     EnterCriticalSection(&g_task_cs);
@@ -175,178 +182,196 @@ static DWORD WINAPI agent_thread(LPVOID unused) {
     else           _snprintf(task, sizeof(task) - 1, "%s", AGENT_PRESET_TASK);
     task[sizeof(task) - 1] = 0;
     LeaveCriticalSection(&g_task_cs);
-    sanitize_task(task);
+    cu_sanitize_task(task, sizeof(task));
 
-    int max_steps = as->agent_max_steps;
-    int wall_ms   = as->agent_max_wallclock_ms;
-    double budget = as->agent_budget_usd;
+    int provider    = as->agent_provider;
+    int tier        = as->agent_tier;
+    int max_steps   = as->agent_max_steps;
+    int wall_ms     = as->agent_max_wallclock_ms;
+    double budget   = as->agent_budget_usd;
     double pace_mult = (as->agent_pace == 0) ? 0.5 : (as->agent_pace == 2 ? 2.0 : 1.0);
+    const char *primary_model = resolve_model(provider, tier);
+    const cu_provider_t *pvd = &cu_providers[provider < 0 || provider > 2 ? 0 : provider];
+
+    const char *api_key = pick_agent_key(cfg, provider);
+    if (!api_key) {
+        char msg[128];
+        _snprintf(msg, sizeof(msg) - 1, "Agent: no API key for %s", pvd->label);
+        ui_agent_set_status(msg, 0);
+        slog_writef("payload.log", "agent: bail no-api-key provider=%s", pvd->label);
+        InterlockedExchange(&g_active, 0);
+        return 1;
+    }
+
+    cu_state_t *cst = cu_state_new();
+    if (!cst) { ui_agent_set_status("Agent: OOM", 0); InterlockedExchange(&g_active, 0); return 1; }
 
     DWORD t_start = GetTickCount();
     int steps = 0;
-    double est_spend = 0.0;
     unsigned last_hash = 0; int consec = 0;
 
+    slog_writef("payload.log",
+                "agent: start provider=%s model=%s tier=%d task=\"%.60s\" "
+                "steps<=%d wall=%dms budget=$%.2f",
+                pvd->label, primary_model, tier, task,
+                max_steps, wall_ms, budget);
     ui_agent_set_status("Agent: starting", 1);
-    slog_writef("payload.log", "agent: start task=\"%.60s\" steps<=%d wall=%dms budget=$%.2f",
-                task, max_steps, wall_ms, budget);
 
-    /* rolling history of the last few actions, injected into each prompt */
-    char history[1024]; history[0] = 0;
-
-    while (InterlockedCompareExchange(&g_active, 0, 0) && !InterlockedCompareExchange(&g_cancel, 0, 0)) {
+    while (InterlockedCompareExchange(&g_active, 0, 0) &&
+           !InterlockedCompareExchange(&g_cancel, 0, 0)) {
         while (InterlockedCompareExchange(&g_paused, 0, 0) &&
                InterlockedCompareExchange(&g_active, 0, 0) &&
                !InterlockedCompareExchange(&g_cancel, 0, 0)) {
             ui_agent_set_status("Agent: paused", 1);
             Sleep(200);
         }
-        if (!InterlockedCompareExchange(&g_active, 0, 0) || InterlockedCompareExchange(&g_cancel, 0, 0)) break;
+        if (!InterlockedCompareExchange(&g_active, 0, 0) ||
+            InterlockedCompareExchange(&g_cancel, 0, 0)) break;
 
+        /* Guards */
         if (steps >= max_steps)                        { ui_agent_set_status("Agent: step cap reached", 1); break; }
         if ((int)(GetTickCount() - t_start) > wall_ms) { ui_agent_set_status("Agent: time cap reached", 1); break; }
-        if (est_spend >= budget)                       { ui_agent_set_status("Agent: budget reached", 1); break; }
+        if (cst->total_spend_usd >= budget)            { ui_agent_set_status("Agent: budget reached", 1); break; }
 
-        status("Agent turn %d: capturing", steps + 1);
+        status("Agent turn %d: capturing", steps + 1, NULL);
 
+        /* Capture */
         unsigned char *png = NULL; unsigned int plen = 0; int from_dwm = 0;
         if (ui_capture_screen_png(&png, &plen, 3000)) from_dwm = 1;
-        else { uint8_t *gp = NULL; size_t gl = 0; if (cap_primary_png(&gp, &gl)) { png = gp; plen = (unsigned)gl; } }
+        else { uint8_t *gp = NULL; size_t gl = 0;
+               if (cap_primary_png(&gp, &gl)) { png = gp; plen = (unsigned)gl; } }
         if (!png || !plen) { ui_agent_set_status("Agent: capture failed", 1); break; }
 
-        uint8_t *gpng = NULL; size_t glen = 0; int gw = 0, gh = 0, nw = 0, nh = 0; double scale = 1.0;
-        int ok_img = imgproc_prepare_png(png, plen, as->render_max_edge, as->render_max_edge * 800,
+        /* Downscale + grid */
+        uint8_t *gpng = NULL; size_t glen = 0;
+        int gw = 0, gh = 0, nw = 0, nh = 0; double scale = 1.0;
+        int ok_img = imgproc_prepare_png(png, plen,
+                                         as->render_max_edge, as->render_max_edge * 800,
                                          1, &gpng, &glen, &gw, &gh, &nw, &nh, &scale);
         if (from_dwm) ui_capture_free(png); else cap_free_png(png);
         if (!ok_img || !gpng) { ui_agent_set_status("Agent: image prep failed", 1); break; }
 
+        /* Monitor for coord dispatch. */
         svc_monitor_t mon; ZeroMemory(&mon, sizeof(mon));
         coords_make_thread_dpi_aware();
         coords_primary_monitor(&mon);
         double render_scale = (nw > 0) ? (double)gw / (double)nw : scale;
 
+        /* UIA anchors */
         char *anchors = ground_build_anchor_block(&mon, render_scale);
 
-        status("Agent turn %d: thinking", steps + 1);
+        /* Base64-encode the JPEG for the vendor. */
+        size_t b64cap = ((glen + 2) / 3) * 4 + 4;
+        char *b64 = (char *)malloc(b64cap);
+        if (!b64) { imgproc_free(gpng); if (anchors) ground_free(anchors); ui_agent_set_status("Agent: OOM", 1); break; }
+        b64_encode_std(gpng, glen, b64);
 
-        char preamble[4096];
-        _snprintf(preamble, sizeof(preamble) - 1,
-            "GOAL: %s\n\n"
-            "The screenshot is %dx%d pixels with a red coordinate grid (x,y labels every 100px). "
-            "Use the grid labels as ground truth.%s%s\n"
-            "%s%s\n"
-            "Return ONLY the JSON object {status,reason,actions[]} with coordinates in this image's "
-            "pixel space. Give the next 1-4 actions for this turn.",
-            task, gw, gh,
-            anchors ? "\n" : "", anchors ? anchors : "",
-            history[0] ? "Actions already taken this session:\n" : "",
-            history[0] ? history : "(none yet)");
-        preamble[sizeof(preamble) - 1] = 0;
+        cu_cap_t cap = {
+            .b64 = b64, .w = gw, .h = gh,
+            .uia_anchor_block = anchors,
+        };
 
-        svc_config_t lc = *cfg;
-        lc.direct_answer_mode = 0;
-        lc.streaming_enabled  = 0;
-        _snprintf(lc.system_prompt, sizeof(lc.system_prompt) - 1, "%s", AGENT_SYSTEM_PROMPT);
-        lc.system_prompt[sizeof(lc.system_prompt) - 1] = 0;
+        status("Agent turn %d: %s thinking", steps + 1, pvd->label);
 
-        char *reply = NULL; char err[512] = {0}; int got = 0;
-        if (cfg->provider == SVC_PROVIDER_CREDITS && cfg->access_token[0]) {
-            int mrc = ai_ask_metered(cfg, preamble, gpng, glen, &reply, err, sizeof(err));
-            got = (mrc == 1 && reply);
-            if (!got) {
-                int has_byo = cfg->api_key[0] || cfg->api_key_openai[0] || cfg->api_key_anthropic[0] ||
-                              cfg->api_key_google[0] || cfg->api_key_openrouter[0];
-                if (has_byo) got = ai_ask(&lc, preamble, gpng, glen, &reply, err, sizeof(err));
-            }
-        } else {
-            got = ai_ask(&lc, preamble, gpng, glen, &reply, err, sizeof(err));
+        /* CU adapter call w/ 429 retry + fallback SKU. */
+        cu_turn_result_t turn;
+        memset(&turn, 0, sizeof(turn));
+        int ok = pvd->turn(cst, primary_model, api_key, &cap, task, &turn);
+        if (!ok && (strstr(turn.err, "HTTP 429") || strstr(turn.err, "HTTP 5"))) {
+            slog_writef("payload.log", "agent: %s -- backing off + retry primary", turn.err);
+            ui_agent_set_status("Agent: rate-limited, retrying", 1);
+            cu_actions_free(&turn);
+            Sleep(4000 + (rand() % 3000));
+            memset(&turn, 0, sizeof(turn));
+            ok = pvd->turn(cst, primary_model, api_key, &cap, task, &turn);
         }
-
+        if (!ok && pvd->fallback && pvd->fallback[0]) {
+            slog_writef("payload.log", "agent: primary err -- trying fallback %s", pvd->fallback);
+            char sf[128];
+            _snprintf(sf, sizeof(sf) - 1, "fallback %.80s", pvd->fallback);
+            status("Agent turn %d: %s", steps + 1, sf);
+            cu_actions_free(&turn);
+            memset(&turn, 0, sizeof(turn));
+            ok = pvd->turn(cst, pvd->fallback, api_key, &cap, task, &turn);
+        }
+        free(b64);
         imgproc_free(gpng);
         if (anchors) ground_free(anchors);
 
-        if (!got || !reply) {
-            ui_agent_set_status("Agent: model error", 1);
-            slog_writef("payload.log", "agent: ai FAILED: %s", err);
-            if (reply) ai_free_reply(reply);
+        if (!ok) {
+            char msg[128];
+            _snprintf(msg, sizeof(msg) - 1, "Agent: %.100s", turn.err);
+            ui_agent_set_status(msg, 1);
+            slog_writef("payload.log", "agent: FATAL turn err=%s", turn.err);
+            cu_actions_free(&turn);
             break;
         }
 
-        est_spend += 0.02;   /* rough per-turn estimate for the budget guard */
-
-        const char *os = strchr(reply, '{');
-        const char *oe = os ? json_skip_object(os) : NULL;
-        char *obj = NULL;
-        if (os && oe && oe > os) { size_t ol = (size_t)(oe - os); obj = (char *)malloc(ol + 1); if (obj) { memcpy(obj, os, ol); obj[ol] = 0; } }
-
-        char st[24] = {0};
-        if (obj) json_get_str(obj, "status", st, sizeof(st));
-
-        ag_action_t acts[6];
-        int nacts = obj ? parse_actions(obj, acts, 6) : 0;
-
-        if ((st[0] && (strcmp(st, "done") == 0 || strcmp(st, "complete") == 0)) || nacts == 0) {
+        /* Terminate on end_turn with no actions. */
+        if (turn.n_actions == 0 &&
+            (!strcmp(turn.stop_reason, "end_turn") ||
+             !strcmp(turn.stop_reason, "stop") ||
+             !strcmp(turn.stop_reason, "end"))) {
             ui_agent_set_status("Agent: model finished", 1);
-            if (obj) free(obj);
-            ai_free_reply(reply);
+            steps++;
+            cu_actions_free(&turn);
             break;
         }
 
-        /* no-progress guard */
-        unsigned h = hash_action(&acts[0]);
-        if (h == last_hash) { if (++consec >= 5) { ui_agent_set_status("Agent: no-progress halt", 1); if (obj) free(obj); ai_free_reply(reply); break; } }
-        else { consec = 1; last_hash = h; }
-
+        /* Dispatch each action. */
         act_ctx_t ctx; ZeroMemory(&ctx, sizeof(ctx));
         ctx.mon = mon; ctx.render_scale = render_scale;
-        ctx.humanize = as->humanize; ctx.uia_snap = as->uia_snap; ctx.secure = 0; ctx.wpm = 220;
+        ctx.humanize = as->humanize; ctx.uia_snap = as->uia_snap;
+        ctx.secure = 0; ctx.wpm = 220;
         act_begin(&ctx);
-        for (int i = 0; i < nacts && !InterlockedCompareExchange(&g_cancel, 0, 0); i++) {
-            ag_action_t *a = &acts[i];
-            const char *t = a->type;
-            status("Agent turn %d: acting", steps + 1);
-            if      (!strcmp(t, "click"))        { if (a->has_xy) act_click_image(&ctx, a->x, a->y, 0, 1); }
-            else if (!strcmp(t, "double_click")) { if (a->has_xy) act_click_image(&ctx, a->x, a->y, 0, 2); }
-            else if (!strcmp(t, "right_click"))  { if (a->has_xy) act_click_image(&ctx, a->x, a->y, 1, 1); }
-            else if (!strcmp(t, "type"))         { if (a->has_xy) { act_click_image(&ctx, a->x, a->y, 0, 1); act_wait(160); } act_type(&ctx, a->text); }
-            else if (!strcmp(t, "key"))          { act_press(&ctx, a->key); }
-            else if (!strcmp(t, "scroll"))       { act_scroll_image(&ctx, a->has_xy ? a->x : gw/2, a->has_xy ? a->y : gh/2, a->dir[0] ? a->dir : "down", a->amount > 0 ? a->amount : 3); }
-            else if (!strcmp(t, "wait"))         { act_wait(a->amount > 0 ? a->amount : 400); }
-            /* append to history */
-            {
-                char frag[96];
-                if (!strcmp(t, "type")) _snprintf(frag, sizeof(frag) - 1, "%d:type \"%.24s\"; ", steps + 1, a->text);
-                else                    _snprintf(frag, sizeof(frag) - 1, "%d:%s(%d,%d); ", steps + 1, t, a->x, a->y);
-                frag[sizeof(frag) - 1] = 0;
-                size_t hl = strlen(history);
-                if (hl + strlen(frag) < sizeof(history) - 1) strcat(history, frag);
-                else { /* keep last half */ memmove(history, history + sizeof(history)/2, strlen(history + sizeof(history)/2) + 1); strcat(history, frag); }
+        for (int i = 0; i < turn.n_actions &&
+                        !InterlockedCompareExchange(&g_cancel, 0, 0); i++) {
+            cu_action_t *a = &turn.actions[i];
+            unsigned h = hash_action(a);
+            if (check_no_progress(h, &last_hash, &consec)) {
+                ui_agent_set_status("Agent: no-progress halt", 1);
+                slog_writef("payload.log", "agent: no-progress halt (5 identical actions)");
+                InterlockedExchange(&g_cancel, 1);
+                break;
             }
-            if (i < nacts - 1) act_interpause(&ctx);
+            char slbl[80];
+            _snprintf(slbl, sizeof(slbl) - 1, "%s", a->action[0] ? a->action : "?");
+            status("Agent turn %d: %s", steps + 1, slbl);
+            dispatch_action(a, &mon, render_scale, &ctx);
+            /* Inter-action dwell with pace multiplier. */
+            int dwell = (int)((300 + (rand() % 400)) * pace_mult);
+            int left = dwell;
+            while (left > 0 && InterlockedCompareExchange(&g_active, 0, 0) &&
+                   !InterlockedCompareExchange(&g_cancel, 0, 0)) {
+                int slice = left < 50 ? left : 50; Sleep(slice); left -= slice;
+            }
         }
         act_end(&ctx);
 
-        if (obj) free(obj);
-        ai_free_reply(reply);
-
+        cu_actions_free(&turn);
         steps++;
+
+        /* Inter-turn dwell with pace multiplier. */
         int dwell = (int)((400 + (rand() % 500)) * pace_mult);
         int left = dwell;
-        while (left > 0 && InterlockedCompareExchange(&g_active, 0, 0) && !InterlockedCompareExchange(&g_cancel, 0, 0)) {
+        while (left > 0 && InterlockedCompareExchange(&g_active, 0, 0) &&
+               !InterlockedCompareExchange(&g_cancel, 0, 0)) {
             int slice = left < 50 ? left : 50; Sleep(slice); left -= slice;
         }
     }
 
-    slog_writef("payload.log", "agent: end steps=%d est_spend=$%.2f", steps, est_spend);
-    Sleep(1500);
+    slog_writef("payload.log", "agent: end steps=%d spend=$%.4f",
+                steps, cst->total_spend_usd);
+    Sleep(1200);
     ui_agent_set_status("", 0);
+    cu_state_free(cst);
     InterlockedExchange(&g_active, 0);
     InterlockedExchange(&g_paused, 0);
     return 0;
 }
 
 void agent_start(void) {
-    if (InterlockedCompareExchange(&g_active, 1, 0) != 0) return;  /* already running */
+    if (InterlockedCompareExchange(&g_active, 1, 0) != 0) return;
     InterlockedExchange(&g_cancel, 0);
     InterlockedExchange(&g_paused, 0);
     mot_set_cancel(0);

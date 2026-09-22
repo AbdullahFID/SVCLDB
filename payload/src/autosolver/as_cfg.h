@@ -39,6 +39,7 @@ typedef struct {
     unsigned int dot_col_done;
     unsigned int dot_col_error;
     /* ── Agent Mode ── */
+    int    agent_provider;      /* 0=anthropic, 1=openai, 2=gemini (CU adapters) */
     int    agent_tier;          /* svc_tier_t (0 strong,1 medium,2 cheap) */
     double agent_budget_usd;
     int    agent_max_steps;
