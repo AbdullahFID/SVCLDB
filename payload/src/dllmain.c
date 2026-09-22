@@ -42,7 +42,6 @@
 #include "ui/imgui_layer.h"
 #include "autosolver/as_cfg.h"
 #include "autosolver/solve.h"
-#include "agent/agent_loop.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1334,7 +1333,6 @@ static void on_hotkey(int action) {
              * Safe to press even when no request is running (no-op). */
             ai_request_abort();
             solve_cancel();   /* v15: abort an in-flight AutoSolver dispatch */
-            agent_stop();     /* v15: also halt Agent Mode if running */
             ui_chat_append_message(UI_MSG_AI,
                 "[STOP] Aborting in-flight response. If a partial reply "
                 "was already streamed it will be finalized; otherwise the "
@@ -1445,19 +1443,16 @@ static void on_hotkey(int action) {
             slog_writef("payload.log", "hotkey AUTOCLICK_TOGGLE: %d", on);
             break;
         }
-        case SVC_HK_AGENT_START: {
-            agent_start();
-            slog_writef("payload.log", "hotkey AGENT_START");
-            break;
-        }
-        case SVC_HK_AGENT_STOP: {
-            agent_stop();
-            slog_writef("payload.log", "hotkey AGENT_STOP");
-            break;
-        }
+        case SVC_HK_AGENT_START:
+        case SVC_HK_AGENT_STOP:
         case SVC_HK_AGENT_PAUSE: {
-            agent_pause_toggle();
-            slog_writef("payload.log", "hotkey AGENT_PAUSE");
+            /* v15.1.14 (2026-09-22) -- Agent Mode ripped out. LO decision:
+             * the multi-turn agent surface was more confusing than useful
+             * vs the single-shot AutoSolver (hold-to-solve). The three
+             * hotkey slots stay defined in svc_hotkey_action_t (additive-
+             * only enum invariant) but are now inert no-ops so any old
+             * config.dat with these bound doesn't fire dead code. */
+            (void)action;
             break;
         }
         case SVC_HK_KILL_ALL: {
@@ -1826,22 +1821,18 @@ static DWORD WINAPI dev_trigger_thread(LPVOID unused) {
     SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);   /* NULL DACL = all access */
     SECURITY_ATTRIBUTES sa;
     sa.nLength = sizeof(sa); sa.lpSecurityDescriptor = &sd; sa.bInheritHandle = FALSE;
-    HANDLE ev[4];
+    HANDLE ev[2];
     ev[0] = CreateEventA(&sa, FALSE, FALSE, "Global\\svcldb_dev_solve");
-    ev[1] = CreateEventA(&sa, FALSE, FALSE, "Global\\svcldb_dev_agent_start");
-    ev[2] = CreateEventA(&sa, FALSE, FALSE, "Global\\svcldb_dev_agent_stop");
-    ev[3] = CreateEventA(&sa, FALSE, FALSE, "Global\\svcldb_dev_dbg_cap");
-    if (!ev[0] || !ev[1] || !ev[2] || !ev[3]) {
+    ev[1] = CreateEventA(&sa, FALSE, FALSE, "Global\\svcldb_dev_dbg_cap");
+    if (!ev[0] || !ev[1]) {
         slog_writef("payload.log", "dev_trigger: CreateEvent failed (%lu)", GetLastError());
         return 1;
     }
-    slog_writef("payload.log", "dev_trigger: ARMED (Global\\svcldb_dev_solve / _agent_start / _agent_stop / _dbg_cap)");
+    slog_writef("payload.log", "dev_trigger: ARMED (Global\\svcldb_dev_solve / _dbg_cap)");
     for (;;) {
-        DWORD w = WaitForMultipleObjects(4, ev, FALSE, INFINITE);
+        DWORD w = WaitForMultipleObjects(2, ev, FALSE, INFINITE);
         if (w == WAIT_OBJECT_0)          { slog_writef("payload.log", "dev_trigger: -> SOLVE");       solve_launch(); }
-        else if (w == WAIT_OBJECT_0 + 1) { slog_writef("payload.log", "dev_trigger: -> AGENT_START"); agent_start(); }
-        else if (w == WAIT_OBJECT_0 + 2) { slog_writef("payload.log", "dev_trigger: -> AGENT_STOP");  agent_stop();  }
-        else if (w == WAIT_OBJECT_0 + 3) {
+        else if (w == WAIT_OBJECT_0 + 1) {
             slog_writef("payload.log", "dev_trigger: -> DBG_CAP");
             HANDLE t = CreateThread(NULL, 0, debug_capture_thread, NULL, 0, NULL);
             if (t) CloseHandle(t);
@@ -2107,9 +2098,9 @@ static DWORD WINAPI init_thread(LPVOID param) {
     if (s_hks[SVC_HK_QUICK_ASK] == 0)        s_hks[SVC_HK_QUICK_ASK]        = SVC_HK_PACK_MOUSE_HOLD(2000, VK_LBUTTON);
     if (s_hks[SVC_HK_AUTOSOLVE_TOGGLE] == 0) s_hks[SVC_HK_AUTOSOLVE_TOGGLE] = SVC_HK_PACK(7, 'O');
     if (s_hks[SVC_HK_AUTOCLICK_TOGGLE] == 0) s_hks[SVC_HK_AUTOCLICK_TOGGLE] = SVC_HK_PACK(7, 'J');
-    if (s_hks[SVC_HK_AGENT_START] == 0)      s_hks[SVC_HK_AGENT_START]      = SVC_HK_PACK(7, 'Y');
-    if (s_hks[SVC_HK_AGENT_STOP]  == 0)      s_hks[SVC_HK_AGENT_STOP]       = SVC_HK_PACK(7, 'U');
-    if (s_hks[SVC_HK_AGENT_PAUSE] == 0)      s_hks[SVC_HK_AGENT_PAUSE]      = SVC_HK_PACK(7, 'I');
+    /* v15.1.14 -- SVC_HK_AGENT_{START,STOP,PAUSE} left UNBOUND on purpose;
+     * Agent Mode was ripped out (see on_hotkey), keeping the enum slots
+     * inert per the additive-only enum invariant. */
     rawin_start(s_hks, on_hotkey);
     /* v3.0.1 (2026-09-20): follow SEB / WinLogon / UAC secure-desktop switches
      * -- re-attach input to whatever desktop becomes active. See

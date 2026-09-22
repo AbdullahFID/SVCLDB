@@ -3719,9 +3719,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     const chkDot      = el('chk-as-dot');
     const chkDotJump  = el('chk-as-dotjump');
     const selEdge     = el('sel-as-edge');
-    const numBudget   = el('num-agent-budget');
-    const numSteps    = el('num-agent-steps');
-    const numWall     = el('num-agent-wall');
     const statusEl    = el('as-save-status');
     // v15.1.7 dot appearance controls
     const rngDotSize    = el('rng-dot-size');
@@ -3735,11 +3732,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     const chkDotHide    = el('chk-dot-hide-when-overlay');
 
     if (!chkEnabled || !window.svc || !window.svc.autosolver) return; // card / preload absent
-
-    const tierRadios = () => Array.from(document.querySelectorAll('input[name="as-agent-tier"]'));
-    const paceRadios = () => Array.from(document.querySelectorAll('input[name="as-agent-pace"]'));
-    const getRadio = (list) => { const c = list.find(r => r.checked); return c ? Number(c.value) : 0; };
-    const setRadio = (list, v) => list.forEach(r => { r.checked = (Number(r.value) === Number(v)); });
 
     let saveTimer = null;
     const flash = (ok, msg) => {
@@ -3756,11 +3748,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       dot_enabled:        chkDot.checked ? 1 : 0,
       dot_jump:           chkDotJump.checked ? 1 : 0,
       render_max_edge:    Number(selEdge.value) || 1280,
-      agent_tier:         getRadio(tierRadios()),
-      agent_pace:         getRadio(paceRadios()),
-      agent_budget_usd:   Number(numBudget.value) || 2.0,
-      agent_max_steps:    Number(numSteps.value) || 40,
-      agent_max_wallclock_ms: Math.round((Number(numWall.value) || 30) * 60000),
       // v15.1.7 dot appearance / behavior master controls
       dot_size_px:         rngDotSize    ? (Number(rngDotSize.value)    || 8)    : undefined,
       dot_opacity:         rngDotOpacity ? ((Number(rngDotOpacity.value) || 30) / 100) : undefined,
@@ -3808,11 +3795,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         const edges = [960, 1280, 1600, 1920];
         const near = edges.reduce((a, b) => Math.abs(b - s.render_max_edge) < Math.abs(a - s.render_max_edge) ? b : a, 1280);
         selEdge.value = String(near);
-        setRadio(tierRadios(), s.agent_tier);
-        setRadio(paceRadios(), s.agent_pace);
-        numBudget.value = s.agent_budget_usd;
-        numSteps.value  = s.agent_max_steps;
-        numWall.value   = Math.round((s.agent_max_wallclock_ms || 1800000) / 60000);
         // dot appearance
         if (rngDotSize)    { rngDotSize.value    = String(Math.max(5, Math.min(16, Number(s.dot_size_px) || 8))); lblDotSize.textContent = rngDotSize.value + ' px'; }
         if (rngDotOpacity) { const p = Math.round((Number(s.dot_opacity) || 0.30) * 100); rngDotOpacity.value = String(Math.max(10, Math.min(100, p))); lblDotOpacity.textContent = rngDotOpacity.value + '%'; }
@@ -3826,9 +3808,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     // ── change listeners ──
     [chkEnabled, chkClick, chkHuman, chkUia, chkDot, chkDotJump].forEach(c => c.addEventListener('change', save));
     selEdge.addEventListener('change', save);
-    [numBudget, numSteps, numWall].forEach(n => n.addEventListener('change', save));
-    tierRadios().forEach(r => r.addEventListener('change', save));
-    paceRadios().forEach(r => r.addEventListener('change', save));
     // v15.1.7
     [rngDotSize, rngDotOpacity, rngDotHold].forEach(r => { if (r) r.addEventListener('change', save); });
     [numDotW, numDotH].forEach(n => { if (n) n.addEventListener('change', save); });

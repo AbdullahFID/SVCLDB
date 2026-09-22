@@ -274,7 +274,9 @@ void ui_dot_set_opacity(float a);
  * overlay is hidden. */
 int  ui_point_in_dot(int x, int y);
 
-/* Agent-mode status line shown in the overlay (thread-safe). */
+/* v15.1.14 -- Agent Mode ripped out. ui_agent_set_status is now a
+ * no-op stub kept in imgui_layer.cpp for ABI compatibility with any
+ * caller that still links against it (none in-tree today). */
 void ui_agent_set_status(const char *line, int active);
 
 /* Shutdown. */

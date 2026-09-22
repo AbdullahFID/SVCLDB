@@ -540,45 +540,6 @@
             </div>
           </div>
 
-          <div class="as-divider"><span>Agent Mode</span></div>
-          <div class="as-howto">
-            Long-horizon autopilot: it keeps looking at the screen and taking actions to finish a
-            whole task (it <i>may</i> click Next/Submit). Start with <kbd>Ctrl+Shift+Alt+Y</kbd>,
-            pause <kbd>Ctrl+Shift+Alt+I</kbd>, stop <kbd>Ctrl+Shift+Alt+U</kbd> (or <kbd>Ctrl+Alt+S</kbd>).
-            <span class="as-howto-dim">Bounded by the budget / step / time caps below.</span>
-          </div>
-
-          <div class="as-field-row">
-            <div class="as-field-label">Model tier</div>
-            <div class="prompt-mode-row" style="margin:0">
-              <label class="prompt-mode-chip"><input type="radio" name="as-agent-tier" value="0"><span>Strong</span></label>
-              <label class="prompt-mode-chip"><input type="radio" name="as-agent-tier" value="1" checked><span>Medium</span></label>
-              <label class="prompt-mode-chip"><input type="radio" name="as-agent-tier" value="2"><span>Cheap</span></label>
-            </div>
-          </div>
-
-          <div class="as-field-row">
-            <div class="as-field-label">Pace</div>
-            <div class="prompt-mode-row" style="margin:0">
-              <label class="prompt-mode-chip"><input type="radio" name="as-agent-pace" value="0"><span>Fast</span></label>
-              <label class="prompt-mode-chip"><input type="radio" name="as-agent-pace" value="1" checked><span>Balanced</span></label>
-              <label class="prompt-mode-chip"><input type="radio" name="as-agent-pace" value="2"><span>Careful</span></label>
-            </div>
-          </div>
-
-          <div class="as-field-row">
-            <div class="as-field-label">Spend cap (USD)<div class="as-field-sub">Agent stops when the estimate is reached.</div></div>
-            <input type="number" id="num-agent-budget" class="as-num" min="0.1" max="100" step="0.5" value="2">
-          </div>
-          <div class="as-field-row">
-            <div class="as-field-label">Max steps</div>
-            <input type="number" id="num-agent-steps" class="as-num" min="1" max="400" step="5" value="40">
-          </div>
-          <div class="as-field-row">
-            <div class="as-field-label">Time cap (minutes)</div>
-            <input type="number" id="num-agent-wall" class="as-num" min="1" max="720" step="5" value="30">
-          </div>
-
           <div class="as-save-row">
             <span id="as-save-status" class="as-save-status">Saved settings apply to the running overlay within ~2s.</span>
           </div>
