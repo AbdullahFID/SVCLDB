@@ -761,6 +761,57 @@ static bool ensure_fake_hwnd_valid(void) {
     if (!restarted) {
         return g_fake_hwnd != NULL;   /* nothing changed */
     }
+
+    /* v6.1.0 (2026-09-21) -- BLIP-DoS DEBOUNCE.
+     *
+     * A medium-IL attacker can taskkill+restart explorer.exe in a tight
+     * loop. Each Progman change here triggers teardown + client_reinit,
+     * which BP's proven recovery path costs ~3 frames of visible blip.
+     * At 30Hz attacker rate (each kill+restart cycle ~30ms), we'd
+     * blip ~5x/sec (capped by our 200ms poll cadence) = sustained
+     * visible flicker = practical DoS of overlay visibility.
+     *
+     * v6.1.0 (AutoRestartShell=0 + sentinel Monitor-A gate) blocks the
+     * KILL-ONLY attack (Windows won't respawn, so kills don't produce
+     * fresh Progman = no reinit). But an attacker who ALSO explicitly
+     * `CreateProcess`es explorer each cycle still triggers churn.
+     *
+     * Fix: rate-limit teardown itself. Between the first change and
+     * `SHELL_TEARDOWN_COOLDOWN_MS` later, ignore further Progman flaps
+     * completely. Attacker at 30Hz churn -> max 1 blip per 2s = 0.5Hz
+     * blips. During the cooldown, backend retains stale HWND state; if
+     * torn down, subsequent frames don't call ImGui_ImplWin32_NewFrame
+     * (backend flag is false) so io.DisplaySize retains last-good
+     * value -> overlay stays VISIBLE with stale-but-plausible layout,
+     * just no mouse-coord tracking. When attacker stops for > cooldown,
+     * next real Progman change gets processed cleanly (single blip,
+     * back to healthy).
+     *
+     * Legitimate one-shot explorer restart: eats ~2s of stale state
+     * before the ONE reinit fires. Acceptable tradeoff -- users rarely
+     * restart explorer on purpose, and when they do a 2s recovery
+     * delay is invisible next to explorer's own respawn latency. */
+    static ULONGLONG g_last_shell_teardown_tick = 0;
+    const ULONGLONG SHELL_TEARDOWN_COOLDOWN_MS = 2000;
+    if (g_last_shell_teardown_tick != 0) {
+        ULONGLONG since = now - g_last_shell_teardown_tick;
+        if (since < SHELL_TEARDOWN_COOLDOWN_MS) {
+            static ULONGLONG s_last_rl_log = 0;
+            if (now - s_last_rl_log > 5000) {
+                diag("[RECOVERY-RL] Progman flapped %p(pid %lu) -> %p(pid %lu) "
+                     "but only %llu ms since last teardown (cooldown %llu ms) -- "
+                     "deferring reinit to defeat blip-DoS. Overlay stays visible "
+                     "with stale backend state during cooldown.",
+                     g_fake_hwnd, (unsigned long)g_progman_pid,
+                     newh, (unsigned long)newpid,
+                     since, (ULONGLONG)SHELL_TEARDOWN_COOLDOWN_MS);
+                s_last_rl_log = now;
+            }
+            return g_fake_hwnd != NULL;   /* keep current state unchanged */
+        }
+    }
+    g_last_shell_teardown_tick = now;
+
     /* Progman changed (explorer restart, session switch, etc.) --
      * teardown Win32 backend, swap HWND, re-init on next frame. */
     if (g_win32_backend_inited) {
