@@ -2061,6 +2061,10 @@ extern "C" void ui_set_forced_mouse(int active, int x, int y) {
 extern "C" void ui_set_mouse_left_down(int down) {
     InterlockedExchange(&g_ui_mouse_left_down, down ? 1 : 0);
 }
+/* v15.1.11 -- accessor for the poll thread's stuck-latch unstick. */
+extern "C" int ui_mouse_left_down_get(void) {
+    return InterlockedCompareExchange(&g_ui_mouse_left_down, 0, 0) != 0;
+}
 extern "C" int ui_mouse_over_widget(void) {
     return (int)InterlockedCompareExchange(&g_mouse_over_widget, 0, 0);
 }
@@ -7857,23 +7861,21 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
                     io.AddMousePosEvent((float)_cur.x, (float)_cur.y);
             }
             io.AddMouseButtonEvent(0, g_ui_mouse_left_down != 0);
-            /* v15.1.10: DEFENSIVE unstick. If the LL hook missed an
-             * LBUTTONUP (e.g. during a desktop transition, or the up
-             * event landed on a foreign desktop we don't hook), our
-             * g_ui_mouse_left_down latch would remain 1 forever and
-             * ImGui would never see a new IsMouseClicked() transition
-             * -- exact symptom: "the dot buttons stop responding after
-             * a while". GetAsyncKeyState is kernel-global (works across
-             * desktops), so if it says the physical L-button is UP but
-             * our latch says DOWN, force-clear so the NEXT press lands
-             * cleanly. Also unlatches the pipe-fed level (same fix
-             * applies whether the stale DOWN came from local LL or
-             * helper-forwarded pipe). */
-            if (g_ui_mouse_left_down &&
-                (GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
-                InterlockedExchange(&g_ui_mouse_left_down, 0);
-                io.AddMouseButtonEvent(0, false);
-            }
+            /* v15.1.10 -- REVERTED: the defensive GetAsyncKeyState unstick
+             * that lived here fired bogus release events mid-drag. DWM's
+             * compose thread has a restricted desktop context where
+             * GetAsyncKeyState(VK_LBUTTON) can briefly read 0 even while
+             * the button is physically held (the mouse_hold_poll thread
+             * doesn't hit this because it lives on a different thread
+             * with different desktop attachment). Each false 0 queued an
+             * extra AddMouseButtonEvent(0, false), which arrived in the
+             * same frame as our press event -> IsMouseClicked + IsMouseReleased
+             * both fired in one tick -> our drag state machine armed then
+             * committed a tap in the same frame, teleporting the dot's
+             * UI-state instead of dragging. Any "stuck L-button" mitigation
+             * belongs on the poll_thread that already uses GetAsyncKeyState
+             * safely (v15.1.11 pushes an unstick down there if it becomes
+             * a real issue in the wild). */
         }
         ImGui::NewFrame();
         draw_chat_window(w, h);

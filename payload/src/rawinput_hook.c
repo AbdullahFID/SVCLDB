@@ -612,6 +612,34 @@ static DWORD WINAPI mouse_hold_poll_thread(LPVOID param) {
             }
         }
 
+        /* v15.1.11 (2026-09-22) -- stuck-LMB unstick (moved here from the
+         * compose thread where GetAsyncKeyState was unreliable under DWM's
+         * restricted thread-desktop context, false-positively cancelling
+         * live drags). This thread ALREADY relies on GetAsyncKeyState for
+         * MOUSE_HOLD triggers and it works fine here (deskwatch keeps our
+         * thread desktop attached to the input desktop). If our ImGui-fed
+         * mouse level has been latched DOWN for >1s but the physical
+         * button reads UP, unstick it -- that's the "LBUTTONUP lost during
+         * a desktop transition + dot buttons silently stop responding"
+         * edge case. Delay is generous so genuine long-holds (MOUSE_HOLD
+         * 2s trigger) aren't disturbed. */
+        static DWORD s_lmb_latch_since = 0;
+        extern int  ui_mouse_left_down_get(void);
+        extern void ui_set_mouse_left_down(int down);
+        int latched_down  = ui_mouse_left_down_get();
+        int physical_down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+        if (latched_down && !physical_down) {
+            if (!s_lmb_latch_since) s_lmb_latch_since = now;
+            else if ((DWORD)(now - s_lmb_latch_since) > 1000) {
+                rin_diag("autosolver: stuck LMB latch cleared "
+                         "(physical=UP for >1s but ImGui-latch=DOWN)");
+                ui_set_mouse_left_down(0);
+                s_lmb_latch_since = 0;
+            }
+        } else {
+            s_lmb_latch_since = 0;
+        }
+
         for (int slot = 0; slot < SVC_HK_COUNT; slot++) {
             if (!g_hk[slot]) continue;
             if (SVC_HK_KIND(g_hk[slot]) != SVC_HK_KIND_MOUSE_HOLD) continue;
