@@ -5785,90 +5785,66 @@ static bool draw_button_icon(ImDrawList *fg, float bx, float by, float bw, float
     (void)mc;
 }
 
-/* Toolbar pill renderer -- horizontal ~140x28 strip with dot + short
- * answer (MCQ letter emphasized) + copy + hamburger. Layout matches
- * hooksdll popout.html: header at bottom-right, row-reverse so the
- * dot is the rightmost element; copy + hamburger sit to its LEFT. */
+/* Toolbar pill renderer -- FIXED narrow pill with just the dot + 2 buttons.
+ * Answer content is never inline; user expands to FULL card (via hamburger)
+ * to see it. Matches hooksdll's toolbar which is a compact icon strip only,
+ * and keeps the hit-test rect stable so the buttons never drift out of
+ * range because a long answer widened the pill. */
+#define TOOLBAR_PILL_W  110.0f
+#define TOOLBAR_PILL_H  30.0f
 static void draw_toolbar_pill(ImDrawList *fg, float ox, float oy, float *out_w, float h,
                               int st, float a,
                               const char *shortbuf, char mcqL,
                               ImVec2 mp, bool mc, bool mr,
                               bool *hit_dot, bool *hit_copy, bool *hit_ham,
                               bool copy_flashing) {
+    (void)shortbuf;
     ImFont *font = ImGui::GetFont();
     float fs = ImGui::GetFontSize();
     float pad = 8.0f, gap = 6.0f;
     float dr = 7.0f;
-    char showtxt[64];
-    if (mcqL) { showtxt[0] = mcqL; showtxt[1] = 0; }
-    else      { _snprintf(showtxt, sizeof(showtxt) - 1, "%.60s", shortbuf ? shortbuf : ""); showtxt[sizeof(showtxt) - 1] = 0; }
-    ImVec2 tsz = ImGui::CalcTextSize(showtxt);
-    /* Only show text preview when we DON'T have an MCQ letter (the letter
-     * is inside the dot; we don't want to duplicate it in the pill body). */
-    float text_w = (mcqL ? 0 : (showtxt[0] ? tsz.x + gap : 0));
     float btn = 26.0f;
-    float w = pad + dr * 2 + gap + text_w + gap + btn + gap + btn + pad;
-    if (w < 100) w = 100;
+    float w = TOOLBAR_PILL_W;   /* fixed -- see comment above */
     if (out_w) *out_w = w;
 
     int   bgA = (int)(200 * a); if (bgA < 60) bgA = 60;
     ImU32 bg  = IM_COL32(8, 9, 12, bgA);
     ImU32 bd  = IM_COL32(255, 255, 255, (int)(80 * a));
-    /* Drop shadow for depth */
     fg->AddRectFilled(ImVec2(ox + 1, oy + 2), ImVec2(ox + w + 1, oy + h + 2),
                       IM_COL32(0, 0, 0, (int)(80 * a)), h * 0.5f);
     fg->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + h), bg, h * 0.5f);
     fg->AddRect      (ImVec2(ox, oy), ImVec2(ox + w, oy + h), bd, h * 0.5f, 0, 1.2f);
 
-    /* hooksdll row-reverse: dot on RIGHT edge, buttons to its left. */
+    /* row-reverse: dot on the RIGHT edge, buttons to its left. */
     float cx = ox + w - pad - dr, cy = oy + h * 0.5f;
     draw_dot_glyph(fg, cx, cy, dr, st, a, dot_state_is_solving(st));
-
-    /* MCQ letter inside the dot -- BLACK, bold, full-alpha (hooksdll spec). */
+    /* MCQ / status letter (BLACK bold) inside the dot. */
     if (mcqL) {
         char lb[2] = { mcqL, 0 };
-        /* Letter size proportional to dot radius (hooksdll: font-size 7 for
-         * a 10px dot -> ratio 0.7). Clamp so tiny dots still show the glyph. */
-        float lfs = dr * 1.4f;
-        if (lfs < 9.0f) lfs = 9.0f;
+        float lfs = dr * 1.4f; if (lfs < 9.0f) lfs = 9.0f;
         ImVec2 lsz = ImGui::CalcTextSize(lb);
-        float scale_l = lfs / lsz.y;
-        float ltw = lsz.x * scale_l, lth = lsz.y * scale_l;
-        /* Draw the letter TWICE for pseudo-bold (offset by 0.5px) so it
-         * pops against the colored dot. Color BLACK, always full alpha. */
-        fg->AddText(font, lfs,
-                    ImVec2(cx - ltw * 0.5f + 0.5f, cy - lth * 0.55f),
+        float sc = lfs / lsz.y;
+        float ltw = lsz.x * sc, lth = lsz.y * sc;
+        fg->AddText(font, lfs, ImVec2(cx - ltw * 0.5f + 0.5f, cy - lth * 0.55f),
                     IM_COL32(0, 0, 0, 255), lb);
-        fg->AddText(font, lfs,
-                    ImVec2(cx - ltw * 0.5f,        cy - lth * 0.55f),
+        fg->AddText(font, lfs, ImVec2(cx - ltw * 0.5f,        cy - lth * 0.55f),
                     IM_COL32(0, 0, 0, 255), lb);
     }
 
-    /* Answer text preview (non-MCQ only). */
-    int Aval = (int)(255 * a); if (Aval < 100) Aval = 100;
-    /* Buttons on the LEFT of the dot: [ham] [copy] [dot] (visual order). */
-    float bxD_left = cx - dr - gap;                       /* right edge of copy button */
-    float bxC = bxD_left - btn;                           /* copy */
-    float bxH = bxC - 4 - btn;                            /* hamburger */
+    /* Buttons: [ham] [copy] * dot ── left of the dot. */
+    float bxC = cx - dr - 8 - btn;                 /* copy button LEFT */
+    float bxH = bxC - 4 - btn;                     /* hamburger LEFT */
     float by  = oy + (h - btn) * 0.5f;
-    if (!mcqL && showtxt[0]) {
-        float tx_end = bxH - gap;
-        float ty = oy + (h - tsz.y) * 0.5f;
-        fg->PushClipRect(ImVec2(ox + pad, oy), ImVec2(tx_end, oy + h), true);
-        fg->AddText(font, fs * 0.95f, ImVec2(ox + pad, ty),
-                    IM_COL32(220, 235, 220, Aval), showtxt);
-        fg->PopClipRect();
-    }
     if (hit_copy) *hit_copy = draw_button_icon(fg, bxC, by, btn, btn,
                                                copy_flashing ? "\xE2\x9C\x93" : "\xE2\x8E\x98",
                                                a, true, copy_flashing, mp, mc, mr);
     if (hit_ham)  *hit_ham  = draw_button_icon(fg, bxH, by, btn, btn, "\xE2\x98\xB0",
                                                a, true, false, mp, mc, mr);
 
-    /* Dot hit region (26x26 hit target around the 10px visible dot). */
+    /* Dot hit region + generous slop. */
     if (hit_dot) *hit_dot = (mp.x >= cx - dr - 8 && mp.x < cx + dr + 8 &&
                              mp.y >= oy - 4 && mp.y < oy + h + 4);
-    (void)mc;
+    (void)mc; (void)fs;
 }
 
 /* Full-card renderer -- hooksdll popout.html parity:
@@ -6169,9 +6145,11 @@ static void draw_answer_dot(UINT sw, UINT sh) {
         if (oy + ch > sh - 4) oy = sh - 4 - ch;
         cx = ox + cw - 10;  cy = oy + ch - 15;   /* dot is at bottom-right of card */
     } else if (ui == 1) {
-        /* TOOLBAR pill -- anchor bottom-right to the dot's br. */
-        ch = 30.0f;
-        cw = 160.0f;
+        /* TOOLBAR pill -- fixed dimensions (see TOOLBAR_PILL_W/H). No
+         * post-render width adjustment needed; the hit-test rect
+         * matches the rendered rect exactly. */
+        cw = TOOLBAR_PILL_W;
+        ch = TOOLBAR_PILL_H;
         ox = dot_br_x - cw;
         oy = dot_br_y - ch;
         if (ox < 2) ox = 2;
@@ -6266,10 +6244,14 @@ static void draw_answer_dot(UINT sw, UINT sh) {
     const float BTN_SLOP = 10.0f;
     bool in_btn_area = false;
     if (ui == 1) {
-        /* TOOLBAR: buttons on the LEFT of the dot (rightmost), so hit area
-         * is left of the dot. Dot is at cx = ox + cw - pad - dr. */
-        float btn_area_right = ox + cw - 8 - 7 - 6;   /* just left of the dot */
-        if (mp.x >= btn_area_right - btn * 2 - 12 - BTN_SLOP && mp.x < btn_area_right + BTN_SLOP &&
+        /* TOOLBAR: buttons on the LEFT of the dot at pill's right edge.
+         * Dot center cx = ox + cw - 8 - 7 = ox + cw - 15. Copy button
+         * starts at cx - dr - 8 - btn = ox + cw - 15 - 7 - 8 - 26 = ox+cw-56.
+         * Hamburger at bxC - 4 - btn = ox + cw - 56 - 30 = ox + cw - 86.
+         * Two buttons span [ox+cw-86, ox+cw-30] ~ 56px. */
+        float bx_min = ox + cw - 86 - BTN_SLOP;
+        float bx_max = ox + cw - 30 + BTN_SLOP;
+        if (mp.x >= bx_min && mp.x < bx_max &&
             mp.y >= oy - BTN_SLOP && mp.y < oy + ch + BTN_SLOP) in_btn_area = true;
     } else if (ui == 2) {
         /* FULL: three buttons on the bottom row, left of the dot. Header
@@ -6393,16 +6375,7 @@ static void draw_answer_dot(UINT sw, UINT sh) {
                           shortbuf, mcqL, mp, mc, mr,
                           &hit_dot_toolbar, &hit_copy, &hit_ham,
                           copy_flashing);
-        /* re-publish width if it grew/shrank + reposition to keep dot's
-         * bottom-right glued to the anchor. */
-        if ((LONG)tw != InterlockedCompareExchange(&g_dot_rect_w, 0, 0)) {
-            /* Grow leftward: keep br fixed */
-            ox = dot_br_x - tw;
-            cw = tw;
-            if (ox < 2) ox = 2;
-            InterlockedExchange(&g_dot_rect_x, (LONG)ox);
-            InterlockedExchange(&g_dot_rect_w, (LONG)cw);
-        }
+        /* toolbar width is FIXED (TOOLBAR_PILL_W); no republish needed. */
     } else {
         draw_dot_glyph(fg, cx, cy, r, st, a, dot_state_is_solving(st));
         if (mcqL) {
