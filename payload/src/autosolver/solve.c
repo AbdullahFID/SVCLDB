@@ -359,8 +359,14 @@ static DWORD WINAPI solve_thread(LPVOID unused) {
     shortans[sizeof(shortans) - 1] = 0;
 
     if (no_q) {
-        ui_dot_set_state(UI_DOT_IDLE);
-        ui_dot_set_answer("-", "No question detected on screen.");
+        /* Visible + friendly: DONE-state color (green -- we successfully
+         * determined "no question here") + "?" glyph in the dot + a
+         * clear message in the FULL card. Was UI_DOT_IDLE + "-" which
+         * looked like the solver had done nothing. */
+        ui_dot_set_state(UI_DOT_DONE);
+        ui_dot_set_answer("?",
+                          "No question detected on screen. Try holding on the "
+                          "question text, or scroll the question into view first.");
     } else {
         ui_dot_set_answer(shortans, answer);
         ui_chat_append_message(1 /*UI_MSG_AI*/, answer);

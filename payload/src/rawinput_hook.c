@@ -2054,6 +2054,10 @@ static HANDLE        g_deskwatch_thread  = NULL;
  * ground.cpp polls this to decide whether to route UIA through the SYSTEM
  * winlogon helper. Starts 0 (Default) at boot. */
 static volatile LONG g_desk_is_isolated = 0;
+/* Forward decls for pipe-input reset used on return-to-Default. */
+extern void ui_set_forced_mouse(int active, int x, int y);
+extern void ui_set_mouse_left_down(int down);
+static void pipe_reset_input_state(void);
 
 int rawin_is_isolated_desktop(void) {
     return InterlockedCompareExchange(&g_desk_is_isolated, 0, 0) != 0;
@@ -2102,8 +2106,20 @@ static DWORD WINAPI desktop_watch_thread(LPVOID param) {
          * helper's named pipe carries it -- doing rawin_restart there was pure
          * churn (full input teardown/rebuild + a 4s CreateWindow spin) and the
          * root of the unreliability. One restart on the way back keeps Default
-         * input fresh. */
-        if (to_default) rawin_restart();
+         * input fresh.
+         *
+         * v15.1.8 (2026-09-22) -- on return-to-Default ALSO clear any pipe-fed
+         * mouse-forcing state. Otherwise ImGui keeps consuming the LAST forced
+         * cursor pos (from the isolated desktop) instead of the real \Default
+         * cursor, and the overlay+dot appear frozen / unclickable until the
+         * next helper disconnect resets things. Mirrors what
+         * seb_pipe_server_thread does on pipe disconnect. */
+        if (to_default) {
+            ui_set_forced_mouse(0, 0, 0);
+            ui_set_mouse_left_down(0);
+            pipe_reset_input_state();
+            rawin_restart();
+        }
     }
     rin_diag("deskwatch: stopped");
     return 0;

@@ -5723,17 +5723,30 @@ static void draw_dot_glyph(ImDrawList *fg, float cx, float cy, float r, int st, 
     }
 }
 
-/* MCQ letter detection so the dot can display an "A/B/C/D/E" glyph inside
- * itself when the answer is a single MCQ letter. */
+/* Return a single glyph to render INSIDE the collapsed dot / toolbar
+ * pill / FULL card header when the short answer is a compact tag.
+ * Matches:
+ *   - MCQ letters A-E (case-insensitive; may be followed by ) . : or a
+ *     separator / whitespace / end-of-string)
+ *   - Status sentinels "?" (no question detected) and "!" (error)
+ * Returns 0 (no glyph) otherwise. */
 static char mcq_letter(const char *ans) {
     if (!ans || !ans[0]) return 0;
     const char *p = ans;
     while (*p == ' ' || *p == '\t') p++;
     char c = *p;
     if (c >= 'a' && c <= 'e') c = (char)(c - 'a' + 'A');
-    if (c < 'A' || c > 'E') return 0;
-    char n = p[1];
-    if (n == 0 || n == ' ' || n == ')' || n == '.' || n == ':' || n == '\t' || n == '\n') return c;
+    /* MCQ letter branch */
+    if (c >= 'A' && c <= 'E') {
+        char n = p[1];
+        if (n == 0 || n == ' ' || n == ')' || n == '.' || n == ':' || n == '\t' || n == '\n') return c;
+        return 0;
+    }
+    /* Status-sentinel branch (single-char + end-of-string / whitespace). */
+    if (c == '?' || c == '!') {
+        char n = p[1];
+        if (n == 0 || n == ' ' || n == '\t' || n == '\n') return c;
+    }
     return 0;
 }
 

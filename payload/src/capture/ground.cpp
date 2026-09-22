@@ -70,9 +70,32 @@ typedef struct {                     /* ENUM req */
  * (the composed anchor block, no trailing NUL guaranteed). */
 #pragma pack(pop)
 
-/* Blocking write+read helper. Times out ~500ms so a wedged helper never
- * hangs a solve. Returns 1 on full success (magic+opcode match echoed
- * reply); 0 on any error (caller falls back to local UIA / grid-vision). */
+/* Blocking write+read helper with **strict timeouts** so the solve thread
+ * can never hang if the helper is stalled, crashed, or busy behind
+ * another request. Uses overlapped I/O + CancelIoEx on any timeout so
+ * ReadFile/WriteFile actually unblock (unlike sync mode which would
+ * wait indefinitely). Returns 1 on full success (magic+opcode match
+ * echoed reply); 0 on any error (caller falls back to local UIA /
+ * grid-vision). Total wall-clock is capped to ~1.2s worst case
+ * (200 wait + 400 write + 600 read). */
+#define UIA_RPC_WAIT_MS      200
+#define UIA_RPC_WRITE_MS     400
+#define UIA_RPC_READ_MS      600
+
+static int overlapped_io_wait(HANDLE h, OVERLAPPED *ov, DWORD to_ms, DWORD *out_transferred) {
+    DWORD wr = 0;
+    DWORD w = WaitForSingleObject(ov->hEvent, to_ms);
+    if (w != WAIT_OBJECT_0) {
+        CancelIoEx(h, ov);
+        /* Drain the cancel: GetOverlappedResult returns immediately once
+         * CancelIoEx flushes the pending op. Prevents "Overlapped I/O
+         * event not in signaled state" edge cases. */
+        GetOverlappedResult(h, ov, &wr, TRUE);
+        return 0;
+    }
+    return GetOverlappedResult(h, ov, out_transferred, FALSE) ? 1 : 0;
+}
+
 static int uia_rpc(uint32_t opcode,
                    const void *req_payload, uint32_t req_len,
                    void *out_reply, uint32_t reply_cap,
@@ -81,40 +104,64 @@ static int uia_rpc(uint32_t opcode,
     const char *pipe = obf_pipe_iso_cmd();
     if (!pipe || !*pipe) return 0;
 
-    HANDLE h = CreateFileA(pipe, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-                           OPEN_EXISTING, 0, nullptr);
-    if (h == INVALID_HANDLE_VALUE) {
-        /* Helper unavailable (no isolated desktop / helper crashed / not
-         * yet injected). Silently fail-open. Log ONCE per boot to keep
-         * log noise low. */
+    /* WaitNamedPipe: fast-fail if server isn't listening. Prevents a
+     * 30-second implicit wait inside CreateFile when helper is gone. */
+    if (!WaitNamedPipeA(pipe, UIA_RPC_WAIT_MS)) {
         static volatile LONG s_logged_absent = 0;
         if (InterlockedCompareExchange(&s_logged_absent, 1, 0) == 0)
-            slog_writef("payload.log", "ground: uia-cmd pipe unavailable (gle=%lu) -- helper UIA disabled",
+            slog_writef("payload.log",
+                        "ground: uia-cmd pipe absent (gle=%lu) -- helper UIA disabled",
                         GetLastError());
         return 0;
     }
-    /* PIPE_READMODE_MESSAGE would be nicer for framing but the helper's
-     * pipe is byte-mode (matches the existing input pipe pattern). Read
-     * the header first, then the exact reply_len bytes. */
+
+    HANDLE h = CreateFileA(pipe, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                           OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+
+    HANDLE ev = CreateEventA(nullptr, TRUE /*manual reset*/, FALSE, nullptr);
+    if (!ev) { CloseHandle(h); return 0; }
+
     int ok = 0;
     uia_hdr_t req = { UIA_MAGIC, opcode, req_len };
     uia_hdr_t rep = {0};
-    DWORD wr = 0, rd = 0;
-    if (!WriteFile(h, &req, sizeof(req), &wr, nullptr) || wr != sizeof(req)) goto done;
+    OVERLAPPED ov = {0};
+    ov.hEvent = ev;
+    DWORD n = 0;
+
+    /* Write header */
+    ResetEvent(ev);
+    if (!WriteFile(h, &req, sizeof(req), NULL, &ov) &&
+        GetLastError() != ERROR_IO_PENDING) goto done;
+    if (!overlapped_io_wait(h, &ov, UIA_RPC_WRITE_MS, &n) || n != sizeof(req)) goto done;
+
+    /* Write payload (if any) */
     if (req_len && req_payload) {
-        if (!WriteFile(h, req_payload, req_len, &wr, nullptr) || wr != req_len) goto done;
+        ResetEvent(ev);
+        if (!WriteFile(h, req_payload, req_len, NULL, &ov) &&
+            GetLastError() != ERROR_IO_PENDING) goto done;
+        if (!overlapped_io_wait(h, &ov, UIA_RPC_WRITE_MS, &n) || n != req_len) goto done;
     }
-    FlushFileBuffers(h);
-    if (!ReadFile(h, &rep, sizeof(rep), &rd, nullptr) || rd != sizeof(rep)) goto done;
+
+    /* Read reply header */
+    ResetEvent(ev);
+    if (!ReadFile(h, &rep, sizeof(rep), NULL, &ov) &&
+        GetLastError() != ERROR_IO_PENDING) goto done;
+    if (!overlapped_io_wait(h, &ov, UIA_RPC_READ_MS, &n) || n != sizeof(rep)) goto done;
     if (rep.magic != UIA_MAGIC || rep.opcode != opcode) goto done;
-    if (rep.payload_len > reply_cap) goto done;    /* refuse to overflow */
+    if (rep.payload_len > reply_cap) goto done;
+
+    /* Read reply payload (if any) */
     if (rep.payload_len) {
-        if (!ReadFile(h, out_reply, rep.payload_len, &rd, nullptr) ||
-            rd != rep.payload_len) goto done;
+        ResetEvent(ev);
+        if (!ReadFile(h, out_reply, rep.payload_len, NULL, &ov) &&
+            GetLastError() != ERROR_IO_PENDING) goto done;
+        if (!overlapped_io_wait(h, &ov, UIA_RPC_READ_MS, &n) || n != rep.payload_len) goto done;
     }
     if (out_reply_len) *out_reply_len = rep.payload_len;
     ok = 1;
 done:
+    CloseHandle(ev);
     CloseHandle(h);
     return ok;
 }
