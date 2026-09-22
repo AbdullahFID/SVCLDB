@@ -88,6 +88,13 @@ const char *obf_pipe_iso(void);
 const char *obf_event_iso_halt(void);
 const char *obf_event_iso_chat(void);
 const char *obf_class_iso_input(void);
+/* v15.1.8 (2026-09-22) -- Payload<->helper UIA request/reply pipe.
+ * Duplex byte pipe. Payload writes {uia_req_hdr, payload}, helper reads
+ * + does UIA on the currently-active desktop (SYSTEM has cross-desktop
+ * access DWM-N does not), replies {uia_rep_hdr, reply payload}.
+ * The 2 request/reply formats live inline in ground.cpp + wl_input.c
+ * (search "UIA_MAGIC"); they MUST agree byte-for-byte. */
+const char *obf_pipe_iso_cmd(void);
 
 #ifdef __cplusplus
 }

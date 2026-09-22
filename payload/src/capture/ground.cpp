@@ -24,6 +24,136 @@
 #include "ground.h"
 
 extern "C" void slog_writef(const char *file, const char *fmt, ...);
+extern "C" const char *obf_pipe_iso_cmd(void);
+extern "C" int  rawin_is_isolated_desktop(void);
+
+/* ══════════════ v15.1.8 (2026-09-22) UIA-via-winlogon RPC ══════════════ *
+ * On isolated desktops (SEB / LDB / WinLogon Secure Desktop) DWM-N (our
+ * payload's process context) cannot reach the isolated desktop's UIA
+ * tree -- ElementFromPoint resolves against the CALLER's thread desktop
+ * (\Default) so it sees the wrong desktop's windows or nothing.
+ *
+ * Fix: route UIA through the winlogon helper (SYSTEM, session 0) which
+ * SetThreadDesktops to the active desktop per-request and has full
+ * cross-desktop UIA access. Duplex named pipe request/reply:
+ *
+ *   Payload           Helper
+ *   ---------- request ---------->  {magic, opcode, payload_len, payload}
+ *   <--------- reply -----------  {magic, opcode, reply_len,   reply}
+ *
+ * Wire types (MUST match wl_input.c copies byte-for-byte). Fixed-width
+ * ints, no padding, little-endian. */
+#define UIA_MAGIC     0x00415155u    /* 'UAA\0' LE */
+#define UIA_OP_SNAP   1u
+#define UIA_OP_ENUM   2u
+
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t magic;
+    uint32_t opcode;
+    uint32_t payload_len;
+} uia_hdr_t;
+typedef struct {                     /* SNAP req */
+    int32_t  sx;
+    int32_t  sy;
+} uia_snap_req_t;
+typedef struct {                     /* SNAP reply */
+    uint32_t snapped;
+    int32_t  sx;
+    int32_t  sy;
+} uia_snap_rep_t;
+typedef struct {                     /* ENUM req */
+    int32_t  mon_left, mon_top, mon_w, mon_h;
+    double   render_scale;
+} uia_enum_req_t;
+/* ENUM reply: uia_hdr_t{opcode=ENUM, payload_len=N} + N bytes of text
+ * (the composed anchor block, no trailing NUL guaranteed). */
+#pragma pack(pop)
+
+/* Blocking write+read helper. Times out ~500ms so a wedged helper never
+ * hangs a solve. Returns 1 on full success (magic+opcode match echoed
+ * reply); 0 on any error (caller falls back to local UIA / grid-vision). */
+static int uia_rpc(uint32_t opcode,
+                   const void *req_payload, uint32_t req_len,
+                   void *out_reply, uint32_t reply_cap,
+                   uint32_t *out_reply_len) {
+    if (out_reply_len) *out_reply_len = 0;
+    const char *pipe = obf_pipe_iso_cmd();
+    if (!pipe || !*pipe) return 0;
+
+    HANDLE h = CreateFileA(pipe, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        /* Helper unavailable (no isolated desktop / helper crashed / not
+         * yet injected). Silently fail-open. Log ONCE per boot to keep
+         * log noise low. */
+        static volatile LONG s_logged_absent = 0;
+        if (InterlockedCompareExchange(&s_logged_absent, 1, 0) == 0)
+            slog_writef("payload.log", "ground: uia-cmd pipe unavailable (gle=%lu) -- helper UIA disabled",
+                        GetLastError());
+        return 0;
+    }
+    /* PIPE_READMODE_MESSAGE would be nicer for framing but the helper's
+     * pipe is byte-mode (matches the existing input pipe pattern). Read
+     * the header first, then the exact reply_len bytes. */
+    int ok = 0;
+    uia_hdr_t req = { UIA_MAGIC, opcode, req_len };
+    uia_hdr_t rep = {0};
+    DWORD wr = 0, rd = 0;
+    if (!WriteFile(h, &req, sizeof(req), &wr, nullptr) || wr != sizeof(req)) goto done;
+    if (req_len && req_payload) {
+        if (!WriteFile(h, req_payload, req_len, &wr, nullptr) || wr != req_len) goto done;
+    }
+    FlushFileBuffers(h);
+    if (!ReadFile(h, &rep, sizeof(rep), &rd, nullptr) || rd != sizeof(rep)) goto done;
+    if (rep.magic != UIA_MAGIC || rep.opcode != opcode) goto done;
+    if (rep.payload_len > reply_cap) goto done;    /* refuse to overflow */
+    if (rep.payload_len) {
+        if (!ReadFile(h, out_reply, rep.payload_len, &rd, nullptr) ||
+            rd != rep.payload_len) goto done;
+    }
+    if (out_reply_len) *out_reply_len = rep.payload_len;
+    ok = 1;
+done:
+    CloseHandle(h);
+    return ok;
+}
+
+/* helper-side snap: returns 1 iff the helper snapped to a real element. */
+static int uia_snap_via_helper(int sx, int sy, int *out_sx, int *out_sy) {
+    uia_snap_req_t req; req.sx = sx; req.sy = sy;
+    uia_snap_rep_t rep = {0};
+    uint32_t got = 0;
+    if (!uia_rpc(UIA_OP_SNAP, &req, sizeof(req), &rep, sizeof(rep), &got)) return 0;
+    if (got != sizeof(rep)) return 0;
+    if (!rep.snapped) return 0;
+    if (out_sx) *out_sx = rep.sx;
+    if (out_sy) *out_sy = rep.sy;
+    return 1;
+}
+
+/* helper-side enumerate: fills a heap-allocated NUL-terminated text
+ * block (caller frees via ground_free). Returns NULL if helper had no
+ * anchors OR the RPC failed. */
+static char *uia_enum_via_helper(const svc_monitor_t *mon, double render_scale) {
+    uia_enum_req_t req;
+    req.mon_left = mon ? mon->left  : 0;
+    req.mon_top  = mon ? mon->top   : 0;
+    req.mon_w    = mon ? mon->width : 0;
+    req.mon_h    = mon ? mon->height: 0;
+    req.render_scale = render_scale;
+    /* Reply capacity 32 KB is plenty; a full-screen tree usually clocks
+     * in under 6 KB. */
+    const uint32_t CAP = 32 * 1024;
+    char *buf = (char *)malloc(CAP + 1);
+    if (!buf) return nullptr;
+    uint32_t got = 0;
+    if (!uia_rpc(UIA_OP_ENUM, &req, sizeof(req), buf, CAP, &got) || got == 0) {
+        free(buf); return nullptr;
+    }
+    buf[got] = 0;
+    return buf;
+}
 
 static CRITICAL_SECTION g_cs;
 static volatile LONG     g_cs_init = 0;
@@ -68,6 +198,22 @@ static int rect_plausible(const RECT *r) {
 extern "C" int ground_snap_screen(int sx, int sy, int *out_sx, int *out_sy) {
     if (out_sx) *out_sx = sx;
     if (out_sy) *out_sy = sy;
+
+    /* v15.1.8 -- on isolated desktops, DWM-N's local UIA cannot reach
+     * the isolated desktop's element tree. Ask the SYSTEM winlogon
+     * helper (which SetThreadDesktops to active per-request). Fall back
+     * to local UIA on the normal desktop OR if the helper is offline. */
+    if (rawin_is_isolated_desktop()) {
+        int hx = sx, hy = sy;
+        if (uia_snap_via_helper(sx, sy, &hx, &hy)) {
+            if (out_sx) *out_sx = hx;
+            if (out_sy) *out_sy = hy;
+            return 1;
+        }
+        /* Helper unavailable or no snap -- try local UIA anyway (harmless;
+         * usually returns nothing on an isolated desktop but no crash). */
+    }
+
     IUIAutomation *uia = get_uia();
     if (!uia) return 0;
 
@@ -202,6 +348,15 @@ static void collect_anchors_seh(IUIAutomation *uia, const svc_monitor_t *mon,
 
 extern "C" char *ground_build_anchor_block(const svc_monitor_t *mon, double render_scale) {
     if (!mon) return nullptr;
+
+    /* v15.1.8 -- isolated desktop -> route through helper (see ground_snap_screen). */
+    if (rawin_is_isolated_desktop()) {
+        char *helper_block = uia_enum_via_helper(mon, render_scale);
+        if (helper_block) return helper_block;   /* success */
+        /* Helper unavailable / gave empty -> fall through to local (usually
+         * also fails on isolated desktop, but harmless and fast). */
+    }
+
     IUIAutomation *uia = get_uia();
     if (!uia) return nullptr;
     double rs = (render_scale > 0.0001) ? render_scale : 1.0;

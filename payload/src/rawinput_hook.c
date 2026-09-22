@@ -2050,6 +2050,14 @@ int rawin_restart(void) {
  * keystate / kernel tap) is needed; validate empirically before assuming it. */
 static volatile LONG g_deskwatch_running = 0;
 static HANDLE        g_deskwatch_thread  = NULL;
+/* v15.1.8 -- current-desktop-is-isolated cache updated by desktop_watch_thread.
+ * ground.cpp polls this to decide whether to route UIA through the SYSTEM
+ * winlogon helper. Starts 0 (Default) at boot. */
+static volatile LONG g_desk_is_isolated = 0;
+
+int rawin_is_isolated_desktop(void) {
+    return InterlockedCompareExchange(&g_desk_is_isolated, 0, 0) != 0;
+}
 
 static void deskwatch_input_name(char *out, int cap) {
     if (cap <= 0) return;
@@ -2070,7 +2078,11 @@ static DWORD WINAPI desktop_watch_thread(LPVOID param) {
     (void)param;
     char last[160];
     deskwatch_input_name(last, sizeof(last));
-    rin_diag("deskwatch: ARMED; input desktop='%s'", last);
+    /* Prime the isolated-desktop flag from the initial name. */
+    InterlockedExchange(&g_desk_is_isolated,
+                        (lstrcmpiA(last, "Default") != 0) ? 1 : 0);
+    rin_diag("deskwatch: ARMED; input desktop='%s' isolated=%d",
+             last, (int)InterlockedCompareExchange(&g_desk_is_isolated, 0, 0));
     while (g_deskwatch_running) {
         Sleep(250);
         if (!g_deskwatch_running) break;
@@ -2078,6 +2090,7 @@ static DWORD WINAPI desktop_watch_thread(LPVOID param) {
         deskwatch_input_name(cur, sizeof(cur));
         if (strcmp(cur, last) == 0) continue;
         int to_default = (lstrcmpiA(cur, "Default") == 0);
+        InterlockedExchange(&g_desk_is_isolated, to_default ? 0 : 1);
         rin_diag("deskwatch: INPUT DESKTOP '%s' -> '%s' (%s)", last, cur,
                  to_default ? SS(SVC_STR_DESKWATCH_SWITCH_DEF)
                             : SS(SVC_STR_DESKWATCH_SWITCH_ISO));

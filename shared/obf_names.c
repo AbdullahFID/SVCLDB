@@ -35,6 +35,12 @@
 #define SALT_EVT_ISO_HALT  "wasvc.evt.iso.halt.1"
 #define SALT_EVT_ISO_CHAT  "wasvc.evt.iso.chat.1"
 #define SALT_CLS_ISO_INPUT "wasvc.cls.iso.input.1"
+/* v15.1.8 (2026-09-22) -- UIA request/reply pipe. Duplex; payload sends
+ * a UIA_OP_SNAP or UIA_OP_ENUM request, helper (SYSTEM winlogon) does
+ * the query with SetThreadDesktop(active) so it sees the isolated
+ * desktop's UIA tree, replies with the snapped coord / anchor block.
+ * See docs/HANDOFF_AUTOSOLVER_AGENTMODE_SVCLDB_PLAN_2026-09-22.md. */
+#define SALT_PIPE_ISO_CMD  "wasvc.pipe.iso.cmd.1"
 
 /* Fallback machine key used only if the registry read fails. Both C
  * and JS use this SAME literal so the endpoints still agree in the
@@ -176,4 +182,9 @@ const char *obf_event_iso_chat(void) {
 const char *obf_class_iso_input(void) {
     static char buf[64] = {0};
     return cached_name(buf, sizeof(buf), "", SALT_CLS_ISO_INPUT);
+}
+/* v15.1.8 -- payload<->helper UIA request/reply pipe (see header). */
+const char *obf_pipe_iso_cmd(void) {
+    static char buf[64] = {0};
+    return cached_name(buf, sizeof(buf), "\\\\.\\pipe\\", SALT_PIPE_ISO_CMD);
 }

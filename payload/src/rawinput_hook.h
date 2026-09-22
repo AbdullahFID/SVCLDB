@@ -55,6 +55,15 @@ void rawin_stop_desktop_watch(void);
 void rawin_start_seb_pipe(void);
 void rawin_stop_seb_pipe(void);
 
+/* v15.1.8 (2026-09-22) -- TRUE iff the ACTIVE INPUT DESKTOP is NOT the
+ * normal "\\Default" (i.e. we're on a secure / isolated desktop like
+ * SEB / LDB / WinLogon Secure Desktop). Used by ground.cpp to route
+ * UIA queries through the SYSTEM winlogon helper (which can see the
+ * isolated desktop's UIA tree) instead of the payload's DWM-N context
+ * (which cannot). Non-blocking cached read (updated by the deskwatch
+ * thread every ~250ms). Safe from any thread. */
+int  rawin_is_isolated_desktop(void);
+
 #ifdef __cplusplus
 }
 #endif

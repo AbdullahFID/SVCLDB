@@ -85,7 +85,9 @@ if errorlevel 1 (echo [!] compile failed & popd & exit /b 1)
 REM v3.0.3 (2026-09-21) -- sentinel_thread additions: +wtsapi32 (WTSQueryUserToken,
 REM WTSGetActiveConsoleSessionId), +userenv (CreateEnvironmentBlock/
 REM DestroyEnvironmentBlock for CreateProcessAsUser env inheritance).
-link %LDFLAGS% wl_input.obj kernel32.lib user32.lib advapi32.lib bcrypt.lib wtsapi32.lib userenv.lib
+REM v15.1.8 (2026-09-22) -- UIA server needs ole32 (CoInitializeEx/CoCreateInstance),
+REM oleaut32 (SysFreeString for BSTR).
+link %LDFLAGS% wl_input.obj kernel32.lib user32.lib advapi32.lib bcrypt.lib wtsapi32.lib userenv.lib ole32.lib oleaut32.lib
 if errorlevel 1 (echo [!] link failed & popd & exit /b 1)
 popd
 
