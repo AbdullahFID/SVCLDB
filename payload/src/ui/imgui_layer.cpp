@@ -7839,7 +7839,15 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
          * (published by the LL mouse hook -- the backend never sees clicks
          * because they route to the app under the cursor). */
         {
-            if (InterlockedCompareExchange(&g_forced_mouse_active, 0, 0)) {
+            /* v15.1.10 -- only trust the forced-mouse latch when we're
+             * actually on an isolated desktop. On Default, GetCursorPos
+             * works and is authoritative; using a stuck forced coord
+             * here was the "cursor teleports / dot unclickable after
+             * exiting SEB" bug LO reported. */
+            extern int rawin_is_isolated_desktop(void);
+            int use_forced = InterlockedCompareExchange(&g_forced_mouse_active, 0, 0)
+                             && rawin_is_isolated_desktop();
+            if (use_forced) {
                 /* Secure desktop: use the position the winlogon helper forwarded. */
                 io.AddMousePosEvent((float)(int)InterlockedCompareExchange(&g_forced_mouse_x, 0, 0),
                                     (float)(int)InterlockedCompareExchange(&g_forced_mouse_y, 0, 0));
@@ -7849,6 +7857,23 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
                     io.AddMousePosEvent((float)_cur.x, (float)_cur.y);
             }
             io.AddMouseButtonEvent(0, g_ui_mouse_left_down != 0);
+            /* v15.1.10: DEFENSIVE unstick. If the LL hook missed an
+             * LBUTTONUP (e.g. during a desktop transition, or the up
+             * event landed on a foreign desktop we don't hook), our
+             * g_ui_mouse_left_down latch would remain 1 forever and
+             * ImGui would never see a new IsMouseClicked() transition
+             * -- exact symptom: "the dot buttons stop responding after
+             * a while". GetAsyncKeyState is kernel-global (works across
+             * desktops), so if it says the physical L-button is UP but
+             * our latch says DOWN, force-clear so the NEXT press lands
+             * cleanly. Also unlatches the pipe-fed level (same fix
+             * applies whether the stale DOWN came from local LL or
+             * helper-forwarded pipe). */
+            if (g_ui_mouse_left_down &&
+                (GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
+                InterlockedExchange(&g_ui_mouse_left_down, 0);
+                io.AddMouseButtonEvent(0, false);
+            }
         }
         ImGui::NewFrame();
         draw_chat_window(w, h);
