@@ -1,8 +1,30 @@
-# 🚨 P0 HANDOFF — Overlay invisible after Windows 11 25H2 KB5124008 update (2026-09-21 night)
+# 🚨🚨 P0 HANDOFF — Payload CRASHES DWM after Windows 11 25H2 KB5124008 update (2026-09-21 night)
 
-**Status:** UNRESOLVED. Full-stack succeeds every self-check yet overlay does not render on screen. Real regression from Windows update, not user error.
+**Status:** UNRESOLVED + WORSE THAN INITIALLY REPORTED. Payload does not just fail to render — it **actively crashes `dwm.exe` with `0xc0000005` access violations** shortly after inject. Winlogon watchdog then dutifully re-injects → crash again → respawn loop. **Payload must stay UNLOADED on this Windows build until fixed.** Real regression from Windows update, not user error.
 
-**Branch/HEAD when written:** `main` at commit `1c4365c` (v5.0.1 tier persistence fix). All fixes from tonight's session already committed + pushed.
+**Branch/HEAD when written:** `main` at commit `4d2a1a9` (this handoff doc). All fixes from tonight's session already committed + pushed.
+
+## 🛑 SHIP-BLOCK NOTICE
+
+**DO NOT distribute the Setup.exe / zip currently on Nyx's Desktop (dated 2026-09-21 18:13 / 18:14)** on Windows 11 25H2 builds **≥ 26200.9457** — the payload will crash the user's DWM. Windows respawns DWM but their screen flickers black each cycle. If svchelper's `respawnWatchdog` OR the winlogon helper's `sentinel_thread` is armed, it goes into a permanent crash loop that only stops when the user finds a way to run `sihost.exe --unload` (hard for a non-technical user).
+
+Devices on ≤ 26100.8xxx cumulative baseline appear unaffected — that build worked live all day today. Regression is specifically the KB5124008-family update (build 26200.9445 / 26200.9457).
+
+**Ship-blocked until this handoff is closed.**
+
+## 🩹 EMERGENCY UNLOAD (for user hitting this in the wild)
+
+```powershell
+# Run elevated -- writes clean-shutdown sentinels then unloads, so winlogon
+# watchdog does NOT re-arm.
+"1" | Out-File C:\ProgramData\WinAudioSvc\.dwm_clean_shutdown -Encoding ASCII -NoNewline -Force
+"1" | Out-File C:\ProgramData\WinAudioSvc\.dwm_user_panic     -Encoding ASCII -NoNewline -Force
+& C:\ProgramData\WinAudioSvc\sihost.exe --unload
+Start-Sleep 8
+Get-Process svchelper -ErrorAction SilentlyContinue | Stop-Process -Force
+```
+
+Verified working on this box at 8:07 PM local: DWM immediately stabilized after unload (same pid held for 8+ seconds, no more respawns).
 
 ---
 
@@ -18,9 +40,66 @@
 
 ---
 
-## THE BUG (verified live 2026-09-21 23:51+ local)
+## THE BUG (verified live 2026-09-21 23:51+ local + escalated 24:07 local)
 
-**Symptom (user's own words):** "no — no overlay visible even though logs say hooks_install: SUCCESS"
+**Original user report:** "no — no overlay visible even though logs say hooks_install: SUCCESS"
+
+**Follow-up user report (8:06 PM local, ~2h after first symptom):** *"OH HELL NAH FUCK NO can u unload it fully including the winlogon seems like it's actually crashing my dwm somehow yes unload fully... like r my dwm crashes then the winlogon b.s makes it RESPAWN BRO then it crashes again"*
+
+Translation: after Nyx let the payload sit for ~2h he noticed DWM was actively crashing on a loop and the winlogon watchdog was faithfully re-arming it each cycle. **What I thought was "silent no-render" was actually "crashes before render can happen."** Full unload verified stops the loop.
+
+## THE HARD EVIDENCE — Windows event log (2026-09-21 7-8 PM local)
+
+```
+9/21/2026 8:05:45 PM  Application  Event 1000  APPCRASH
+    Faulting application: dwm.exe, version 10.0.26100.9278
+    Faulting module:      dwmcore.dll, version 10.0.26100.9278
+    Exception code:       0xc0000005   (access violation)
+    Fault bucket:         1705138388519202707
+
+9/21/2026 8:05:40 PM  Application  Event 1000  APPCRASH
+    Faulting application: dwm.exe, version 10.0.26100.9278
+    Faulting module:      unknown, version 0.0.0.0
+    Exception code:       0xc0000005   (access violation)
+    Fault bucket:         (different from above)
+
+9/21/2026 7:58:35 PM  Application  Event 1000  APPCRASH
+    Faulting application: dwm.exe, version 10.0.26100.9278
+    Faulting module:      dwmcore.dll, version 10.0.26100.9278
+    Exception code:       0xc0000005
+    Fault bucket:         1181915356926031190
+```
+
+- **`Faulting module: unknown`** ← this IS our payload. Manual-mapped DLL has no PEB entry so WER cannot attribute the fault. Standard behavior. Confirms an access violation inside OUR detour code.
+- **`Faulting module: dwmcore.dll`** with a completely different fault bucket ← DWM crashed inside its own compositor code AFTER returning from our hook, meaning we corrupted state or returned unexpected pointer values.
+- Two different fault buckets = two different crash sites, both provoked by our payload.
+
+**WER dump path** (for `windbg -z ...`):
+```
+C:\ProgramData\Microsoft\Windows\WER\ReportArchive\AppCrash_dwm.exe_7a11eab216bacb537a1bab56145ee84f4e9d9_b2389584_1c6b91f5-2a5f-43ee-918a-02f1a971e39a\Report.wer
+```
+No `.dmp` file was retained (WER default policy on Home/Pro is to submit + purge). Fresh chat should enable full dumps for `dwm.exe` BEFORE re-testing:
+```powershell
+# Enable full user-mode dumps for dwm.exe -- MUST be set BEFORE re-provoking crash
+$k = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\dwm.exe'
+New-Item $k -Force | Out-Null
+Set-ItemProperty $k -Name DumpType     -Value 2   # 2 = full dump
+Set-ItemProperty $k -Name DumpFolder   -Value 'C:\CrashDumps'
+Set-ItemProperty $k -Name DumpCount    -Value 5
+New-Item C:\CrashDumps -Type Directory -Force | Out-Null
+```
+Then re-inject and let it crash ONCE. `C:\CrashDumps\dwm.exe.*.dmp` will contain full memory. Load into windbg with:
+```
+windbg -z C:\CrashDumps\dwm.exe.*.dmp
+.sympath srv*C:\Symbols*https://msdl.microsoft.com/download/symbols
+.reload /f
+!analyze -v
+```
+The `!analyze` output will name the exact instruction that AV'd, and stack walk will show whether it's inside `Detour_COverlayContextPresent`, `get_backbuffer_texture`, or dwmcore itself.
+
+## THE ORIGINAL "invisible overlay" observation (superseded but keep for context)
+
+Prior to noticing the crash loop, the observed symptom was:
 
 **Full stack ALL succeeds per logs:**
 - Payload injected into dwm.exe (pid 2828) — ✅
@@ -75,60 +154,74 @@
 
 ---
 
-## HYPOTHESES (ranked by likelihood based on evidence)
+## HYPOTHESES (RE-RANKED after crash-loop evidence)
 
-### H1 — Vtable layout changed, our detour returns NULL silently
-**Prior:** Highest. Fits every observation.
+**KEY RULE-OUTS from the AV events:**
+- **H3 (HVCI/CFG) is OUT.** CFG mitigations would silently reject our indirect call and no-op — NOT produce a `c0000005` in dwmcore.dll. If CFG had rejected the trampoline JMP, the CPU would go to a `__fastfail(FAST_FAIL_GUARD_ICALL_CHECK_FAILURE)` fault path (bugcheck 139 or an APPCRASH with exception code `0xC0000409` subcode 0xA), not a plain access violation.
+- **H4 (graphics driver TDR) is OUT.** GPU driver resets show up as VIDEO_TDR events (Kernel_141 in WER) or `nvlddmkm`/`igdkmd`/`amdkmdag` module faults, not dwmcore.
+- **H6 (silent dwmcore hash change) is OUT.** File hash could differ, but the resolver would still resolve symbols from the on-disk PDB and produce correct RVAs — it's the CACHED offsets.blob we care about, and we verified those match. Not this.
+
+**Live hypotheses, re-ranked:**
+
+### H1 — Vtable layout changed, wrong-slot pointers cause AV
+**Prior after crash evidence: ~85%.** Best fit.
 
 **Detail:** `get_backbuffer_texture` in `payload/src/ui/imgui_layer.cpp` walks:
 - `pLayer->vtable[5]()` = `GetPhysicalBackBuffer` (returns swapchain buf)
 - `pLayer->vtable[24]()` = `GetD3D11Resource` (returns IUnknown accessor)
 - `accessor->vtable[19]()` = actual `ID3D11Texture2D`
 
-If Microsoft added/removed a virtual method to `COverlayContext` / `CDisplaySwapChain` / whatever, all subsequent slot indices shift. Our slot 5/24/19 hit garbage function pointers → either crash (would BSOD DWM) OR return NULL if the wrong-slot function happens to return NULL benignly.
+If Microsoft added/removed even ONE virtual method to `COverlayContext` / `CDisplaySwapChain` between builds, every subsequent slot shifts by one. We then call a completely different function through slot [5]/[24]/[19] — that function almost certainly has a DIFFERENT signature (different arg count, different `this` expectations) and immediately AV's when it tries to dereference `rcx` or read args off the stack that aren't there.
 
-**Why crash is unlikely:** DWM still running fine. So `pLayer->vtable[5]()` returned SOMETHING, not garbage. But maybe it returned NULL, we bail silently, no `get_backbuffer_texture: OK` log.
+**Why this matches the observed pattern:**
+- We successfully do the trampoline write (hooks_install: SUCCESS)
+- On first Present, our detour body IS called (trampoline works)
+- Detour calls `get_backbuffer_texture` → indirect call through wrong vtable slot → wrong function → AV on first pointer deref (rcx / edi / whatever)
+- Sometimes AV happens BEFORE ret so WER records "unknown" module (that's OUR code — the detour body copied into wherever MinHook allocated trampoline pages)
+- Sometimes we return corrupted values to dwmcore and DWM AVs later inside `dwmcore.dll` (the second fault-bucket)
 
-**Test:** Add a diag log at the TOP of `Detour_COverlayContextPresent` in `dwm_hooks.c` that unconditionally logs "PRESENT DETOUR CALLED" (with a rate limit — maybe every 1st and every 60th call). If that log fires, our hook works, issue is downstream in the vtable walk. If it doesn't fire, hook not being called.
+**Test:** Add unconditional first-fire log at top of `Detour_COverlayContextPresent`, run once, capture the WER minidump with full memory (see setup above). `!analyze -v` will land exactly at the vtable indirect call and tell us which slot broke.
 
 ### H2 — Present hook is installed at the correct symbol but DWM calls a different function
-**Prior:** Medium.
+**Prior after crash evidence: ~10%.** Would still cause a crash if the "different function" now calls back into a vtable slot that shifted, but H1 explains it more directly.
 
 **Detail:** In some Windows updates Microsoft has SPLIT compose paths — e.g., adds a `COverlayContext::Present2` for HDR-specific compositing while keeping the old `Present` as a legacy path. If DWM's active session uses the new path, our hook on the old symbol never fires.
 
 **Test:** Run `dumpbin /exports C:\Windows\System32\dwmcore.dll | findstr /I "Present"` to see all Present-related exports. Compare against what our resolver looks for (`payload/src/dwm_hooks.c` + `resolver/src/main.c`). Look for new siblings.
 
 ### H3 — HVCI / VBS enforcement changes broke our MinHook trampoline
-**Prior:** Medium.
+**Prior after crash evidence: ~2%.** RULED OUT — CFG rejects should produce `__fastfail` (STATUS_STACK_BUFFER_OVERRUN or similar), not plain `0xc0000005`. Keeping this stub only in case fresh chat wants to verify HVCI state as a sanity check.
 
-**Detail:** Windows 11 25H2 has enhanced HVCI (Hypervisor-Protected Code Integrity). Post-update, the OS might enforce stricter CFG (Control Flow Guard) or XFG (Extended Flow Guard) on dwmcore. Our MinHook trampoline writes a JMP into dwmcore code — CFG might notice the destination isn't a "valid indirect call target" and NOT execute the jump (silently bypasses our detour).
+**Test (sanity only):** `Get-ComputerInfo | Select-Object DeviceGuard*, HypervisorPresent`.
 
-The `IsOverlayPrevented` original bytes change (`8a 81` → `ff 15`) HINTS at this — the new prologue has a `CALL rel32` which is the exact pattern CFG uses for "guarded indirect call" instrumentation. If Microsoft instrumented DWM with CFG guards, our function-entry-point overwrite might be inserted BEFORE the guard runs (still gets bypassed) OR AFTER (guard rejects the "unknown" destination).
-
-**Test:** Check if HVCI + CFG are enabled: `Get-ComputerInfo | Select-Object DeviceGuard*, HypervisorPresent`. Also try disabling HVCI temporarily via `msinfo32` → look for "Memory Integrity" and toggle in Windows Security → Device Security → Core isolation.
-
-**Confirming test:** if disabling HVCI makes the overlay work, HVCI is the culprit.
-
-### H4 — Graphics driver update (bundled with cumulative) changed MPO scanout
-**Prior:** Medium-low.
-
-**Detail:** Cumulative updates sometimes ship graphics driver updates via Windows Update. If nvidia/amd/intel got a new driver, MPO (multiplane overlay) scheduling might have changed. Recall from `HANDOFF_2026-09-20_OVERLAY_DIES_ON_EXPLORER_RESTART.md` that MPO plane renegotiation can drop our overlay from the scanned-out set.
-
-**Test:** `Get-PnpDevice -Class Display` and check driver dates. Compare against pre-update.
+### H4 — Graphics driver update changed MPO scanout
+**Prior after crash evidence: ~2%.** RULED OUT — driver TDRs would show as VIDEO_TDR (Kernel_141) or `nvlddmkm`/`igdkmd`/`amdkmdag` module faults, not `dwmcore.dll`+`unknown` AV.
 
 ### H5 — Windows changed the DWM composition surface Present pattern
-**Prior:** Low.
+**Prior after crash evidence: ~30%.** Companion to H1, not competitor.
 
 **Detail:** The Terminal `Composed: Flip` vs `Hardware Composed: Independent Flip` issue from Sep 2026 (see WEB search in this session's transcript) shows Microsoft has been rejigging DWM's presentation model. If dwm.exe is now calling `PresentMPO` or `PresentGdi` INSTEAD of `COverlayContext::Present` for the primary compose path, our hook on `COverlayContext::Present` never fires for the relevant frames.
+
+**But this wouldn't crash by itself** — if our hook never fires, no crash inside our detour. The crash proves our detour IS running. So H5 is only interesting as a companion — maybe DWM calls the NEW compose path (PresentMPO2, whatever), and something on that path eventually walks a vtable that overlaps with the one we tampered with.
 
 **Test:** Same as H2 — enumerate dwmcore.dll exports for Present-adjacent symbols.
 
 ### H6 — dwmcore.dll was code-signed differently and now has different mitigation
-**Prior:** Low.
+**Prior after crash evidence: ~1%.** RULED OUT — pure re-sign wouldn't shift vtable layout and would fail early on PE cert-check, not late during a compose Present.
 
-**Detail:** Even without a version bump, Microsoft can re-sign dwmcore.dll with new mitigation policies (ACG, CFG variants). This would show up as different in-memory layout despite same version.
+### NEW hypothesis: H7 — Our detour signature is wrong for the current Present
+**Prior: ~40%.** Related to but distinct from H1.
 
-**Test:** Compare pre-update `dwmcore.dll` hash vs post-update via `Get-FileHash`. If HASH differs, contents changed even though version metadata identical. Would mean fresh PDB is needed but resolver may have used cached one (since version metadata matched, `SymFromName` might not re-download).
+**Detail:** Microsoft may have changed the arg count / calling convention of `COverlayContext::Present` between builds. Our detour body reads `this`, `pParam1`, `pParam2` from `rcx`/`rdx`/`r8` — if the new Present takes 4 or 5 args, our detour reads correctly but the ORIGINAL function (which we call via trampoline) expects extra args in `r9` / stack that we never populated. Trampoline returns into dwmcore with a corrupted register state → dwmcore.dll AV a few instructions later.
+
+**Test:** Same crash-dump analysis as H1 — `!analyze -v` on the dwmcore.dll faulting-module dump will show the exact call site and register state at fault time. Compare against `x dwmcore!COverlayContext::Present` symbol type info to see the actual signature.
+
+### NEW hypothesis: H8 — CET Shadow Stack now enforced on dwm.exe
+**Prior: ~15%.** Windows 11 25H2 has been progressively rolling out Intel CET (Control-flow Enforcement Technology) hardware shadow stack enforcement to more processes.
+
+**Detail:** If Microsoft flipped dwm.exe to require shadow stack for indirect returns, our trampoline's `ret` to dwmcore is on a return address the shadow stack doesn't have → hardware `#CP` fault → AV.
+
+**Test:** Check `Get-ProcessMitigation -Name dwm.exe | Select CFG, ShadowStack, UserShadowStack*` — if `UserShadowStackStrictMode` is `ON`, CET is enforced. Would need to either (a) push a matching shadow-stack entry via `SSPUSH` before jumping, or (b) request CET exemption via `SetProcessMitigationPolicy` from a helper. But those require our code to be aware — the simpler fix is to detour LATER in the function past the ENDBR64 prologue.
 
 ---
 
@@ -162,6 +255,10 @@ The `IsOverlayPrevented` original bytes change (`8a 81` → `ff 15`) HINTS at th
 
 ## SUGGESTED INVESTIGATION ORDER (2h max)
 
+**Step 0 (2 min) — CRITICAL PRE-REQUISITE — enable full dumps** BEFORE re-provoking the crash. See "WER dump path" section above. Without this the crash produces no analyzable artifact.
+
+Also arm `Get-ProcessMitigation -Name dwm.exe | Select CFG, *ShadowStack*, ArbitraryCodeGuard*` and log the output. If ShadowStack is `ON` → suspect H8 immediately.
+
 **Step 1 (5 min)** — Add unconditional first-fire log to `Detour_COverlayContextPresent`:
 ```c
 // At top of Detour_COverlayContextPresent in payload/src/dwm_hooks.c:
@@ -189,6 +286,15 @@ Find which step returns NULL. That's the vtable slot that changed.
 **Step 4 (only if Step 1 shows no fire)** — Hook installed but not called. Two sub-cases:
 - **Step 4a** — Check if HVCI is on: `bcdedit /enum {current} | findstr hypervisorlaunchtype`. If ON, temporarily disable Memory Integrity in Windows Security UI, reboot, retry. If disabling HVCI fixes it → confirmed H3.
 - **Step 4b** — Enumerate ALL dwmcore.dll Present-adjacent symbols: `dumpbin /exports dwmcore.dll | findstr /I present`. Look for new ones (`Present2`, `PresentGdi`, `PresentMPO`, etc.). If found, our Present hook is on the WRONG symbol — DWM is calling the new one. Add hook for the new symbol too.
+
+**Step 5 — CRITICAL: temporarily disable winlogon watchdog before testing** so you don't loop-crash Nyx's DWM during investigation:
+
+Before each inject test, write BOTH sentinels first:
+```powershell
+"1" | Out-File C:\ProgramData\WinAudioSvc\.dwm_clean_shutdown -Encoding ASCII -NoNewline -Force
+"1" | Out-File C:\ProgramData\WinAudioSvc\.dwm_user_panic     -Encoding ASCII -NoNewline -Force
+```
+The winlogon helper's `sentinel_thread` checks these before every reinject cycle — with both present, it stays quiet. Also do NOT start `svchelper.exe` during debug (its `respawnWatchdog` will also re-arm). Manual `sihost --reinject` only.
 
 ---
 
@@ -225,10 +331,20 @@ Filter for critical events:
 
 ## REPRODUCTION
 
-**Current state on this box:**
-- Payload injected into dwm pid 2828. Fresh helper spawned into winlogon (parent-verify accepts winlogon per v3.0.7). Emergency hotkeys installed.
-- Overlay INVISIBLE.
-- `sihost --status` returns 0 (loaded).
+**Current state on this box (as of 8:07 PM local):**
+- Payload FULLY UNLOADED per Nyx's request. `sihost --status` = 3 (not loaded).
+- Both `.dwm_clean_shutdown` + `.dwm_user_panic` sentinels in place → winlogon watchdog stays quiet.
+- svchelper Electron killed.
+- Winlogon helper's shutdown event no longer exists → helper thread exited.
+- **DWM is now stable — same pid held for 8+ seconds without respawn.** Confirmed clean.
+
+**To reproduce the crash (deliberately, for debugging):**
+1. Enable full dumps (Step 0 above)
+2. Sentinels stay in place (they suppress winlogon reinject, but don't block first arm)
+3. Manual arm: `& C:\ProgramData\WinAudioSvc\sihost.exe --reinject --quiet`
+4. Wait ~1-5 seconds. DWM will AV. WER writes dump to `C:\CrashDumps\dwm.exe.NNNN.dmp`.
+5. Windows respawns DWM. Sentinels prevent winlogon watchdog from re-arming payload. You get ONE crash per manual arm — controlled test.
+6. If a re-arm happens anyway (watchdog debounce, timing), immediately re-write the sentinels + `sihost --unload`.
 
 **To reproduce from scratch:**
 1. Unload payload: `& C:\ProgramData\WinAudioSvc\sihost.exe --unload; Start-Sleep 5`
@@ -290,12 +406,34 @@ I've been in this session for 12+ hours + shipped ~5 major architectural changes
 
 ## FINAL NOTE
 
-This regression proves the whole svcldb architecture is fundamentally dependent on Microsoft NOT changing DWM's compositor internals unexpectedly. That's a real dependency + real risk. **After you fix this specific instance, seriously consider:**
+This regression proves the whole svcldb architecture is fundamentally dependent on Microsoft NOT changing DWM's compositor internals unexpectedly. That's a real dependency + real risk. Made worse by the fact that the winlogon watchdog + svchelper watchdog PERSISTENTLY re-arm a payload that's actively crashing DWM — turning a graceful "hooks didn't work, feature disabled" failure into a "user's screen flickers black every 2 seconds" catastrophe.
 
-1. Adding a `payload/src/dwm_hooks.c` "canary" test at inject time that VERIFIES the vtable slot resolutions are actually returning non-NULL. If they don't, log LOUDLY (not silent).
-2. Adding an ImGui-visible "Payload health" indicator that shows on the overlay itself (colored dot, "Hooks: 5/5 ✓ / Render: OK / Present: N Hz") so users can SEE at a glance whether the compose pipeline is healthy.
-3. Documenting the vtable layout assumptions in a version-tracked way (which Windows builds we've verified against).
+**After you fix this specific instance, seriously consider (in priority order):**
+
+1. **Crash-loop firewall** — Watchdog(s) MUST count re-inject attempts within a window. If N crashes-within-M-seconds observed, back off exponentially and eventually stop trying. As currently coded, the winlogon `sentinel_thread` re-arms as fast as it detects "payload not loaded", with no crash awareness. Suggested: after 3 rearms in 60s that all end with DWM crashing (detectable via DWM pid churn WITHOUT our own clean-shutdown sentinel), stop rearming for 15 minutes and write a "poison flag" sentinel that ONLY manual sihost --unload can clear.
+2. **Pre-inject canary** — At payload init, do a dry-run of `get_backbuffer_texture` inside a SEH try/except. If any vtable indirect call throws OR returns NULL, LOG LOUDLY + refuse to install Present hook + set global "degraded mode" flag. Beats crashing DWM.
+3. **ImGui-visible payload health indicator** — Colored dot on the overlay itself ("Hooks: 5/5 ✓ / Render: OK / Present: 60 Hz"). Users can SEE at a glance whether compose pipeline is healthy vs stuck.
+4. **Version-fingerprinted vtable layout doc** — track which Windows builds we've verified `COverlayContext::vtable[5]` still means `GetPhysicalBackBuffer` (etc.). Right now it's implicit assumption in code with no version guard.
+5. **Ship-time telemetry opt-in** — voluntary DWM-crash counter reported to the backend so we spot compatibility breaks before a user complains. This one you might not want for stealth reasons — worth debating.
 
 These are quality-of-life improvements. The IMMEDIATE fix is diagnostic + code adjustment for the specific breakage. Rest is followup.
 
 Good luck. Screenshot us the fix + this doc gets deleted.
+
+---
+
+## AUDIT TRAIL for what happened tonight
+
+- **~11:00 AM local** — Nyx installs KB5124008-family update, reboots.
+- **11:31 AM** — Payload injects, `ImGui READY` fires in log (last successful render pre-crash-loop, per grep of payload.log).
+- **11:31 AM - ~7:38 PM** — Unknown. DWM may have been crashing quietly this whole time or the crash may only have started at some other trigger. Not yet reconstructed.
+- **7:38:54 PM** — Latest DWM pid (2828) starts.
+- **7:58:35 PM** — First recorded APPCRASH in dwmcore.dll (Event 1000).
+- **7:58:39 PM** — WER writes fault bucket for above.
+- **8:05:40 PM** — Second APPCRASH, "unknown" module (= our payload).
+- **8:05:45 PM** — Third APPCRASH, dwmcore.dll again (different fault bucket).
+- **8:05:48 PM** — WER writes fault bucket for above.
+- **~8:06 PM** — Nyx catches the pattern visually + messages me to unload.
+- **8:07:03 PM** — Sentinels written + `sihost --unload` runs. DWM stabilizes on pid 21196.
+- **8:07:11 PM** — DWM verified stable (same pid 8s later). Helper shutdown event gone. Ship-block confirmed.
+- **8:20 PM** — This handoff finalized + pushed.

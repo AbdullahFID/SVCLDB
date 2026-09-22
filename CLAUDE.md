@@ -9,8 +9,29 @@ memory from prior sessions (~4.8k lines).
 For live operational stuff (launch/test/deploy procedure), see `AGENTS.md`
 and `.cursor/rules/fast-testing-launch.mdc`.
 
+## 🛑🛑 ACTIVE P0 SHIP-BLOCK (as of 2026-09-21 8:07 PM local)
+
+**PAYLOAD IS CRASHING `dwm.exe` (0xc0000005 AV) on Windows 11 25H2 build ≥ 26200.9457 (KB5124008 family).** DO NOT distribute the Setup.exe / zip on Nyx's Desktop until this is fixed. Full write-up + WER evidence + investigation plan in `docs/HANDOFF_2026-09-21_POST_WINDOWS_UPDATE_OVERLAY_INVISIBLE.md`. Payload currently unloaded on Nyx's box (sentinels in place; winlogon watchdog + Electron watchdog stood down; DWM stable). If you're a fresh chat: READ THAT HANDOFF FIRST before touching any inject/hook code.
+
 Recent operational handoffs (append to top as new ones land):
 
+- `docs/HANDOFF_2026-09-21_POST_WINDOWS_UPDATE_OVERLAY_INVISIBLE.md` —
+ **🚨 UNRESOLVED P0 2026-09-21 20:07 local.** Payload crashes `dwm.exe`
+ with `0xc0000005` on latest Windows 11 25H2 build (KB5124008 family,
+ build 26200.9457). Winlogon watchdog + Electron watchdog were
+ dutifully re-arming a payload that AVs on every inject → DWM crash
+ loop → user screen flickers black every ~2s. Fully unloaded now
+ (sentinels + `sihost --unload`). Two distinct fault buckets recorded
+ in WER (one inside `dwmcore.dll`, one in "unknown" = our manual-mapped
+ payload). dwmcore.dll `FileVersion` string unchanged (10.0.26100.9278)
+ BUT `IsOverlayPrevented` prologue bytes changed pre/post update
+ (`8a 81 28 01 00 00` → `ff 15 5a df 11 00`) proving Microsoft
+ altered dwmcore internals despite metadata match. Leading hypothesis
+ (H1, ~85%): vtable slot layout shifted → wrong-slot indirect call in
+ `get_backbuffer_texture` AVs. H8 (CET Shadow Stack) at ~15% as
+ backup. Full crash-loop reproduction procedure + full dump collection
+ procedure + investigation-order in the doc. **Ship-blocked** until
+ fixed — do not ship Desktop artifacts.
 - `docs/HANDOFF_2026-09-21_WINLOGON_WATCHDOG_LANDED.md` — **✅ v3.0.3 →
  v3.0.5 LANDED 2026-09-21 evening.** Four-layer overlay/shell/payload
  resilience system: (L1) payload's `ensure_fake_hwnd_valid()` now uses
