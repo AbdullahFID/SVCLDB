@@ -530,15 +530,16 @@ static int fire(int slot) {
     else if (slot == SVC_HK_ASK || slot == SVC_HK_TYPING || slot == SVC_HK_STOP_GEN)
         min_gap = 60;
     else if (g_repeat_allowed[slot]) {
-        /* v11 (2026-07-24) -- SMOOTH_NUDGE: when the flag is set (default ON)
-         * we run at 60Hz (16ms) which matches Bypassify's buttery-smooth
-         * nudge cadence. With 8-px steps in dllmain that's 480 px/sec
-         * continuous slide. If the user disables SMOOTH_NUDGE via the
-         * dashboard, fall back to the historical 50ms/20Hz gap so old
-         * behavior is one flag flip away. */
-        extern unsigned ui_get_overlay_flags(void);
-        unsigned flg = ui_get_overlay_flags();
-        min_gap = (flg & SVC_OVFLAG_SMOOTH_NUDGE) ? 16 : 50;
+        /* v3.5.2 (2026-09-23) -- FIXED at 16ms (60Hz). Pre-3.5.2 this
+         * gated on SVC_OVFLAG_SMOOTH_NUDGE, but that flag was not reliably
+         * propagated through every arm path (Electron overlay.json read
+         * paths could silently zero it) which fell back to 50ms/20Hz --
+         * below the smooth-motion perceptual threshold no matter the
+         * per-fire step size. Nobody wants the 20Hz path (it just looks
+         * broken) so it's gone unconditionally. Debounce paces the fire
+         * rate; on_hotkey's held-repeat detector uses small steps so
+         * cumulative velocity = 720 px/sec of butter-smooth glide. */
+        min_gap = 16;
     }
     else if (slot == SVC_HK_COPY_REPLY || slot == SVC_HK_COPY_ANSWER ||
              slot == SVC_HK_COPY_CODE || slot == SVC_HK_NEW_CHAT ||

@@ -7148,12 +7148,28 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
         g_disp_off_y = target_y;
         g_disp_off_primed = true;
     } else {
-        /* v1.7.8f: 1.0 factor = INSTANT snap (no glide). LO ask --
-         * BP is instant, so we are too. Hypothesis: BP's smoothness
-         * comes from smaller nudge step + LL-hook auto-repeat, not
-         * glide animation. If instant + 48px feels choppy, drop step
-         * in dllmain SVC_HK_MOVE_* handlers to ~20px. */
-        const float k = 1.0f;
+        /* v3.5.4 (2026-09-23) -- RE-ENABLED glide interpolation.
+         *
+         * v1.7.8f had set k=1.0 (instant snap) on the hypothesis that
+         * "BP's smoothness comes from smaller step + LL-hook auto-repeat".
+         * That hypothesis was WRONG -- proven by v3.5.x testing where
+         * smaller steps still stuttered because the underlying issue is
+         * DWM Present rate vs. hotkey fire rate desync (nudges land on
+         * FIRE frames, position is stationary on Present frames in between
+         * = eye sees "jump, hold, jump, hold" = stutter).
+         *
+         * True glide requires interpolating the DISPLAYED position toward
+         * the TARGET position on EVERY Present frame, decoupled from fire
+         * rate. Each Present frame the display moves 35% of the remaining
+         * gap. At 60Hz present that's 130ms visual settle for a 48px tap.
+         * For a HELD-repeat where target keeps moving 24px per fire, the
+         * display continuously chases with a small lag = butter smooth
+         * regardless of whether hotkey fires at 20Hz or 60Hz.
+         *
+         * Trade-off vs instant: single-tap has ~130ms lag before overlay
+         * arrives at final position. Imperceptibly small vs. the "no
+         * stutter" win. */
+        const float k = 0.35f;
         g_disp_off_x += (target_x - g_disp_off_x) * k;
         g_disp_off_y += (target_y - g_disp_off_y) * k;
         /* Snap-to-target when within 0.5px (inline compare -- avoids

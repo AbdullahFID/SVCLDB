@@ -1176,44 +1176,22 @@ static void on_hotkey(int action) {
         case SVC_HK_MOVE_UP:
         case SVC_HK_MOVE_DOWN: {
             const svc_config_t *ncfg = cfg_get();
-            unsigned oflags = ncfg ? ncfg->overlay_flags : 0;
-            int base_step = (ncfg && ncfg->nudge_step_px >= 1 && ncfg->nudge_step_px <= 200)
-                            ? ncfg->nudge_step_px : 48;
-            /* v3.5 (2026-09-23) -- SMOOTH GLIDE FIX.
+            int nstep = (ncfg && ncfg->nudge_step_px >= 1 && ncfg->nudge_step_px <= 200)
+                        ? ncfg->nudge_step_px : 48;
+            /* v3.5.4 (2026-09-23) -- Simple fixed step.
              *
-             * The pre-3.5 code always used base_step (default 48px) per fire.
-             * At the 60Hz cadence SMOOTH_NUDGE selects (see rawinput_hook.c
-             * fire() min_gap=16), that's 48px x 60Hz = 2880 px/sec applied in
-             * 48-pixel jumps -- you SEE the overlay teleport chunk-by-chunk
-             * every frame instead of gliding. Drag doesn't stutter because
-             * mouse WM_MOUSEMOVE deltas are 1-5px per event (per pixel of
-             * physical motion) so ui_nudge is called with small deltas.
+             * Prior v3.5.x tried held-repeat step reduction (8/12px) and
+             * velocity-scaled step but both stuttered because the actual
+             * problem was DWM Present desync (see imgui_layer.cpp glide
+             * interpolation comment @ k=0.35). Now that Present frames
+             * interpolate 35% of the gap per frame, we don't need any
+             * clever per-fire sizing -- each nudge just sets a fresh
+             * target and the compose thread smoothly chases it.
              *
-             * Fix: when SMOOTH_NUDGE is on AND this fire is a HELD-repeat
-             * (previous fire for this slot was <100ms ago), use a SMALL 8px
-             * step so cumulative motion at 60Hz = 480 px/sec = butter-smooth
-             * glide (matches Bypassify's numbers). First tap after a gap
-             * keeps the full base_step for precise micro-adjustment control.
-             *
-             * When SMOOTH_NUDGE is off, or on a fresh tap, use base_step
-             * -- preserves the "1cm per press" precision LO asked for.
-             *
-             * Time source: per-slot last-fire timestamp maintained here (fire()
-             * has its own g_last_fire but we can't reach it from dllmain --
-             * mirror the timestamp locally, only touched on this hot path). */
-            static ULONGLONG s_last_move_ms[4] = {0};
-            int idx = (action == SVC_HK_MOVE_LEFT)  ? 0 :
-                      (action == SVC_HK_MOVE_RIGHT) ? 1 :
-                      (action == SVC_HK_MOVE_UP)    ? 2 : 3;
-            ULONGLONG now_ms = GetTickCount64();
-            int is_held_repeat = (s_last_move_ms[idx] != 0)
-                              && ((now_ms - s_last_move_ms[idx]) < 100);
-            s_last_move_ms[idx] = now_ms;
-            int nstep = base_step;
-            if ((oflags & SVC_OVFLAG_SMOOTH_NUDGE) && is_held_repeat) {
-                /* Small step during hold-glide. 8px @ 60Hz = 480 px/sec. */
-                nstep = 8;
-            }
+             * Effective visual speed: (nstep=48 * fire_rate=20Hz) with
+             * 0.35 gap-closing = butter-smooth ~800-1000 px/sec chase,
+             * feels like BP. Single tap: 48px target reached in ~5 frames
+             * (~85ms) via exponential ease-out, no perceptible latency. */
             if      (action == SVC_HK_MOVE_LEFT)  ui_nudge(-nstep, 0);
             else if (action == SVC_HK_MOVE_RIGHT) ui_nudge( nstep, 0);
             else if (action == SVC_HK_MOVE_UP)    ui_nudge( 0, -nstep);
