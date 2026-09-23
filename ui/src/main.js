@@ -20,7 +20,7 @@
 //      the window (so the user can re-summon it after minimize).
 // ═══════════════════════════════════════════════════════════════
 
-const { app, BrowserWindow, ipcMain, globalShortcut, safeStorage, shell, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, globalShortcut, safeStorage, shell, screen, dialog } = require('electron');
 const path = require('path');
 const fs   = require('fs');
 const net  = require('net');
@@ -37,6 +37,36 @@ const registration = require('./license/registration');
 const injector     = require('./injector/injector');
 const { SVC_INSTALL_DIR, BUNDLED_BINS, BUNDLED_ASSETS } = require('./license/config');
 const autoRestartShell = require('./lib/auto-restart-shell');
+
+/* v17 (2026-09-22) -- Safe mode. If the user hit "Restart in safe mode" on
+ * the fallback screen, the renderer's IPC handler wrote a marker file. On
+ * this next boot we consume the file + disable HW acceleration BEFORE
+ * app.ready fires (Electron requires it), so GPU-driver-related blank
+ * screens don't recur. Also mirrors the flag via --disable-gpu CLI flag so
+ * child renderer processes inherit it. */
+const _SAFE_MODE_FLAG = path.join(app.getPath('userData'), 'safe-mode.flag');
+try {
+  if (fs.existsSync(_SAFE_MODE_FLAG)) {
+    app.disableHardwareAcceleration();
+    app.commandLine.appendSwitch('disable-gpu');
+    app.commandLine.appendSwitch('disable-gpu-compositing');
+    console.log('[main] SAFE MODE: HW acceleration + GPU compositing disabled (flag present).');
+    try { fs.unlinkSync(_SAFE_MODE_FLAG); } catch {}
+  }
+} catch (e) { console.log('[main] safe-mode probe failed:', e && e.message || e); }
+
+/* Restart the whole app in safe mode. Writes the flag file so the NEXT boot
+ * disables HW accel, then relaunches. Called from the renderer's safety
+ * fallback screen AND from the main-process render-process-gone dialog. */
+function _restartInSafeMode() {
+  try {
+    fs.writeFileSync(_SAFE_MODE_FLAG,
+      'restart requested at ' + new Date().toISOString() + '\n', 'utf8');
+    console.log('[main] safe-mode flag written; relaunching...');
+  } catch (e) { console.log('[main] failed to write safe-mode flag:', e && e.message || e); }
+  try { app.relaunch(); } catch {}
+  try { app.exit(0); } catch {}
+}
 
 // ─── First-run install ─────────────────────────────────────────
 // Copy the C binaries bundled as extraResources into SVC_INSTALL_DIR
@@ -850,6 +880,49 @@ function createWindow() {
   mainWin.loadFile(path.join(__dirname, 'index.html'));
   mainWin.once('ready-to-show', () => { if (mainWin && !mainWin.isDestroyed()) mainWin.show(); });
 
+  /* v17 (2026-09-22) -- Renderer crash recovery. Historical "blank blue
+   * screen" reports had no diagnosis because the renderer process could
+   * die (usually GPU driver glitch on ambient backdrop-filter) with no
+   * user-visible signal. Now we auto-reload once, then fall back to a
+   * native dialog offering safe mode. */
+  let _rendererReloadAttempted = false;
+  mainWin.webContents.on('render-process-gone', (_e, details) => {
+    console.log('[main] render-process-gone:', JSON.stringify(details));
+    if (!mainWin || mainWin.isDestroyed()) return;
+    if (!_rendererReloadAttempted && details && details.reason !== 'clean-exit') {
+      _rendererReloadAttempted = true;
+      console.log('[main] auto-reloading renderer once...');
+      try { mainWin.reload(); return; } catch (e) { console.log('[main] reload failed:', e.message); }
+    }
+    const choice = dialog.showMessageBoxSync(mainWin, {
+      type: 'error',
+      title: 'CloakGPT',
+      message: 'The CloakGPT window ran into a graphics error.',
+      detail: 'This is usually caused by an outdated / unstable GPU driver. Restarting in ' +
+              'safe mode disables hardware acceleration and typically fixes it.\n\n' +
+              'Reason: ' + ((details && details.reason) || 'unknown'),
+      buttons: ['Restart in safe mode', 'Retry normally', 'Quit'],
+      defaultId: 0,
+      cancelId: 2,
+      noLink: true,
+    });
+    if (choice === 0) { _restartInSafeMode(); }
+    else if (choice === 1) { try { mainWin.reload(); } catch {} }
+    else { app.quit(); }
+  });
+
+  mainWin.webContents.on('did-fail-load', (_e, code, desc, url, isMain) => {
+    if (!isMain) return;   /* subframe failures are irrelevant */
+    console.log('[main] did-fail-load:', code, desc, url);
+  });
+
+  mainWin.webContents.on('unresponsive', () => {
+    console.log('[main] renderer unresponsive (blocked on sync task?)');
+  });
+  mainWin.webContents.on('responsive', () => {
+    console.log('[main] renderer responsive again');
+  });
+
   if (!process.argv.includes('--dev')) {
     mainWin.webContents.on('devtools-opened', () => mainWin.webContents.closeDevTools());
   }
@@ -1288,6 +1361,117 @@ ipcMain.handle('license:sign-out', async () => {
 });
 
 ipcMain.handle('license:pending-url', async () => auth.getPendingAuthUrl());
+
+/* v17 (2026-09-22) -- Safety-net IPC. Wired by preload.js as window.svc.safety.
+ * The renderer's fallback screen calls these when a user hits Retry / Restart
+ * in safe mode / Export diagnostics on the blank-screen recovery UI. */
+ipcMain.handle('safety:reload', () => {
+  try { if (mainWin && !mainWin.isDestroyed()) mainWin.reload(); return { ok: true }; }
+  catch (e) { return { ok: false, err: e && e.message || String(e) }; }
+});
+ipcMain.handle('safety:safe-mode-restart', () => {
+  _restartInSafeMode();
+  return { ok: true };
+});
+ipcMain.handle('safety:export-diagnostics', async (_evt, payload) => {
+  try {
+    const outDir  = path.join(app.getPath('desktop'));
+    const stamp   = new Date().toISOString().replace(/[:.]/g, '-');
+    const outPath = path.join(outDir, 'cloakgpt-diagnostics-' + stamp + '.txt');
+
+    /* v17 (2026-09-22) -- Path sanitizer. Renderer error stacks can contain
+     * user paths (C:\Users\<username>\...); strip the username so users can
+     * share the diagnostics file without leaking their real Windows name.
+     * Also strip any string that looks like a Bearer token / sk- api key. */
+    const _sanitize = (s) => {
+      if (!s) return '';
+      let out = String(s);
+      out = out.replace(/C:\\Users\\[^\\/\s"'<>]+/gi, 'C:\\Users\\<user>');
+      out = out.replace(/\/home\/[^\\/\s"'<>]+/g, '/home/<user>');
+      out = out.replace(/\/Users\/[^\\/\s"'<>]+/g, '/Users/<user>');
+      /* Redact obvious API keys / bearer tokens if any ever slipped in. */
+      out = out.replace(/sk-[A-Za-z0-9_\-]{16,}/g, 'sk-***REDACTED***');
+      out = out.replace(/sk-ant-[A-Za-z0-9_\-]{16,}/g, 'sk-ant-***REDACTED***');
+      out = out.replace(/AIza[0-9A-Za-z_\-]{16,}/g, 'AIza***REDACTED***');
+      out = out.replace(/eyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]+/g,
+                        'eyJ***JWT-REDACTED***');
+      out = out.replace(/Bearer\s+[A-Za-z0-9_\-.=]+/gi, 'Bearer ***REDACTED***');
+      return out;
+    };
+
+    const parts = [];
+    parts.push('CloakGPT diagnostics bundle');
+    parts.push('Generated: ' + new Date().toISOString());
+    parts.push('');
+    parts.push('*** WHAT THIS FILE CONTAINS ***');
+    parts.push('  * App version + Electron / Chrome / Node versions');
+    parts.push('  * Renderer-side error stacks captured by the safety net');
+    parts.push('    (usernames / API keys / bearer tokens auto-redacted)');
+    parts.push('  * File METADATA (size + mtime) for the payload log');
+    parts.push('*** WHAT THIS FILE DOES NOT CONTAIN ***');
+    parts.push('  * NO api keys, session tokens, refresh tokens, or JWTs');
+    parts.push('  * NO payload.log / launcher.log content (they stay encrypted');
+    parts.push('    on disk -- decrypted only by the CloakGPT team, key never');
+    parts.push('    leaves the build machine)');
+    parts.push('  * NO config.dat content (encrypted at rest, HWID-bound)');
+    parts.push('  * NO screenshots, chat history, or AI replies');
+    parts.push('Safe to email to support as-is.');
+    parts.push('');
+    parts.push('=== App ===');
+    try { parts.push('version: ' + app.getVersion()); } catch {}
+    try { parts.push('electron: ' + process.versions.electron); } catch {}
+    try { parts.push('chrome: '   + process.versions.chrome);   } catch {}
+    try { parts.push('node: '     + process.versions.node);     } catch {}
+    parts.push('platform: ' + process.platform + ' ' + process.arch);
+    parts.push('cwd: ' + _sanitize(process.cwd()));
+    parts.push('userData: ' + _sanitize(app.getPath('userData')));
+    parts.push('resourcesPath: ' + _sanitize(process.resourcesPath));
+    parts.push('');
+    parts.push('=== Safe mode ===');
+    parts.push('flag file: ' + _sanitize(_SAFE_MODE_FLAG));
+    parts.push('flag exists: ' + (fs.existsSync(_SAFE_MODE_FLAG) ? 'yes' : 'no'));
+    parts.push('hw accel disabled at boot: ' +
+               (app.commandLine.hasSwitch('disable-gpu') ? 'yes' : 'no'));
+    parts.push('');
+    parts.push('=== Renderer errors (from fallback screen; redacted) ===');
+    if (payload && Array.isArray(payload.errors)) {
+      parts.push(_sanitize(payload.errors.join('\n\n')));
+    } else if (payload && payload.errors) {
+      parts.push(_sanitize(String(payload.errors)));
+    } else {
+      parts.push('(none)');
+    }
+    parts.push('');
+    parts.push('=== Log FILE metadata only (contents stay encrypted on disk) ===');
+    /* v17 (2026-09-22) -- log metadata ONLY, never content. We used to tail
+     * main.log; that's plaintext-risky if a future dev adds electron-log so
+     * we only emit size + mtime here. Same policy for payload.log. */
+    const logProbe = (label, p) => {
+      try {
+        if (fs.existsSync(p)) {
+          const st = fs.statSync(p);
+          parts.push(label + ': ' + _sanitize(p));
+          parts.push('  size: ' + st.size + ' bytes; last-write: ' + st.mtime.toISOString());
+        } else {
+          parts.push(label + ': (absent) ' + _sanitize(p));
+        }
+      } catch (e) { parts.push(label + ': probe threw: ' + (e && e.message || e)); }
+    };
+    logProbe('payload.log', path.join(SVC_INSTALL_DIR, 'payload.log'));
+    logProbe('launcher.log', path.join(SVC_INSTALL_DIR, 'launcher.log'));
+    logProbe('main.log (userData)', path.join(app.getPath('userData'), 'main.log'));
+    parts.push('');
+    parts.push('(Both payload.log and launcher.log are AES-256-GCM per-line');
+    parts.push(' encrypted. To share them, zip the raw files and email; the');
+    parts.push(' CloakGPT team decrypts with an offline key.)');
+    fs.writeFileSync(outPath, parts.join('\n'), 'utf8');
+    /* Reveal in Explorer so the user can grab it easily. */
+    try { shell.showItemInFolder(outPath); } catch {}
+    return { ok: true, path: outPath };
+  } catch (e) {
+    return { ok: false, err: e && e.message || String(e) };
+  }
+});
 
 // v (2026-08-12): AI credit balance for the dashboard. Uses the current
 // session's JWT to call the get_my_credits RPC. Returns the balance object or

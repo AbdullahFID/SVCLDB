@@ -145,6 +145,13 @@ int  ui_has_reply(void);
 void ui_set_status(const char *provider, const char *tier,
                    const char *model, int streaming);
 
+/* v17 (2026-09-22) -- Transient toast overlay. Renders a small pill at top-
+ * center of the overlay for `ms` milliseconds, then fades out. Replaces the
+ * old pattern of appending "[streaming ON]" / "[LaTeX disabled]" etc. as
+ * chat messages that clobbered the conversation area. Setting toggles show
+ * a toast instead. `text` is copied; safe from any thread. */
+void ui_show_toast(const char *text, unsigned ms);
+
 /* ── Hotkey binding registry ──
  *
  * The UI layer needs to know the current hotkey mappings so it can

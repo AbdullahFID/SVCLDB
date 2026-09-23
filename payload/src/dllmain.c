@@ -1230,14 +1230,16 @@ static void on_hotkey(int action) {
             mcfg->tier = next;
             refresh_status_badge(mcfg);
             const svc_model_tier_t *t = ai_get_tier(mcfg->provider, mcfg->tier);
-            char msg[256];
-            _snprintf(msg, sizeof(msg) - 1, "[tier changed] %s | %s | %s",
-                      ai_provider_name(mcfg->provider),
+            char msg[128];
+            _snprintf(msg, sizeof(msg) - 1, "Tier: %s (%s)",
                       ai_tier_name(mcfg->tier),
                       t && t->model_id ? t->model_id : "?");
             msg[sizeof(msg) - 1] = 0;
-            ui_chat_append_message(UI_MSG_AI, msg);
-            slog_writef("payload.log", "hotkey CYCLE_TIER: %s", msg);
+            ui_show_toast(msg, 2200);
+            slog_writef("payload.log", "hotkey CYCLE_TIER: %s | %s | %s",
+                        ai_provider_name(mcfg->provider),
+                        ai_tier_name(mcfg->tier),
+                        t && t->model_id ? t->model_id : "?");
             break;
         }
         case SVC_HK_CYCLE_PROVIDER: {
@@ -1254,9 +1256,9 @@ static void on_hotkey(int action) {
             if (mcfg->api_key_google[0])     opts[n++] = SVC_PROVIDER_GOOGLE;
             if (mcfg->api_key_openrouter[0]) opts[n++] = SVC_PROVIDER_OPENROUTER;
             if (n <= 1) {
-                ui_chat_append_message(UI_MSG_AI,
-                    n == 1 ? "[provider] only one option available (no other API keys set)."
-                           : "[provider] no credits session and no API keys configured.");
+                ui_show_toast(n == 1
+                    ? "Only one provider option available"
+                    : "No providers configured (add an API key)", 2400);
                 slog_writef("payload.log", "CYCLE_PROVIDER: nothing to cycle (n=%d)", n);
                 break;
             }
@@ -1265,17 +1267,14 @@ static void on_hotkey(int action) {
             int nx = opts[(cur + 1) % n];
             mcfg->provider = nx;
             refresh_status_badge(mcfg);
-            char msg[256];
+            char msg[128];
             if (nx == SVC_PROVIDER_CREDITS) {
-                _snprintf(msg, sizeof(msg) - 1, "[provider] CloakGPT credits (managed AI)");
+                _snprintf(msg, sizeof(msg) - 1, "Provider: CloakGPT credits");
             } else {
-                const svc_model_tier_t *t = ai_get_tier(nx, mcfg->tier);
-                _snprintf(msg, sizeof(msg) - 1, "[provider] %s | %s | %s",
-                          ai_provider_name(nx), ai_tier_name(mcfg->tier),
-                          t && t->model_id ? t->model_id : "?");
+                _snprintf(msg, sizeof(msg) - 1, "Provider: %s", ai_provider_name(nx));
             }
             msg[sizeof(msg) - 1] = 0;
-            ui_chat_append_message(UI_MSG_AI, msg);
+            ui_show_toast(msg, 2200);
             slog_writef("payload.log", "hotkey CYCLE_PROVIDER: %s", msg);
             break;
         }
@@ -1308,12 +1307,9 @@ static void on_hotkey(int action) {
             if (!mcfg) break;
             mcfg->streaming_enabled = !mcfg->streaming_enabled;
             refresh_status_badge(mcfg);
-            char msg[128];
-            _snprintf(msg, sizeof(msg) - 1, "[streaming %s]",
-                      mcfg->streaming_enabled ? "ON" : "OFF");
-            msg[sizeof(msg) - 1] = 0;
-            ui_chat_append_message(UI_MSG_AI, msg);
-            slog_writef("payload.log", "hotkey STREAM_TOGGLE: %s", msg);
+            ui_show_toast(mcfg->streaming_enabled ? "Streaming: ON" : "Streaming: OFF", 1800);
+            slog_writef("payload.log", "hotkey STREAM_TOGGLE: %s",
+                        mcfg->streaming_enabled ? "ON" : "OFF");
             break;
         }
         case SVC_HK_COPY_CODE: {
@@ -1333,10 +1329,7 @@ static void on_hotkey(int action) {
              * Safe to press even when no request is running (no-op). */
             ai_request_abort();
             solve_cancel();   /* v15: abort an in-flight AutoSolver dispatch */
-            ui_chat_append_message(UI_MSG_AI,
-                "[STOP] Aborting in-flight response. If a partial reply "
-                "was already streamed it will be finalized; otherwise the "
-                "AI bubble will show 'stopped by user'.");
+            ui_show_toast("Stopped -- partial reply preserved", 1800);
             slog_writef("payload.log", "hotkey STOP_GEN: abort requested");
             break;
         }
@@ -1344,79 +1337,32 @@ static void on_hotkey(int action) {
             svc_config_t *mcfg = (svc_config_t *)cfg_get();
             if (!mcfg) break;
             mcfg->latex_disabled = !mcfg->latex_disabled;
-            char msg[256];
-            if (mcfg->latex_disabled) {
-                _snprintf(msg, sizeof(msg) - 1,
-                    "[LaTeX **DISABLED**] Next AI reply will use plain "
-                    "Unicode / keyboard math (`x^2`, `sqrt(x)`, `pi`, "
-                    "`sum from i=1 to n of`, etc.) instead of `\\frac`, "
-                    "`\\int`, `\\sum`.");
-            } else {
-                _snprintf(msg, sizeof(msg) - 1,
-                    "[LaTeX **ENABLED**] Next AI reply may use LaTeX "
-                    "commands (`$..$` inline, `\\[..\\]` display, "
-                    "`\\frac{}{}`, `\\int`, etc.) rendered as raw text "
-                    "in the overlay.");
-            }
-            msg[sizeof(msg) - 1] = 0;
-            ui_chat_append_message(UI_MSG_AI, msg);
+            ui_show_toast(mcfg->latex_disabled
+                ? "LaTeX: OFF  (AI uses plain keyboard math)"
+                : "LaTeX: ON  (AI uses formatted math -- rendered as symbols)", 2200);
             slog_writef("payload.log", "hotkey LATEX_TOGGLE: %s",
                         mcfg->latex_disabled ? "DISABLED" : "ENABLED");
             break;
         }
         case SVC_HK_DIRECT_TOGGLE: {
             /* v6: toggle DIRECT ANSWER mode. When ON, AI replies with
-             * ONLY the direct factual answer (or 'ERROR' if uncertain).
-             * See materialize_default_system in ai_provider.c for the
-             * exact system prompt override. */
+             * ONLY the direct factual answer (or 'ERROR' if uncertain). */
             svc_config_t *mcfg = (svc_config_t *)cfg_get();
             if (!mcfg) break;
             mcfg->direct_answer_mode = !mcfg->direct_answer_mode;
-            char msg[512];
-            if (mcfg->direct_answer_mode) {
-                _snprintf(msg, sizeof(msg) - 1,
-                    "[Direct-answer mode **ON**] Next AI reply will contain "
-                    "ONLY the factual answer - no explanation, no reasoning, "
-                    "no framing. If the AI is uncertain it will reply "
-                    "'ERROR' instead of guessing.\n\n"
-                    "Shape rules: MCQ -> just the letter (`B`). Numeric -> "
-                    "value + units (`9.81 m/s^2`). True/False -> just the "
-                    "word. Toggle back off with `Ctrl+Shift+Alt+D`.");
-            } else {
-                _snprintf(msg, sizeof(msg) - 1,
-                    "[Direct-answer mode **OFF**] Next AI reply will use "
-                    "the normal detailed format (answer + reasoning + "
-                    "sanity check per the system prompt).");
-            }
-            msg[sizeof(msg) - 1] = 0;
-            ui_chat_append_message(UI_MSG_AI, msg);
+            ui_show_toast(mcfg->direct_answer_mode
+                ? "Direct-answer: ON  (letter / value / word only)"
+                : "Direct-answer: OFF  (detailed reply)", 2200);
             slog_writef("payload.log", "hotkey DIRECT_TOGGLE: %s",
                         mcfg->direct_answer_mode ? "ON" : "OFF");
             break;
         }
         case SVC_HK_LEAN_TOGGLE: {
-            /* v1.7.10: toggle LEAN MODE. Overlay switches between full
-             * ImGui Begin/End render (chat bubbles, MD, scrollback, buttons)
-             * and BP-parity draw-list-only render (raw AddRectFilled +
-             * AddText on GetForegroundDrawList -- much lighter per-frame
-             * workload = smoother nudge feel). See ui_toggle_lean() in
-             * imgui_layer.cpp for the exact implementation. */
             ui_toggle_lean();
             int now_lean = ui_is_lean();
-            char msg[512];
-            if (now_lean) {
-                _snprintf(msg, sizeof(msg) - 1,
-                    "[LEAN mode **ON**] Overlay now renders via raw draw "
-                    "list (Bypassify parity). Chat scrollback / MD / bubbles "
-                    "hidden. Shows LAST AI reply as plain wrapped text. "
-                    "Smoother nudge feel. Toggle off: `Ctrl+Shift+Alt+M`.");
-            } else {
-                _snprintf(msg, sizeof(msg) - 1,
-                    "[LEAN mode **OFF**] Full overlay restored -- chat "
-                    "scrollback, markdown, code blocks, buttons all back.");
-            }
-            msg[sizeof(msg) - 1] = 0;
-            ui_chat_append_message(UI_MSG_AI, msg);
+            ui_show_toast(now_lean
+                ? "Lean mode: ON  (Bypassify-parity)"
+                : "Lean mode: OFF  (full overlay restored)", 2000);
             slog_writef("payload.log", "hotkey LEAN_TOGGLE: %s",
                         now_lean ? "ON" : "OFF");
             break;

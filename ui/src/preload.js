@@ -166,6 +166,15 @@ contextBridge.exposeInMainWorld('svc', {
     close:    () => ipcRenderer.invoke('window:close'),
     quit:     () => ipcRenderer.invoke('window:quit'),
   },
+  /* v17 (2026-09-22) -- Safety-net API. Called from the fallback screen
+   * when the app enters a blank/broken state. reload() = hot-reload the
+   * renderer; safeModeRestart() = write flag + relaunch with HW accel off;
+   * exportDiagnostics() = write a diagnostics bundle to the Desktop. */
+  safety: {
+    reload:             ()         => ipcRenderer.invoke('safety:reload'),
+    safeModeRestart:    ()         => ipcRenderer.invoke('safety:safe-mode-restart'),
+    exportDiagnostics:  (payload)  => ipcRenderer.invoke('safety:export-diagnostics', payload),
+  },
   /* v1.2: single-source-of-truth app version (from package.json via
    * electron app.getVersion) so the login card + titlebar always match
    * the shipped build number without editing HTML. */

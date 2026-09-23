@@ -2618,6 +2618,99 @@ extern "C" void ui_set_status(const char *provider, const char *tier,
     wake_dwm_composition();
 }
 
+/* v17 (2026-09-22) -- Transient toast overlay. Written from any thread
+ * (setting-toggle hotkey handlers in dllmain.c call this instead of clobbering
+ * the chat with "[streaming ON]" style messages). Rendered from draw_chat_window
+ * as a top-center pill that fades over the last 350ms of its lifetime. */
+static CRITICAL_SECTION g_toast_cs;
+static volatile LONG    g_toast_cs_init = 0;
+static char             g_toast_text[192] = {0};
+static volatile LONGLONG g_toast_expire_tick = 0;
+static volatile LONGLONG g_toast_show_tick   = 0;
+
+static void ensure_toast_cs(void) {
+    if (InterlockedCompareExchange(&g_toast_cs_init, 1, 0) == 0)
+        InitializeCriticalSection(&g_toast_cs);
+}
+
+extern "C" void ui_show_toast(const char *text, unsigned ms) {
+    if (!text || !text[0]) return;
+    if (ms == 0) ms = 1800;
+    if (ms > 8000) ms = 8000;
+    ensure_toast_cs();
+    EnterCriticalSection(&g_toast_cs);
+    strncpy(g_toast_text, text, sizeof(g_toast_text) - 1);
+    g_toast_text[sizeof(g_toast_text) - 1] = 0;
+    LONGLONG now = (LONGLONG)GetTickCount64();
+    InterlockedExchange64(&g_toast_show_tick,   now);
+    InterlockedExchange64(&g_toast_expire_tick, now + (LONGLONG)ms);
+    LeaveCriticalSection(&g_toast_cs);
+    wake_dwm_composition();
+}
+
+/* Draw the toast pill (if any) top-centered inside the overlay window.
+ * Called from inside draw_chat_window (after topbar / body / composer,
+ * before the resize grip). Colors keyed off g_theme_effective so we don't
+ * need to forward-declare ui_theme_t here (its definition lives ~2000
+ * lines later in the "GORGEOUS custom UI toolkit" block). */
+static void draw_toast_maybe(float scale) {
+    LONGLONG expire = InterlockedCompareExchange64(&g_toast_expire_tick, 0, 0);
+    if (expire == 0) return;
+    LONGLONG now = (LONGLONG)GetTickCount64();
+    if (now >= expire) return;
+    /* Snapshot text under lock. */
+    char msg[192];
+    ensure_toast_cs();
+    EnterCriticalSection(&g_toast_cs);
+    strncpy(msg, g_toast_text, sizeof(msg) - 1);
+    msg[sizeof(msg) - 1] = 0;
+    LeaveCriticalSection(&g_toast_cs);
+    if (!msg[0]) return;
+
+    /* Fade curve: full opacity for most of the lifetime, ease out over the
+     * final 350ms. */
+    float remain = (float)(expire - now);
+    float fade = remain < 350.0f ? (remain / 350.0f) : 1.0f;
+    if (fade < 0.0f) fade = 0.0f;
+
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    ImVec2 wp = ImGui::GetWindowPos();
+    ImVec2 ws = ImGui::GetWindowSize();
+    float fh = ImGui::GetFontSize();
+    ImVec2 ts = ImGui::CalcTextSize(msg);
+    float padx = 14.0f * scale, pady = 8.0f * scale;
+    float w = ts.x + padx * 2.0f;
+    float h = fh + pady * 2.0f;
+    float cx = wp.x + ws.x * 0.5f;
+    float x0 = cx - w * 0.5f;
+    float y0 = wp.y + 44.0f * scale;   /* just below the topbar */
+    /* Slight ease-in slide from -4px. */
+    float slide = (1.0f - fade) * 4.0f;
+    y0 -= slide;
+
+    /* Theme-aware palette (NL card surface + softened border/text). */
+    int th_eff = (int)InterlockedCompareExchange(&g_theme_effective, 0, 0);
+    int bg_r = 17, bg_g = 17, bg_b = 17;
+    int tx_r = 245, tx_g = 245, tx_b = 247;
+    if (th_eff == 1) {   /* LIGHT */
+        bg_r = 245; bg_g = 245; bg_b = 247;
+        tx_r = 20;  tx_g = 20;  tx_b = 24;
+    }
+    int a_bg     = (int)(230.0f * fade);
+    int a_border = (int)(120.0f * fade);
+    int a_text   = (int)(255.0f * fade);
+    ImU32 bg  = IM_COL32(bg_r, bg_g, bg_b, a_bg);
+    ImU32 bd  = IM_COL32(255, 255, 255, a_border);
+    if (th_eff == 1) bd = IM_COL32(0, 0, 0, a_border / 2);
+    ImU32 txt = IM_COL32(tx_r, tx_g, tx_b, a_text);
+    /* Soft shadow. */
+    dl->AddRectFilled(ImVec2(x0 + 1, y0 + 2), ImVec2(x0 + w + 1, y0 + h + 2),
+                      IM_COL32(0, 0, 0, (int)(70 * fade)), 6.0f * scale);
+    dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + w, y0 + h), bg, 6.0f * scale);
+    dl->AddRect      (ImVec2(x0, y0), ImVec2(x0 + w, y0 + h), bd, 6.0f * scale, 0, 1.0f);
+    dl->AddText(ImVec2(x0 + padx, y0 + pady), txt, msg);
+}
+
 extern "C" void ui_set_hotkey_bindings(const unsigned *hks, int n) {
     if (!hks) return;
     int copy_n = n;
@@ -4226,7 +4319,9 @@ static void md_render_tinted_block(const char *body, size_t body_len,
         }
         ImGui::PopFont();
     }
-    float pad_h = 16.0f, pad_v = 10.0f;
+    float pad_h = 20.0f, pad_v = 14.0f;
+    /* v17 (2026-09-22) -- generous 20x14 padding so code / math body text
+     * never hugs the block edges. Header + separator + body inherits from it. */
     /* Block width: at least parent avail width, but let content push
      * out to force horizontal scrollbar in parent when needed. */
     float parent_w = ImGui::GetContentRegionAvail().x;
@@ -4413,6 +4508,9 @@ static void md_render_code_block(const char *lang, const char *body,
                                  size_t body_len, int block_idx,
                                  float wrap_width, float font_mul) {
     (void)wrap_width;
+    /* v16 (2026-09-22) -- breathe: block-level surfaces get vertical air on
+     * both sides so they visually separate from surrounding prose. */
+    ImGui::Spacing();
     /* Count lines for the label. */
     int line_count = 1;
     for (size_t i = 0; i < body_len; i++) if (body[i] == '\n') line_count++;
@@ -4439,6 +4537,7 @@ static void md_render_code_block(const char *lang, const char *body,
     md_render_tinted_block(body, body_len, block_idx, label,
         with_alpha_mul(ImVec4(0.02f, 0.04f, 0.08f, 0.98f)),   /* bg: near-black (universal) */
         border, lbl, "code", font_mul);
+    ImGui::Spacing();
 }
 
 /* latex_to_unicode is defined in the included latex_convert.h below.
@@ -4453,6 +4552,7 @@ static void md_render_code_block(const char *lang, const char *body,
  * Body is converted from LaTeX to Unicode for readability. */
 static void md_render_math_display(const char *body, size_t body_len,
                                    int block_idx, float font_mul) {
+    ImGui::Spacing();
     char uni_buf[8192];
     size_t ulen = latex_to_unicode(body, body_len, uni_buf, sizeof(uni_buf) - 1);
     uni_buf[ulen] = 0;
@@ -4465,6 +4565,7 @@ static void md_render_math_display(const char *body, size_t body_len,
         _mth == 1 ? ImVec4(0.0f, 0.0f, 0.0f, 0.16f) : ImVec4(1.0f, 1.0f, 1.0f, 0.16f),   /* border */
         _mth == 1 ? ImVec4(0.35f, 0.35f, 0.40f, 0.90f) : ImVec4(0.70f, 0.70f, 0.75f, 0.90f), /* label */
         "math", font_mul);
+    ImGui::Spacing();
 }
 
 /* Render a heading (# / ## / ###) line -- larger font + accent color.
@@ -4497,9 +4598,11 @@ static void md_render_heading(const char *line, size_t line_len, int level) {
 }
 
 /* Render a bullet-list item. `line` is body without the `- ` / `* ` /
- * `* ` marker. */
+ * `* ` marker. v16 (2026-09-22): wrapped in Indent so list items visually
+ * hang off the left margin -- reads as a nested block. */
 static void md_render_list_item(const char *line, size_t line_len,
                                 int is_numbered, int number) {
+    ImGui::Indent(12.0f);
     /* Bullet or number, then indented body. B&W, theme-aware. */
     int _lth = (int)InterlockedCompareExchange(&g_theme_effective, 0, 0);
     ImGui::PushStyleColor(ImGuiCol_Text,
@@ -4512,6 +4615,7 @@ static void md_render_list_item(const char *line, size_t line_len,
     ImGui::PopStyleColor();
     ImGui::SameLine(0, 8.0f);
     ImGui::TextUnformatted(line, line + line_len);
+    ImGui::Unindent(12.0f);
 }
 
 /* LaTeX-to-Unicode simplifier: already included above (right before
@@ -4523,6 +4627,84 @@ static void md_render_list_item(const char *line, size_t line_len,
 /* Render a plain-text run. Splits on newlines and detects per-line
  * markdown structure: headings, list items. Non-structured lines
  * render as TextWrapped. */
+/* v16 (2026-09-22) -- Inline formatting emitter. Splits a paragraph at `**`
+ * (bold) and `` ` `` (code) markers and emits each run separately, chaining
+ * via SameLine(0,0) so ImGui's wrap (set by the caller via PushTextWrapPos)
+ * still handles line breaks between runs. Bold gets a shade toward the theme's
+ * text extremum; code renders with g_font_mono + a subtly tinted color.
+ * Long-standing weakness: previous md_render_plain stripped these markers
+ * outright ("makes prose look junky") which flattened every AI heading /
+ * emphasis / code identifier. This restores them without introducing hue. */
+static void md_emit_para_runs(const char *s, size_t n) {
+    if (n == 0) return;
+    ImGuiStyle &st = ImGui::GetStyle();
+    ImVec4 base = st.Colors[ImGuiCol_Text];
+    int th_eff = (int)InterlockedCompareExchange(&g_theme_effective, 0, 0);
+    ImVec4 bold = (th_eff == 1)
+        ? ImVec4(base.x * 0.55f, base.y * 0.55f, base.z * 0.55f, base.w)  /* darker on light */
+        : ImVec4(1.00f, 1.00f, 1.00f, base.w);                             /* pure white on dark */
+    ImVec4 code = (th_eff == 1)
+        ? ImVec4(0.20f, 0.20f, 0.22f, 1.0f)
+        : ImVec4(0.82f, 0.86f, 0.92f, 1.0f);
+
+    bool  boldstate = false, codestate = false;
+    size_t start = 0, i = 0;
+    bool  first = true;
+
+    /* Helper closure: emit s[start..upto). */
+    auto flush = [&](size_t upto) {
+        if (upto <= start) return;
+        char tmp[4096], uni[5120];
+        size_t take = upto - start;
+        if (take > sizeof(tmp) - 1) take = sizeof(tmp) - 1;
+        memcpy(tmp, s + start, take); tmp[take] = 0;
+        size_t ulen = latex_to_unicode(tmp, take, uni, sizeof(uni) - 1);
+        uni[ulen] = 0;
+        if (!first) ImGui::SameLine(0, 0);
+        first = false;
+        if (codestate) {
+            if (g_font_mono) ImGui::PushFont(g_font_mono);
+            ImGui::PushStyleColor(ImGuiCol_Text, code);
+            ImGui::TextUnformatted(uni);
+            ImGui::PopStyleColor();
+            if (g_font_mono) ImGui::PopFont();
+        } else if (boldstate) {
+            ImGui::PushStyleColor(ImGuiCol_Text, bold);
+            ImGui::TextUnformatted(uni);
+            /* Pseudo-bold via a hairline redraw offset -- last item's rect gives
+             * us the position so we don't have to reason about wrapping. Works
+             * cleanly for single-line runs (99% of bold segments in AI answers);
+             * on wrap it only bolds the last line but stays visually crisp. */
+            ImVec2 rmn = ImGui::GetItemRectMin();
+            ImGui::GetWindowDrawList()->AddText(ImVec2(rmn.x + 0.6f, rmn.y),
+                                                ImGui::GetColorU32(bold), uni);
+            ImGui::PopStyleColor();
+        } else {
+            ImGui::TextUnformatted(uni);
+        }
+        start = upto;
+    };
+
+    while (i < n) {
+        /* ** toggles bold (ignored inside code so `**` in a code snippet stays). */
+        if (!codestate && i + 1 < n && s[i] == '*' && s[i+1] == '*') {
+            flush(i);
+            boldstate = !boldstate;
+            i += 2; start = i;
+            continue;
+        }
+        /* ` toggles inline code. */
+        if (s[i] == '`') {
+            flush(i);
+            codestate = !codestate;
+            i += 1; start = i;
+            continue;
+        }
+        i++;
+    }
+    flush(n);
+}
+
 static void md_render_plain(const char *body, size_t body_len) {
     if (body_len == 0) return;
     /* Skip if all whitespace but keep a spacing hint for blank lines. */
@@ -4548,16 +4730,11 @@ static void md_render_plain(const char *body, size_t body_len) {
     char para[8192];
     size_t para_len = 0;
 
-    /* Convert any LaTeX ($..$ / \(..\) / \frac / \pi / etc.) to
-     * Unicode at render time. Keeps chat_msg.text as the original
-     * LaTeX (so copy hotkeys give raw LaTeX for pasting to Overleaf)
-     * while display shows readable Unicode. */
-    char para_uni[10240];
+    /* Convert LaTeX per-run inside md_emit_para_runs (below). The paragraph
+     * buffer here just accumulates raw text -- markers preserved. */
     auto flush_para = [&]() {
         if (para_len == 0) return;
-        size_t ulen = latex_to_unicode(para, para_len, para_uni, sizeof(para_uni) - 1);
-        para_uni[ulen] = 0;
-        ImGui::TextUnformatted(para_uni, para_uni + ulen);
+        md_emit_para_runs(para, para_len);
         para_len = 0;
     };
 
@@ -4628,27 +4805,17 @@ static void md_render_plain(const char *body, size_t body_len) {
         if (!handled) {
             /* Accumulate into paragraph buffer with a space separator
              * (markdown wrapping: consecutive non-blank lines are one
-             * paragraph). Strip inline markers (**, *, `) for cleaner
-             * display -- bold/italic/inline-code markers passthrough
-             * makes prose look junky in an ImGui rendered view. */
+             * paragraph). v16 (2026-09-22) -- KEEP inline markers (`**`
+             * `*` `` ` ``) so md_emit_para_runs can render bold + code
+             * runs. Old code stripped them, flattening every heading /
+             * emphasis / code identifier in AI answers. */
             if (effective_len > 0) {
                 if (para_len > 0 && para_len + 1 < sizeof(para)) {
                     para[para_len++] = ' ';
                 }
-                /* Walk source, skipping ** and * and ` markers. */
                 for (size_t k = 0; k < effective_len; k++) {
-                    unsigned char c = (unsigned char)p[k];
-                    if (c == '*') {
-                        /* Skip ** or single *. */
-                        if (k + 1 < effective_len && p[k + 1] == '*') k++;
-                        continue;
-                    }
-                    if (c == '`') {
-                        /* Skip inline-code backtick. */
-                        continue;
-                    }
                     if (para_len + 1 >= sizeof(para) - 1) break;
-                    para[para_len++] = (char)c;
+                    para[para_len++] = p[k];
                 }
                 para[para_len] = 0;
             }
@@ -4840,14 +5007,18 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
         btn_bg    = ImVec4(0.0f, 0.0f, 0.0f, 0.05f);
         btn_hi    = ImVec4(0.0f, 0.0f, 0.0f, 0.10f);
     } else {
-        bg        = (role == UI_MSG_USER) ? ImVec4(0.17f, 0.17f, 0.19f, 1.0f)
-                                          : ImVec4(0.10f, 0.10f, 0.11f, 1.0f);
-        border    = ImVec4(1.0f, 1.0f, 1.0f, 0.12f);
-        label_col = ImVec4(0.62f, 0.62f, 0.66f, 1.0f);
-        text_col  = ImVec4(0.94f, 0.94f, 0.95f, 1.0f);
-        dim_col   = ImVec4(0.58f, 0.58f, 0.62f, 1.0f);
-        btn_bg    = ImVec4(1.0f, 1.0f, 1.0f, 0.06f);
-        btn_hi    = ImVec4(1.0f, 1.0f, 1.0f, 0.12f);
+        /* v16 (2026-09-22) DARK bubbles -- NL palette. AI bubble sits on
+         * NL.card (#111) so it lifts crisply off the #0A0A0A window; USER
+         * bubble goes one step brighter (~#1E) for right-side distinction.
+         * No hue anywhere -- pure monochrome so any exam BG shows through. */
+        bg        = (role == UI_MSG_USER) ? ImVec4(0.118f, 0.118f, 0.125f, 1.0f)
+                                          : ImVec4(0.067f, 0.067f, 0.067f, 1.0f);
+        border    = ImVec4(1.0f, 1.0f, 1.0f, 0.06f);
+        label_col = ImVec4(0.604f, 0.604f, 0.604f, 1.0f);
+        text_col  = ImVec4(0.960f, 0.960f, 0.970f, 1.0f);
+        dim_col   = ImVec4(0.545f, 0.545f, 0.580f, 1.0f);
+        btn_bg    = ImVec4(1.0f, 1.0f, 1.0f, 0.05f);
+        btn_hi    = ImVec4(1.0f, 1.0f, 1.0f, 0.10f);
     }
 
     /* Right-align USER bubbles. */
@@ -4878,35 +5049,21 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
     s_split.SetCurrentChannel(dl, 1);    /* draw text on channel 1 (fg) */
 
     ImVec2 start = ImGui::GetCursorScreenPos();
-    /* Padding: 20px horizontal so text has breathing room from the
-     * bubble edges (was 14px -- user reported "hugging the [edge]"). */
-    float pad_h = 20.0f, pad_v = 12.0f;
+    /* Padding: 22px horizontal so text has generous breathing room, 15px
+     * vertical so paragraphs / MD blocks don't feel cramped against the
+     * bubble edges. v16 (2026-09-22): bumped from 20x12 for more air after
+     * Sam's readability pass. */
+    float pad_h = 22.0f, pad_v = 15.0f;
 
     /* Constrain body to bubble width. Push cursor inward for padding
      * and push text-wrap so prose wraps within bubble width. */
     ImGui::SetCursorScreenPos(ImVec2(start.x + pad_h, start.y + pad_v));
 
-    /* Label row. */
-    ImGui::PushStyleColor(ImGuiCol_Text, label_col);
-    if (role == UI_MSG_USER) {
-        /* Right-align "You" label inside bubble. */
-        float body_w = bubble_max_w - pad_h * 2.0f;
-        const char *lbl = "You";
-        ImVec2 tsz = ImGui::CalcTextSize(lbl);
-        float x = start.x + pad_h + body_w - tsz.x;
-        ImGui::SetCursorScreenPos(ImVec2(x, start.y + pad_v));
-        ImGui::TextUnformatted(lbl);
-    } else {
-        ImGui::TextUnformatted(pending ? "AI (streaming)" : "AI");
-    }
-    ImGui::PopStyleColor();
-
-    /* Separator drawn manually. */
-    float sep_y = ImGui::GetCursorScreenPos().y + 2.0f;
-    dl->AddLine(ImVec2(start.x + pad_h,                          sep_y),
-                ImVec2(start.x + bubble_max_w - pad_h,           sep_y),
-                ImGui::GetColorU32(border), 1.0f);
-    ImGui::SetCursorScreenPos(ImVec2(start.x + pad_h, sep_y + 6.0f));
+    /* v16 (2026-09-22) -- NO role label, NO top separator. Right/left alignment
+     * + bubble bg already distinguish USER vs AI; a "You"/"AI" chip is redundant
+     * chat-app chrome (Sam's rule). Body starts at top padding. */
+    (void)label_col;
+    ImGui::SetCursorScreenPos(ImVec2(start.x + pad_h, start.y + pad_v));
 
     /* Body -- text wraps at bubble body width.
      *
@@ -4953,62 +5110,10 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
     ImGui::PopTextWrapPos();
     ImGui::PopStyleColor();
 
-    /* ── AI bubble footer: copy-full + copy-answer buttons ─────────
-     *
-     * Only shown on FINALIZED (non-pending) AI messages with actual
-     * content. Buttons are labeled with their mapped hotkeys pulled
-     * from the registry so they stay in sync if user rebinds. */
-    if (role == UI_MSG_AI && !pending && text && text[0]) {
-        /* Small separator line under content. */
-        float sep_y2 = ImGui::GetCursorScreenPos().y + 4.0f;
-        dl->AddLine(ImVec2(start.x + pad_h,               sep_y2),
-                    ImVec2(start.x + bubble_max_w - pad_h, sep_y2),
-                    ImGui::GetColorU32(border), 1.0f);
-        ImGui::SetCursorScreenPos(ImVec2(start.x + pad_h, sep_y2 + 6.0f));
-
-        /* Snapshot text for the copy handlers (button click fires
-         * out-of-band; we need a stable copy). Snapshot only if the
-         * button is pressed -- cheaper than snapshotting every frame.
-         *
-         * v1.3 (2026-07-07): button bg alphas scale with the frame
-         * multiplier so they blend uniformly with the bubble bg.
-         * Button TEXT stays at full opacity so labels remain
-         * readable at low transparency. */
-        ImGui::PushStyleColor(ImGuiCol_Button,        btn_bg);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, btn_hi);
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  btn_hi);
-        ImGui::PushStyleColor(ImGuiCol_Text,          text_col);
-
-        char hk_full[32] = {0}, hk_ans[32] = {0};
-        ui_format_hotkey(3 /* SVC_HK_COPY_REPLY  */, hk_full, sizeof(hk_full));
-        ui_format_hotkey(29 /* SVC_HK_COPY_ANSWER */, hk_ans,  sizeof(hk_ans));
-        char label_full[64], label_ans[64];
-        if (hk_full[0]) _snprintf(label_full, sizeof(label_full) - 1, "Copy full [%s]##full_%d", hk_full, msg_idx);
-        else            _snprintf(label_full, sizeof(label_full) - 1, "Copy full##full_%d", msg_idx);
-        if (hk_ans[0])  _snprintf(label_ans,  sizeof(label_ans)  - 1, "Copy answer [%s]##ans_%d", hk_ans, msg_idx);
-        else            _snprintf(label_ans,  sizeof(label_ans)  - 1, "Copy answer##ans_%d", msg_idx);
-        label_full[sizeof(label_full) - 1] = 0;
-        label_ans [sizeof(label_ans)  - 1] = 0;
-
-        if (ImGui::SmallButton(label_full)) {
-            md_copy_to_clipboard(text, strlen(text));
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton(label_ans)) {
-            /* Emit first-line only (matches ui_copy_last_ai_answer). */
-            const char *first_nl = strchr(text, '\n');
-            size_t first_len = first_nl ? (size_t)(first_nl - text) : strlen(text);
-            /* Strip leading whitespace + trailing \r. */
-            const char *p = text;
-            while (first_len > 0 && (*p == ' ' || *p == '\t')) { p++; first_len--; }
-            while (first_len > 0 && (p[first_len - 1] == ' ' ||
-                                      p[first_len - 1] == '\t' ||
-                                      p[first_len - 1] == '\r')) first_len--;
-            if (first_len > 0) md_copy_to_clipboard(p, first_len);
-        }
-        ImGui::PopStyleColor(4);
-        ImGui::Spacing();
-    }
+    /* v16 (2026-09-22) -- Copy-full / Copy-answer buttons removed. The hotkeys
+     * (Ctrl+Alt+C full, Ctrl+Alt+A answer) still work and the answer style is
+     * cleaner without per-bubble chrome. */
+    (void)btn_bg; (void)btn_hi;
 
     /* Capture end cursor and compute rect. */
     ImVec2 end = ImGui::GetCursorScreenPos();
@@ -5019,9 +5124,9 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
     /* ── Bubble draw phase 2: backfill background on channel 0 ── */
     s_split.SetCurrentChannel(dl, 0);
     dl->AddRectFilled(start, rect_max,
-        ImGui::GetColorU32(bg), 12.0f);
+        ImGui::GetColorU32(bg), 8.0f);
     dl->AddRect(start, rect_max,
-        ImGui::GetColorU32(border), 12.0f, 0, 1.5f);
+        ImGui::GetColorU32(border), 8.0f, 0, 1.0f);
     s_split.Merge(dl);
 
     /* Ensure ImGui knows the item consumed this space so subsequent
@@ -5053,7 +5158,9 @@ enum {
     IC_NONE = -1, IC_GEAR = 0, IC_MOON, IC_SUN, IC_BOLT, IC_CHAT, IC_SEND,
     IC_PLUS, IC_STOP, IC_REFRESH, IC_SPARK, IC_SLIDERS, IC_LAYOUT, IC_TEXT,
     IC_CHEVRON_UP, IC_CHEVRON_DOWN, IC_CAMERA, IC_TRASH,
-    IC_COPY, IC_CODE, IC_EYE_OFF, IC_LEAN
+    IC_COPY, IC_CODE, IC_EYE_OFF, IC_LEAN,
+    /* v16 (2026-09-22) -- reskin additions: cleaner header + composer. */
+    IC_MSGSQ, IC_X, IC_EYE, IC_MONITOR
 };
 
 /* 8 unit directions (avoids pulling in <math.h> for cos/sin). */
@@ -5087,6 +5194,11 @@ static const char *icon_glyph(int kind) {
     case IC_CODE:    return "\xEE\x82\x93";  /* E093 code                */
     case IC_EYE_OFF: return "\xEE\x82\xBB";  /* E0BB eye-off (hide)      */
     case IC_LEAN:    return "\xEE\x84\x9B";  /* E11B minimize-2 (lean)   */
+    /* v16 reskin glyphs (Lucide). */
+    case IC_MSGSQ:   return "\xEE\x84\x97";  /* E117 message-square      */
+    case IC_X:       return "\xEE\x86\xB2";  /* E1B2 x                   */
+    case IC_EYE:     return "\xEE\x82\xBA";  /* E0BA eye                 */
+    case IC_MONITOR: return "\xEE\x84\x9D";  /* E11D monitor             */
     default:         return 0;
     }
 }
@@ -5305,93 +5417,157 @@ static void card_end(void) {
     ImGui::PopStyleColor(2);
 }
 
-/* Clean header (NO colored strip) laid out with normal ImGui flow so hit
- * rects always match -- logo mark + wordmark on the left; opacity slider,
- * theme + settings icon buttons on the right -- then segmented Chat/Home
- * tabs + a right-aligned status chip, and a thin divider. */
+/* v16 (2026-09-22) -- Shared logo tile used by header + welcome hero.
+ * A rounded accent square with a sparkle glyph centered on top. No external
+ * PNG asset dependency -- pure vector so it always renders. */
+static void draw_logo_tile(ImDrawList *dl, ImVec2 lp, float sz, float scale, const ui_theme_t &T) {
+    dl->AddRectFilled(lp, ImVec2(lp.x + sz, lp.y + sz),
+                      ImGui::GetColorU32(T.accent), sz * 0.22f);
+    draw_icon(dl, IC_SPARK, ImVec2(lp.x + sz * 0.5f, lp.y + sz * 0.5f), sz * 0.26f,
+              ImGui::GetColorU32(T.accent_text), ImGui::GetColorU32(T.accent), 2.0f * scale);
+}
+
+/* v16 (2026-09-22) -- Clean single-row header. Brand tile + "CloakGPT" left;
+ * opacity slider + theme chip + camera (Ask) + trash (Clear) + eye-off (Hide)
+ * right. NO second row of tabs -- the composer owns input, one view only.
+ * Status chip (provider|tier|stream) moved to a subtle right-aligned label
+ * BELOW the divider so header stays lean but the info is still discoverable. */
 static void draw_topbar(const ui_theme_t &T, float scale, float alpha_cur,
                         const char *prov, const char *tier, int streaming) {
     ImDrawList *dl = ImGui::GetWindowDrawList();
     float rowh = ImGui::GetFrameHeight();
 
-    /* Logo mark (reserved via Dummy, painted on top). */
+    /* Brand left: logo tile + wordmark. */
     ImVec2 lp = ImGui::GetCursorScreenPos();
     ImGui::Dummy(ImVec2(rowh, rowh));
-    dl->AddRectFilled(lp, ImVec2(lp.x + rowh, lp.y + rowh),
-                      ImGui::GetColorU32(T.accent), rowh * 0.28f);
-    draw_icon(dl, IC_SPARK, ImVec2(lp.x + rowh * 0.5f, lp.y + rowh * 0.5f), rowh * 0.24f,
-              ImGui::GetColorU32(T.accent_text), ImGui::GetColorU32(T.accent), 2.0f * scale);
+    draw_logo_tile(dl, lp, rowh, scale, T);
     ImGui::SameLine(0, 9.0f * scale);
     ImGui::AlignTextToFramePadding();
     ImGui::TextColored(T.text, "CloakGPT");
 
-    /* Right cluster: opacity slider + theme + settings. */
-    float ib = rowh;
-    float sw = 120.0f * scale;
-    float cluster = sw + 8.0f * scale + ib + 4.0f * scale + ib + 4.0f * scale + ib;
+    /* Right cluster: opacity slider + theme + camera + trash + hide. */
+    float ib      = rowh;
+    float sw      = 116.0f * scale;
+    float cluster = sw + 8.0f * scale + ib + 6.0f * scale + ib + 4.0f * scale
+                       + ib + 4.0f * scale + ib;
     float rx = ImGui::GetContentRegionMax().x - cluster;
     ImGui::SameLine();
     if (rx > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(rx);
-    ImGui::SetNextItemWidth(sw);
-    float a = alpha_cur;
-    if (ImGui::SliderFloat("##tb_op", &a, 0.05f, 1.00f, "opacity %.2f"))
-        ui_bump_alpha(a - alpha_cur);
+
+    /* v17 (2026-09-22) -- Thin custom opacity slider. 3px track + small knob
+     * instead of the chunky ImGui SliderFloat block. Reads immediately as
+     * "slider" without dominating the header. Hover shows a tooltip. */
+    {
+        ImVec2 sp = ImGui::GetCursorScreenPos();
+        ImGui::InvisibleButton("##tb_op", ImVec2(sw, rowh));
+        bool hov    = ImGui::IsItemHovered();
+        bool active = ImGui::IsItemActive();
+        float trk_y = sp.y + rowh * 0.5f;
+        ImU32 trk_bg = ImGui::GetColorU32(T.frame_bg);
+        ImU32 trk_fg = ImGui::GetColorU32(T.accent);
+        /* Track base. */
+        dl->AddRectFilled(ImVec2(sp.x, trk_y - 1.5f),
+                          ImVec2(sp.x + sw, trk_y + 1.5f), trk_bg, 2.0f);
+        /* Filled portion (range 0.05..1.00). */
+        float t = (alpha_cur - 0.05f) / 0.95f;
+        if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
+        float kx = sp.x + t * sw;
+        dl->AddRectFilled(ImVec2(sp.x, trk_y - 1.5f),
+                          ImVec2(kx,   trk_y + 1.5f), trk_fg, 2.0f);
+        /* Knob (grows on hover / drag). */
+        float knob_r = (hov || active) ? 6.0f : 5.0f;
+        dl->AddCircleFilled(ImVec2(kx, trk_y), knob_r,
+                            ImGui::GetColorU32(T.accent_hi), 20);
+        /* Drag: alpha proportional to cursor X inside the track. */
+        if (active) {
+            float mx = ImGui::GetIO().MousePos.x - sp.x;
+            if (mx < 0.0f) mx = 0.0f;
+            if (mx > sw)   mx = sw;
+            float new_a = 0.05f + (mx / sw) * 0.95f;
+            float d = new_a - alpha_cur;
+            if (d > 0.001f || d < -0.001f) ui_bump_alpha(d);
+        }
+        if (hov) ImGui::SetTooltip("Opacity  %d%%", (int)(alpha_cur * 100 + 0.5f));
+    }
     ImGui::SameLine(0, 8.0f * scale);
     {
-        int tp = ui_get_theme_pref();
+        int tp  = ui_get_theme_pref();
         int eff = ui_get_theme_effective();
         if (icon_button("##tb_theme", eff == 1 ? IC_SUN : IC_MOON, ib, T, scale))
             ui_apply_theme_and_flags((tp + 1) % 3, ui_get_overlay_flags());
     }
-    ImGui::SameLine(0, 4.0f * scale);
+    ImGui::SameLine(0, 6.0f * scale);
+    /* Settings (gear) -- toggles the Home hub over the chat. Highlighted when
+     * Home is showing so it reads as "click again to return to chat". */
     if (icon_button("##tb_gear", IC_GEAR, ib, T, scale, g_home_view_forced != 0))
         (g_home_view_forced ? ui_view_show_chat() : ui_view_show_home());
     ImGui::SameLine(0, 4.0f * scale);
-    if (icon_button("##tb_chev", IC_CHEVRON_UP, ib, T, scale))
-        InterlockedExchange(&g_chrome_collapsed, 1);   /* focus mode: hide chrome */
+    if (icon_button("##tb_clear", IC_TRASH,   ib, T, scale)) ui_action_fire(SVC_HK_NEW_CHAT);
+    ImGui::SameLine(0, 4.0f * scale);
+    if (icon_button("##tb_hide",  IC_EYE_OFF, ib, T, scale)) ui_action_fire(SVC_HK_TOGGLE);
 
-    ImGui::Dummy(ImVec2(0, 5.0f * scale));
-
-    /* Segmented tabs + status chip. */
-    bool on_home = (g_home_view_forced != 0);
-    if (cta_button("##tab_chat", IC_CHAT, "Chat", !on_home, scale, T)) ui_view_show_chat();
-    ImGui::SameLine(0, 6.0f * scale);
-    if (cta_button("##tab_home", IC_SLIDERS, "Home", on_home, scale, T)) ui_view_show_home();
-    /* Right cluster: status chip + camera (snap+send) + clear-chat. */
-    {
-        float tib = ImGui::GetFrameHeight();
-        float rc  = tib * 3.0f + 8.0f * scale;     /* camera + trash + hide */
-        char chip[96]; chip[0] = 0;
-        if (prov && prov[0]) {
-            _snprintf(chip, sizeof(chip) - 1, "%s  |  %s%s", prov, tier ? tier : "",
-                      streaming ? "  |  stream" : "");
-            chip[sizeof(chip) - 1] = 0;
-            rc += ImGui::CalcTextSize(chip).x + 10.0f * scale;
-        }
-        ImGui::SameLine();
-        float rx2 = ImGui::GetContentRegionMax().x - rc;
-        if (rx2 > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(rx2);
-        if (chip[0]) {
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextColored(T.text_dim, "%s", chip);
-            ImGui::SameLine(0, 10.0f * scale);
-        }
-        if (icon_button("##tb_cam", IC_CAMERA, tib, T, scale))
-            ui_action_fire(SVC_HK_ASK);        /* screenshot + send to AI */
-        ImGui::SameLine(0, 4.0f * scale);
-        if (icon_button("##tb_clear", IC_TRASH, tib, T, scale))
-            ui_action_fire(SVC_HK_NEW_CHAT);   /* clear the whole chat */
-        ImGui::SameLine(0, 4.0f * scale);
-        if (icon_button("##tb_hide", IC_EYE_OFF, tib, T, scale))
-            ui_action_fire(SVC_HK_TOGGLE);     /* hide overlay (restore via hotkey) */
-    }
-
-    /* Thin divider. */
-    ImGui::Dummy(ImVec2(0, 3.0f * scale));
+    /* Thin divider (hairline stroke). */
+    ImGui::Dummy(ImVec2(0, 6.0f * scale));
     ImVec2 sp = ImGui::GetCursorScreenPos();
     float availw = ImGui::GetContentRegionAvail().x;
     dl->AddLine(ImVec2(sp.x, sp.y), ImVec2(sp.x + availw, sp.y), ImGui::GetColorU32(T.sep), 1.0f);
-    ImGui::Dummy(ImVec2(0, 5.0f * scale));
+
+    /* Right-aligned status label below the divider: provider | tier | stream. */
+    if (prov && prov[0]) {
+        char chip[96];
+        _snprintf(chip, sizeof(chip) - 1, "%s  \xE2\x80\xA2  %s%s",
+                  prov, tier ? tier : "",
+                  streaming ? "  \xE2\x80\xA2  stream" : "");
+        chip[sizeof(chip) - 1] = 0;
+        ImGui::Dummy(ImVec2(0, 4.0f * scale));
+        float cw = ImGui::CalcTextSize(chip).x;
+        float _availw = ImGui::GetContentRegionAvail().x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (_availw - cw));
+        ImGui::TextColored(T.text_dim, "%s", chip);
+    } else {
+        ImGui::Dummy(ImVec2(0, 4.0f * scale));
+    }
+}
+
+/* v17 (2026-09-22) -- Reusable thin slider. Matches the topbar opacity style:
+ * 3px track, small knob, accent fill, tooltip on hover. Called from home hub
+ * (Opacity + Font) and anywhere else that used ImGui::SliderFloat. */
+static void draw_thin_slider(const char *id, float *val, float vmin, float vmax,
+                             float width, const ui_theme_t &T, float scale,
+                             const char *fmt) {
+    float rowh = ImGui::GetFrameHeight();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    ImVec2 sp = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton(id, ImVec2(width, rowh));
+    bool hov    = ImGui::IsItemHovered();
+    bool active = ImGui::IsItemActive();
+    float trk_y = sp.y + rowh * 0.5f;
+    dl->AddRectFilled(ImVec2(sp.x, trk_y - 1.5f),
+                      ImVec2(sp.x + width, trk_y + 1.5f),
+                      ImGui::GetColorU32(T.frame_bg), 2.0f);
+    float span = vmax - vmin;
+    float t = span > 0 ? (*val - vmin) / span : 0.0f;
+    if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
+    float kx = sp.x + t * width;
+    dl->AddRectFilled(ImVec2(sp.x, trk_y - 1.5f),
+                      ImVec2(kx,   trk_y + 1.5f),
+                      ImGui::GetColorU32(T.accent), 2.0f);
+    float knob_r = (hov || active) ? 6.0f : 5.0f;
+    dl->AddCircleFilled(ImVec2(kx, trk_y), knob_r,
+                        ImGui::GetColorU32(T.accent_hi), 20);
+    if (active && span > 0) {
+        float mx = ImGui::GetIO().MousePos.x - sp.x;
+        if (mx < 0.0f) mx = 0.0f;
+        if (mx > width) mx = width;
+        *val = vmin + (mx / width) * span;
+    }
+    if (hov) {
+        char tt[64];
+        _snprintf(tt, sizeof(tt) - 1, fmt ? fmt : "%.2f", *val);
+        tt[sizeof(tt) - 1] = 0;
+        ImGui::SetTooltip("%s", tt);
+    }
+    (void)scale;
 }
 
 /* HOME hub -- the "master control" surface. Every control is live. */
@@ -5457,11 +5633,19 @@ static void draw_home_hub(const ui_theme_t &T, float scale, float alpha_cur,
             ui_apply_theme_and_flags((tp + 1) % 3, ui_get_overlay_flags());
     }
     float a = alpha_cur;
-    ImGui::SetNextItemWidth(220.0f * scale);
-    if (ImGui::SliderFloat("Opacity", &a, 0.05f, 1.00f, "%.2f")) ui_bump_alpha(a - alpha_cur);
+    /* v17 (2026-09-22) -- thin slider for Opacity + Font (matches topbar
+     * style). Label sits to the LEFT via SameLine so it reads clean. */
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(T.text_dim, "Opacity");
+    ImGui::SameLine(84.0f * scale);
+    draw_thin_slider("##h_opacity", &a, 0.05f, 1.00f, 200.0f * scale, T, scale, "Opacity  %d%%  (%.2f)");
+    if (a != alpha_cur) ui_bump_alpha(a - alpha_cur);
     float f = font_cur;
-    ImGui::SetNextItemWidth(220.0f * scale);
-    if (ImGui::SliderFloat("Font", &f, 0.60f, 3.00f, "%.2fx")) ui_bump_font(f - font_cur);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(T.text_dim, "Font");
+    ImGui::SameLine(84.0f * scale);
+    draw_thin_slider("##h_font", &f, 0.60f, 3.00f, 200.0f * scale, T, scale, "Font  %.2fx");
+    if (f != font_cur) ui_bump_font(f - font_cur);
     {
         int lean_on = ui_is_lean();
         if (cta_button("##h_lean", IC_LEAN, lean_on ? "Lean mode: ON" : "Lean mode: OFF",
@@ -5489,39 +5673,174 @@ static void draw_home_hub(const ui_theme_t &T, float scale, float alpha_cur,
     card_end();
 }
 
-/* Empty-chat WELCOME hero -- a single glass card with a gradient badge. */
+/* v16 (2026-09-22) -- Centered empty-state hero: logo tile + welcome + subtitle.
+ * NO CTA buttons -- the always-on composer at the bottom of the window provides
+ * the Ask affordance (camera + text + send). One clean surface. */
 static void draw_welcome_hero(const ui_theme_t &T, float scale) {
-    ImGui::Dummy(ImVec2(0, 20.0f * scale));
-    card_begin("##card_welcome", T, scale);
-    ImGui::Dummy(ImVec2(0, 12.0f * scale));
-
     ImDrawList *dl = ImGui::GetWindowDrawList();
     float availw = ImGui::GetContentRegionAvail().x;
-    ImVec2 p = ImGui::GetCursorScreenPos();
-    float bs = 60.0f * scale;
-    ImVec2 bc(p.x + availw * 0.5f, p.y + bs * 0.5f);
-    dl->AddCircleFilled(bc, bs * 0.5f, ImGui::GetColorU32(T.accent), 32);
-    draw_icon(dl, IC_SPARK, bc, bs * 0.28f, ImGui::GetColorU32(T.accent_text),
-              ImGui::GetColorU32(T.accent), 3.0f * scale);
-    ImGui::Dummy(ImVec2(0, bs + 16.0f * scale));
+    float innerH = ImGui::GetContentRegionAvail().y;
+    float logoS  = 48.0f * scale;
+    float blockH = logoS + 14.0f * scale + ImGui::GetFontSize() * 3.4f;
+    float topPad = (innerH - blockH) * 0.40f;
+    if (topPad < 8.0f * scale) topPad = 8.0f * scale;
+    ImGui::Dummy(ImVec2(0, topPad));
 
+    ImVec2 lp = ImGui::GetCursorScreenPos();
+    draw_logo_tile(dl, ImVec2(lp.x + (availw - logoS) * 0.5f, lp.y), logoS, scale, T);
+    ImGui::Dummy(ImVec2(0, logoS + 14.0f * scale));
+
+    ImGui::SetWindowFontScale(1.30f);
     const char *title = "Welcome to CloakGPT";
     float tw = ImGui::CalcTextSize(title).x;
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (ImGui::GetContentRegionAvail().x - tw) * 0.5f);
     ImGui::TextColored(T.text, "%s", title);
-    const char *sub = "Screenshot-grounded answers for whatever's on screen.";
+    ImGui::SetWindowFontScale(1.0f);
+
+    ImGui::Dummy(ImVec2(0, 4.0f * scale));
+    const char *sub = "Ask anything \xE2\x80\x94 the camera / \xE2\x86\x91 button snaps whatever's on screen.";
     float sw2 = ImGui::CalcTextSize(sub).x;
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (ImGui::GetContentRegionAvail().x - sw2) * 0.5f);
     ImGui::TextColored(T.text_dim, "%s", sub);
+}
 
-    ImGui::Dummy(ImVec2(0, 16.0f * scale));
-    float bw = 150.0f * scale + 172.0f * scale + 6.0f * scale;
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (ImGui::GetContentRegionAvail().x - bw) * 0.5f);
-    if (cta_button("##w_solve", IC_BOLT, "Auto Solve", true, scale, T)) ui_action_fire(SVC_HK_ASK);
-    ImGui::SameLine(0, 6.0f * scale);
-    if (cta_button("##w_type", IC_CHAT, "Type a question", false, scale, T)) ui_chat_toggle();
-    ImGui::Dummy(ImVec2(0, 12.0f * scale));
-    card_end();
+/* v16 (2026-09-22) -- Always-on composer. Camera square (screenshot+ask) +
+ * rounded live-input field (click to focus, unfocus on outside click, buffer
+ * preserved) + send square (submits typed text OR fires ASK if empty).
+ * All svcldb hotkeys stay wired unchanged; the LL keyboard hook still feeds
+ * g_chat_buf while active. Field radius 8, corner squares 6 (Apple-tight). */
+static void composer_bar(const ui_theme_t &T, float scale) {
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    float rowh   = 42.0f * scale;
+    float cam    = rowh;
+    float send   = rowh;
+    float gap    = 8.0f * scale;
+    float availw = ImGui::GetContentRegionAvail().x;
+    float fieldw = availw - send - cam - gap * 2.0f;
+    if (fieldw < 60.0f * scale) fieldw = 60.0f * scale;
+    bool  active = ui_chat_is_active() != 0;
+    float fh     = ImGui::GetFontSize();
+
+    ImU32 soft_border = ImGui::GetColorU32(T.card_border);
+    ImU32 hi_border   = IM_COL32(220, 224, 235, 200);    /* focus ring -- not stark white */
+
+    /* Camera (LEFT). Fires ASK -- screenshot + immediate send to AI. */
+    ImVec2 cp = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##cmp_cam", ImVec2(cam, rowh));
+    bool cam_hov = ImGui::IsItemHovered(), cam_clk = ImGui::IsItemClicked();
+    dl->AddRectFilled(cp, ImVec2(cp.x + cam, cp.y + rowh),
+                      ImGui::GetColorU32(cam_hov ? T.frame_hi : T.card_bg), 6.0f * scale);
+    dl->AddRect(cp, ImVec2(cp.x + cam, cp.y + rowh), soft_border, 6.0f * scale, 0, 1.0f);
+    draw_icon(dl, IC_CAMERA, ImVec2(cp.x + cam * 0.5f, cp.y + rowh * 0.5f),
+              cam * 0.24f, ImGui::GetColorU32(T.text),
+              ImGui::GetColorU32(T.card_bg), 1.8f * scale);
+    if (cam_clk) ui_action_fire(SVC_HK_ASK);
+    ImGui::SameLine(0, gap);
+
+    /* Rounded input field. Click to focus; when active, mirrors g_chat_buf. */
+    ImVec2 fp = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##cmp_field", ImVec2(fieldw, rowh));
+    bool fld_clk = ImGui::IsItemClicked();
+    dl->AddRectFilled(fp, ImVec2(fp.x + fieldw, fp.y + rowh),
+                      ImGui::GetColorU32(T.card_bg), 8.0f * scale);
+    dl->AddRect(fp, ImVec2(fp.x + fieldw, fp.y + rowh),
+                active ? hi_border : soft_border, 8.0f * scale, 0,
+                active ? 1.4f * scale : 1.0f);
+
+    char cbuf[CHAT_BUF_SIZE]; int clen = 0; int ccur = 0;
+    if (active) {
+        ensure_chat_cs();
+        EnterCriticalSection(&g_chat_cs);
+        clen = g_chat_len; if (clen > CHAT_BUF_SIZE - 1) clen = CHAT_BUF_SIZE - 1;
+        memcpy(cbuf, g_chat_buf, (size_t)clen); cbuf[clen] = 0;
+        ccur = g_chat_cursor; if (ccur < 0) ccur = 0; if (ccur > clen) ccur = clen;
+        LeaveCriticalSection(&g_chat_cs);
+    }
+    /* Clip so long typing doesn't spill into the send square. */
+    dl->PushClipRect(ImVec2(fp.x + 8.0f * scale, fp.y),
+                     ImVec2(fp.x + fieldw - 8.0f * scale, fp.y + rowh), true);
+    ImVec2 tp(fp.x + 14.0f * scale, fp.y + (rowh - fh) * 0.5f);
+    bool blink = ((GetTickCount() / 500) & 1) == 0;
+    if (active) {
+        if (clen > 0) {
+            /* Split at cursor so the blink block sits at ccur. */
+            char before[CHAT_BUF_SIZE], after[CHAT_BUF_SIZE];
+            memcpy(before, cbuf, (size_t)ccur); before[ccur] = 0;
+            int tail = clen - ccur;
+            memcpy(after, cbuf + ccur, (size_t)tail); after[tail] = 0;
+            float bx = tp.x;
+            if (ccur > 0) {
+                dl->AddText(ImVec2(bx, tp.y), ImGui::GetColorU32(T.text), before);
+                bx += ImGui::CalcTextSize(before).x;
+            }
+            if (blink) dl->AddText(ImVec2(bx, tp.y), ImGui::GetColorU32(T.text), "\xE2\x96\x8A");
+            if (tail > 0) {
+                float ax = bx + (blink ? ImGui::CalcTextSize("\xE2\x96\x8A").x : 0.0f);
+                dl->AddText(ImVec2(ax, tp.y), ImGui::GetColorU32(T.text), after);
+            }
+        } else {
+            dl->AddText(tp, ImGui::GetColorU32(T.text), blink ? "\xE2\x96\x8A" : " ");
+        }
+    } else {
+        dl->AddText(tp, ImGui::GetColorU32(T.text_dim), "Ask anything\xE2\x80\xA6");
+    }
+    dl->PopClipRect();
+
+    if (fld_clk && !active) {
+        /* Activate typing mode -- preserves any existing buffer content. */
+        ensure_chat_cs();
+        EnterCriticalSection(&g_chat_cs);
+        bool has_text = g_chat_len > 0;
+        LeaveCriticalSection(&g_chat_cs);
+        if (has_text) {
+            EnterCriticalSection(&g_ui_cs); g_visible = true; LeaveCriticalSection(&g_ui_cs);
+            InterlockedExchange(&g_chat_active, 1);
+            wake_dwm_composition();
+        } else {
+            ui_chat_toggle();
+        }
+    }
+
+    /* Send square (RIGHT). Only enabled when there's typed text -- the camera
+     * (LEFT) handles screenshot-only asks. When empty: renders dim + no-op so
+     * users understand it's the "commit what I've typed" affordance. Uses the
+     * IC_SEND paper-plane glyph so it reads as "send", not "up arrow". */
+    bool has_text = false;
+    if (active) {
+        ensure_chat_cs();
+        EnterCriticalSection(&g_chat_cs);
+        has_text = g_chat_len > 0;
+        LeaveCriticalSection(&g_chat_cs);
+    }
+    ImGui::SameLine(0, gap);
+    ImVec2 sp = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##cmp_send", ImVec2(send, rowh));
+    bool snd_hov = ImGui::IsItemHovered(), snd_clk = ImGui::IsItemClicked();
+    ImU32 snd_bg = has_text
+        ? ImGui::GetColorU32(snd_hov ? T.accent_hi : T.accent)
+        : ImGui::GetColorU32(T.frame_bg);
+    dl->AddRectFilled(sp, ImVec2(sp.x + send, sp.y + rowh), snd_bg, 6.0f * scale);
+    if (!has_text)
+        dl->AddRect(sp, ImVec2(sp.x + send, sp.y + rowh),
+                    soft_border, 6.0f * scale, 0, 1.0f);
+    ImU32 snd_fg = has_text
+        ? ImGui::GetColorU32(T.accent_text)
+        : ImGui::GetColorU32(T.text_dim);
+    draw_icon(dl, IC_SEND, ImVec2(sp.x + send * 0.5f, sp.y + rowh * 0.5f),
+              send * 0.24f, snd_fg, snd_bg, 2.0f * scale);
+    if (snd_clk && has_text) chat_submit_typed_text();
+
+    /* Outside-click unfocus. Preserves buffer -- only stops LL key routing. */
+    if (active && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        ImVec2 m = ImGui::GetIO().MousePos;
+        bool in_field = m.x >= fp.x && m.x <= fp.x + fieldw && m.y >= fp.y && m.y <= fp.y + rowh;
+        bool in_send  = m.x >= sp.x && m.x <= sp.x + send   && m.y >= sp.y && m.y <= sp.y + rowh;
+        bool in_cam   = m.x >= cp.x && m.x <= cp.x + cam    && m.y >= cp.y && m.y <= cp.y + rowh;
+        if (!in_field && !in_send && !in_cam) {
+            InterlockedExchange(&g_chat_active, 0);
+            wake_dwm_composition();
+        }
+    }
 }
 
 /* Visible resize grips -- corner brackets on ALL FOUR corners so it's
@@ -5808,8 +6127,8 @@ static void draw_toolbar_pill(ImDrawList *fg, float ox, float oy, float *out_w, 
     if (out_w) *out_w = w;
 
     int   bgA = (int)(200 * a); if (bgA < 60) bgA = 60;
-    ImU32 bg  = IM_COL32(8, 9, 12, bgA);
-    ImU32 bd  = IM_COL32(255, 255, 255, (int)(80 * a));
+    ImU32 bg  = IM_COL32(17, 17, 17, bgA);
+    ImU32 bd  = IM_COL32(255, 255, 255, (int)(60 * a));
     fg->AddRectFilled(ImVec2(ox + 1, oy + 2), ImVec2(ox + w + 1, oy + h + 2),
                       IM_COL32(0, 0, 0, (int)(80 * a)), h * 0.5f);
     fg->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + h), bg, h * 0.5f);
@@ -5868,11 +6187,13 @@ static void draw_full_card(ImDrawList *fg, float ox, float oy, float w, float h,
                            ImVec2 mp, bool mc, bool mr,
                            bool *hit_copy, bool *hit_chevron, bool *hit_ham, bool *hit_dot,
                            bool copy_flashing, bool show_slider) {
-    float radius = 8.0f;
+    /* v16 (2026-09-22) -- Apple-tight radius (6px, not 8) matches the overlay
+     * chrome. Bg = NL.card #111 area (~ IM_COL32(17,17,17)) for cohesion. */
+    float radius = 6.0f;
     int   bgA    = (int)(230 * a);
     if (bgA < 60) bgA = 60;
-    ImU32 bg  = IM_COL32(8, 9, 12, bgA);
-    ImU32 bd  = IM_COL32(255, 255, 255, (int)(70 * a));
+    ImU32 bg  = IM_COL32(17, 17, 17, bgA);
+    ImU32 bd  = IM_COL32(255, 255, 255, (int)(60 * a));
     /* Two-layer shadow so the card lifts off the desktop a bit. */
     fg->AddRectFilled(ImVec2(ox + 3, oy + 5), ImVec2(ox + w + 3, oy + h + 5),
                       IM_COL32(0, 0, 0, (int)(60 * a)), radius);
@@ -5884,7 +6205,9 @@ static void draw_full_card(ImDrawList *fg, float ox, float oy, float w, float h,
     ImFont *font = ImGui::GetFont();
     float fs = ImGui::GetFontSize();
     int   Aval = (int)(255 * a); if (Aval < 90) Aval = 90;
-    float pad = 10.0f;
+    /* v17 (2026-09-22) -- bumped from 10 -> 14 so answer body never hugs
+     * the card edges (Sam: text should never touch borders). */
+    float pad = 14.0f;
 
     /* ── Header row -- bottom-right anchored (hooksdll layout) ── */
     float dr = 8.0f;
@@ -6025,10 +6348,10 @@ static void draw_full_card(ImDrawList *fg, float ox, float oy, float w, float h,
         float knob_x = sx_track + t * (sx1 - sx_track);
         fg->AddRectFilled(ImVec2(sx_track, track_y - 3),
                           ImVec2(knob_x,   track_y + 3),
-                          IM_COL32(90, 170, 240, Aval), 3.0f);
+                          IM_COL32(240, 240, 245, Aval), 3.0f);
         fg->AddCircleFilled(ImVec2(knob_x, track_y), 6.5f, IM_COL32(255, 255, 255, Aval));
         fg->AddCircle       (ImVec2(knob_x, track_y), 6.5f,
-                             IM_COL32(60, 120, 200, Aval), 0, 1.5f);
+                             IM_COL32(120, 120, 128, Aval), 0, 1.5f);
         char pctbuf[16];
         _snprintf(pctbuf, sizeof(pctbuf) - 1, "%d%%", (int)(a * 100 + 0.5f)); pctbuf[sizeof(pctbuf) - 1] = 0;
         fg->AddText(font, fs * 0.85f, ImVec2(sx1 + 8, sy + 3),
@@ -6702,16 +7025,18 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
         col_scroll_grab     = ImVec4(0.00f, 0.00f, 0.00f, 0.22f);
         col_scroll_grab_hi  = ImVec4(0.00f, 0.00f, 0.00f, 0.34f);
     } else {
-        /* DARK -- near-black bg, white text, neutral grays (no hue). */
-        col_window_bg       = ImVec4(0.05f, 0.05f, 0.06f, 1.00f);
-        col_title_bg        = ImVec4(0.10f, 0.10f, 0.11f, 0.98f);
-        col_title_bg_active = ImVec4(0.14f, 0.14f, 0.16f, 0.98f);
-        col_border          = ImVec4(1.00f, 1.00f, 1.00f, 0.12f);
-        col_text            = ImVec4(0.94f, 0.94f, 0.95f, 1.00f);
-        col_sep             = ImVec4(1.00f, 1.00f, 1.00f, 0.10f);
-        col_scroll_bg       = ImVec4(1.00f, 1.00f, 1.00f, 0.04f);
-        col_scroll_grab     = ImVec4(1.00f, 1.00f, 1.00f, 0.22f);
-        col_scroll_grab_hi  = ImVec4(1.00f, 1.00f, 1.00f, 0.34f);
+        /* v16 (2026-09-22) DARK -- NL palette. Deeper #0A0A0A window, #1A1A1A
+         * title-active lift, softened white text, hairline strokes. Monochrome
+         * on purpose: overlay must blend into any exam / test-taker background. */
+        col_window_bg       = ImVec4(0.039f, 0.039f, 0.039f, 1.00f); /* NL.bg     #0A0A0A */
+        col_title_bg        = ImVec4(0.039f, 0.039f, 0.039f, 0.98f); /* NL.bg     #0A0A0A */
+        col_title_bg_active = ImVec4(0.102f, 0.102f, 0.102f, 0.98f); /* NL.cardHi #1A1A1A */
+        col_border          = ImVec4(1.000f, 1.000f, 1.000f, 0.08f); /* NL.stroke white/8 */
+        col_text            = ImVec4(0.960f, 0.960f, 0.970f, 1.00f); /* NL.txt    softened white */
+        col_sep             = ImVec4(1.000f, 1.000f, 1.000f, 0.08f); /* NL.stroke white/8 */
+        col_scroll_bg       = ImVec4(1.000f, 1.000f, 1.000f, 0.03f);
+        col_scroll_grab     = ImVec4(1.000f, 1.000f, 1.000f, 0.22f);
+        col_scroll_grab_hi  = ImVec4(1.000f, 1.000f, 1.000f, 0.34f);
     }
 
     /* v14 (2026-08-11): accent + surface palette for the redesigned UI.
@@ -6732,17 +7057,20 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
         col_card_border = ImVec4(0.00f, 0.00f, 0.00f, 0.10f);
         col_text_dim    = ImVec4(0.38f, 0.38f, 0.42f, 1.0f);
     } else {
-        /* DARK -- accent is white; text ON accent is black. */
-        col_accent      = ImVec4(0.95f, 0.95f, 0.96f, 1.0f);
-        col_accent_hi   = ImVec4(1.00f, 1.00f, 1.00f, 1.0f);
-        col_accent_dim  = ImVec4(1.00f, 1.00f, 1.00f, 0.08f);
-        col_accent2     = ImVec4(0.95f, 0.95f, 0.96f, 1.0f);
-        col_accent_text = ImVec4(0.06f, 0.06f, 0.07f, 1.0f);
-        col_frame_bg    = ImVec4(1.00f, 1.00f, 1.00f, 0.06f);
-        col_frame_hi    = ImVec4(1.00f, 1.00f, 1.00f, 0.12f);
-        col_card_bg     = ImVec4(1.00f, 1.00f, 1.00f, 0.045f);
-        col_card_border = ImVec4(1.00f, 1.00f, 1.00f, 0.10f);
-        col_text_dim    = ImVec4(0.60f, 0.60f, 0.64f, 1.0f);
+        /* v16 (2026-09-22) DARK -- NL accent + surface palette. Near-white
+         * accent for primary CTAs (the send square, active toggles); SOLID
+         * #111 card surfaces so cards visually LIFT off the #0A0A0A window bg
+         * instead of blending into it. Hairline strokes throughout. */
+        col_accent      = ImVec4(0.950f, 0.950f, 0.960f, 1.0f);
+        col_accent_hi   = ImVec4(1.000f, 1.000f, 1.000f, 1.0f);
+        col_accent_dim  = ImVec4(1.000f, 1.000f, 1.000f, 0.10f);
+        col_accent2     = ImVec4(0.860f, 0.880f, 0.920f, 1.0f); /* icon tint / focus border */
+        col_accent_text = ImVec4(0.060f, 0.060f, 0.070f, 1.0f); /* dark text ON white accent */
+        col_frame_bg    = ImVec4(1.000f, 1.000f, 1.000f, 0.05f);
+        col_frame_hi    = ImVec4(1.000f, 1.000f, 1.000f, 0.10f);
+        col_card_bg     = ImVec4(0.067f, 0.067f, 0.067f, 1.00f); /* NL.card   #111  SOLID */
+        col_card_border = ImVec4(1.000f, 1.000f, 1.000f, 0.08f); /* NL.stroke white/8 */
+        col_text_dim    = ImVec4(0.604f, 0.604f, 0.604f, 1.0f);  /* NL.txt2   #9A9A9A */
     }
 
     /* v14b: bundle the palette for the custom-drawn UI helpers. */
@@ -6862,7 +7190,7 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
      * bumped 4 -> 5 accordingly). */
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha < 0.05f ? 0.05f : alpha);
 
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding,  14.0f * scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding,  8.0f * scale);
     /* v1.7.11.15 (2026-07-25) -- tighter chrome. User: "it be nice if
      * we didnt have the outer border or like less ui/ux and more simple
      * ui/ux for the app so more space can be used for the ai answer".
@@ -6874,12 +7202,14 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,   ImVec2(10.0f * scale, 10.0f * scale));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,     ImVec2(8.0f * scale, 6.0f * scale));
-    /* v14: modern rounding on frames / grabs / child cards / popups / scrollbar. */
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding,     8.0f * scale);
-    ImGui::PushStyleVar(ImGuiStyleVar_GrabRounding,      7.0f * scale);
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding,     12.0f * scale);
-    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding,     8.0f * scale);
-    ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarRounding, 9.0f * scale);
+    /* v16 (2026-09-22) -- Apple-tight radii. Big rounded corners scream "AI
+     * slop demo" (Sam's rule); real macOS windows sit at 8-10px, cards at
+     * 5-6px, buttons at 4-5px. Roundings below match that ratio. */
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding,     5.0f * scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_GrabRounding,      4.0f * scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding,     6.0f * scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding,     6.0f * scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarRounding, 4.0f * scale);
 
     /* v1.3 (2026-07-07): all chrome elements (title/border/separator/
      * scrollbar) scale with the user's opacity setting via
@@ -6950,11 +7280,15 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
          * compacts to make room; the typing bar is ALWAYS visible when
          * chat mode is active. Even on tiny overlays the input bar
          * wins the fight for pixels. */
-        int _chat_on_snap = g_chat_active;
-        float footer_height = _chat_on_snap
-            ? ImGui::GetFrameHeightWithSpacing() * 4.5f    /* chat-input mode */
-            : (collapsed ? 0.0f                            /* focus mode: no footer */
-                         : ImGui::GetFrameHeightWithSpacing() * 1.5f); /* hint strip */
+        /* v16 (2026-09-22) -- One unified view. Body reserves space for BOTH
+         * the composer bar (always visible) AND the static kbd-hint strip.
+         * Composer owns typing UX; the LL keyboard hook still feeds g_chat_buf
+         * behind the scenes so all existing hotkeys work unchanged. */
+        float composer_h = 42.0f * scale + 12.0f * scale;   /* row + spacing after */
+        float hints_h    = collapsed ? 0.0f
+                                     : (ImGui::GetFrameHeightWithSpacing() * 1.35f);
+        float footer_height = composer_h + hints_h;
+        (void)sl;                /* v16 -- old sl branching gone (was: hint variants) */
 
         /* ── TOP BAR -- hidden in focus mode (chevron collapse) ─────── */
         if (!collapsed) {
@@ -6967,22 +7301,17 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
                 InterlockedExchange(&g_chrome_collapsed, 0);
         }
 
-        if (!have_msgs) {
-            /* v14 (2026-08-11): HOME hub (master control) when home is
-             * forced; otherwise the empty-chat WELCOME hero. This branch
-             * never renders bubbles, so free the message snapshots here
-             * (they may be non-empty in the home-forced-with-msgs case). */
-            for (int i = 0; i < msg_n; i++) if (msgs[i].text) free(msgs[i].text);
-
-            ImGui::BeginChild("body", ImVec2(0, -footer_height), false, 0);
-            if (home_forced_eff) {
-                draw_home_hub(T, scale, alpha, font_mul,
-                              stat_provider, stat_tier, stat_model, stat_streaming);
-            } else {
-                draw_welcome_hero(T, scale);
-            }
-
-            /* Keep hotkey scroll working here too (hub can overflow). */
+        /* ── BODY: Home hub (gear active) OR welcome (empty) OR bubble list. ── */
+        bool show_home = (home_forced_eff != 0);
+        ImGui::BeginChild("body", ImVec2(0, -footer_height), false,
+                          (show_home || have_msgs) ? ImGuiWindowFlags_AlwaysVerticalScrollbar : 0);
+        if (show_home) {
+            /* Refined settings panel -- all cards render with the new NL palette
+             * (card_begin/card_end use T.card_bg + T.card_border which now point
+             * at the deeper #111 surface + hairline stroke). */
+            draw_home_hub(T, scale, alpha, font_mul,
+                          stat_provider, stat_tier, stat_model, stat_streaming);
+            /* Scroll handling for hub overflow. */
             LONG cs_scroll = InterlockedExchange(&g_reply_scroll_pending, 0);
             if (cs_scroll != 0) {
                 float cur = ImGui::GetScrollY();
@@ -6992,35 +7321,13 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
                 if (tgt > mx)   tgt = mx;
                 ImGui::SetScrollY(tgt);
             }
-            ImGui::EndChild();
-        } else {
-            /* ── Chat state: bubble list ──────────────────────────────── *
-             * Parent-level scroll: BOTH y (vertical scroll through
-             * message history) AND x (horizontal for long code lines /
-             * long math expressions). No per-bubble child scrollbars. */
-            ImGui::BeginChild("chat", ImVec2(0, -footer_height), false,
-                              ImGuiWindowFlags_HorizontalScrollbar |
-                              ImGuiWindowFlags_AlwaysVerticalScrollbar);
+        } else if (have_msgs) {
             float region_w = ImGui::GetContentRegionAvail().x;
             for (int i = 0; i < msg_n; i++) {
                 draw_chat_bubble(i, msgs[i].role, msgs[i].text,
                                  msgs[i].pending, region_w, font_mul);
             }
-            /* Free snapshots. */
-            for (int i = 0; i < msg_n; i++) if (msgs[i].text) free(msgs[i].text);
-
-            /* Scroll handling.
-             *
-             * v1.7.10.1 (2026-07-24) -- AUTO-PIN BUG FIX.
-             * Pre-fix: `else` branch auto-pinned to bottom EVERY frame
-             * when scroll_delta == 0. So user Ctrl+[ scrolled up -> next
-             * frame delta=0 -> auto-pinned back to bottom -> scroll up
-             * appeared broken. Fix: track when user last manually
-             * scrolled; skip auto-pin for 6 seconds after. User can
-             * scroll freely; auto-follow (for streaming new content)
-             * resumes 6s after user stops interacting. Auto-follow
-             * also resumes ANY time a NEW message arrives (see
-             * g_last_msg_id delta check below). */
+            /* Scroll handling (hotkey + auto-follow on new/streaming). */
             static ULONGLONG s_last_user_scroll_tick = 0;
             static int       s_last_seen_msg_count  = 0;
             LONG scroll_delta = InterlockedExchange(&g_reply_scroll_pending, 0);
@@ -7032,9 +7339,6 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
                 if (tgt > mx)   tgt = mx;
                 ImGui::SetScrollY(tgt);
                 s_last_user_scroll_tick = GetTickCount64();
-                /* Diag log -- helps debug "scroll doesn't work" reports.
-                 * Prints when hotkey fires + shows if there was actually
-                 * something to scroll (mx > 0). */
                 static volatile LONG s_scroll_log_count = 0;
                 LONG lc = InterlockedIncrement(&s_scroll_log_count);
                 if (lc <= 8 || lc % 20 == 0) {
@@ -7043,9 +7347,6 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
                          (mx <= 0.0f) ? "(NO-OP - nothing to scroll)" : "");
                 }
             } else {
-                /* Only auto-follow if EITHER (a) user hasn't scrolled
-                 * in the last 6s AND is already at bottom, OR (b) a
-                 * new message just arrived (count went up). */
                 ULONGLONG since_scroll = GetTickCount64() - s_last_user_scroll_tick;
                 bool new_msg = (msg_n > s_last_seen_msg_count);
                 s_last_seen_msg_count = msg_n;
@@ -7054,156 +7355,46 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
                     ImGui::SetScrollHereY(1.0f);
                 }
             }
-            ImGui::EndChild();
+        } else {
+            draw_welcome_hero(T, scale);
         }
+        ImGui::EndChild();
 
-        /* ── Persistent footer -- visible in BOTH states. Two variants:
-         *    - CHAT INPUT ACTIVE: show the current text buffer with
-         *      blinking cursor + "Enter to send / Esc to cancel" hint.
-         *      This is the killer feature -- user types freely and the
-         *      LL keyboard hook diverts keys into the buffer instead of
-         *      matching hotkeys, so ANY app receives no keystrokes
-         *      during input.
-         *    - CHAT INPUT INACTIVE: normal hotkey cheat-sheet strip. */
-        if (_chat_on_snap || !collapsed) ImGui::Separator();
-        /* v1.7.11.16: use the same snapshot taken at footer_height so
-         * footer content matches its reserved space. If g_chat_active
-         * flips mid-frame the previous re-read would have the input
-         * bar rendering in a 1.5-line hole (clipped) or the cheat
-         * strip rendering in a 4.5-line hole (padded with air). */
-        int chat_on = _chat_on_snap;
-        if (chat_on) {
-            /* Snapshot buffer + cursor under lock so we don't tear
-             * mid-utf8 while rendering. */
-            char cbuf[CHAT_BUF_SIZE];
-            int  cbuf_len, ccur;
-            ensure_chat_cs();
-            EnterCriticalSection(&g_chat_cs);
-            memcpy(cbuf, g_chat_buf, (size_t)g_chat_len);
-            cbuf[g_chat_len] = 0;
-            cbuf_len = g_chat_len;
-            ccur     = g_chat_cursor;
-            LeaveCriticalSection(&g_chat_cs);
+        /* Free msg snapshots now that body has consumed them. */
+        for (int i = 0; i < msg_n; i++) if (msgs[i].text) free(msgs[i].text);
 
-            /* Bounds sanity for tearing edge case. */
-            if (ccur < 0) ccur = 0;
-            if (ccur > cbuf_len) ccur = cbuf_len;
+        /* ── COMPOSER: camera + rounded field + send square. Always on. ── */
+        composer_bar(T, scale);
 
-            /* Blink cursor -- 500ms on / 500ms off. */
-            bool cursor_on = ((GetTickCount() / 500) & 1) == 0;
-            int  chars_shown = cbuf_len;   /* for char counter */
-
+        /* ── FOOTER: static kbd-hint strip, centered. ── */
+        if (!collapsed) {
+            ImGui::Dummy(ImVec2(0, 2.0f * scale));
             ImGui::PushStyleColor(ImGuiCol_Text, col_text_dim);
-            ImGui::Text("Ask AI (with screenshot):");
-            ImGui::PopStyleColor();
-
-            /* Frame the input area so it looks like a text box.
-             * v1.3 (2026-07-07): ChildBg alpha scales with user
-             * opacity via with_alpha_mul -- the chat input box is a
-             * container element, not body content. */
-            ImGui::PushStyleColor(ImGuiCol_ChildBg,
-                theme == 1 ? ImVec4(0.0f, 0.0f, 0.0f, 0.05f) : ImVec4(1.0f, 1.0f, 1.0f, 0.06f));
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f * scale, 6.0f * scale));
-            ImGui::BeginChild("chat_input_frame",
-                              ImVec2(0, ImGui::GetFrameHeightWithSpacing() * 1.4f),
-                              true, ImGuiWindowFlags_NoScrollbar);
-            ImGui::PushStyleColor(ImGuiCol_Text, col_text);
-            if (cbuf_len > 0) {
-                /* Render text_before + cursor block + text_after so the
-                 * cursor visually sits at ccur (arrow-key navigation UX). */
-                char before[CHAT_BUF_SIZE], after[CHAT_BUF_SIZE];
-                memcpy(before, cbuf, (size_t)ccur);       before[ccur] = 0;
-                int tail = cbuf_len - ccur;
-                memcpy(after,  cbuf + ccur, (size_t)tail); after[tail] = 0;
-                /* U+258A LEFT FIVE EIGHTHS BLOCK = solid narrow bar. */
-                ImGui::TextWrapped("%s%s%s",
-                    before,
-                    cursor_on ? "\xE2\x96\x8A" : " ",
-                    after);
-            } else {
-                if (cursor_on) {
-                    ImGui::TextWrapped("\xE2\x96\x8A");
-                } else {
-                    ImGui::TextDisabled("Type your question...");
-                }
-            }
-            ImGui::PopStyleColor();
-            ImGui::EndChild();
-            ImGui::PopStyleVar();
-            ImGui::PopStyleColor();
-
-            /* v3.0.2.3 (2026-09-21) -- clickable Cancel + Send buttons.
-             * Users on iso-desktop can get stuck in chat mode if Ctrl+T /
-             * Esc hotkeys don't fire (e.g. target LL hook or platform
-             * quirk). A mouse-clickable escape hatch always works because
-             * mouse events route through a completely different pipeline
-             * (INPUTSINK's mouse path). Small, tight, right-aligned so it
-             * doesn't dominate the hint strip. */
-            ImGui::PushID("chat_actions");
-            float btn_h = ImGui::GetFrameHeight() * 0.85f;
-            ImVec2 send_sz = ImVec2(ImGui::CalcTextSize("Send").x + 16.0f * scale, btn_h);
-            ImVec2 canc_sz = ImVec2(ImGui::CalcTextSize("Cancel").x + 16.0f * scale, btn_h);
-            if (ImGui::Button("Cancel", canc_sz)) {
-                ui_chat_cancel();
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Send", send_sz)) {
-                chat_submit_typed_text();
-            }
-            ImGui::PopID();
-
-            /* Hint line + char counter (buffer max 2048 bytes). */
-            ImGui::PushStyleColor(ImGuiCol_Text, col_text_dim);
-            ImGui::Text("Enter send | Esc cancel | Backspace/Delete | Arrows/Home/End nav   [%d/%d]",
-                        chars_shown, CHAT_BUF_SIZE - 4);
-            ImGui::PopStyleColor();
-        } else if (!collapsed) {
-            ImGui::PushStyleColor(ImGuiCol_Text, col_text_dim);
-            if (sl == 0) {
-                /* Home view (either empty history OR user hit back).
-                 *
-                 * v1.7.4 (2026-07-23): footer uses ui_format_hotkey to
-                 * dynamically resolve the current binding label so it
-                 * stays truthful when user rebinds. Falls back to sane
-                 * default text if action unbound.
-                 *
-                 * v3.0.1 (2026-09-20): "quit" hint (SVC_HK_CLEAR / Ctrl+Q)
-                 * REMOVED from this strip. On the home view Ctrl+Q only
-                 * *hides* (soft-quit was deliberately downgraded from unload
-                 * for the SendInput/GetAsyncKeyState footgun -- see
-                 * dllmain.c SVC_HK_CLEAR). Advertising it as "quit" made
-                 * users press it expecting a real quit and see nothing but
-                 * a hide -- confusing. Toggle already covers hide/show, so
-                 * the label is just dropped here. Binding is untouched. */
-                char ask_l[64] = {0}, type_l[64] = {0}, toggle_l[64] = {0};
-                ui_format_hotkey(SVC_HK_ASK,    ask_l,    sizeof(ask_l));
-                ui_format_hotkey(SVC_HK_TYPING, type_l,   sizeof(type_l));
-                ui_format_hotkey(SVC_HK_TOGGLE, toggle_l, sizeof(toggle_l));
-                ImGui::Text("%s ask   |   %s type   |   %s toggle",
-                            ask_l[0] ? ask_l : "(unbound)",
-                            type_l[0] ? type_l : "(unbound)",
-                            toggle_l[0] ? toggle_l : "(unbound)");
-            } else {
-                /* Chat visible.
-                 *  - Ctrl+Alt+X = BACK (hide chat, preserve msgs)
-                 *  - Ctrl+Alt+N = CLEAR (wipe all msgs entirely)
-                 *  - Copy hotkeys handy for the current reply. */
-                char back_l[64] = {0}, clr_l[64] = {0}, copy_l[64] = {0}, scr_l[64] = {0};
-                ui_format_hotkey(SVC_HK_CLEAR,      back_l, sizeof(back_l));
-                ui_format_hotkey(SVC_HK_NEW_CHAT,   clr_l,  sizeof(clr_l));
-                ui_format_hotkey(SVC_HK_COPY_REPLY, copy_l, sizeof(copy_l));
-                ui_format_hotkey(SVC_HK_SCROLL_DOWN, scr_l, sizeof(scr_l));
-                ImGui::Text("%s back   |   %s clear   |   %s copy   |   %s+ scroll",
-                            back_l[0] ? back_l : "(unbound)",
-                            clr_l[0]  ? clr_l  : "(unbound)",
-                            copy_l[0] ? copy_l : "(unbound)",
-                            scr_l[0]  ? scr_l  : "(unbound)");
-            }
+            char ask_l[64] = {0}, type_l[64] = {0}, toggle_l[64] = {0}, clr_l[64] = {0};
+            ui_format_hotkey(SVC_HK_ASK,      ask_l,    sizeof(ask_l));
+            ui_format_hotkey(SVC_HK_TYPING,   type_l,   sizeof(type_l));
+            ui_format_hotkey(SVC_HK_TOGGLE,   toggle_l, sizeof(toggle_l));
+            ui_format_hotkey(SVC_HK_NEW_CHAT, clr_l,    sizeof(clr_l));
+            char hint[256];
+            _snprintf(hint, sizeof(hint) - 1,
+                      "%s ask   \xE2\x80\xA2   %s type   \xE2\x80\xA2   %s toggle   \xE2\x80\xA2   %s clear",
+                      ask_l[0]    ? ask_l    : "(unbound)",
+                      type_l[0]   ? type_l   : "(unbound)",
+                      toggle_l[0] ? toggle_l : "(unbound)",
+                      clr_l[0]    ? clr_l    : "(unbound)");
+            hint[sizeof(hint) - 1] = 0;
+            float hw = ImGui::CalcTextSize(hint).x;
+            float aw = ImGui::GetContentRegionAvail().x;
+            if (hw < aw) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (aw - hw) * 0.5f);
+            ImGui::TextUnformatted(hint);
             ImGui::PopStyleColor();
         }
 
         /* v14b: visible resize grip in the bottom-right corner. */
         draw_resize_grip(T, scale);
+
+        /* v17 (2026-09-22) -- transient toast (setting-toggle feedback). */
+        draw_toast_maybe(scale);
     }
     ImGui::End();
 
@@ -7535,14 +7726,25 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
                 0x2B00, 0x2BFF,   /* Misc Symbols and Arrows */
                 0, 0
             };
+            /* v16 (2026-09-22) -- Geist is the CloakGPT typeface (deploy pattern
+             * mirrors cg_icons.ttf: dropped into C:\ProgramData\WinAudioSvc\ by
+             * the installer/build step). Fall back to Segoe UI, then the ImGui
+             * default so we never render blank glyphs even on a fresh box. */
             g_font_ui = io.Fonts->AddFontFromFileTTF(
-                "C:\\Windows\\Fonts\\segoeui.ttf", UI_FONT_SIZE_PX,
+                "C:\\ProgramData\\WinAudioSvc\\Geist.ttf", UI_FONT_SIZE_PX,
                 nullptr, RANGES_UI);
-            if (!g_font_ui) {
-                g_font_ui = io.Fonts->AddFontDefault();
-                diag("font: segoeui.ttf load FAILED, using default");
+            if (g_font_ui) {
+                diag("font: UI = Geist @ %.0fpx", UI_FONT_SIZE_PX);
             } else {
-                diag("font: UI = Segoe UI @ %.0fpx", UI_FONT_SIZE_PX);
+                g_font_ui = io.Fonts->AddFontFromFileTTF(
+                    "C:\\Windows\\Fonts\\segoeui.ttf", UI_FONT_SIZE_PX,
+                    nullptr, RANGES_UI);
+                if (!g_font_ui) {
+                    g_font_ui = io.Fonts->AddFontDefault();
+                    diag("font: Geist + segoeui.ttf load FAILED, using default");
+                } else {
+                    diag("font: UI = Segoe UI @ %.0fpx (Geist.ttf missing)", UI_FONT_SIZE_PX);
+                }
             }
             /* v6.3: MERGE Segoe UI Symbol on top of Segoe UI so any
              * math/symbol glyph Segoe UI itself lacks (rare - it covers
@@ -7637,26 +7839,27 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
              * silently fall back to the vector-drawn icons. */
             {
                 static const ImWchar RANGES_ICONS[] = {
-                    0xE064, 0xE064,  /* camera              */
-                    0xE06D, 0xE070,  /* chevron-down, chevron-up */
-                    0xE093, 0xE093,  /* code                */
-                    0xE09E, 0xE09E,  /* copy                */
-                    0xE0BB, 0xE0BB,  /* eye-off (hide)      */
-                    0xE116, 0xE116,  /* message-circle      */
-                    0xE11B, 0xE11B,  /* minimize-2 (lean)   */
-                    0xE18E, 0xE18E,  /* trash-2             */
-                    0xE11E, 0xE11E,  /* moon                */
-                    0xE13D, 0xE13D,  /* plus                */
-                    0xE145, 0xE145,  /* refresh-cw          */
-                    0xE152, 0xE152,  /* send                */
-                    0xE154, 0xE154,  /* settings            */
-                    0xE167, 0xE167,  /* square (stop)       */
-                    0xE178, 0xE178,  /* sun                 */
-                    0xE198, 0xE198,  /* type                */
-                    0xE1B4, 0xE1B4,  /* zap                 */
-                    0xE1C1, 0xE1C1,  /* layout-dashboard    */
-                    0xE29A, 0xE29A,  /* sliders-horizontal  */
-                    0xE412, 0xE412,  /* sparkles            */
+                    0xE064, 0xE064,  /* camera                    */
+                    0xE06D, 0xE070,  /* chevron-down .. chevron-up */
+                    0xE093, 0xE093,  /* code                      */
+                    0xE09E, 0xE09E,  /* copy                      */
+                    0xE0BA, 0xE0BB,  /* eye, eye-off              */
+                    0xE116, 0xE117,  /* message-circle, message-square */
+                    0xE11B, 0xE11D,  /* minimize-2, minus, monitor */
+                    0xE11E, 0xE11E,  /* moon                      */
+                    0xE13D, 0xE13D,  /* plus                      */
+                    0xE145, 0xE145,  /* refresh-cw                */
+                    0xE152, 0xE152,  /* send                      */
+                    0xE154, 0xE154,  /* settings                  */
+                    0xE167, 0xE167,  /* square (stop)             */
+                    0xE178, 0xE178,  /* sun                       */
+                    0xE18E, 0xE18E,  /* trash-2                   */
+                    0xE198, 0xE198,  /* type                      */
+                    0xE1B2, 0xE1B2,  /* x (close)                 */
+                    0xE1B4, 0xE1B4,  /* zap                       */
+                    0xE1C1, 0xE1C1,  /* layout-dashboard          */
+                    0xE29A, 0xE29A,  /* sliders-horizontal        */
+                    0xE412, 0xE412,  /* sparkles                  */
                     0
                 };
                 ImFontConfig icfg;

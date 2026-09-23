@@ -251,6 +251,24 @@
               <div class="b-val"><span id="d-badge-credits">…</span> <a id="btn-buy-credits" style="cursor:pointer;color:var(--cyan-light);font-size:11px;margin-left:6px">Buy more</a></div>
             </div>
           </div>
+
+          <!-- v16 (2026-09-22): "Show answer dot" master toggle promoted to the
+               status card. Writes the same autosolver.json the detailed card
+               below writes (payload mtime-watches; changes apply within ~2s
+               with no re-inject). Two-way synced with the detailed chk-as-dot. -->
+          <div class="status-quick-toggle">
+            <label class="ans-toggle" style="margin-top:2px">
+              <input type="checkbox" id="chk-dashboard-dot" checked>
+              <span class="ans-toggle-slider"></span>
+            </label>
+            <div class="status-quick-text">
+              <div class="status-quick-title">Show answer dot</div>
+              <div class="status-quick-sub">
+                The tiny capture-stealth dot that expands into the AutoSolver answer.
+                Applies live within <b>~2&nbsp;s</b> &mdash; no re-inject.
+              </div>
+            </div>
+          </div>
         </div>
 
         <!-- Settings: model tier + 4 provider keys with per-provider test -->
@@ -270,7 +288,7 @@
               <div class="tier-row"><b>Strong</b> — flagship reasoning models (GPT-6 Astra, Claude Fable 5.1, Gemini 3.1 Pro). Best answers on hard exam questions. Slow (30&nbsp;s – 10&nbsp;min per answer for deep reasoning) and expensive (up to $50 per 1M output tokens). Use for the hardest MCQs or when Medium keeps missing.</div>
               <div class="tier-row"><b>Medium</b> — balanced daily drivers (GPT-5.6 Terra, Claude Sonnet 5, Gemini 3.8 Flash). Sub-10&nbsp;s answers on typical exam questions, still highly accurate. Costs ~5× less than Strong. <b>Recommended default.</b></div>
               <div class="tier-row"><b>Cheap</b> — fast + affordable (GPT-5.6 Luna, Claude Haiku 4.5, Gemini 3.5 Flash-Lite). ~2&nbsp;s answers, cheap enough for study drills. Good for factual recall, weaker on multi-step math/logic.</div>
-              <div class="tier-row" style="color:var(--fg3);font-size:11px;margin-top:8px">Cycle live in-overlay with <kbd>Ctrl+Alt+M</kbd>.</div>
+              <div class="tier-row" style="color:var(--fg3);font-size:11px;margin-top:8px">Cycle live in-overlay with <kbd data-hk="24">Ctrl+Alt+M</kbd>.</div>
             </div>
           </div>
         </div>
@@ -294,7 +312,7 @@
               <div class="ans-toggle-sub">
                 AI replies with ONLY the direct answer - no explanation, no reasoning. Returns <code>ERROR</code> if uncertain.
                 <br>MCQ: just the letter (<code>B</code>). Numeric: value + units. True/False: just the word.
-                <br>Toggle live in-overlay with <kbd>Ctrl+Shift+Alt+D</kbd>.
+                <br>Toggle live in-overlay with <kbd data-hk="32">Ctrl+Shift+Alt+D</kbd>.
               </div>
             </div>
           </div>
@@ -311,7 +329,7 @@
                 Tell the AI to use plain-keyboard + Unicode math notation instead of LaTeX commands.
                 Fixes cases where the AI emits complex LaTeX the overlay can't render cleanly (e.g. malformed <code>\sqrt2,2,2</code>).
                 <br>Uses <code>x^2</code>, <code>sqrt(x)</code>, <code>pi</code>, <code>Σ[i=1..n]</code> instead of <code>x^{2}</code>, <code>\sqrt{x}</code>, <code>\pi</code>, <code>\sum_{i=1}^n</code>.
-                <br>Toggle live in-overlay with <kbd>Ctrl+Shift+Alt+L</kbd>.
+                <br>Toggle live in-overlay with <kbd data-hk="30">Ctrl+Shift+Alt+L</kbd>.
               </div>
             </div>
           </div>
@@ -393,7 +411,7 @@
             <div class="ans-toggle-text">
               <div class="ans-toggle-title">Enable AutoSolver <span class="as-hk">hold Left-Click 2s</span></div>
               <div class="ans-toggle-sub">
-                Master switch for hold-to-solve. Toggle live in-overlay with <kbd>Ctrl+Shift+Alt+O</kbd>.
+                Master switch for hold-to-solve. Toggle live in-overlay with <kbd data-hk="35">Ctrl+Shift+Alt+O</kbd>.
               </div>
             </div>
           </div>
@@ -405,7 +423,7 @@
               <span class="ans-toggle-slider"></span>
             </label>
             <div class="ans-toggle-text">
-              <div class="ans-toggle-title">Auto-click the answer <span class="as-hk">Ctrl+Shift+Alt+J</span></div>
+              <div class="ans-toggle-title">Auto-click the answer <span class="as-hk" data-hk="36">Ctrl+Shift+Alt+J</span></div>
               <div class="ans-toggle-sub">
                 <b>ON:</b> the mouse moves and clicks / types the answer in automatically (humanized motion).
                 <b>OFF (default):</b> display-only &mdash; the answer is shown in the dot, nothing is clicked. Safer / more discreet.
@@ -839,7 +857,7 @@
             </label>
             <div class="ans-toggle-text">
               <div class="ans-toggle-title">Enable screenshot redactor</div>
-              <div class="ans-toggle-sub">Applies to every screenshot taken via the overlay (<kbd>Ctrl+U</kbd>). Toggle off any time to restore full stealth.</div>
+              <div class="ans-toggle-sub">Applies to every screenshot taken via the overlay (<kbd data-hk="0">Ctrl+U</kbd>). Toggle off any time to restore full stealth.</div>
             </div>
             <button id="btn-ocr-edit" class="btn btn-secondary btn-mini" style="margin-left:auto">Edit blacklist</button>
           </div>
@@ -957,6 +975,66 @@
 
   <!-- Hotkey record modal (built lazily by renderer.js) -->
   <div id="hk-record-modal-root"></div>
+
+  <!-- v17 (2026-09-22) -- Safety fallback screen. Shows ONLY when the
+       renderer errors out before showing any real screen (blank-blue bug).
+       Hidden by default; revealed by the error boundary in renderer.js. -->
+  <div id="safety-fallback" style="display:none;position:fixed;inset:40px 0 0 0;
+       z-index:5;align-items:center;justify-content:center;padding:24px;">
+    <div style="max-width:520px;padding:36px 40px;border-radius:20px;
+                background:rgba(15,23,42,0.85);border:1px solid rgba(255,255,255,0.10);
+                backdrop-filter:blur(24px);text-align:center;color:#fff;">
+      <div style="width:64px;height:64px;margin:0 auto 20px;border-radius:18px;
+                  background:linear-gradient(135deg,#7f1d1d 0%,#dc2626 100%);
+                  display:flex;align-items:center;justify-content:center;
+                  box-shadow:0 12px 32px rgba(220,38,38,0.35);">
+        <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="#fff"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+          <line x1="12" y1="9" x2="12" y2="13"/>
+          <line x1="12" y1="17" x2="12.01" y2="17"/>
+        </svg>
+      </div>
+      <h1 style="font-size:22px;font-weight:700;margin:0 0 10px;letter-spacing:-0.01em;">
+        CloakGPT ran into a problem loading.
+      </h1>
+      <p style="font-size:13.5px;color:#94a3b8;line-height:1.6;margin:0 0 8px;">
+        The app started but a startup error prevented the dashboard from showing.
+        This is usually caused by a graphics driver glitch or a stale cached file.
+      </p>
+      <div id="safety-detail" style="font-family:'SF Mono','Cascadia Code','Consolas',monospace;
+           font-size:11px;color:#f87171;background:rgba(239,68,68,0.08);
+           border:1px solid rgba(239,68,68,0.22);border-radius:8px;
+           padding:10px 12px;margin:16px 0 20px;text-align:left;
+           max-height:120px;overflow:auto;white-space:pre-wrap;word-break:break-word;">
+      </div>
+      <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:12px;">
+        <button id="safety-retry" style="padding:12px 22px;border-radius:12px;border:0;
+                cursor:pointer;font-size:13.5px;font-weight:600;color:#fff;
+                background:linear-gradient(135deg,#3b82f6,#06b6d4);
+                box-shadow:0 8px 22px rgba(59,130,246,0.35);">
+          Retry
+        </button>
+        <button id="safety-safe-mode" style="padding:12px 22px;border-radius:12px;
+                border:1px solid rgba(255,255,255,0.14);cursor:pointer;
+                font-size:13.5px;font-weight:600;color:#fff;
+                background:rgba(255,255,255,0.06);">
+          Restart in safe mode
+        </button>
+        <button id="safety-export" style="padding:12px 22px;border-radius:12px;
+                border:1px solid rgba(255,255,255,0.14);cursor:pointer;
+                font-size:13.5px;font-weight:600;color:#fff;
+                background:rgba(255,255,255,0.06);">
+          Export diagnostics
+        </button>
+      </div>
+      <p style="font-size:11px;color:#64748b;margin:18px 0 0;line-height:1.55;">
+        <b style="color:#94a3b8;">Safe mode</b> restarts CloakGPT with hardware acceleration
+        disabled -- usually fixes GPU-driver-related blank screens. If the problem persists,
+        email the exported diagnostics bundle to support.
+      </p>
+    </div>
+  </div>
 
   <script src="renderer.js"></script>
 </body>

@@ -13,6 +13,96 @@
 
 'use strict';
 
+/* v17 (2026-09-22) -- Error boundary. "Blank blue screen" reports from a
+ * handful of users historically had no diagnosis because the renderer just
+ * died silently (usually a GPU driver glitch on the ambient backdrop-filter,
+ * or an early await throwing before the first showScreen('splash') painted).
+ *
+ * These handlers convert any uncaught error / unhandled rejection / long boot
+ * stall into the visible #safety-fallback screen with Retry, Safe-mode, and
+ * Export-diagnostics buttons. Users always see something actionable. */
+(function installSafetyNet() {
+  const errors = [];
+  const rec = (label, e) => {
+    const at = new Date().toISOString();
+    const msg = e && (e.stack || e.message) ? (e.stack || e.message) : String(e);
+    errors.push(at + '  ' + label + '  ' + msg);
+    try { console.error('[safety]', label, e); } catch {}
+    // Any error inside the first ~15s of boot -> show fallback immediately.
+    if (!document.body || !document.body.classList.contains('booted-ok')) {
+      showSafetyFallback(errors.join('\n\n'));
+    }
+  };
+  window.addEventListener('error', (ev) => rec('window.error', ev.error || ev.message));
+  window.addEventListener('unhandledrejection', (ev) => rec('unhandledrejection', ev.reason));
+
+  /* Boot-timeout watchdog. If 15s after DOM-ready NO screen is `.active`
+   * AND we haven't marked boot as OK, assume the renderer stalled and
+   * reveal the fallback. */
+  const startWatchdog = () => setTimeout(() => {
+    const anyActive = document.querySelector('.screen.active');
+    if (!document.body.classList.contains('booted-ok') && !anyActive) {
+      rec('boot-timeout', new Error('No screen became active within 15s of DOM-ready.'));
+    }
+  }, 15000);
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', startWatchdog, { once: true });
+  } else {
+    startWatchdog();
+  }
+
+  // Wire the fallback screen's action buttons once the DOM has parsed them.
+  const wireFallback = () => {
+    const $ = (id) => document.getElementById(id);
+    const retry = $('safety-retry');
+    const safe  = $('safety-safe-mode');
+    const exp   = $('safety-export');
+    if (retry && !retry.dataset.wired) {
+      retry.dataset.wired = '1';
+      retry.addEventListener('click', () => {
+        try { window.svc && window.svc.safety && window.svc.safety.reload && window.svc.safety.reload(); }
+        catch { location.reload(); }
+      });
+    }
+    if (safe && !safe.dataset.wired) {
+      safe.dataset.wired = '1';
+      safe.addEventListener('click', () => {
+        try { window.svc && window.svc.safety && window.svc.safety.safeModeRestart && window.svc.safety.safeModeRestart(); }
+        catch (e) { alert('Safe-mode restart unavailable: ' + (e && e.message || e)); }
+      });
+    }
+    if (exp && !exp.dataset.wired) {
+      exp.dataset.wired = '1';
+      exp.addEventListener('click', async () => {
+        try {
+          const r = window.svc && window.svc.safety && window.svc.safety.exportDiagnostics
+            ? await window.svc.safety.exportDiagnostics({ errors })
+            : null;
+          alert(r && r.ok ? 'Diagnostics exported to:\n\n' + r.path
+                          : 'Export failed: ' + ((r && r.err) || 'IPC unavailable'));
+        } catch (e) { alert('Export failed: ' + (e && e.message || e)); }
+      });
+    }
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', wireFallback, { once: true });
+  } else {
+    wireFallback();
+  }
+})();
+
+function showSafetyFallback(details) {
+  try {
+    const fb = document.getElementById('safety-fallback');
+    if (!fb) return;
+    /* Hide any half-rendered screen so the fallback owns the viewport. */
+    for (const s of document.querySelectorAll('.screen.active')) s.classList.remove('active');
+    fb.style.display = 'flex';
+    const d = document.getElementById('safety-detail');
+    if (d) d.textContent = String(details || '(no detail)');
+  } catch { /* worst case, nothing more we can do */ }
+}
+
 // ─── Screen management ──────────────────────────────────────────
 const SCREENS = ['splash', 'login', 'nosub', 'dashboard', 'suspended', 'devicelimit'];
 function showScreen(name) {
@@ -25,6 +115,8 @@ function showScreen(name) {
     const el = document.getElementById(`screen-${s}`);
     if (el) el.classList.toggle('active', s === name);
   }
+  /* v17 -- signal the safety-net watchdog that we successfully routed. */
+  try { document.body.classList.add('booted-ok'); } catch {}
 }
 
 // ─── Toast + loading ────────────────────────────────────────────
@@ -1880,7 +1972,11 @@ function _renderStatus() {
   if (state.injected) {
     dot.classList.add('on');
     title.textContent = 'Payload: Active';
-    sub.textContent = 'Overlay is armed. Hotkeys are live — Ctrl+Shift+Space to ask AI.';
+    /* v16 (2026-09-22) -- ask hotkey is user-configurable (SVC_HK_ASK = 0);
+     * pull the current binding via _hotkeyLabelFor so this text stays truthful
+     * across rebinds + across the two default sets (aggressive vs legacy). */
+    const askHk = _hotkeyLabelFor(0, 'Ctrl+U');
+    sub.textContent = 'Overlay is armed. Hotkeys are live \u2014 ' + askHk + ' to ask AI.';
     document.getElementById('btn-inject').disabled = true;
     document.getElementById('btn-uninject').disabled = false;
   } else if (state.payloadUnverified) {
@@ -2334,6 +2430,10 @@ async function _loadHotkeys() {
   _hkState.stealth_overrides = r.stealth_overrides || {};
   _hkState.speed_mode = r.speed_mode || 'adaptive';
   _renderHotkeyEditor();
+  /* v16 -- push fresh bindings into every [data-hk] label in the DOM AND
+   * refresh the dashboard status sub if the payload is showing "armed". */
+  try { _applyHotkeyLabels(); } catch {}
+  try { if (state && state.injected) _renderStatus(); } catch {}
 }
 
 /* v10 (2026-07-17): stealth mode = every slot in stealth_overrides
@@ -2357,6 +2457,40 @@ function _bindingFor(slot) {
     return _hkState.overrides[slot];
   }
   return _hkState.defaults[slot] || 0;
+}
+
+/* v16 (2026-09-22) -- Dynamic hotkey label for UI text that references the
+ * user's real binding. Returns a formatted string (e.g. "Ctrl+U", "Tap G three
+ * times", "Hold Left Click for 2.0s") or the caller's fallback if hotkeys
+ * haven't loaded yet OR the slot is unbound. Never returns "(unbound)" so UI
+ * copy stays readable even mid-load. */
+function _hotkeyLabelFor(slot, fallback) {
+  const loaded = _hkState && Array.isArray(_hkState.defaults) && _hkState.defaults.length > 0;
+  if (!loaded) return fallback;
+  const packed = _bindingFor(slot);
+  if (!packed) return fallback;
+  const s = formatHotkey(packed);
+  return (s === '(unbound)' || s === '(disabled)') ? fallback : s;
+}
+
+/* v16 -- Walk every [data-hk="N"] / [data-hk-fallback="..."] element and
+ * replace its textContent with the current binding label for slot N (fallback
+ * text preserved if unbound / not loaded). Called after _loadHotkeys() and
+ * whenever hotkeys change so any static HTML that references a hotkey stays
+ * truthful. Elements MUST have data-hk-fallback set; without it the mechanism
+ * assumes the element's initial textContent is the fallback and captures it
+ * on first sweep. */
+function _applyHotkeyLabels() {
+  const nodes = document.querySelectorAll('[data-hk]');
+  for (const n of nodes) {
+    const slot = Number(n.getAttribute('data-hk'));
+    if (!Number.isFinite(slot)) continue;
+    if (!n.hasAttribute('data-hk-fallback')) {
+      n.setAttribute('data-hk-fallback', n.textContent || '');
+    }
+    const fb = n.getAttribute('data-hk-fallback') || '';
+    n.textContent = _hotkeyLabelFor(slot, fb);
+  }
 }
 
 // Which slots share the same packed binding as `packed`?
@@ -3071,7 +3205,7 @@ document.getElementById('btn-restart-tour').addEventListener('click', async () =
 });
 
 // ═══════════════════════════════════════════════════════════════
-//  Onboarding walkthrough (first-launch, 12 steps)
+//  Onboarding walkthrough (first-launch, 15 steps as of v17)
 // ═══════════════════════════════════════════════════════════════
 
 let _obActive = false;
@@ -3149,10 +3283,10 @@ function _obSteps() {
       lead: 'The bread-and-butter workflow: press one hotkey, get an answer.',
       body: `
         <div class="ob-kbdrow">
-          <kbd>Ctrl+Shift+Space</kbd>
+          <kbd data-hk="0">Ctrl+U</kbd>
           <span class="desc">Capture the current screen + send to your active AI tier</span>
         </div>
-        <p>The AI reply appears in the overlay a few seconds later. Cycle model tier with <kbd style="font-family:monospace">Ctrl+Alt+M</kbd> if you want faster (Cheap) or better (Strong) answers.</p>
+        <p>The AI reply appears in the overlay a few seconds later. Cycle model tier with <kbd data-hk="24" style="font-family:monospace">Ctrl+Alt+M</kbd> if you want faster (Cheap) or better (Strong) answers.</p>
         <p>All keystrokes for hotkeys are consumed by a low-level hook <b>before</b> any other app sees them — invisible to whatever app you're inside of.</p>
       `,
       features: [
@@ -3164,13 +3298,13 @@ function _obSteps() {
       tag: 'STEP 4',
       icon: 'message-square',
       title: 'Type a follow-up',
-      lead: 'For freeform questions, use chat mode — no screenshot required.',
+      lead: 'For freeform questions, use chat mode -- no screenshot required.',
       body: `
         <div class="ob-kbdrow">
-          <kbd>Ctrl+Alt+T</kbd>
-          <span class="desc">Enter chat mode — type your question, press Enter to submit</span>
+          <kbd data-hk="2">Ctrl+Alt+T</kbd>
+          <span class="desc">Enter chat mode -- type your question, press Enter to submit</span>
         </div>
-        <p>Chat mode captures every keystroke — even letters and punctuation — so <b>nothing</b> leaks into the underlying app while you\'re typing. Perfect if you\'re on a Google Doc or exam browser and don\'t want it to hear you type.</p>
+        <p>Chat mode captures every keystroke -- even letters and punctuation -- so <b>nothing</b> leaks into the underlying app while you\'re typing. Perfect if you\'re on a Google Doc or exam browser and don\'t want it to hear you type.</p>
         <p>The current screenshot is attached as context, so you can ask "explain this passage" or "what step comes next?".</p>
       `,
       features: [
@@ -3178,100 +3312,149 @@ function _obSteps() {
         'Enter submits, Esc cancels',
       ],
     },
-    { // 5
+    { // 5 -- NEW (v17 2026-09-22): AutoSolver / capture-stealth dot
       tag: 'STEP 5',
+      icon: 'target',
+      title: 'AutoSolver -- the hands-free dot',
+      lead: 'Hold left-click on any question for ~2 s. A tiny capture-stealth dot appears with the answer.',
+      body: `
+        <div class="ob-kbdrow">
+          <kbd>Hold Left-Click 2 s</kbd>
+          <span class="desc">Snap the screen + solve + surface answer in the dot (no keyboard)</span>
+        </div>
+        <div class="ob-kbdrow">
+          <kbd data-hk="35">Ctrl+Shift+Alt+O</kbd>
+          <span class="desc">Master toggle for AutoSolver</span>
+        </div>
+        <p>The <b>dot</b> is a small colored circle that sits on the right edge of your screen. It changes state -- <span style="color:#34c759">idle</span> &rarr; <span style="color:#f59e0a">capturing</span> &rarr; <span style="color:#ff9500">analyzing</span> &rarr; <span style="color:#34c759">done</span> -- and expands into a card showing the answer + question stem. Click the hamburger to switch between dot / expanded views; drag to reposition; drag the corner to resize.</p>
+        <p>The dot is <b>invisible to screenshots and screen-sharing</b> (same DWM-plane trick as the overlay). It never appears in a proctor recording. Perfect for MCQs -- glance at the letter and click the option yourself.</p>
+        <p><b>Auto-click is OFF by default</b> (stealth pick). Enable it in the dashboard\'s <i>AutoSolver</i> card if you want the mouse to move and click / type the answer for you (with humanized curves + timing). Off = display-only, safer.</p>
+        <p>Master switch: the <b>Show answer dot</b> toggle in the status card (right next to Inject) flips the dot on / off live -- no re-inject needed.</p>
+      `,
+      features: [
+        'No hotkey needed -- just hold left-click',
+        'Dot hides itself when the main overlay is open (mutually exclusive)',
+        'Auto-click OFF by default; display-only is the stealth pick',
+        'Solve budget + image detail configurable per-provider',
+      ],
+    },
+    { // 6 -- NEW (v17): Composer bar + gear/settings hub + toasts
+      tag: 'STEP 6',
+      icon: 'layout',
+      title: 'The overlay -- composer + gear + toasts',
+      lead: 'The layout you see every session, top to bottom.',
+      body: `
+        <p><b>Header row</b> -- brand mark + wordmark on the left; on the right, a thin opacity slider, a theme chip (moon / sun / auto), a gear (opens settings), a trash (clear chat), and an eye-off (hide overlay).</p>
+        <p><b>Body</b> -- either an empty welcome screen or your chat transcript. Bubbles auto-follow new AI content unless you scrolled up recently (auto-follow resumes after 6 s of no interaction).</p>
+        <p><b>Composer</b> -- pinned at the bottom of the overlay:</p>
+        <ul>
+          <li><b>Camera square</b> (left) -- click = screenshot + ask AI (same as <kbd data-hk="0" style="font-family:monospace">Ctrl+U</kbd>).</li>
+          <li><b>Rounded text field</b> (middle) -- click to focus and start typing. The LL keyboard hook captures every keystroke so nothing leaks. Click outside the composer to unfocus (buffer preserved).</li>
+          <li><b>Send square</b> (right, paper-plane icon) -- lights up only when there\'s text in the field. Empty = dimmed + no-op (camera is for screenshot-only asks).</li>
+        </ul>
+        <p><b>Gear icon</b> -- opens the in-overlay <i>settings hub</i> (AI model, Ask actions, Appearance sliders, Layout controls). Everything you can tune on the dashboard is reachable here too, so you can adjust the overlay <i>from inside the overlay</i> without alt-tabbing. Click gear again to return to chat.</p>
+        <p><b>Toasts</b> -- when you toggle a setting via hotkey (LaTeX, direct-answer, streaming, tier / provider cycle, etc.) a small pill fades in at the top of the overlay confirming the new state. Chat stays clean -- settings feedback lives in the toast, not in the conversation.</p>
+      `,
+      features: [
+        'Composer never leaves your view -- Ask is always one click away',
+        'Gear = full settings hub without alt-tabbing to the dashboard',
+        'Toast feedback keeps chat noise-free',
+      ],
+    },
+    { // 7 -- was 5
+      tag: 'STEP 7',
       icon: 'move',
       title: 'Position + resize',
-      lead: 'The overlay starts in the top-left. Move / resize / restyle to taste.',
+      lead: 'The overlay starts in the top-right. Move / resize / restyle to taste.',
       body: `
         <div class="ob-kbdrow">
           <kbd>Ctrl+Alt+Arrows</kbd>
-          <span class="desc">Nudge overlay 20 px in any direction (hold to repeat)</span>
+          <span class="desc">Nudge overlay in any direction (hold to repeat)</span>
         </div>
         <div class="ob-kbdrow">
           <kbd>Ctrl+Shift+Alt+Arrows</kbd>
-          <span class="desc">Resize the overlay (wider/taller/narrower/shorter)</span>
+          <span class="desc">Resize the overlay (wider / taller / narrower / shorter)</span>
         </div>
         <div class="ob-kbdrow">
-          <kbd>Ctrl+Alt+Q</kbd>
-          <span class="desc">Snap to next corner (TL → TR → BR → BL)</span>
+          <kbd data-hk="13">Ctrl+Alt+Q</kbd>
+          <span class="desc">Snap to next corner (TL -> TR -> BR -> BL)</span>
         </div>
         <div class="ob-kbdrow">
-          <kbd>Ctrl+Alt+R</kbd>
+          <kbd data-hk="18">Ctrl+Alt+R</kbd>
           <span class="desc">Reset overlay to default position + size</span>
         </div>
-        <p>Position, size, opacity, and font size are all remembered across launches.</p>
+        <p>Position, size, opacity, and font size are all remembered across launches. You can also set the launch defaults from the dashboard\'s <b>Overlay appearance</b> card -- <i>Ultra size mode</i> unlocks a tiny corner pip or near-fullscreen.</p>
       `,
       features: [
         'Hold Ctrl+Alt+Arrow to auto-repeat move at 20 Hz',
         'Everything you tweak persists automatically',
       ],
     },
-    { // 6
-      tag: 'STEP 6',
+    { // 8 -- was 6
+      tag: 'STEP 8',
       icon: 'eye-off',
       title: 'Panic key + toggle',
       lead: 'Two hotkeys that always work: hide the overlay, or unload it entirely.',
       body: `
         <div class="ob-kbdrow">
-          <kbd>Ctrl+Alt+G</kbd>
+          <kbd data-hk="1">Ctrl+Alt+G</kbd>
           <span class="desc">Toggle overlay visibility (payload still armed)</span>
         </div>
         <div class="ob-kbdrow">
-          <kbd>Ctrl+Alt+X</kbd>
+          <kbd data-hk="4">Ctrl+Alt+X</kbd>
           <span class="desc">Back to home / soft quit (clean uninject)</span>
         </div>
         <div class="ob-kbdrow" style="border-color:rgba(239,68,68,0.35);background:rgba(239,68,68,0.05)">
-          <kbd>Ctrl+Shift+Alt+K</kbd>
-          <span class="desc" style="color:#fca5a5"><b>EMERGENCY STOP</b> — unloads + terminates dwm.exe (Windows respawns fresh in ~2 s)</span>
+          <kbd data-hk="20">Ctrl+Shift+Alt+K</kbd>
+          <span class="desc" style="color:#fca5a5"><b>EMERGENCY STOP</b> -- unloads + terminates dwm.exe (Windows respawns fresh in ~2 s)</span>
         </div>
-        <p>Use <kbd style="font-family:monospace">Ctrl+Alt+G</kbd> if a proctor walks up. Use <kbd style="font-family:monospace">Ctrl+Shift+Alt+K</kbd> if you need the overlay <b>gone</b> immediately — your screen will flash black for 2 s while DWM restarts.</p>
+        <p>Use <kbd data-hk="1" style="font-family:monospace">Ctrl+Alt+G</kbd> if a proctor walks up. Use <kbd data-hk="20" style="font-family:monospace">Ctrl+Shift+Alt+K</kbd> if you need the overlay <b>gone</b> immediately -- your screen will flash black for 2 s while DWM restarts.</p>
       `,
       features: [
         'Panic keys always work, even mid-AI-request',
         'Emergency stop leaves no trace of the payload in memory',
       ],
     },
-    { // 7
-      tag: 'STEP 7',
+    { // 9 -- was 7
+      tag: 'STEP 9',
       icon: 'copy',
       title: 'Copy modes',
       lead: 'Three different copy hotkeys for different situations.',
       body: `
         <div class="ob-kbdrow">
-          <kbd>Ctrl+Alt+C</kbd>
+          <kbd data-hk="3">Ctrl+Alt+C</kbd>
           <span class="desc">Copy the ENTIRE last AI reply (markdown + code + math)</span>
         </div>
         <div class="ob-kbdrow">
-          <kbd>Ctrl+Alt+A</kbd>
-          <span class="desc">Copy JUST the direct answer (first line — "x = 4", "B) Photosynthesis")</span>
+          <kbd data-hk="29">Ctrl+Alt+A</kbd>
+          <span class="desc">Copy JUST the direct answer (first line -- "x = 4", "B) Photosynthesis")</span>
         </div>
         <div class="ob-kbdrow">
-          <kbd>Ctrl+Shift+Alt+C</kbd>
+          <kbd data-hk="28">Ctrl+Shift+Alt+C</kbd>
           <span class="desc">Copy JUST fenced code blocks (Python, JS, etc.)</span>
         </div>
-        <p>Pick the shortest one that fits — the AI is prompted to always put the direct answer on line 1, so <kbd style="font-family:monospace">Ctrl+Alt+A</kbd> is often enough for MCQs.</p>
+        <p>Pick the shortest one that fits -- the AI is prompted to always put the direct answer on line 1, so <kbd data-hk="29" style="font-family:monospace">Ctrl+Alt+A</kbd> is often enough for MCQs.</p>
       `,
       features: [
         'Copies clean plaintext (no markdown asterisks or backticks)',
         'Preserved exactly as generated — you paste into anything',
       ],
     },
-    { // 8
-      tag: 'STEP 8',
+    { // 10 -- was 8
+      tag: 'STEP 10',
       icon: 'stop-circle',
       title: 'Reasoning + stop',
       lead: 'Reasoning models can take a while. You can abort any time.',
       body: `
         <div class="ob-kbdrow">
-          <kbd>Ctrl+Alt+S</kbd>
+          <kbd data-hk="31">Ctrl+Alt+S</kbd>
           <span class="desc">Stop the current AI response (partial reply preserved)</span>
         </div>
-        <p>Strong-tier reasoning models (GPT-6 Astra, Claude Fable 5.1, Gemini 3.1 Pro) can spend 30 s – 10 min thinking. Ctrl+Alt+S aborts cleanly and appends "(stopped by user)" to whatever streamed so far.</p>
+        <p>Strong-tier reasoning models (GPT-6 Astra, Claude Fable 5.1, Gemini 3.1 Pro) can spend 30 s -- 10 min thinking. The stop hotkey aborts cleanly and appends "(stopped by user)" to whatever streamed so far.</p>
         <p>Regen the last question with a fresh AI call:</p>
         <div class="ob-kbdrow">
-          <kbd>Ctrl+Alt+Enter</kbd>
-          <span class="desc">Regenerate — re-runs your last question with the current tier/provider</span>
+          <kbd data-hk="26">Ctrl+Alt+Enter</kbd>
+          <span class="desc">Regenerate -- re-runs your last question with the current tier/provider</span>
         </div>
       `,
       features: [
@@ -3279,8 +3462,32 @@ function _obSteps() {
         'Regen useful for cycling tier and comparing answers',
       ],
     },
-    { // 9
-      tag: 'STEP 9',
+    { // 11 -- NEW (v17 2026-09-22): Screenshot redactor
+      tag: 'STEP 11',
+      icon: 'shield-off',
+      title: 'Screenshot redactor',
+      lead: 'On-device OCR blacks out proctor / exam names in every screenshot before it leaves your machine.',
+      body: `
+        <p>Some proctoring apps stamp their name across your screen (Respondus, Proctorio, ProctorU, Honorlock, "TEST MODE", etc.). Sending that pixel to an AI is a red flag if any provider audit ever surfaces the image.</p>
+        <p>The <b>Screenshot redactor</b> card on the dashboard runs Windows\' built-in <code>Windows.Media.Ocr</code> over every outbound screenshot, finds words / phrases you\'ve blacklisted, and paints them solid black <b>before</b> the image is base64-encoded and sent to the AI. Nothing is uploaded -- everything runs locally.</p>
+        <p><b>Off by default</b> -- turning it ON keeps a small helper process (<code>sihost.exe --ocr-daemon</code>) resident, which is a slight stealth cost. Flip it ON only for actual proctored sessions. Default blacklist covers the big proctoring brands; click <i>Edit blacklist</i> to add exam-specific text.</p>
+        <div class="ob-kbdrow">
+          <kbd>Words</kbd>
+          <span class="desc">Exact-token match (per OCR word)</span>
+        </div>
+        <div class="ob-kbdrow">
+          <kbd>Phrases</kbd>
+          <span class="desc">Substring match across the joined line (multi-word banners)</span>
+        </div>
+      `,
+      features: [
+        'Fully on-device -- nothing uploaded',
+        'Off by default; flip on only when needed',
+        'Editable blacklist for exam-specific keywords',
+      ],
+    },
+    { // 12 -- was 9
+      tag: 'STEP 12',
       icon: 'sliders',
       title: 'Customize hotkeys',
       lead: 'Don\'t like a default binding? Change it.',
@@ -3294,8 +3501,8 @@ function _obSteps() {
         'Reset any single hotkey or all of them',
       ],
     },
-    { // 10
-      tag: 'STEP 10',
+    { // 13 -- was 10
+      tag: 'STEP 13',
       icon: 'shield',
       title: 'One device policy',
       lead: 'Your subscription is bound to this machine.',
@@ -3314,7 +3521,7 @@ function _obSteps() {
         'HWID is derived from your motherboard + Windows install — stable',
       ],
     },
-    { // 11 — final agreement
+    { // 14 -- final agreement (was 11)
       tag: 'BEFORE YOU START',
       icon: 'file-text',
       title: 'One last thing',
@@ -3348,6 +3555,10 @@ const _obIconSvgs = {
   'sliders':      '<line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>',
   'shield':       '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
   'file-text':    '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/>',
+  /* v17 (2026-09-22) -- new icons for AutoSolver / Composer / Redactor steps. */
+  'target':       '<circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/>',
+  'layout':       '<rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/>',
+  'shield-off':   '<path d="M19.69 14a6.9 6.9 0 0 0 .31-2V5l-8-3-3.16 1.18"/><path d="M4.73 4.73L4 5v7c0 6 8 10 8 10a20.29 20.29 0 0 0 5.62-4.38"/><line x1="1" y1="1" x2="23" y2="23"/>',
 };
 
 function showOnboarding() {
@@ -3362,7 +3573,7 @@ function showOnboarding() {
         <div class="ob-brand"><div class="logo">C</div><div class="name">CloakGPT</div></div>
         <div class="ob-progress">
           <div class="ob-progress-bar"><div class="ob-progress-fill" id="ob-fill" style="width:0%"></div></div>
-          <div class="ob-progress-label" id="ob-label">1 / 12</div>
+          <div class="ob-progress-label" id="ob-label">1 / 15</div>
         </div>
         <div class="ob-header-actions">
           <button id="ob-skip" class="ob-header-btn">Skip tutorial</button>
@@ -3428,6 +3639,8 @@ function _renderObStep() {
     <div class="ob-step-lead">${escapeHtml(step.lead)}</div>
     ${step.body || ''}
   `;
+  /* v16 -- refresh any [data-hk] hotkey labels the tour body added. */
+  try { _applyHotkeyLabels(); } catch {}
 
   document.getElementById('ob-back').disabled = (_obStep === 0);
   const nextBtn = document.getElementById('ob-next');
@@ -3508,9 +3721,17 @@ function _obTeardown() {
 
 // ─── Boot ──────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
-  boot();
+  /* v17 -- boot() runs in a try/catch so ANY thrown exception (missing
+   * window.svc, IPC failure, downstream throw) shows the fallback with a
+   * specific reason instead of silently dying to a blank blue screen. */
+  try {
+    await boot();
+  } catch (e) {
+    try { console.error('[boot] failed:', e); } catch {}
+    showSafetyFallback('boot() threw:\n\n' + (e && (e.stack || e.message) ? (e.stack || e.message) : String(e)));
+  }
   // Load hotkeys once the dashboard is likely to be shown.
-  try { await _loadHotkeys(); } catch {}
+  try { await _loadHotkeys(); } catch (e) { try { console.error('[hotkeys] load:', e); } catch {} }
 });
 
 /* ══════════════════════════════════════════════════════════════════
@@ -3812,6 +4033,21 @@ document.addEventListener('DOMContentLoaded', async () => {
     [rngDotSize, rngDotOpacity, rngDotHold].forEach(r => { if (r) r.addEventListener('change', save); });
     [numDotW, numDotH].forEach(n => { if (n) n.addEventListener('change', save); });
     if (chkDotHide) chkDotHide.addEventListener('change', save);
+
+    // v16 (2026-09-22) -- dashboard's promoted "Show answer dot" toggle in the
+    // status card mirrors chk-as-dot two-ways. Flipping either side updates the
+    // other + fires the same save (autosolver.json, mtime-watched by payload).
+    const chkDashDot = el('chk-dashboard-dot');
+    if (chkDashDot) {
+      chkDashDot.checked = chkDot.checked;
+      chkDashDot.addEventListener('change', () => {
+        chkDot.checked = chkDashDot.checked;
+        save();
+      });
+      chkDot.addEventListener('change', () => {
+        chkDashDot.checked = chkDot.checked;
+      });
+    }
   };
 
   if (document.readyState === 'loading') {

@@ -89,3 +89,7 @@ tools/redteam/probes/ddup.exe
 tools/redteam/probes/*.obj
 
 tools/redteam/runtime/
+
+# v17 (2026-09-22) -- cloned reference repos live here, never committed
+_ref/
+
