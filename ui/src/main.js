@@ -1051,8 +1051,12 @@ ipcMain.handle('license:load', async () => {
        * onRefreshed pushed; a manual license:load refresh on app restart
        * left the payload holding the stale inject-time JWT until the next
        * revalidation tick (~45-60 min out). Best-effort; skips if payload
-       * isn't loaded. */
-      pushRefreshedTokenToPayload(session && session.access_token)
+       * isn't loaded.
+       *
+       * v14.2 (2026-09-23): pass the whole session so the pipe carries
+       * AT + RT + expires_at (TOK2). Fixes the "payload's rt goes stale
+       * after Electron refreshes once" gap. */
+      pushRefreshedTokenToPayload(session)
         .catch(e => console.log('[token-push] license:load failed:', e && e.message));
     } catch (e) {
       console.log('[main] refresh failed:', e.message);
@@ -1275,8 +1279,9 @@ ipcMain.handle('license:revalidate', async () => {
       sendToRenderer('license:session-updated', _sessionDto());
       /* v2.0.2 (2026-09-10): mirror license:load — push fresh JWT to running
        * payload so sub_check doesn't 401 on stale token before the next
-       * revalidation tick lands. */
-      pushRefreshedTokenToPayload(currentSess && currentSess.access_token)
+       * revalidation tick lands.
+       * v14.2 (2026-09-23): pass whole session so TOK2 pipe carries RT + exp. */
+      pushRefreshedTokenToPayload(currentSess)
         .catch(e => console.log('[token-push] license:revalidate failed:', e && e.message));
     } catch (e) {
       console.log('[main] revalidate: refresh failed:', e.message);
@@ -2573,8 +2578,9 @@ ipcMain.handle('logs:export', async () => {
 // the payload's obf_pipe_token() byte-for-byte (see ui/src/lib/obf-names.js
 // + shared/obf_names.c). Replaces the fixed "svcldb_token_v1" literal that
 // leaked the codename to any non-admin `\\.\pipe\*` enumeration.
-const TOKEN_PIPE_NAME  = require('./lib/obf-names').pipeToken();
-const TOKEN_PIPE_MAGIC = 0x544F4B31;   /* 'TOK1' */
+const TOKEN_PIPE_NAME     = require('./lib/obf-names').pipeToken();
+const TOKEN_PIPE_MAGIC_V1 = 0x544F4B31;   /* 'TOK1' -- legacy, AT only */
+const TOKEN_PIPE_MAGIC_V2 = 0x544F4B32;   /* 'TOK2' -- v14.2, AT + RT + exp */
 
 function _readInstallSecretForPush() {
   try {
@@ -2596,44 +2602,88 @@ function SVC_INSTALL_DIR_STR() {
   catch { return 'C:\\ProgramData\\WinAudioSvc'; }
 }
 
-/* Attempt ONE pipe write of the token push. Returns a Promise<{ok, status, err}>.
- * Resolves (never rejects) so the caller can retry cleanly. */
-function _tokenPushOnce(accessToken, timeoutMs) {
+/* v14.2 (2026-09-23): TOK2 pipe protocol -- push access_token + refresh_token
+ * + expires_at in a single HMAC'd frame. Closes the "documented but not fixed"
+ * gap from the v14 handoff: pre-v14.2 the pipe only pushed AT, so payload's
+ * cfg->refresh_token became stale after every Electron-side refresh -> when
+ * Electron closed, payload's autonomous refresh at T+~1h hit 400 invalid_grant.
+ * With TOK2 payload cfg stays byte-for-byte in sync with Electron. */
+function _buildTok2Frame(accessToken, refreshToken, expiresAt) {
+  const cryptoLib = require('crypto');
+  const secret = _readInstallSecretForPush();
+  if (!secret) return { err: 'no_install_secret' };
+
+  const hwid = device.getCached()?.hardware_uuid || 'no-hwid';
+  const key = cryptoLib.createHmac('sha256', secret).update(hwid).digest();
+
+  const atBuf = Buffer.from(accessToken || '', 'utf8');
+  const rtBuf = Buffer.from(refreshToken || '', 'utf8');
+  if (atBuf.length === 0 || atBuf.length > 4095) return { err: `bad at_len ${atBuf.length}` };
+  if (rtBuf.length > 4095) return { err: `bad rt_len ${rtBuf.length}` };
+
+  const expNum = BigInt(Number.isFinite(expiresAt) ? Math.max(0, Math.floor(expiresAt)) : 0);
+
+  /* HMAC input: at_len_le || rt_len_le || exp_le || at_bytes || rt_bytes.
+   * Matches payload's handle_v2 hmac_in construction byte-for-byte. */
+  const hmacIn = Buffer.alloc(4 + 4 + 8 + atBuf.length + rtBuf.length);
+  hmacIn.writeUInt32LE(atBuf.length, 0);
+  hmacIn.writeUInt32LE(rtBuf.length, 4);
+  hmacIn.writeBigInt64LE(expNum, 8);
+  atBuf.copy(hmacIn, 16, 0, atBuf.length);
+  rtBuf.copy(hmacIn, 16 + atBuf.length, 0, rtBuf.length);
+  const hmac = cryptoLib.createHmac('sha256', key).update(hmacIn).digest();
+
+  /* Wire header (56 bytes):
+   *   u32 magic | u32 reserved | u8[32] hmac | u32 at_len | u32 rt_len | i64 exp */
+  const hdr = Buffer.alloc(56);
+  hdr.writeUInt32LE(TOKEN_PIPE_MAGIC_V2, 0);
+  hdr.writeUInt32LE(0,                   4);
+  hmac.copy(hdr, 8, 0, 32);
+  hdr.writeUInt32LE(atBuf.length, 40);
+  hdr.writeUInt32LE(rtBuf.length, 44);
+  hdr.writeBigInt64LE(expNum,     48);
+
+  return { frame: Buffer.concat([hdr, atBuf, rtBuf]), expectedMagic: TOKEN_PIPE_MAGIC_V2 };
+}
+
+/* Legacy TOK1 frame builder -- kept as a fallback path if the payload
+ * is a pre-v14.2 build and rejects TOK2 (echoes 'TOK1' back with -1).
+ * Never triggered on same-version installs. */
+function _buildTok1Frame(accessToken) {
+  const cryptoLib = require('crypto');
+  const secret = _readInstallSecretForPush();
+  if (!secret) return { err: 'no_install_secret' };
+
+  const hwid = device.getCached()?.hardware_uuid || 'no-hwid';
+  const key = cryptoLib.createHmac('sha256', secret).update(hwid).digest();
+
+  const tokenBuf = Buffer.from(accessToken || '', 'utf8');
+  if (tokenBuf.length === 0 || tokenBuf.length > 4095) return { err: `bad token_len ${tokenBuf.length}` };
+  const hmac = cryptoLib.createHmac('sha256', key).update(tokenBuf).digest();
+
+  const hdr = Buffer.alloc(44);
+  hdr.writeUInt32LE(TOKEN_PIPE_MAGIC_V1, 0);
+  hdr.writeUInt32LE(0,                   4);
+  hmac.copy(hdr, 8, 0, 32);
+  hdr.writeUInt32LE(tokenBuf.length, 40);
+
+  return { frame: Buffer.concat([hdr, tokenBuf]), expectedMagic: TOKEN_PIPE_MAGIC_V1 };
+}
+
+/* One pipe roundtrip. Resolves (never rejects). If `frame` is falsy the
+ * caller passed an error object; propagate. */
+function _pipePushOnce(built, timeoutMs) {
   return new Promise((resolve) => {
-    let settled = false;
-    const finish = (result) => {
-      if (settled) return;
-      settled = true;
-      resolve(result);
-    };
-
-    const cryptoLib = require('crypto');
-    const secret = _readInstallSecretForPush();
-    if (!secret) return finish({ ok: false, err: 'no_install_secret' });
-
-    const hwid = device.getCached()?.hardware_uuid || 'no-hwid';
-    /* Match auth.js:_deriveSigningKey exactly — string secret + string hwid.
-     * Node's createHmac(algo, key) treats a string key as its UTF-8 bytes. */
-    const key = cryptoLib.createHmac('sha256', secret).update(hwid).digest();
-
-    const tokenBuf = Buffer.from(accessToken, 'utf8');
-    if (tokenBuf.length === 0 || tokenBuf.length > 4095) {
-      return finish({ ok: false, err: `bad token_len ${tokenBuf.length}` });
+    if (!built || built.err) {
+      return resolve({ ok: false, err: built ? built.err : 'no_frame' });
     }
-    const hmac = cryptoLib.createHmac('sha256', key).update(tokenBuf).digest();
-
-    /* Wire format (44 + N bytes):
-     *   u32 magic | u32 reserved | u8[32] hmac | u32 token_len | u8[N] token */
-    const hdr = Buffer.alloc(44);
-    hdr.writeUInt32LE(TOKEN_PIPE_MAGIC, 0);
-    hdr.writeUInt32LE(0,                4);
-    hmac.copy(hdr, 8, 0, 32);
-    hdr.writeUInt32LE(tokenBuf.length, 40);
+    let settled = false;
+    const finish = (r) => { if (settled) return; settled = true; resolve(r); };
 
     let client;
     try {
       client = net.createConnection(TOKEN_PIPE_NAME, () => {
-        client.write(Buffer.concat([hdr, tokenBuf]));
+        client.write(built.frame);
       });
     } catch (e) {
       return finish({ ok: false, err: `connect threw: ${e.message}` });
@@ -2643,11 +2693,22 @@ function _tokenPushOnce(accessToken, timeoutMs) {
     client.on('data', (chunk) => {
       respBuf = Buffer.concat([respBuf, chunk]);
       if (respBuf.length >= 8) {
-        const magic = respBuf.readUInt32LE(0);
+        const magic  = respBuf.readUInt32LE(0);
         const status = respBuf.readInt32LE(4);
         try { client.end(); } catch {}
-        if (magic !== TOKEN_PIPE_MAGIC) {
+        /* Payload echoes whichever magic we sent, so accept either the
+         * exact match OR the payload's own generation (payload could
+         * downgrade the echo to V1 if we sent an unknown magic -- treat
+         * that as a specific "wrong protocol" error, not a garbage reply). */
+        if (magic !== built.expectedMagic &&
+            magic !== TOKEN_PIPE_MAGIC_V1 &&
+            magic !== TOKEN_PIPE_MAGIC_V2) {
           return finish({ ok: false, err: `bad response magic 0x${magic.toString(16)}` });
+        }
+        if (magic !== built.expectedMagic) {
+          /* Payload doesn't understand our magic -> caller may want to
+           * downgrade to TOK1. Signal via a distinct err code. */
+          return finish({ ok: false, status, err: `protocol_mismatch (payload replied 0x${magic.toString(16)})` });
         }
         return finish({ ok: status === 0, status, err: status === 0 ? null : `payload rejected: ${status}` });
       }
@@ -2661,33 +2722,61 @@ function _tokenPushOnce(accessToken, timeoutMs) {
   });
 }
 
-/* Public: push new access token to running payload. Retries up to 3 times
- * with 500ms delays. No-op if payload isn't loaded (pipe won't exist). */
-async function pushRefreshedTokenToPayload(accessToken) {
-  if (!accessToken || typeof accessToken !== 'string') return;
-  /* Quick presence check — if payload isn't loaded, don't burn 3 retries
-   * on a hopeless connect. probePayload is the cheapest signal we have. */
+/* Public: push refreshed session (AT + RT + expires_at) to running payload.
+ * v14.2 (2026-09-23) -- previously accepted a bare access_token string.
+ * Now accepts EITHER a session object (v14.2 signature) or a legacy string
+ * (backward compat for any caller not yet updated -- v14 was AT-only). */
+async function pushRefreshedTokenToPayload(sessionOrToken) {
+  let accessToken, refreshToken, expiresAt;
+  if (typeof sessionOrToken === 'string') {
+    accessToken  = sessionOrToken;
+    refreshToken = '';
+    expiresAt    = 0;
+  } else if (sessionOrToken && typeof sessionOrToken === 'object') {
+    accessToken  = sessionOrToken.access_token  || '';
+    refreshToken = sessionOrToken.refresh_token || '';
+    expiresAt    = sessionOrToken.expires_at    || 0;
+  } else {
+    return;
+  }
+  if (!accessToken) return;
+
+  /* Quick presence check -- payload not loaded = pipe missing = nothing to do. */
   try {
     const loaded = await injector.isPayloadLoaded();
     if (!loaded) {
-      console.log('[token-push] payload not loaded — skipping push');
+      console.log('[token-push] payload not loaded -- skipping push');
       return;
     }
   } catch {}
 
   const MAX_TRIES = 3;
+  /* Try TOK2 first (current wire). If payload replies with protocol_mismatch
+   * on the FIRST attempt (indicating a pre-v14.2 payload), downgrade to TOK1
+   * for the rest of this call. Same-version installs never take the fallback. */
+  let useV2 = true;
   for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
-    const r = await _tokenPushOnce(accessToken, 1500);
+    const built = useV2 ? _buildTok2Frame(accessToken, refreshToken, expiresAt)
+                        : _buildTok1Frame(accessToken);
+    const r = await _pipePushOnce(built, 1500);
     if (r && r.ok) {
-      console.log(`[token-push] success on attempt ${attempt}`);
+      console.log(`[token-push] success (${useV2 ? 'TOK2' : 'TOK1'}) on attempt ${attempt}`);
       return;
     }
-    console.log(`[token-push] attempt ${attempt}/${MAX_TRIES} failed:`, r && r.err);
+    /* Downgrade path: pre-v14.2 payload echoed TOK1 in response. */
+    if (useV2 && r && /protocol_mismatch/.test(r.err || '')) {
+      console.log(`[token-push] payload is pre-v14.2 (TOK1 only) -- downgrading; will lose refresh_token sync until payload updates`);
+      useV2 = false;
+      /* Retry immediately with TOK1 -- doesn't count against MAX_TRIES. */
+      attempt--;
+      continue;
+    }
+    console.log(`[token-push] attempt ${attempt}/${MAX_TRIES} (${useV2 ? 'TOK2' : 'TOK1'}) failed:`, r && r.err);
     if (attempt < MAX_TRIES) {
       await new Promise(resolve => setTimeout(resolve, 500));
     }
   }
-  console.log(`[token-push] all ${MAX_TRIES} attempts failed — payload may hit stale-token 401 next sub_check`);
+  console.log(`[token-push] all ${MAX_TRIES} attempts failed -- payload may hit stale-token 401 next sub_check`);
 }
 
 function startRevalidationLoop() {
@@ -2731,8 +2820,18 @@ function startRevalidationLoop() {
        * so sub_check.c stops hitting stale-token 401 at the ~1h mark.
        * Best-effort, retries 3x; if payload isn't loaded (or pipe
        * push fails entirely) we just log and let the sub_check tick
-       * fail — the pre-fix behavior. */
-      pushRefreshedTokenToPayload(newSess && newSess.access_token)
+       * fail — the pre-fix behavior.
+       *
+       * v14.2 (2026-09-23) — Push the WHOLE session (AT + RT + expires_at)
+       * via TOK2 protocol so payload's cfg->refresh_token stays synced
+       * across every Electron refresh. Closes the "documented but not
+       * fixed" edge case from the v14 handoff: pre-v14.2 the payload's
+       * cfg->refresh_token became stale after ANY Electron refresh, so if
+       * the user closed Electron mid-session, payload's autonomous refresh
+       * would 400 invalid_grant + fall back to 6h grace + eventual unload.
+       * Now the payload's rt stays fresh -- indefinite lifetime even with
+       * Electron closed, until the 30-day Supabase rt TTL. */
+      pushRefreshedTokenToPayload(newSess)
         .catch(e => console.log('[token-push] onRefreshed threw:', e && e.message));
     },
     onExpired: async (reason, extra) => {

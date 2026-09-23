@@ -9,6 +9,75 @@ memory from prior sessions (~4.8k lines).
 For live operational stuff (launch/test/deploy procedure), see `AGENTS.md`
 and `.cursor/rules/fast-testing-launch.mdc`.
 
+## ✅ v14.2 AUTH-6H CERTAINTY PASS (2026-09-23) — TOK2 + cfg_persist fixes
+
+Landed today: the "coordination edge case" from
+`docs/HANDOFF_2026-09-19_PAYLOAD_JWT_AUTONOMY.md` (deferred as "6h grace
+covers it") is now CLOSED. Also fixed two related bugs discovered during
+empirical validation:
+
+1. **TOK2 pipe protocol** — `token_refresh_server.c` now handles both TOK1
+   (legacy AT-only push) and TOK2 (AT + RT + expires_at). Electron's
+   `pushRefreshedTokenToPayload` builds TOK2 by default and auto-downgrades
+   to TOK1 if the payload replies with an unknown-magic error. Payload's
+   `cfg->refresh_token` now stays byte-for-byte in sync with Electron
+   across every refresh. Result: user can close svchelper.exe after inject
+   and the overlay survives **indefinitely** (bounded only by Supabase's
+   30-day refresh_token TTL) — previously bounded to ~7-8h post-close
+   after any pre-close Electron refresh via the 6h wall-clock grace.
+
+2. **`cfg_persist` ACCESS_DENIED bug** — DWM runs as `Window Manager\DWM-<N>`
+   virtual account, which is NOT in `BUILTIN\Users` (no ProgramData default
+   inherit). Pre-v14.2 `config.dat` was owned by launcher-elevated Admin with
+   default ProgramData DACL, so DWM-N had ZERO write permission → every
+   autonomous `token_refresh_client` refresh's `cfg_persist` call got
+   ACCESS_DENIED on `MoveFileEx` → rotated refresh_token was LOST on next
+   payload reload / reboot → v14's whole autonomy premise was quietly
+   defeated on any install that had been running long enough for Windows to
+   respawn DWM. Fix: launcher's `heal_log_dacls_all` (called on every arm)
+   now includes `config.dat` + `config.dat.tmp` and widens the DACL to
+   `D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;S-1-5-90-0)` — SYSTEM + Admins +
+   Window Manager Group FullControl, no more `BUILTIN\Users:Read` (bonus
+   P2 win closing the v3.1 "encrypted JWTs world-readable" accepted
+   residual). New `config.dat` files created by `config_write` also start
+   with this DACL via `svc_build_log_file_sa`.
+
+3. **DWM crash from payload-side SA on `cfg_persist`** — During Bug 2's
+   fix I tried adding the same SA to the payload's `cfg_persist` .tmp
+   creation. Reliably crashed DWM (WER APPCRASH ntdll+0x164eba c0000008
+   STATUS_INVALID_HANDLE). Root cause not fully diagnosed — suspected
+   manual-map + CRT-less + PROTECTED-DACL-from-virtual-account interaction.
+   Log_secure.c uses the same helper without crashing (cached SA + OPEN_ALWAYS
+   + FILE_APPEND_DATA, different code path). Fix: payload's `cfg_persist`
+   creates `.tmp` with DEFAULT DACL (inheriting from ProgramData); the
+   MoveFileEx-inherited destination gets widened by the launcher's heal
+   on next arm. Explicitly documented decision in `payload/src/config_read.c`
+   for the next agent — DO NOT put an explicit SA back in payload's
+   cfg_persist without diagnosing that crash first.
+
+**Runtime evidence (2026-09-23):**
+- All 6 TOK2 pipe protocol tests PASS live (valid, tampered-HMAC, oversized,
+  AT-only, TOK1 fallback, unknown magic).
+- `cfg_persist: wrote 27756 bytes to C:\ProgramData\WinAudioSvc\config.dat
+  (attempt 1)` + `token_refresh v2: at=243 rt=updated exp=updated persist=OK`.
+- Post-heal DACL: `SYSTEM: Full, Administrators: Full, Window Manager Group: Full`
+  (no Users entry).
+- 25000-sample Monte-Carlo confirms `revalidation.js nextDelayMs()` NEVER
+  overshoots JWT expiry (0/25000 across 5 timing ranges).
+- Empirical Supabase HTTP contract test confirms garbage rt → 400
+  validation_failed, bogus JWT → 401 PGRST301 — matching what `sub_check.c`
+  and `token_refresh_client.c` assume for their `-2` and `-1` return paths.
+- Full 6h-scenario overnight test with Electron closed still needs Sam's
+  hands-on final verification (see
+  `docs/HANDOFF_2026-09-23_AUTH_6H_CERTAINTY_TOK2.md` "For Sam to test" section).
+
+Files touched (7 code + 3 test tools + 1 handoff):
+- Code: `payload/src/token_refresh_server.c`, `payload/src/config_read.c`,
+  `launcher/src/config_write.c`, `launcher/src/main.c`, `ui/src/main.js`
+- Tests: `tools/auth/test_supabase_refresh_contract.js`,
+  `tools/auth/test_reval_timing.js`, `tools/auth/test_pipe_tok2.js`
+- Doc: `docs/HANDOFF_2026-09-23_AUTH_6H_CERTAINTY_TOK2.md`
+
 ## ✅ P0 SHIP-BLOCK RESOLVED (2026-09-21 8:42 PM local) — v3.1
 
 **Root cause was NOT what the handoff hypothesized.** Fixed by v3.1

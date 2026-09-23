@@ -1,5 +1,5 @@
 /* ================================================================== *
- * token_refresh_server.c -- v14 (2026-08-24)                          *
+ * token_refresh_server.c -- v14 (2026-08-24) / v14.2 (2026-09-23)     *
  *                                                                    *
  * Payload-side named-pipe SERVER that lets Electron push a refreshed *
  * Supabase JWT into `cfg->access_token` while the payload is running. *
@@ -21,19 +21,48 @@
  *     in-memory cfg. Fixed here by pushing the new token over a       *
  *     named pipe, HMAC-authenticated by a shared install secret.     *
  *                                                                    *
- * ── Wire protocol (little-endian) ───────────────────────────────────  *
+ * ── Wire protocols (little-endian) ──────────────────────────────────  *
  *                                                                    *
- *   Request  (Electron -> payload, 44 + token_len bytes):              *
+ *   TOK1 (legacy v14, 2026-08-24)   -- header 44 bytes                *
  *     uint32_t  magic         = 0x544F4B31   ('TOK1')                 *
  *     uint32_t  reserved      = 0                                     *
- *     uint8_t   hmac[32]      = HMAC-SHA256(k, token_bytes) where     *
- *                                k = HMAC-SHA256(install_secret_hex,  *
- *                                                cfg->handshake_hwid) *
+ *     uint8_t   hmac[32]      = HMAC-SHA256(k, at_bytes)              *
  *     uint32_t  token_len     = strlen(new_access_token) [1..4095]    *
  *     char      token[token_len] = ASCII JWT (no NUL)                 *
  *                                                                    *
- *   Response (payload -> Electron, 8 bytes):                          *
- *     uint32_t  magic         = 0x544F4B31                            *
+ *   TOK2 (v14.2, 2026-09-23)         -- header 56 bytes; carries      *
+ *   BOTH access_token AND refresh_token AND expires_at so the payload *
+ *   stays fully synchronized with Electron across every refresh.     *
+ *   Root fix for the "Electron refreshed at least once, then closed" *
+ *   scenario documented in                                            *
+ *   docs/HANDOFF_2026-09-19_PAYLOAD_JWT_AUTONOMY.md                   *
+ *   "Coordination edge case (documented, not fixed)".                *
+ *     uint32_t  magic         = 0x544F4B32   ('TOK2')                 *
+ *     uint32_t  reserved      = 0                                     *
+ *     uint8_t   hmac[32]      = HMAC-SHA256(k, wire_body) where       *
+ *                               wire_body =                           *
+ *                                 at_len_le || rt_len_le ||           *
+ *                                 exp_le    || at_bytes  || rt_bytes  *
+ *                               (all little-endian numerics; no       *
+ *                                separators needed because the        *
+ *                                length prefixes make the encoding    *
+ *                                unambiguous).                        *
+ *     uint32_t  at_len        [1..4095]                               *
+ *     uint32_t  rt_len        [0..4095] -- 0 = keep cfg->refresh_token *
+ *     int64_t   expires_at    unix seconds; 0 = keep cfg exp          *
+ *     char      access_token[at_len]                                  *
+ *     char      refresh_token[rt_len]                                 *
+ *                                                                    *
+ *   The k HMAC key derivation is IDENTICAL in both protocols:         *
+ *     k = HMAC-SHA256(install_secret_hex_ASCII, cfg->handshake_hwid). *
+ *   Payload accepts both magic values; Electron always sends TOK2     *
+ *   post-v14.2. Backward compatibility ensures a mid-upgrade user     *
+ *   (payload newer than Electron OR vice versa) still gets AT pushed. *
+ *                                                                    *
+ *   Response (payload -> Electron, 8 bytes) -- identical shape for    *
+ *   both protocols, magic echoes whichever was received so caller     *
+ *   sanity-checks the reply is from the right server generation:     *
+ *     uint32_t  magic         = 0x544F4B31 or 0x544F4B32              *
  *     int32_t   status        =  0 accepted                           *
  *                                -1 bad HMAC / generic reject         *
  *                                -2 token too long                    *
@@ -93,15 +122,19 @@
  * per-machine GUID indistinguishable from legit COM/RPC/mojo pipes.
  * (Function call, not a string literal -- only ever used as a runtime
  * pipe-name argument, cached after first derivation.) */
-#define TOKEN_PIPE_NAME     obf_pipe_token()
-#define TOKEN_PIPE_MAGIC    0x544F4B31u    /* 'TOK1' */
-#define TOKEN_HMAC_LEN      32u
-#define TOKEN_REQ_HDR_LEN   (4u + 4u + 32u + 4u)   /* magic+reserved+hmac+token_len */
-#define TOKEN_RESP_LEN      8u                      /* magic+status */
+#define TOKEN_PIPE_NAME       obf_pipe_token()
+#define TOKEN_PIPE_MAGIC_V1   0x544F4B31u    /* 'TOK1' */
+#define TOKEN_PIPE_MAGIC_V2   0x544F4B32u    /* 'TOK2' -- v14.2 */
+#define TOKEN_HMAC_LEN        32u
+#define TOKEN_V1_HDR_LEN      (4u + 4u + 32u + 4u)         /* magic+reserved+hmac+at_len         (44) */
+#define TOKEN_V2_HDR_LEN      (4u + 4u + 32u + 4u + 4u + 8u) /* magic+reserved+hmac+at_len+rt_len+exp (56) */
+#define TOKEN_RESP_LEN        8u                            /* magic+status */
 
 /* Max JWT length. Supabase JWTs are typically ~1200-2000 chars; cap
  * at 4095 to match cfg->access_token[4096]-1 NUL. Anything larger
- * rejects with status -2 (protects against DoS via giant reads). */
+ * rejects with status -2 (protects against DoS via giant reads).
+ * refresh_token has the same cap for buffer symmetry (Supabase's rt
+ * is typically ~40 chars but the field is [4096]). */
 #define TOKEN_MAX_LEN       4095u
 
 #define INSTALL_SECRET_PATH SVC_INSTALL_DIR "\\.svchelper_install_secret"
@@ -136,10 +169,9 @@ static BOOL write_all(HANDLE h, const void *buf, DWORD n) {
     return TRUE;
 }
 
-static void write_response(HANDLE pipe, int32_t status) {
+static void write_response(HANDLE pipe, uint32_t magic, int32_t status) {
     uint8_t resp[TOKEN_RESP_LEN];
-    uint32_t rmagic = TOKEN_PIPE_MAGIC;
-    memcpy(resp + 0, &rmagic, 4);
+    memcpy(resp + 0, &magic, 4);
     memcpy(resp + 4, &status, 4);
     (void)write_all(pipe, resp, TOKEN_RESP_LEN);
 }
@@ -207,47 +239,40 @@ static int derive_verify_key(uint8_t out[32]) {
     return ok;
 }
 
-/* ─── One-shot handler ───────────────────────────────────────────── */
+/* ─── One-shot handlers ─────────────────────────────────────────── */
 
-/* Read one full request off `pipe`, validate, apply if valid, send
- * response. Returns 0 on success, negative on any error (response is
- * always sent best-effort, even on error paths, so Electron can log
- * a specific status). */
-static int handle_one_client(HANDLE pipe) {
-    uint8_t hdr[TOKEN_REQ_HDR_LEN];
-    if (!read_all(pipe, hdr, TOKEN_REQ_HDR_LEN)) {
-        slog_write("payload.log", "token_refresh: read header failed");
-        write_response(pipe, -4);
+/* TOK1 handler (legacy). Header already read into first 4 bytes of the
+ * caller's read; we finish reading the remaining bytes here. Returns 0
+ * on success, negative on failure. `magic` is echoed in response so
+ * Electron sanity-checks the reply matches its own protocol version. */
+static int handle_v1(HANDLE pipe, uint32_t magic) {
+    uint8_t hdr[TOKEN_V1_HDR_LEN - 4];   /* magic already consumed */
+    if (!read_all(pipe, hdr, sizeof(hdr))) {
+        slog_write("payload.log", "token_refresh v1: read header tail failed");
+        write_response(pipe, magic, -4);
         return -4;
     }
-    uint32_t magic;
-    memcpy(&magic, hdr + 0, 4);
-    if (magic != TOKEN_PIPE_MAGIC) {
-        slog_writef("payload.log", "token_refresh: bad magic 0x%08x", magic);
-        write_response(pipe, -1);
-        return -1;
-    }
-    /* hdr[4..8]: reserved, ignored */
+    /* hdr[0..4]: reserved (was uint32_t at offset 4 of full hdr) */
     uint8_t incoming_hmac[32];
-    memcpy(incoming_hmac, hdr + 8, 32);
+    memcpy(incoming_hmac, hdr + 4, 32);
     uint32_t token_len;
-    memcpy(&token_len, hdr + 40, 4);
+    memcpy(&token_len, hdr + 36, 4);
     if (token_len == 0 || token_len > TOKEN_MAX_LEN) {
-        slog_writef("payload.log", "token_refresh: bad token_len %u", token_len);
-        write_response(pipe, -2);
+        slog_writef("payload.log", "token_refresh v1: bad token_len %u", token_len);
+        write_response(pipe, magic, -2);
         return -2;
     }
 
     char *token = (char *)HeapAlloc(GetProcessHeap(), 0, (SIZE_T)token_len + 1);
     if (!token) {
-        slog_write("payload.log", "token_refresh: HeapAlloc failed");
-        write_response(pipe, -4);
+        slog_write("payload.log", "token_refresh v1: HeapAlloc failed");
+        write_response(pipe, magic, -4);
         return -4;
     }
     if (!read_all(pipe, token, token_len)) {
         HeapFree(GetProcessHeap(), 0, token);
-        slog_write("payload.log", "token_refresh: read token payload failed");
-        write_response(pipe, -4);
+        slog_write("payload.log", "token_refresh v1: read token payload failed");
+        write_response(pipe, magic, -4);
         return -4;
     }
     token[token_len] = 0;
@@ -255,38 +280,205 @@ static int handle_one_client(HANDLE pipe) {
     uint8_t key[32];
     if (!derive_verify_key(key)) {
         HeapFree(GetProcessHeap(), 0, token);
-        write_response(pipe, -3);
+        write_response(pipe, magic, -3);
         return -3;
     }
     uint8_t expected[32];
     if (!cu_hmac_sha256(key, 32, token, token_len, expected)) {
         svc_secure_zero(key, sizeof(key));
         HeapFree(GetProcessHeap(), 0, token);
-        write_response(pipe, -1);
+        write_response(pipe, magic, -1);
         return -1;
     }
     svc_secure_zero(key, sizeof(key));
     if (cu_ct_eq(expected, incoming_hmac, 32) != 0) {
-        slog_write("payload.log", "token_refresh: HMAC MISMATCH -- rejecting");
+        slog_write("payload.log", "token_refresh v1: HMAC MISMATCH -- rejecting");
         HeapFree(GetProcessHeap(), 0, token);
-        write_response(pipe, -1);
+        write_response(pipe, magic, -1);
         return -1;
     }
 
     if (!cfg_update_access_token(token, (size_t)token_len)) {
         svc_secure_zero(token, (size_t)token_len);
         HeapFree(GetProcessHeap(), 0, token);
-        slog_write("payload.log", "token_refresh: cfg_update_access_token FAILED");
-        write_response(pipe, -1);
+        slog_write("payload.log", "token_refresh v1: cfg_update_access_token FAILED");
+        write_response(pipe, magic, -1);
         return -1;
     }
     slog_writef("payload.log",
-                "token_refresh: cfg->access_token updated (%u bytes)", token_len);
+                "token_refresh v1: cfg->access_token updated (%u bytes)", token_len);
     svc_secure_zero(token, (size_t)token_len);
     HeapFree(GetProcessHeap(), 0, token);
 
-    write_response(pipe, 0);
+    write_response(pipe, magic, 0);
     return 0;
+}
+
+/* TOK2 handler -- carries access_token + refresh_token + expires_at.
+ *
+ * Closes the "documented but not fixed" edge case from the v14 handoff:
+ * pre-v14.2 the payload's cfg->refresh_token became stale after ANY
+ * Electron-side refresh (the pipe only pushed AT), so payload's
+ * autonomous refresh at T+~1h into the new AT would 400 invalid_grant.
+ * With TOK2 the payload's cfg stays byte-for-byte synchronized with
+ * Electron across every refresh -- payload autonomous refresh keeps
+ * working indefinitely even after Electron closes mid-session.
+ *
+ * HMAC covers all length-prefixed fields to prevent field-swap attacks.
+ */
+static int handle_v2(HANDLE pipe, uint32_t magic) {
+    uint8_t hdr[TOKEN_V2_HDR_LEN - 4];   /* magic already consumed */
+    if (!read_all(pipe, hdr, sizeof(hdr))) {
+        slog_write("payload.log", "token_refresh v2: read header tail failed");
+        write_response(pipe, magic, -4);
+        return -4;
+    }
+    /* Layout of hdr (offsets relative to hdr[0], AFTER magic):
+     *   [0..4]   reserved (u32)
+     *   [4..36]  hmac (32 bytes)
+     *   [36..40] at_len (u32 LE)
+     *   [40..44] rt_len (u32 LE)
+     *   [44..52] expires_at (i64 LE) */
+    uint8_t incoming_hmac[32];
+    memcpy(incoming_hmac, hdr + 4, 32);
+    uint32_t at_len, rt_len;
+    int64_t  exp_at;
+    memcpy(&at_len, hdr + 36, 4);
+    memcpy(&rt_len, hdr + 40, 4);
+    memcpy(&exp_at, hdr + 44, 8);
+
+    if (at_len == 0 || at_len > TOKEN_MAX_LEN) {
+        slog_writef("payload.log", "token_refresh v2: bad at_len %u", at_len);
+        write_response(pipe, magic, -2);
+        return -2;
+    }
+    if (rt_len > TOKEN_MAX_LEN) {
+        slog_writef("payload.log", "token_refresh v2: bad rt_len %u", rt_len);
+        write_response(pipe, magic, -2);
+        return -2;
+    }
+
+    /* Single allocation for both payloads so cleanup is simple.
+     * Layout: [at_bytes][rt_bytes]. */
+    SIZE_T total = (SIZE_T)at_len + (SIZE_T)rt_len;
+    uint8_t *body = (uint8_t *)HeapAlloc(GetProcessHeap(), 0, total + 2);   /* +2 for NULs */
+    if (!body) {
+        slog_write("payload.log", "token_refresh v2: HeapAlloc failed");
+        write_response(pipe, magic, -4);
+        return -4;
+    }
+    if (!read_all(pipe, body, (DWORD)total)) {
+        HeapFree(GetProcessHeap(), 0, body);
+        slog_write("payload.log", "token_refresh v2: read payload failed");
+        write_response(pipe, magic, -4);
+        return -4;
+    }
+
+    /* HMAC input: [at_len_le][rt_len_le][exp_le][at_bytes][rt_bytes]. */
+    uint8_t key[32];
+    if (!derive_verify_key(key)) {
+        HeapFree(GetProcessHeap(), 0, body);
+        write_response(pipe, magic, -3);
+        return -3;
+    }
+    /* Build HMAC input in a scratch buffer (numerics + body). */
+    SIZE_T hmac_in_len = 4 + 4 + 8 + total;
+    uint8_t *hmac_in = (uint8_t *)HeapAlloc(GetProcessHeap(), 0, hmac_in_len);
+    if (!hmac_in) {
+        svc_secure_zero(key, sizeof(key));
+        HeapFree(GetProcessHeap(), 0, body);
+        write_response(pipe, magic, -4);
+        return -4;
+    }
+    memcpy(hmac_in + 0,  &at_len, 4);
+    memcpy(hmac_in + 4,  &rt_len, 4);
+    memcpy(hmac_in + 8,  &exp_at, 8);
+    memcpy(hmac_in + 16, body,    total);
+
+    uint8_t expected[32];
+    int hmac_ok = cu_hmac_sha256(key, 32, hmac_in, hmac_in_len, expected);
+    svc_secure_zero(key, sizeof(key));
+    svc_secure_zero(hmac_in, hmac_in_len);
+    HeapFree(GetProcessHeap(), 0, hmac_in);
+    if (!hmac_ok) {
+        HeapFree(GetProcessHeap(), 0, body);
+        write_response(pipe, magic, -1);
+        return -1;
+    }
+    if (cu_ct_eq(expected, incoming_hmac, 32) != 0) {
+        slog_write("payload.log", "token_refresh v2: HMAC MISMATCH -- rejecting");
+        HeapFree(GetProcessHeap(), 0, body);
+        write_response(pipe, magic, -1);
+        return -1;
+    }
+
+    /* Apply updates. All three fields are optional-except-at (at is
+     * required); rt_len=0 or exp_at<=0 means "don't touch that field". */
+    char *at_p = (char *)body;
+    at_p[at_len] = 0;
+    char *rt_p = (char *)body + at_len;
+    if (rt_len > 0) rt_p[rt_len] = 0;
+
+    if (!cfg_update_access_token(at_p, (size_t)at_len)) {
+        svc_secure_zero(body, total);
+        HeapFree(GetProcessHeap(), 0, body);
+        slog_write("payload.log", "token_refresh v2: cfg_update_access_token FAILED");
+        write_response(pipe, magic, -1);
+        return -1;
+    }
+    int rt_updated = 0;
+    if (rt_len > 0) {
+        if (cfg_update_refresh_token(rt_p, (size_t)rt_len)) {
+            rt_updated = 1;
+        } else {
+            slog_write("payload.log", "token_refresh v2: cfg_update_refresh_token FAILED (kept old rt)");
+        }
+    }
+    int exp_updated = 0;
+    if (exp_at > 0) {
+        cfg_update_token_expires_at((long long)exp_at);
+        exp_updated = 1;
+    }
+
+    /* Persist so a payload reload / DWM crash / reboot preserves the
+     * rotated refresh_token. Best-effort; the rt is still in the cache
+     * and the next natural refresh will re-persist if this fails. */
+    int persist_ok = 0;
+    if (rt_updated || exp_updated) {
+        persist_ok = cfg_persist();
+    }
+
+    slog_writef("payload.log",
+                "token_refresh v2: at=%u rt=%s exp=%s persist=%s",
+                at_len,
+                rt_updated  ? "updated" : (rt_len == 0 ? "skipped" : "FAILED"),
+                exp_updated ? "updated" : "skipped",
+                (rt_updated || exp_updated) ? (persist_ok ? "OK" : "FAIL") : "n/a");
+
+    svc_secure_zero(body, total);
+    HeapFree(GetProcessHeap(), 0, body);
+
+    write_response(pipe, magic, 0);
+    return 0;
+}
+
+/* Dispatch: read magic first, route to v1 or v2 handler. */
+static int handle_one_client(HANDLE pipe) {
+    uint32_t magic;
+    if (!read_all(pipe, &magic, 4)) {
+        slog_write("payload.log", "token_refresh: read magic failed");
+        write_response(pipe, TOKEN_PIPE_MAGIC_V1, -4);
+        return -4;
+    }
+    if (magic == TOKEN_PIPE_MAGIC_V2) {
+        return handle_v2(pipe, magic);
+    }
+    if (magic == TOKEN_PIPE_MAGIC_V1) {
+        return handle_v1(pipe, magic);
+    }
+    slog_writef("payload.log", "token_refresh: unknown magic 0x%08x -- rejecting", magic);
+    write_response(pipe, TOKEN_PIPE_MAGIC_V1, -1);
+    return -1;
 }
 
 /* ─── Thread body ────────────────────────────────────────────────── */
@@ -326,7 +518,8 @@ static DWORD WINAPI token_refresh_thread(LPVOID param) {
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             1,        /* max instances -- single-client */
             256,      /* out buffer size (just the 8-byte resp) */
-            8192,     /* in buffer size -- max header 44 + token 4095 */
+            /* v14.2: TOK2 header (56) + at (4095) + rt (4095) = 8246. Round up. */
+            16384,    /* in buffer size */
             0,        /* default timeout */
             have_sa ? &sa : NULL);
         if (sd) LocalFree(sd);

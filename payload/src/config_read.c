@@ -263,8 +263,51 @@ int cfg_persist(void) {
      * If we crash between CreateFile+WriteFile and MoveFileEx, the ORIGINAL
      * config.dat is untouched -- next boot's cfg_read still succeeds with the
      * pre-refresh (still-valid, just about to be stale) token, and the next
-     * refresh attempt gets a fresh chance. */
+     * refresh attempt gets a fresh chance.
+     *
+     * v14.2 (2026-09-23) -- Create the .tmp with an explicit DACL granting
+     * SYSTEM+Admins+WMG FullControl (svc_build_log_file_sa). MoveFileEx with
+     * REPLACE_EXISTING inherits the source's SD, so the final config.dat
+     * ends up with the widened DACL too -- preserves DWM-N write access
+     * after every persist call (matches launcher's config_write DACL). */
     static const char *tmp_path = CONFIG_PATH ".tmp";
+    /* v14.2 (2026-09-23) -- DELIBERATELY no explicit SECURITY_ATTRIBUTES.
+     * Why: passing an SA built from svc_build_log_file_sa (SDDL:
+     *   D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;S-1-5-90-0)
+     * with the PROTECTED bit) into CreateFileA from the payload's DWM-N
+     * context reliably crashed DWM in end-to-end tests (2026-09-23 3:22 PM
+     * local). Root cause not fully diagnosed -- suspected interaction
+     * between manual-map + CRT-less + PROTECTED-DACL application from a
+     * virtual account that lacks SeSecurityPrivilege. Rather than dive
+     * further, the design defers DACL policy to the launcher:
+     *
+     *   1. Payload's cfg_persist creates .tmp with default DACL. MoveFileEx
+     *      REPLACE_EXISTING inherits that SD onto config.dat. Result:
+     *      config.dat owner becomes the current DWM-<N> with FullControl
+     *      granted to DWM-<N> (specific), SYSTEM, and BUILTIN\Users:Read
+     *      (from ProgramData inheritance). Admins gets Full via inheritance.
+     *      Payload can immediately re-read cfg (we're DWM-<N>). Admin
+     *      tools work. Users can only read the encrypted blob.
+     *
+     *   2. On the very next arm (--reinject or --json-config), launcher's
+     *      heal_dacls_all() re-widens the DACL to
+     *        D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;S-1-5-90-0)
+     *      This grants Window Manager Group (not specific DWM-N) FA and
+     *      strips BUILTIN\Users -- the same policy config_write applies
+     *      on fresh install. Future DWM crashes/respawns thus stay
+     *      writable regardless of which DWM-<N+M> variant is current.
+     *
+     * Cost of this design: if the payload persists MANY times between arms
+     * (unlikely -- typical rotation is ~1x/hour), the DACL drifts back to
+     * "current DWM-<N> only". A DWM crash + respawn as DWM-<N+1> during
+     * that window would leave the new payload unable to write to config.dat
+     * until the next arm heals it. But: the new payload can still READ
+     * config.dat (SYSTEM inheritance + admin inheritance both survive),
+     * and the token_refresh_client's next successful refresh will simply
+     * fail to persist (logged, non-fatal) -- the in-memory cache stays
+     * fresh, so runtime auth still works, only reboot-survival is affected
+     * until the launcher heals on next arm. Acceptable trade-off vs the
+     * "SA in payload crashes DWM" alternative. */
     HANDLE h = CreateFileA(tmp_path, GENERIC_WRITE, 0, NULL,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) {
@@ -289,7 +332,15 @@ int cfg_persist(void) {
      * atomic rename on NTFS. The old config.dat is replaced only if the
      * write above landed fully. Under simultaneous access from another
      * process (unlikely -- config.dat is owned by launcher/payload only)
-     * ERROR_SHARING_VIOLATION would abort; retry once after 50ms. */
+     * ERROR_SHARING_VIOLATION would abort; retry once after 50ms.
+     *
+     * v14.2 (2026-09-23) -- Log EVERY failure GLE (including ACCESS_DENIED),
+     * not just the first. Pre-fix, ACCESS_DENIED was silently retried and
+     * only logged after 3 attempts as a generic "MoveFileEx failed" -- but
+     * the real GLE (5 = ACCESS_DENIED) revealed the DACL bug this function
+     * is now designed to survive. Loud logging protects against future
+     * regressions. */
+    DWORD last_gle = 0;
     for (int attempt = 0; attempt < 3; attempt++) {
         if (MoveFileExA(tmp_path, CONFIG_PATH,
                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
@@ -297,13 +348,19 @@ int cfg_persist(void) {
                         clen, CONFIG_PATH, attempt + 1);
             return 1;
         }
-        DWORD gle = GetLastError();
-        if (gle != ERROR_SHARING_VIOLATION && gle != ERROR_ACCESS_DENIED) {
-            slog_writef("payload.log", "cfg_persist: MoveFileEx failed gle=%lu", gle);
+        last_gle = GetLastError();
+        if (last_gle != ERROR_SHARING_VIOLATION && last_gle != ERROR_ACCESS_DENIED) {
+            slog_writef("payload.log", "cfg_persist: MoveFileEx failed gle=%lu (fatal)",
+                        (unsigned long)last_gle);
             break;
         }
+        slog_writef("payload.log", "cfg_persist: MoveFileEx gle=%lu (attempt %d/3, retrying)",
+                    (unsigned long)last_gle, attempt + 1);
         Sleep(50);
     }
+    slog_writef("payload.log", "cfg_persist: exhausted retries -- last gle=%lu; "
+                "did the launcher's config_heal_dacl run? (fresh install: re-arm from sihost --json-config)",
+                (unsigned long)last_gle);
     DeleteFileA(tmp_path);   /* best-effort cleanup */
     return 0;
 }

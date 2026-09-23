@@ -284,6 +284,18 @@ static void heal_log_dacls_all(const char *ctx) {
         SVC_INSTALL_DIR "\\ai.log",
         SVC_INSTALL_DIR "\\http.log",
         SVC_INSTALL_DIR "\\wl_input.log",   /* winlogon helper diag log (dev builds) */
+        /* v14.2 (2026-09-23) -- config.dat and its .tmp sibling must be
+         * writable by DWM-<N> (via WMG) so the payload's cfg_persist can
+         * atomically rewrite after an autonomous refresh_token rotation.
+         * Pre-v14.2 default DACL was SYSTEM+Admins FullControl + Users:Read,
+         * excluding WMG => cfg_persist got ACCESS_DENIED on every rotation
+         * => rotated rt was lost on payload reload/reboot => the whole point
+         * of v14 autonomous refresh was silently defeated. This heal uses
+         * the same SDDL the log-file heal uses (P(A;;FA;;;SY)(A;;FA;;;BA)
+         * (A;;FA;;;S-1-5-90-0)) -- WMG gets FullControl, Users lose read
+         * access (bonus P2 win: encrypted JWTs no longer world-readable). */
+        SVC_INSTALL_DIR "\\config.dat",
+        SVC_INSTALL_DIR "\\config.dat.tmp",
     };
     int total = 0, ok = 0, absent = 0, failed = 0;
     for (size_t i = 0; i < sizeof(kLogs) / sizeof(kLogs[0]); i++) {
@@ -301,7 +313,7 @@ static void heal_log_dacls_all(const char *ctx) {
      * way non-fatal, next log rotation via the payload's SA on create
      * will heal it. */
     slog_writef("launcher.log",
-                "%s: heal_log_dacls total=%d ok=%d absent=%d failed=%d",
+                "%s: heal_dacls total=%d ok=%d absent=%d failed=%d",
                 ctx, total, ok, absent, failed);
 }
 
