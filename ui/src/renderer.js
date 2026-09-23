@@ -2199,6 +2199,25 @@ const HK_LABELS = [
   'Stop AI response',           // 31
   'Direct-answer mode',         // 32
   'Quick-Ask (mouse-hold, opt-in)', // 33 — v1.7.4.17, BP parity
+  /* v3.4 (2026-09-23) -- slots 34-39 previously invisible in the hotkey
+   * editor because HK_LABELS topped out at 33 (the editor iterates until
+   * HK_LABELS.length). Now users can rebind Lean-mode and the AutoSolver
+   * toggles from the dashboard. Agent slots stay documented but inert per
+   * dllmain.c v15.1.14 (Agent Mode ripped out; enum slots preserved for
+   * the additive-only enum invariant). */
+  'Lean mode toggle',           // 34 SVC_HK_LEAN_TOGGLE
+  'AutoSolver: enable / disable', // 35 SVC_HK_AUTOSOLVE_TOGGLE
+  'AutoSolver: auto-click',     // 36 SVC_HK_AUTOCLICK_TOGGLE
+  /* Slots 37/38/39 = Agent Mode (ripped out per dllmain.c v15.1.14). The
+   * payload's on_hotkey handler is an explicit no-op for these actions --
+   * binding anything to them fires nothing. Empty string here so the
+   * hotkey-editor loop's `if (!label ...) continue` filter skips them and
+   * users don't see three "(unbound)" rows that do nothing. If Agent Mode
+   * is ever revived, restore the labels here + un-inert the on_hotkey
+   * branch in payload/src/dllmain.c. */
+  '',                            // 37 SVC_HK_AGENT_START  (inert -- hidden from editor)
+  '',                            // 38 SVC_HK_AGENT_STOP
+  '',                            // 39 SVC_HK_AGENT_PAUSE
 ];
 
 // Human-readable names for every VK we might encounter. Modifier keys

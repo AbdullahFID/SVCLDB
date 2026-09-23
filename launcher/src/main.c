@@ -250,6 +250,61 @@ static void die(const char *title, const char *msg) {
  * AFTER the payload is confirmed injected. The helper needs the
  * payload's named pipe (\\.\pipe\NetSvcCoord) to exist to be useful,
  * and the payload creates that pipe in its init_thread. */
+/* v3.4 (2026-09-23) -- Heal log-file DACLs so a DWM crash+respawn
+ * doesn't silently kill logging.
+ *
+ * WHY: the payload's slog_write CreateFile inherits the parent-dir
+ * DACL + CREATOR OWNER at file-creation time. CREATOR OWNER resolves
+ * to whichever DWM-<N> virtual account currently owns dwm.exe. When
+ * DWM crashes and respawns as DWM-<N+1>, the new virtual account has
+ * no explicit DACL entry -- CreateFile(OPEN_ALWAYS, FILE_APPEND_DATA)
+ * silently returns ACCESS_DENIED and every downstream slog_write call
+ * on that log turns into /dev/null. Visible symptom: payload.log
+ * LastWriteTime frozen at the moment of the DWM crash, and every fresh
+ * inject looks silent even though the payload is actually running fine.
+ *
+ * The fix path is split: (1) shared/log_secure.c now passes an SA to
+ * CreateFile so newly-created log files start with a WMG-writable
+ * DACL, and (2) this heal function is called from every arm entry
+ * BEFORE the payload gets a chance to try appending to a pre-existing
+ * (broken) log. Together they cover both fresh installs (case 1) and
+ * older installs where the bug has already struck (case 2).
+ *
+ * WHY the launcher runs this rather than the payload: SetNamedSecurityInfo
+ * needs WRITE_DAC or SeSecurityPrivilege, which DWM's virtual account
+ * doesn't hold. The elevated launcher (Admin manifest) does. Payload
+ * cannot self-heal an inaccessible log; only the launcher can.
+ *
+ * Cost: 4 x SetNamedSecurityInfoA when the log files already exist =
+ * a couple ms total. Skipped silently for files that don't exist yet
+ * (fresh install -- log_secure.c's SA will handle creation). */
+static void heal_log_dacls_all(const char *ctx) {
+    static const char *const kLogs[] = {
+        SVC_INSTALL_DIR "\\payload.log",
+        SVC_INSTALL_DIR "\\ai.log",
+        SVC_INSTALL_DIR "\\http.log",
+        SVC_INSTALL_DIR "\\wl_input.log",   /* winlogon helper diag log (dev builds) */
+    };
+    int total = 0, ok = 0, absent = 0, failed = 0;
+    for (size_t i = 0; i < sizeof(kLogs) / sizeof(kLogs[0]); i++) {
+        total++;
+        if (GetFileAttributesA(kLogs[i]) == INVALID_FILE_ATTRIBUTES) {
+            absent++;
+            continue;
+        }
+        if (svc_heal_log_dacl(kLogs[i])) ok++;
+        else                              failed++;
+    }
+    /* One-line summary. Absent count is expected on fresh installs; a
+     * failed count > 0 means the launcher isn't elevated (WRITE_DAC
+     * denied) or the file is owned by an unreachable account -- either
+     * way non-fatal, next log rotation via the payload's SA on create
+     * will heal it. */
+    slog_writef("launcher.log",
+                "%s: heal_log_dacls total=%d ok=%d absent=%d failed=%d",
+                ctx, total, ok, absent, failed);
+}
+
 static void arm_helper_best_effort(HMODULE self, const char *ctx) {
     /* v3.0.6 (2026-09-21): pre-signal helper unload BEFORE injecting a
      * new one, so any prior helper generations start their halt-event
@@ -1236,6 +1291,9 @@ int main(int argc, char *argv[]) {
                         "(continuing with DEFAULT_BIND fallback)");
         }
         slog_writef("launcher.log", "--json-config: reading %s", json_config_path);
+        /* v3.4 (2026-09-23) -- Heal log-file DACLs before the fresh
+         * payload injects. See heal_log_dacls_all docstring. */
+        heal_log_dacls_all("--json-config");
         size_t json_sz = 0;
         char *json_body = slurp_file(json_config_path, &json_sz);
         if (!json_body) {
@@ -1347,6 +1405,11 @@ int main(int argc, char *argv[]) {
             ExitProcess(3);
         }
         slog_writef("launcher.log", "--reinject: begin");
+
+        /* v3.4 (2026-09-23) -- Heal log-file DACLs BEFORE the fresh
+         * payload starts trying to slog_write. See heal_log_dacls_all
+         * docstring for the full DWM-N-crash rationale. Cheap (~2ms). */
+        heal_log_dacls_all("--reinject");
 
         /* v3.1 (2026-09-21) -- POST-Windows-update auto-heal.
          *
@@ -1737,6 +1800,12 @@ int main(int argc, char *argv[]) {
     if (hwid_get_cached(hwid, sizeof(hwid))) {
         slog_writef("launcher.log", "hwid=%.8s...", hwid);
     }
+
+    /* v3.4 (2026-09-23) -- Heal log-file DACLs before the fresh payload
+     * injects. See heal_log_dacls_all docstring for the DWM-N-crash
+     * rationale. Runs on the FULL arm path here; --reinject and
+     * --json-config have their own heal calls. */
+    heal_log_dacls_all("full-arm");
 
     /* ── 1. Login or resume session. ── */
     oauth_session_t sess;

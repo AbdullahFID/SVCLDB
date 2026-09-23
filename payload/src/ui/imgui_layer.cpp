@@ -54,9 +54,20 @@ extern "C" {
 #include "../dwm_hooks.h"
 #include "../clipboard_out.h"   /* v9: unified retry+UNICODETEXT copy helper */
 #include "../redact/redact_client.h"   /* screenshot-redactor pipe client */
+#include "../config_read.h"    /* v3.4 (2026-09-23): cfg_get + cfg_persist for Home-hub quick-toggles */
+#include "../autosolver/as_cfg.h"   /* v3.4 (2026-09-23): moved up from mid-file so draw_home_hub can render AutoSolver state */
 /* v3.0.2.3 (2026-09-21) -- extern for the Cancel/Send buttons in the
  * chat footer (defined in dllmain.c). */
 void chat_submit_typed_text(void);
+/* v3.4 (2026-09-23) -- forward decl for the dot-state persistence helpers
+ * used by the answer-dot's drag/resize/opacity handlers. Function bodies
+ * live in autosolver/as_cfg.c. Moved here from the dot-render section so
+ * the compilation-unit-wide extern "C" block is one place, not two. */
+void as_cfg_set_dot_ui_state(int ui);
+void as_cfg_set_dot_pos(int x, int y);
+void as_cfg_set_dot_full_size(int w, int h);
+void as_cfg_set_dot_opacity(double alpha);
+void as_cfg_set_dot_show_slider(int on);
 }
 
 #pragma comment(lib, "d3d11.lib")
@@ -549,8 +560,11 @@ static bool             g_imgui_inited= false;
  *   - Theme colors (dark or light)
  *   - Show/hide via Ctrl+B
  *
- * Toggled at runtime via SVC_HK_LEAN_TOGGLE (Ctrl+Shift+Alt+M) or
- * via svchelper UI at inject time. */
+ * Toggled at runtime via SVC_HK_LEAN_TOGGLE (default Ctrl+Shift+Alt+M --
+ * user-rebindable via the Electron hotkey editor; the label rendered in
+ * lean mode's own header is composed dynamically via ui_format_hotkey so
+ * it stays truthful across rebinds), or from the Home hub's Lean mode
+ * toggle button. */
 static volatile LONG    g_lean_mode   = 0;
 
 /* v12 (2026-07-24) -- ARCHITECTURAL REFACTOR TO BP PARITY.
@@ -897,8 +911,16 @@ static int              g_status_streaming = 0;
  * ui_set_hotkey_bindings. Used by UI buttons that show the mapped
  * hotkey (e.g. "copy full [Ctrl+Alt+C]"). Read-mostly after init;
  * no locking needed for simple reads since writes are rare + atomic
- * on x64 for aligned 32-bit ints. */
-#define UI_HK_MAX 32
+ * on x64 for aligned 32-bit ints.
+ *
+ * v3.4 (2026-09-23) -- bumped 32 -> 64 to match svc_config_t.hotkeys[]
+ * capacity. Prior 32-slot cap silently dropped labels for slots 32+
+ * (DIRECT_TOGGLE=32, QUICK_ASK=33, LEAN_TOGGLE=34, AutoSolver 35/36,
+ * Agent 37-39) -- ui_format_hotkey(SVC_HK_LEAN_TOGGLE, ...) returned
+ * empty string, making the Lean-mode header render "(unbound)" even
+ * though the hotkey was actually bound at the config layer. Widening
+ * this to 64 (the config field width) makes every slot addressable. */
+#define UI_HK_MAX 64
 static unsigned         g_hk_bindings[UI_HK_MAX] = {0};
 static int              g_hk_bindings_n = 0;
 static volatile LONG    g_hk_bindings_ver = 0;   /* bumps on update */
@@ -2930,6 +2952,164 @@ extern "C" void ui_toggle_lean() {
 
 extern "C" int ui_is_lean() {
     return (int)InterlockedCompareExchange(&g_lean_mode, 0, 0);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ * v3.4 (2026-09-23) -- Home hub quick-toggles for settings previously
+ * only reachable from the Electron dashboard. See imgui_layer.h for the
+ * design contract. Every mutator persists via cfg_persist() so the choice
+ * survives payload reload; every read is a snapshot (no locking cost
+ * beyond a cfg_get() dereference + one Interlocked/atomic word read).
+ * ══════════════════════════════════════════════════════════════════════ */
+
+extern "C" void ui_toggle_silent_mods(void) {
+    svc_config_t *mcfg = (svc_config_t *)cfg_get();
+    if (!mcfg) return;
+    mcfg->overlay_flags ^= SVC_OVFLAG_SILENT_MODS;
+    /* Refresh the cached g_overlay_flags so ui_get_overlay_flags reflects
+     * the change instantly (rawinput_hook.c's LL hook reads cfg->overlay_flags
+     * directly on every keystroke via cfg_get, so its swallow logic already
+     * flips atomically -- but the imgui-layer's own theme/chrome loop
+     * subscribes to g_overlay_flags for the SMOOTH_NUDGE and UNIFORM_ALPHA
+     * bits, which we do NOT want to knock out of sync here). */
+    InterlockedExchange(&g_overlay_flags, (LONG)mcfg->overlay_flags);
+    int on = (mcfg->overlay_flags & SVC_OVFLAG_SILENT_MODS) != 0;
+    cfg_persist();
+    /* Caveat: the winlogon helper's LL hook (isolated / secure desktops)
+     * reads _hk.bin which the LAUNCHER writes on arm -- so this in-flight
+     * toggle only affects the Default desktop's payload-side hook until
+     * the next --reinject rewrites _hk.bin. Toast makes that explicit so
+     * the user isn't surprised on secure-desktop workflows. */
+    ui_show_toast(on
+        ? "Deep hide: ON  (Ctrl/Shift/Alt swallowed. Re-inject to apply on secure desktops.)"
+        : "Deep hide: OFF  (modifiers pass through to focused app)", 2600);
+    diag("silent_mods toggled: %d (flags=0x%x)", on, mcfg->overlay_flags);
+}
+
+extern "C" void ui_toggle_stream_batched(void) {
+    svc_config_t *mcfg = (svc_config_t *)cfg_get();
+    if (!mcfg) return;
+    mcfg->stream_display_batched = mcfg->stream_display_batched ? 0 : 1;
+    cfg_persist();
+    ui_show_toast(mcfg->stream_display_batched
+        ? "Batched stream: ON  (renders full reply at once -- less DWM churn)"
+        : "Batched stream: OFF  (live-typing effect)", 2400);
+    diag("stream_batched -> %d", mcfg->stream_display_batched);
+}
+
+extern "C" void ui_toggle_ultra_size(void) {
+    svc_config_t *mcfg = (svc_config_t *)cfg_get();
+    if (!mcfg) return;
+    mcfg->size_mode = mcfg->size_mode ? 0 : 1;
+    cfg_persist();
+    /* size_mode changes the runtime clamp range used by ui_resize; nothing
+     * to invalidate immediately (the overlay is at its current size, and
+     * subsequent resize hotkeys / drag events will honor the new bounds). */
+    ui_show_toast(mcfg->size_mode
+        ? "Ultra size: ON  (tiny pip <-> near-fullscreen bounds)"
+        : "Ultra size: OFF  (normal on-screen bounds)", 2200);
+    diag("ultra_size -> %d", mcfg->size_mode);
+}
+
+extern "C" int ui_cycle_reasoning(void) {
+    svc_config_t *mcfg = (svc_config_t *)cfg_get();
+    if (!mcfg) return 0;
+    /* Cycle 1..5 (skip 0 = unset/default-high). Wraps: xhigh -> minimal. */
+    int e = mcfg->reasoning_effort;
+    if (e < 1 || e > 5) e = 4;      /* normalize old / stale values */
+    e = (e % 5) + 1;                 /* 1->2, 2->3, ..., 5->1 */
+    mcfg->reasoning_effort = e;
+    cfg_persist();
+    const char *n = (e == 1) ? "minimal" :
+                    (e == 2) ? "low"     :
+                    (e == 3) ? "medium"  :
+                    (e == 4) ? "high"    : "xhigh";
+    char msg[96];
+    _snprintf(msg, sizeof(msg) - 1, "Reasoning: %s", n);
+    msg[sizeof(msg) - 1] = 0;
+    ui_show_toast(msg, 2000);
+    diag("reasoning_effort -> %d (%s)", e, n);
+    return e;
+}
+
+/* Cycle 40 / 80 / 160 / 240 -- covers "gentle", "default", "fast",
+ * "leap". Value is clamped 20..400 elsewhere; any stale/corrupt value
+ * lands us at 80 on next cycle. */
+extern "C" int ui_cycle_scroll_step(void) {
+    svc_config_t *mcfg = (svc_config_t *)cfg_get();
+    if (!mcfg) return 80;
+    int s = mcfg->scroll_step_px;
+    int nx;
+    if      (s <= 40)  nx = 80;
+    else if (s <= 80)  nx = 160;
+    else if (s <= 160) nx = 240;
+    else               nx = 40;
+    mcfg->scroll_step_px = nx;
+    cfg_persist();
+    char msg[64];
+    _snprintf(msg, sizeof(msg) - 1, "Scroll step: %d px", nx);
+    msg[sizeof(msg) - 1] = 0;
+    ui_show_toast(msg, 1800);
+    diag("scroll_step_px -> %d", nx);
+    return nx;
+}
+
+/* Cycle 4 / 12 / 24 / 48 / 96 -- micro-adjust -> big-hop. */
+extern "C" int ui_cycle_nudge_step(void) {
+    svc_config_t *mcfg = (svc_config_t *)cfg_get();
+    if (!mcfg) return 48;
+    int s = mcfg->nudge_step_px;
+    int nx;
+    if      (s <= 4)  nx = 12;
+    else if (s <= 12) nx = 24;
+    else if (s <= 24) nx = 48;
+    else if (s <= 48) nx = 96;
+    else              nx = 4;
+    mcfg->nudge_step_px = nx;
+    cfg_persist();
+    char msg[64];
+    _snprintf(msg, sizeof(msg) - 1, "Nudge step: %d px", nx);
+    msg[sizeof(msg) - 1] = 0;
+    ui_show_toast(msg, 1800);
+    diag("nudge_step_px -> %d", nx);
+    return nx;
+}
+
+extern "C" int ui_get_reasoning_effort(void) {
+    const svc_config_t *rcfg = cfg_get();
+    if (!rcfg) return 4;   /* default = high (matches effort_str's fallback) */
+    int e = rcfg->reasoning_effort;
+    if (e < 1 || e > 5) e = 4;
+    return e;
+}
+
+extern "C" int ui_get_scroll_step(void) {
+    const svc_config_t *rcfg = cfg_get();
+    if (!rcfg) return 80;
+    int s = rcfg->scroll_step_px;
+    return (s >= 20 && s <= 400) ? s : 80;
+}
+
+extern "C" int ui_get_nudge_step(void) {
+    const svc_config_t *rcfg = cfg_get();
+    if (!rcfg) return 48;
+    int s = rcfg->nudge_step_px;
+    return (s >= 1 && s <= 200) ? s : 48;
+}
+
+extern "C" int ui_get_stream_batched(void) {
+    const svc_config_t *rcfg = cfg_get();
+    return (rcfg && rcfg->stream_display_batched) ? 1 : 0;
+}
+
+extern "C" int ui_get_ultra_size(void) {
+    const svc_config_t *rcfg = cfg_get();
+    return (rcfg && rcfg->size_mode) ? 1 : 0;
+}
+
+extern "C" int ui_get_silent_mods(void) {
+    unsigned f = ui_get_overlay_flags();
+    return (f & SVC_OVFLAG_SILENT_MODS) ? 1 : 0;
 }
 
 extern "C" int ui_is_visible() {
@@ -5620,8 +5800,31 @@ static void draw_home_hub(const ui_theme_t &T, float scale, float alpha_cur,
     buf[sizeof(buf) - 1] = 0;
     if (cta_button("##h_tier", IC_NONE, buf, false, scale, T)) { ui_action_fire(SVC_HK_CYCLE_TIER); ui_view_show_home(); }
     ImGui::TextColored(T.text_dim, "Model: %s", (model && model[0]) ? model : "(default)");
+    /* v3.4 (2026-09-23) -- Reasoning effort cycler. Mirrors the Electron
+     * "AI answer style" dropdown but exposed as a one-click cycler so users
+     * can flip Strong-tier reasoning intensity without opening svchelper. */
+    {
+        int re = ui_get_reasoning_effort();
+        const char *rn = (re == 1) ? "minimal" :
+                         (re == 2) ? "low"     :
+                         (re == 3) ? "medium"  :
+                         (re == 4) ? "high"    : "xhigh";
+        _snprintf(buf, sizeof(buf) - 1, "Reasoning: %s", rn);
+        buf[sizeof(buf) - 1] = 0;
+        if (cta_button("##h_reason", IC_NONE, buf, false, scale, T)) { ui_cycle_reasoning(); ui_view_show_home(); }
+    }
     if (cta_button("##h_str", IC_NONE, streaming ? "Streaming: ON" : "Streaming: OFF",
                    streaming != 0, scale, T)) { ui_action_fire(SVC_HK_STREAM_TOGGLE); ui_view_show_home(); }
+    ImGui::SameLine(0, 6.0f * scale);
+    /* v3.4 (2026-09-23) -- Batched-stream toggle. When on, the overlay
+     * buffers SSE chunks and only re-renders once at stream-done -- 200x
+     * less DWM churn on long answers, matches Electron's "Wait for full
+     * answer" checkbox. Only meaningful when Streaming is also ON. */
+    {
+        int sb = ui_get_stream_batched();
+        if (cta_button("##h_sbat", IC_NONE, sb ? "Batched: ON" : "Batched: OFF",
+                       sb != 0, scale, T)) { ui_toggle_stream_batched(); ui_view_show_home(); }
+    }
     ImGui::SameLine(0, 6.0f * scale);
     if (cta_button("##h_dir", IC_NONE, "Direct", false, scale, T)) { ui_action_fire(SVC_HK_DIRECT_TOGGLE); ui_view_show_home(); }
     ImGui::SameLine(0, 6.0f * scale);
@@ -5681,6 +5884,19 @@ static void draw_home_hub(const ui_theme_t &T, float scale, float alpha_cur,
         if (cta_button("##h_lean", IC_LEAN, lean_on ? "Lean mode: ON" : "Lean mode: OFF",
                        lean_on != 0, scale, T)) ui_toggle_lean();
     }
+    /* v3.4 (2026-09-23) -- Deep-hide toggle. Mirror of Electron's "Deep
+     * hide" chip (SVC_OVFLAG_SILENT_MODS). When on, bare Ctrl/Shift/Alt
+     * key events are swallowed so the target app never sees them --
+     * concealment mode for typing-heavy exams where "user held Ctrl"
+     * would be evidence. In-app shortcuts (Ctrl+C copy, Ctrl+A select-
+     * all) stop working while on -- explicit opt-in trade-off. */
+    ImGui::SameLine(0, 6.0f * scale);
+    {
+        int dh = ui_get_silent_mods();
+        if (cta_button("##h_deephide", IC_EYE_OFF,
+                       dh ? "Deep hide: ON" : "Deep hide: OFF",
+                       dh != 0, scale, T)) ui_toggle_silent_mods();
+    }
     card_end();
 
     ImGui::Dummy(ImVec2(0, 8.0f * scale));
@@ -5698,8 +5914,82 @@ static void draw_home_hub(const ui_theme_t &T, float scale, float alpha_cur,
     if (cta_button("##h_corner", IC_LAYOUT, "Corner", false, scale, T)) ui_cycle_corner();
     ImGui::SameLine(0, 6.0f * scale);
     if (cta_button("##h_reset", IC_REFRESH, "Reset layout", false, scale, T)) ui_reset_geometry();
+    /* v3.4 (2026-09-23) -- Ultra size + step-granularity cyclers. Mirror
+     * of Electron's "Overlay appearance" card so users don't need to
+     * open svchelper to switch between pip-in-corner and near-fullscreen
+     * bounds or to tune arrow-key micro-adjust vs big-hop speed. */
+    {
+        int us = ui_get_ultra_size();
+        _snprintf(buf, sizeof(buf) - 1, "Ultra size: %s", us ? "ON" : "OFF");
+        buf[sizeof(buf) - 1] = 0;
+        if (cta_button("##h_ultra", IC_LAYOUT, buf, us != 0, scale, T)) ui_toggle_ultra_size();
+    }
+    ImGui::SameLine(0, 6.0f * scale);
+    {
+        int ns = ui_get_nudge_step();
+        _snprintf(buf, sizeof(buf) - 1, "Nudge: %dpx", ns);
+        buf[sizeof(buf) - 1] = 0;
+        if (cta_button("##h_nudge", IC_NONE, buf, false, scale, T)) ui_cycle_nudge_step();
+    }
+    ImGui::SameLine(0, 6.0f * scale);
+    {
+        int ss = ui_get_scroll_step();
+        _snprintf(buf, sizeof(buf) - 1, "Scroll: %dpx", ss);
+        buf[sizeof(buf) - 1] = 0;
+        if (cta_button("##h_scroll", IC_NONE, buf, false, scale, T)) ui_cycle_scroll_step();
+    }
     ImGui::Dummy(ImVec2(0, 2.0f * scale));
     ImGui::TextColored(T.text_dim, "Drag the header to move. Drag any corner to resize.");
+    card_end();
+
+    ImGui::Dummy(ImVec2(0, 8.0f * scale));
+
+    /* ── AutoSolver card (v3.4, 2026-09-23) ─────────────────────── *
+     *
+     * Mirrors the Electron dashboard's AutoSolver & Agent card. The
+     * ENABLE toggle owns hold-to-solve globally; AUTO-CLICK gates
+     * synthetic mouse movement (display-only vs move+click); DOT
+     * ENABLE controls whether the capture-stealth status dot renders
+     * when the overlay is hidden.
+     *
+     * Rebinding the trigger (which mouse button, hold duration, etc.)
+     * still lives in the Electron hotkey editor -- that's the "except
+     * hotkey binding" carve-out from the settings-consistency request
+     * (adult text-input edits belong in the desktop app, not in the
+     * overlay's ImGui surface).
+     *
+     * All three actions round-trip through as_cfg_* so autosolver.json
+     * on disk is updated within the same tick; Electron's mtime watcher
+     * (main.js loadAutosolver) sees the change on next dashboard visit. */
+    card_begin("##card_solve", T, scale);
+    section_header(IC_BOLT, "AutoSolver", scale, T);
+    {
+        const as_settings_t *asc = as_cfg();
+        int as_on   = asc && asc->autosolver_enabled;
+        int ac_on   = asc && asc->auto_click;
+        int dot_on  = ui_dot_is_enabled();
+
+        _snprintf(buf, sizeof(buf) - 1, "Enable: %s", as_on ? "ON" : "OFF");
+        buf[sizeof(buf) - 1] = 0;
+        if (cta_button("##h_asen", IC_BOLT, buf, as_on != 0, scale, T)) {
+            ui_action_fire(SVC_HK_AUTOSOLVE_TOGGLE); ui_view_show_home();
+        }
+        ImGui::SameLine(0, 6.0f * scale);
+        _snprintf(buf, sizeof(buf) - 1, "Auto-click: %s", ac_on ? "ON" : "OFF");
+        buf[sizeof(buf) - 1] = 0;
+        if (cta_button("##h_acen", IC_NONE, buf, ac_on != 0, scale, T)) {
+            ui_action_fire(SVC_HK_AUTOCLICK_TOGGLE); ui_view_show_home();
+        }
+        ImGui::SameLine(0, 6.0f * scale);
+        _snprintf(buf, sizeof(buf) - 1, "Dot: %s", dot_on ? "ON" : "OFF");
+        buf[sizeof(buf) - 1] = 0;
+        if (cta_button("##h_doten", IC_EYE_OFF, buf, dot_on != 0, scale, T)) {
+            ui_dot_set_enabled(!dot_on);
+        }
+    }
+    ImGui::Dummy(ImVec2(0, 2.0f * scale));
+    ImGui::TextColored(T.text_dim,
+        "Hold the trigger (default: LMB 2s) on a question to solve.");
     card_end();
 }
 
@@ -5917,15 +6207,9 @@ static void draw_resize_grip(const ui_theme_t &T, float scale) {
  *     and drops them through ImGui IO -- we then read them here via
  *     ImGui::IsMouseClicked/Down/Released to run the drag / click state
  *     machine on the foreground draw list. */
-#include "../autosolver/as_cfg.h"
-extern "C" {
-    void as_cfg_set_dot_ui_state(int ui);
-    void as_cfg_set_dot_pos(int x, int y);
-    void as_cfg_set_dot_full_size(int w, int h);
-    void as_cfg_set_dot_opacity(double alpha);
-    void as_cfg_set_dot_show_slider(int on);
-    const as_settings_t *as_cfg(void);
-}
+/* v3.4 (2026-09-23) -- as_cfg.h + the as_cfg_set_dot_* extern block moved
+ * to the top-of-file extern "C" block so draw_home_hub (defined earlier)
+ * can also render AutoSolver state without a forward-decl dance. */
 
 static volatile LONG      g_dot_enabled = 1;
 static volatile LONG      g_dot_state   = UI_DOT_IDLE;       /* solve state (color)   */
@@ -7181,15 +7465,40 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
             fg->AddRectFilled(ImVec2(rx0, ry0), ImVec2(rx1, ry1), bg_col, 12.0f * scale);
             fg->AddRect(ImVec2(rx0, ry0), ImVec2(rx1, ry1), border_col, 12.0f * scale, 0, 2.0f);
 
-            /* "LEAN" label top-left. */
+            /* "LEAN" label top-left.
+             *
+             * v3.3.3 (2026-09-23) -- LEAN MODE hotkey-label consistency pass.
+             * The header and placeholder used to hardcode "Ctrl+Shift+Alt+M"
+             * and "Ctrl+Shift+Space" -- both were the pre-BP-parity defaults
+             * that stopped being the current bindings back in v1.7.4.13
+             * (2026-07-24, "Ctrl+U" for ASK) AND stopped being truthful the
+             * moment a user rebinds either action in the Electron hotkey
+             * editor. Now composed dynamically via ui_format_hotkey against
+             * g_hk_bindings[] (single source of truth = the live payload
+             * config the launcher wrote from Electron overrides on inject).
+             * If either slot is unbound, we fall back to "(unbound)" so the
+             * user sees the truth instead of a lie. */
+            char lean_hk[64] = {0}, ask_hk[64] = {0};
+            ui_format_hotkey(SVC_HK_LEAN_TOGGLE, lean_hk, sizeof(lean_hk));
+            ui_format_hotkey(SVC_HK_ASK,         ask_hk,  sizeof(ask_hk));
+            char header[128];
+            _snprintf(header, sizeof(header) - 1,
+                      "LEAN  \xE2\x80\xA2  %s to toggle",
+                      lean_hk[0] ? lean_hk : "(unbound)");
+            header[sizeof(header) - 1] = 0;
             float pad = 14.0f * scale;
             fg->AddText(ImVec2(rx0 + pad, ry0 + pad),
-                        label_col, "LEAN  \xE2\x80\xA2  Ctrl+Shift+Alt+M to toggle");
+                        label_col, header);
 
             /* Last AI reply body (or placeholder). */
+            char placeholder[160];
+            _snprintf(placeholder, sizeof(placeholder) - 1,
+                      "no reply yet - press %s to ask",
+                      ask_hk[0] ? ask_hk : "(unbound)");
+            placeholder[sizeof(placeholder) - 1] = 0;
             const char *body = lean_text && *lean_text
                                ? lean_text
-                               : "no reply yet - press Ctrl+Shift+Space to ask";
+                               : placeholder;
             /* Wrap text to overlay width via PushTextWrapPos equivalent --
              * ImDrawList::AddText has a wrap_width overload. */
             float text_pad_top = pad + 26.0f * scale;

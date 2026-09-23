@@ -75,3 +75,62 @@ int svc_build_bind_secret_sa(SECURITY_ATTRIBUTES *out_sa,
     out_sa->lpSecurityDescriptor = *out_sd;
     return 1;
 }
+
+int svc_build_log_file_sa(SECURITY_ATTRIBUTES *out_sa,
+                          PSECURITY_DESCRIPTOR *out_sd) {
+    if (!out_sa || !out_sd) return 0;
+    *out_sd = NULL;
+    out_sa->nLength = sizeof(*out_sa);
+    out_sa->bInheritHandle = FALSE;
+    out_sa->lpSecurityDescriptor = NULL;
+    /* FA = FILE_ALL_ACCESS. P = Protected DACL (no inheritance from
+     * ProgramData -- keeps the ACL stable across parent-dir tweaks).
+     * SY + BA gives elevated tools (launcher, dlog tail, support export)
+     * full access. S-1-5-90-0 (Window Manager Group) covers every past
+     * and future DWM-<N> virtual account so the file stays writable
+     * across DWM crashes / shell restarts -- the whole point of this
+     * SA (see sec_attr.h docstring). */
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;S-1-5-90-0)",
+            SDDL_REVISION_1, out_sd, NULL)) {
+        return 0;
+    }
+    out_sa->lpSecurityDescriptor = *out_sd;
+    return 1;
+}
+
+#include <aclapi.h>
+#pragma comment(lib, "advapi32.lib")
+
+int svc_heal_log_dacl(const char *path) {
+    if (!path || !*path) return 0;
+    /* Silent no-op if the file doesn't exist yet -- nothing to heal. */
+    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) return 1;
+
+    /* Build the target DACL from the same SDDL svc_build_log_file_sa uses
+     * so on-disk healed files match freshly-created ones byte-for-byte
+     * in their ACL. */
+    PSECURITY_DESCRIPTOR psd = NULL;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;S-1-5-90-0)",
+            SDDL_REVISION_1, &psd, NULL)) {
+        return 0;
+    }
+    BOOL dacl_present = FALSE, dacl_defaulted = FALSE;
+    PACL dacl = NULL;
+    int rc = 0;
+    if (GetSecurityDescriptorDacl(psd, &dacl_present, &dacl, &dacl_defaulted)
+            && dacl_present) {
+        /* PROTECTED_DACL_SECURITY_INFORMATION mirrors the "P" flag in
+         * the SDDL string above -- ensures existing inherited ACEs get
+         * stripped when we overwrite. Without this, a parent-dir DACL
+         * change would silently re-add a Users-inheritance entry that
+         * doesn't cover Window Manager Group. */
+        DWORD r = SetNamedSecurityInfoA((LPSTR)path, SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            NULL, NULL, dacl, NULL);
+        rc = (r == ERROR_SUCCESS) ? 1 : 0;
+    }
+    LocalFree(psd);
+    return rc;
+}

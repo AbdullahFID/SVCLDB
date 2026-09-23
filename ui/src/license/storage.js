@@ -231,7 +231,7 @@ const HOTKEYS_FILE = path.join(APPDATA_DIR, 'hotkeys.json');
  * injector.js changes shape or slot->key mapping. Ok to leave
  * constant across minor bug-fix versions that don't touch the
  * default map. */
-const HOTKEYS_DEFAULTS_VER = 5;   /* v1.7.4.17 = + SVC_HK_QUICK_ASK slot 33 (unbound default) */
+const HOTKEYS_DEFAULTS_VER = 6;   /* v3.4 (2026-09-23) -- DEFAULT_HOTKEYS array grew from 34 to 40 slots (Lean mode + AutoSolver + Agent). Bump forces stale sub-34 override maps to discard so the new full-length defaults apply cleanly; user preferences on slots 0..33 that they DID explicitly customize survive only because save stamps the current version -- the whole point of this bump is that anyone whose overrides predate v6 gets a clean slate for the wider slot range. v1.7.4.17 = + SVC_HK_QUICK_ASK slot 33. */
 const SPEED_MODES = ['fast','normal','slow','adaptive'];
 
 function _readHotkeyFile() {

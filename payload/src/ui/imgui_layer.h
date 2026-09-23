@@ -234,6 +234,37 @@ void ui_apply_theme_and_flags(int theme, unsigned overlay_flags);
 unsigned ui_get_overlay_flags(void);
 int      ui_get_theme_effective(void);
 
+/* v3.4 (2026-09-23) -- Home hub quick-toggles that mutate cfg fields
+ * previously only settable from the Electron dashboard. Each writer:
+ *   (a) mutates the cached svc_config_t under the cfg critical section,
+ *   (b) calls cfg_persist() so the choice survives a payload reload,
+ *   (c) fires ui_show_toast() so the user sees a live confirmation, and
+ *   (d) updates any dependent runtime state (e.g. Deep-hide flag also
+ *       rewrites the DACL'd _hk.bin so the winlogon helper's LL hook on
+ *       isolated desktops flips its swallow behavior instantly).
+ * Every call is thread-safe -- safe from the compose thread, from the
+ * imgui button-click handler, and from hotkey callbacks.
+ *
+ * Ownership: these live in imgui_layer.cpp alongside ui_toggle_visible /
+ * ui_toggle_lean because they're semantically "one-click settings from
+ * the overlay" -- same audience as the existing home-hub toggles. */
+void ui_toggle_silent_mods(void);       /* flip SVC_OVFLAG_SILENT_MODS bit */
+void ui_toggle_stream_batched(void);    /* flip cfg->stream_display_batched */
+void ui_toggle_ultra_size(void);        /* flip cfg->size_mode 0<->1 */
+int  ui_cycle_reasoning(void);          /* cycle 0..5, returns new value */
+int  ui_cycle_scroll_step(void);        /* cycle 40 / 80 / 160 / 240 px, returns new */
+int  ui_cycle_nudge_step(void);         /* cycle 4 / 12 / 24 / 48 / 96 px, returns new */
+
+/* v3.4 (2026-09-23) -- read-only introspection so the Home hub can render
+ * the current value on the label ("Reasoning: high", "Nudge: 48px", etc.).
+ * All cheap Interlocked / cfg reads; no allocation, safe from any thread. */
+int  ui_get_reasoning_effort(void);
+int  ui_get_scroll_step(void);
+int  ui_get_nudge_step(void);
+int  ui_get_stream_batched(void);
+int  ui_get_ultra_size(void);
+int  ui_get_silent_mods(void);
+
 /* Request a DWM-side screen capture. Blocks up to `timeout_ms` for a fresh
  * frame to be grabbed from the compositor's layer backbuffer (the same
  * texture we render into). Returns 1 on success with *png_out / *len_out

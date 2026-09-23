@@ -8,6 +8,10 @@
 
 #include "common.h"
 #include "log_secure.h"
+#include "sec_attr.h"     /* v3.4 (2026-09-23): svc_build_log_file_sa for
+                           * CreateFile so newly-created log files start
+                           * with a WMG-writable DACL -- prevents the
+                           * "logs go silent after DWM crash" bug. */
 
 #include <bcrypt.h>
 #include <stdio.h>
@@ -260,9 +264,38 @@ void slog_write(const char *filename, const char *message) {
 
     CreateDirectoryA(SVC_INSTALL_DIR, NULL);
 
+    /* v3.4 (2026-09-23) -- Build the log-file SA once, cache forever.
+     * Windows applies the SD ONLY when CreateFile actually creates the
+     * file (OPEN_ALWAYS on an existing file ignores the SD). So the
+     * cost is one SDDL parse per process; every subsequent slog_write
+     * reuses the cached descriptor. On the first fresh log create, the
+     * DACL grants FA to SYSTEM+Admins+WindowManagerGroup so future
+     * DWM-<N+1> instances (after any shell restart) can still append.
+     *
+     * Failing to build the SA falls back to CreateFile(NULL) -- same
+     * as pre-v3.4 behavior, i.e. the bug reappears but nothing breaks.
+     * The launcher's arm-time svc_heal_log_dacl covers this fallback +
+     * heals older installs that predate this fix. */
+    static SECURITY_ATTRIBUTES s_log_sa;
+    static PSECURITY_DESCRIPTOR s_log_sd = NULL;
+    static volatile LONG s_log_sa_init = 0;   /* 0=unset 1=building 2=ok 3=failed */
+    LPSECURITY_ATTRIBUTES psa = NULL;
+    LONG sa_state = InterlockedCompareExchange(&s_log_sa_init, 1, 0);
+    if (sa_state == 0) {
+        if (svc_build_log_file_sa(&s_log_sa, &s_log_sd)) {
+            InterlockedExchange(&s_log_sa_init, 2);
+        } else {
+            InterlockedExchange(&s_log_sa_init, 3);
+        }
+    } else if (sa_state == 1) {
+        /* Another thread is initializing; brief spin (rare). */
+        for (int i = 0; i < 50 && s_log_sa_init == 1; i++) Sleep(1);
+    }
+    if (s_log_sa_init == 2) psa = &s_log_sa;
+
     EnterCriticalSection(&g_lock);
     HANDLE h = CreateFileA(fullpath, FILE_APPEND_DATA,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, psa,
                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) {
         DWORD w = 0;

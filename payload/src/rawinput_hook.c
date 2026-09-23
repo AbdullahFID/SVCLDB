@@ -2813,20 +2813,83 @@ static void dispatch_external_mouse(unsigned int wp, int px, int py, unsigned in
 }
 
 /* Repeat driver: on the isolated desktop where poll_thread's GetAsyncKeyState
- * is blind, this thread drains LONGPRESS timers (which need periodic "is the
- * key still held?" checks). The MODIFIER-hold path has been simplified to
- * fire-per-UP in dispatch_external_key -- see the v3.0.2.2 comment there for
- * why virt-hold was removed. */
+ * is blind, this thread drains LONGPRESS timers AND drives continuous-hold
+ * MODIFIER re-fires ("hold Ctrl+arrow to glide"). Two independent drains:
+ *
+ *   (a) LONGPRESS: fires the slot once when hold_ms elapses on a still-held vk.
+ *   (b) MODIFIER hold-to-repeat (v3.3.3, 2026-09-23): for MODIFIER slots that
+ *       have g_repeat_allowed=1 (movement, resize, alpha, font, scroll), if
+ *       the payload's Pass 1 has granted this slot ownership of its target vk
+ *       AND both key + modifiers are still held per g_pipe_key[], re-fire at
+ *       60Hz -- same cadence poll_thread drives on Default. Result: iso
+ *       desktop now has the SAME smooth-glide UX as Default when holding
+ *       Ctrl+arrow etc.
+ *
+ * WHY THIS WORKS NOW (was blocked pre-v3.3):
+ *   Pre-v3.3 the pipe path saw only RIDEV_INPUTSINK events, and Windows'
+ *   desktop-chord suppression on iso delivered only sparse ~400-700ms UPs
+ *   for Ctrl+key -- no reliable "is it held right now" signal, so any
+ *   heuristic virt-hold randomly false-triggered on rapid taps and was
+ *   removed in v3.0.2.2.
+ *
+ *   v3.3 routes iso keyboard through the winlogon helper's LL hook (fires
+ *   BEFORE Windows' desktop-chord suppression, at the raw input path
+ *   layer). LL hook forwards every DN/UP via pipe, so g_pipe_key[vk] is
+ *   now a RELIABLE "physically held right now" oracle -- exactly the
+ *   missing signal that killed virt-hold before. This drain uses that
+ *   oracle directly (no heuristic streak-detection), so no false-triggers:
+ *   on a tap, UP arrives within ~30-50ms and both flags clear; on a hold,
+ *   flags stay set for the full duration.
+ *
+ * TAP SAFETY: a fast tap (physical DN then UP within <16ms) already fires
+ * ONCE via dispatch_external_key's Pass 1 on the DN. This drain runs at
+ * 16ms cadence; if the UP arrives before the next drain tick, no extra
+ * fire. If the UP arrives after (say 20ms hold), one extra tick may fire
+ * -- but fire()'s per-slot debounce (16ms for SMOOTH_NUDGE-enabled repeat
+ * slots) drops it. Net: 1 fire per tap, N fires per Nms hold at 60Hz. */
 static volatile LONG g_seb_repeat_running = 0;
 static HANDLE        g_seb_repeat_thread  = NULL;
-static int pk_mod(int a, int b, int c) { return g_pipe_key[a] || g_pipe_key[b] || g_pipe_key[c]; }
 static DWORD WINAPI seb_repeat_thread_fn(LPVOID unused) {
     (void)unused;
-    (void)pk_mod;   /* kept for future re-use if virt-hold ever returns */
     while (g_seb_repeat_running) {
         Sleep(16);
         if (!g_seb_repeat_running) break;
         DWORD now = GetTickCount();
+
+        /* Snapshot pipe-fed modifier state ONCE per tick (cheap, three
+         * reads). Used by the MODIFIER drain below to verify combos
+         * are still satisfied. */
+        int pk_ctrl  = g_pipe_key[VK_CONTROL] || g_pipe_key[VK_LCONTROL] || g_pipe_key[VK_RCONTROL];
+        int pk_shift = g_pipe_key[VK_SHIFT]   || g_pipe_key[VK_LSHIFT]   || g_pipe_key[VK_RSHIFT];
+        int pk_alt   = g_pipe_key[VK_MENU]    || g_pipe_key[VK_LMENU]    || g_pipe_key[VK_RMENU];
+
+        /* v3.3.3 MODIFIER hold-to-repeat drain -- gives iso desktop the
+         * same 60Hz smooth-glide UX as Default's poll_thread. Only fires
+         * for repeat-allowed slots (movement/resize/alpha/font/scroll)
+         * whose ownership was granted on the DN by dispatch_external_key
+         * Pass 1. Conditions:
+         *   1. slot is MODIFIER kind + g_repeat_allowed[slot]=1
+         *   2. payload's Pass 1 granted this vk to this slot on DN
+         *      (g_pipe_consumed_vk[vk]==1, g_pipe_consumed_vk_slot[vk]==i)
+         *   3. target key is STILL physically held per pipe state
+         *   4. required modifiers are STILL held per pipe state
+         *
+         * Any missing condition = skip (drops back to the DN-only cadence
+         * naturally). fire()'s per-slot debounce paces the actual re-fires. */
+        for (int i = 0; i < SVC_HK_COUNT; i++) {
+            if (!g_hk[i]) continue;
+            if (SVC_HK_KIND(g_hk[i]) != SVC_HK_KIND_MODIFIER) continue;
+            if (!g_repeat_allowed[i]) continue;
+            unsigned tvk = SVC_HK_VK(g_hk[i]);
+            if (tvk == 0 || tvk >= 256) continue;
+            if (g_pipe_consumed_vk[tvk]      != 1) continue;
+            if (g_pipe_consumed_vk_slot[tvk] != i) continue;
+            if (g_pipe_key[tvk]              == 0) continue;
+            if (!match_hk_mod(g_hk[i], (USHORT)tvk, pk_ctrl, pk_shift, pk_alt))
+                continue;
+            (void)fire(i);   /* debounce inside handles cadence + drops taps */
+        }
+
         /* LONGPRESS drain -- mirrors poll_thread's LONGPRESS branch but uses
          * g_pipe_key[] as the "still held" oracle (poll_thread's
          * GetAsyncKeyState is dead on the isolated desktop). */

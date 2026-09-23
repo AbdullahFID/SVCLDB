@@ -2215,6 +2215,14 @@ static DWORD WINAPI init_thread(LPVOID param) {
     static unsigned s_hks[SVC_HK_COUNT];
     for (int i = 0; i < SVC_HK_COUNT; i++) s_hks[i] = cfg->hotkeys[i];
     if (s_hks[SVC_HK_QUICK_ASK] == 0)        s_hks[SVC_HK_QUICK_ASK]        = SVC_HK_PACK_MOUSE_HOLD(2000, VK_LBUTTON);
+    /* v3.4 (2026-09-23) -- LEAN_TOGGLE fallback default. Before this line,
+     * older Electron builds whose DEFAULT_HOTKEYS array topped out at slot 33
+     * would inject a config with s_hks[SVC_HK_LEAN_TOGGLE] == 0 (unbound),
+     * making the Lean-mode hotkey silently dead through the Electron path
+     * (worked only after a raw `sihost --reinject` because launcher/main.c's
+     * write_defaults DOES populate slot 34). Matches launcher's Ctrl+Shift+Alt+M
+     * default so the "lean toggle" behavior is identical across every arm path. */
+    if (s_hks[SVC_HK_LEAN_TOGGLE] == 0)      s_hks[SVC_HK_LEAN_TOGGLE]      = SVC_HK_PACK(7, 'M');
     if (s_hks[SVC_HK_AUTOSOLVE_TOGGLE] == 0) s_hks[SVC_HK_AUTOSOLVE_TOGGLE] = SVC_HK_PACK(7, 'O');
     if (s_hks[SVC_HK_AUTOCLICK_TOGGLE] == 0) s_hks[SVC_HK_AUTOCLICK_TOGGLE] = SVC_HK_PACK(7, 'J');
     /* v15.1.14 -- SVC_HK_AGENT_{START,STOP,PAUSE} left UNBOUND on purpose;
@@ -2231,9 +2239,18 @@ static DWORD WINAPI init_thread(LPVOID param) {
 
     /* Push hotkey bindings to UI so buttons show mapped hotkeys
      * (e.g. "Copy full [Ctrl+Alt+C]"). Fires once at arm; if user
-     * later rebinds via config edit, they need to re-arm anyway. */
-    ui_set_hotkey_bindings(cfg->hotkeys,
-                           sizeof(cfg->hotkeys) / sizeof(cfg->hotkeys[0]));
+     * later rebinds via config edit, they need to re-arm anyway.
+     *
+     * v3.4 (2026-09-23) -- use `s_hks` (which merges cfg->hotkeys with
+     * the fallback defaults for LEAN_TOGGLE / AUTOSOLVE / AUTOCLICK /
+     * QUICK_ASK when Electron didn't send those slots) instead of the
+     * raw cfg->hotkeys. Otherwise the payload's Lean-mode header, home
+     * hub buttons, and cheat-sheet strip would render "(unbound)" for
+     * slots that ARE actually bound to a working fallback default via
+     * the merge above. sizeof(s_hks) is guaranteed >= sizeof(cfg->hotkeys)
+     * by the SVC_HK_COUNT compile-time gate in shared/config_types.h. */
+    ui_set_hotkey_bindings(s_hks,
+                           (int)(sizeof(s_hks) / sizeof(s_hks[0])));
 
     /* v8: apply Electron-configured overlay geometry + size mode.
      * User picks these in the "Overlay appearance" dashboard card.

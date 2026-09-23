@@ -542,10 +542,37 @@ const DEFAULT_HOTKEYS = [
                         //    control from a fresh install. User can rebind in the
                         //    hotkey editor (MOUSE_HOLD LMB 2000ms, RMB triple, etc.)
                         //    for BP-parity "Quick-Send" UX.
+  /* ── v3.4 (2026-09-23) -- slots 34-39 (SVC_HK_LEAN_TOGGLE +
+   * AutoSolver/Agent) added to the Electron default map so
+   * `hotkeys_packed_csv` covers the FULL SVC_HK_COUNT the payload
+   * expects. Prior to this the array topped out at slot 33, so the
+   * launcher wrote `hotkeys[34..39] = 0` (unbound) on every Electron
+   * inject and Lean-mode's Ctrl+Shift+Alt+M hotkey was silently
+   * dead -- only worked after a raw `sihost --reinject` which uses
+   * launcher/main.c's own write_defaults path. The payload's
+   * dllmain install_hk_defaults ALSO now provides a fallback for
+   * slot 34 (same Ctrl+Shift+Alt+M) as belt-and-suspenders.
+   *
+   * Bindings match the launcher fallback in launcher/src/main.c so
+   * ALL arm paths -- Electron JSON, launcher --reinject, and payload
+   * self-defaults -- agree on a single canonical mapping. */
+  pack(MOD_CSA, 0x4D),         // 34 LEAN_TOGGLE       Ctrl+Shift+Alt+M
+  pack(MOD_CSA, 0x4F),         // 35 AUTOSOLVE_TOGGLE  Ctrl+Shift+Alt+O
+  pack(MOD_CSA, 0x4A),         // 36 AUTOCLICK_TOGGLE  Ctrl+Shift+Alt+J
+  0,                            // 37 AGENT_START       (unbound -- Agent Mode ripped out per dllmain.c v15.1.14)
+  0,                            // 38 AGENT_STOP        (unbound -- Agent Mode ripped out)
+  0,                            // 39 AGENT_PAUSE       (unbound -- Agent Mode ripped out)
 ];
 
 /* Old stealth-multitap map kept for users who preferred it. Flip
- * via the "Invisible Hotkeys" toggle in the hotkey editor. */
+ * via the "Invisible Hotkeys" toggle in the hotkey editor.
+ *
+ * v3.4 (2026-09-23) -- extended to cover slots 34-39 (LEAN_TOGGLE +
+ * AutoSolver + Agent). QUICK_ASK (33) is a mouse-multi binding, not a
+ * key-multitap -- kept as its DEFAULT_HOTKEYS mouse-triple even in
+ * "stealth" mode since a middle-triple-click is already zero-keyboard
+ * concealment. Agent slots (37-39) stay 0/unbound to match the enum's
+ * inert-slot semantics after Agent Mode was ripped out. */
 const LEGACY_STEALTH_HOTKEYS = [
   _MT(0xC0, 500, true), _MT(0x47, 500, true), _MT(0xDC, 500, true), _MT(0x43, 500, true),
   _MT(0x58, 500, true), _MT(0x25, 500, true), _MT(0x27, 500, true), _MT(0x26, 500, true),
@@ -556,6 +583,13 @@ const LEGACY_STEALTH_HOTKEYS = [
   _MT(0x21, 500, true), _MT(0x22, 500, true), _MT(0x4E, 500, true), _MT(0x4D, 500, true),
   _MT(0x50, 500, true), _MT(0x0D, 500, true), _MT(0x54, 500, true), _MT(0x4B, 500, true),
   _MT(0x41, 500, true), _MT(0x4C, 500, true), _MT(0x53, 500, true), _MT(0x44, 500, true),
+  packMouseMulti(4, 3, 400),  // 33 QUICK_ASK -- middle-triple (kept from DEFAULT_HOTKEYS)
+  _MT(0x4D, 500, true),        // 34 LEAN_TOGGLE       -- triple-M watch-only
+  _MT(0x4F, 500, true),        // 35 AUTOSOLVE_TOGGLE  -- triple-O watch-only
+  _MT(0x4A, 500, true),        // 36 AUTOCLICK_TOGGLE  -- triple-J watch-only
+  0,                            // 37 AGENT_START  (Agent Mode inert)
+  0,                            // 38 AGENT_STOP
+  0,                            // 39 AGENT_PAUSE
 ];
 
 // Legacy "all modifier combos" preset — user can select this via
@@ -579,6 +613,17 @@ const LEGACY_MODIFIER_HOTKEYS = [
   pack(MOD_CA,  0x0D), pack(MOD_CSA, 0x54),
   pack(MOD_CSA, 0x43), pack(MOD_CA,  0x41), pack(MOD_CSA, 0x4C),
   pack(MOD_CA,  0x53), pack(MOD_CSA, 0x44),
+  /* v3.4 (2026-09-23) -- slots 33-39 added so the legacy-preset path
+   * covers the full SVC_HK_COUNT array the payload expects. QUICK_ASK
+   * (33) is left as its canonical mouse-triple even in legacy-modifier
+   * mode since there's no natural modifier-combo equivalent. */
+  packMouseMulti(4, 3, 400),   // 33 QUICK_ASK        middle-triple
+  pack(MOD_CSA, 0x4D),         // 34 LEAN_TOGGLE      Ctrl+Shift+Alt+M
+  pack(MOD_CSA, 0x4F),         // 35 AUTOSOLVE_TOGGLE Ctrl+Shift+Alt+O
+  pack(MOD_CSA, 0x4A),         // 36 AUTOCLICK_TOGGLE Ctrl+Shift+Alt+J
+  0,                            // 37 AGENT_START      (inert)
+  0,                            // 38 AGENT_STOP       (inert)
+  0,                            // 39 AGENT_PAUSE      (inert)
 ];
 
 /* v10 (2026-07-17) — STEALTH MODE overlay.
