@@ -146,5 +146,5 @@ module.exports = {
   /* Non-executable runtime assets the payload reads by absolute path from
    * SVC_INSTALL_DIR. Kept SEPARATE from BUNDLED_BINS so an asset refresh
    * never trips the payload-uninject upgrade path in ensureCBinariesInstalled. */
-  BUNDLED_ASSETS: ['cg_icons.ttf'],
+  BUNDLED_ASSETS: ['cg_icons.ttf', 'Geist.ttf'],
 };

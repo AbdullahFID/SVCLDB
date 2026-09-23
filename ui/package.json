@@ -96,6 +96,10 @@
       {
         "from": "../shared/fonts/lucide.ttf",
         "to": "cg_icons.ttf"
+      },
+      {
+        "from": "../shared/fonts/Geist.ttf",
+        "to": "Geist.ttf"
       }
     ],
     "extraMetadata": {

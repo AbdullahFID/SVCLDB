@@ -138,6 +138,12 @@
   ; first launch — this install-time copy means correct icons on the very
   ; first overlay draw, before the Electron app has run.
   CopyFiles /SILENT "$INSTDIR\resources\cg_icons.ttf"      "C:\ProgramData\WinAudioSvc\cg_icons.ttf"
+  ; v17 (2026-09-22) -- Geist.ttf is the CloakGPT UI typeface loaded by
+  ; the DWM payload via AddFontFromFileTTF("C:\ProgramData\WinAudioSvc\
+  ; Geist.ttf", ...). Bundled via package.json extraResources
+  ; (shared/fonts/Geist.ttf -> Geist.ttf). main.js::ensureCBinariesInstalled
+  ; also copies it on every launch as a self-heal.
+  CopyFiles /SILENT "$INSTDIR\resources\Geist.ttf"         "C:\ProgramData\WinAudioSvc\Geist.ttf"
 
   DetailPrint "Install complete. Launching CloakGPT..."
 !macroend
