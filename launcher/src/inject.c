@@ -986,18 +986,12 @@ int inject_helper_signal_unload(void) {
         HANDLE ev = OpenEventW(EVENT_MODIFY_STATE, FALSE, nm_w);
         if (ev) { SetEvent(ev); CloseHandle(ev); hit = 1; }
     }
-    /* v3.0.2 static event name -- kicks helpers built between v3.0.2 and
-     * v3.0.2.4. Safe to remove after transition. */
-    {
-        HANDLE ev = OpenEventW(EVENT_MODIFY_STATE, FALSE, L"Global\\NetSvcCoord_Halt");
-        if (ev) { SetEvent(ev); CloseHandle(ev); hit = 1; }
-    }
-    /* Pre-v3.0.2 event name -- kicks any LoadLibrary'd helper from the
-     * original iteration era. Also safe to remove after transition. */
-    {
-        HANDLE ev = OpenEventW(EVENT_MODIFY_STATE, FALSE, L"Global\\svcldb_wlinput_stop");
-        if (ev) { SetEvent(ev); CloseHandle(ev); hit = 1; }
-    }
+    /* v3.2 (2026-09-23): pre-v3.0.2.4 event names removed. Those wide
+     * literals appeared in sihost.exe's binary strings and gave a
+     * medium-IL attacker doing `strings -e l sihost.exe` free proof our
+     * product was installed. Two months post-v3.0.2.4 shipping (Jul '26)
+     * every user has rebooted past those helper generations, so the
+     * kick-old-helpers code is safe to drop entirely. */
     return hit;
 }
 

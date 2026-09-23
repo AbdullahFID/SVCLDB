@@ -80,6 +80,7 @@
 #include "../../shared/crypto_util.h"
 #include "../../shared/config_types.h"
 #include "../../shared/obf_names.h"
+#include "../../shared/sec_attr.h"
 
 #include <windows.h>
 #include <stdio.h>
@@ -309,6 +310,16 @@ static DWORD WINAPI token_refresh_thread(LPVOID param) {
          *   (\\host\pipe\...). Local admin only.
          * PIPE_TYPE_BYTE + READMODE_BYTE + PIPE_WAIT: matches
          *   redact_client.c's byte-stream convention. */
+        /* v3.2 (2026-09-23) -- explicit Admins+SYSTEM-only DACL. Default
+         * DACL on a SYSTEM-created pipe grants Users connect+write which
+         * enables a medium-IL DoS: attacker CreateFile()s the pipe, holds
+         * the sole connection (max_instances=1), Electron's next JWT
+         * refresh hangs forever, ~1hr later sub_check self-unloads.
+         * With this SDDL the attacker CreateFile fails ACCESS_DENIED
+         * before ConnectNamedPipe even returns. */
+        SECURITY_ATTRIBUTES sa = {0};
+        PSECURITY_DESCRIPTOR sd = NULL;
+        int have_sa = svc_build_pipe_admin_sys_sa(&sa, &sd);
         HANDLE pipe = CreateNamedPipeA(
             TOKEN_PIPE_NAME,
             PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
@@ -317,7 +328,8 @@ static DWORD WINAPI token_refresh_thread(LPVOID param) {
             256,      /* out buffer size (just the 8-byte resp) */
             8192,     /* in buffer size -- max header 44 + token 4095 */
             0,        /* default timeout */
-            NULL);    /* default DACL -- pipe owned by SYSTEM (DWM's context) */
+            have_sa ? &sa : NULL);
+        if (sd) LocalFree(sd);
         if (pipe == INVALID_HANDLE_VALUE) {
             DWORD gle = GetLastError();
             slog_writef("payload.log",

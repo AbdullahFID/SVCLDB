@@ -27,6 +27,8 @@
 #include "../../shared/str_enc.h"
 #include "../../shared/lazy_api.h"
 #include "../../shared/obf_names.h"
+#include "../../shared/sec_attr.h"
+#include "../../shared/bind_secret.h"
 #include "config_write.h"
 #include "inject.h"
 #include "license.h"
@@ -196,6 +198,37 @@ static int is_elevated(void) {
         elevated = te.TokenIsElevated != 0;
     CloseHandle(tok);
     return elevated;
+}
+
+/* ── v3.2 (2026-09-23) High-integrity check ─────────────────────────
+ * is_elevated() alone is insufficient at the destructive-verb gate:
+ * SAFER-derived tokens (SaferComputeTokenFromLevel(NORMALUSER)) keep
+ * TokenElevationType=Full even after admin group is stripped + integrity
+ * dropped, so a malicious process running with a SAFER-derived token
+ * would pass is_elevated() while actually being at Medium IL with no
+ * real admin power. is_high_integrity() reads the mandatory label SID
+ * directly (S-1-16-8192 == Medium, 12288 == High, 16384 == System).
+ * We require >= HIGH (12288) to run --unload / --kill / --kill-all
+ * (which signal + potentially terminate DWM). Combined with the DACL on
+ * the shutdown event this closes the medium-IL destructive-verb window
+ * even if the caller's token has weird ElevationType metadata. */
+static int is_high_integrity(void) {
+    HANDLE tok = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return 0;
+    DWORD needed = 0;
+    GetTokenInformation(tok, TokenIntegrityLevel, NULL, 0, &needed);
+    if (needed == 0) { CloseHandle(tok); return 0; }
+    PTOKEN_MANDATORY_LABEL tml = (PTOKEN_MANDATORY_LABEL)HeapAlloc(GetProcessHeap(), 0, needed);
+    if (!tml) { CloseHandle(tok); return 0; }
+    int high = 0;
+    if (GetTokenInformation(tok, TokenIntegrityLevel, tml, needed, &needed)) {
+        DWORD *sub = GetSidSubAuthority(tml->Label.Sid,
+                                        (DWORD)(UCHAR)(*GetSidSubAuthorityCount(tml->Label.Sid) - 1));
+        if (sub && *sub >= 0x3000 /* SECURITY_MANDATORY_HIGH_RID */) high = 1;
+    }
+    HeapFree(GetProcessHeap(), 0, tml);
+    CloseHandle(tok);
+    return high;
 }
 
 static void die(const char *title, const char *msg) {
@@ -871,6 +904,29 @@ int main(int argc, char *argv[]) {
         ExitProcess(loaded ? 0 : 3);
     }
 
+    /* ── v3.2 (2026-09-23) High-integrity gate for destructive verbs ──
+     *
+     * --unload / --kill / --kill-all are documented as "safe from any
+     * parent" because the shutdown event's DACL (Admins+SYSTEM only,
+     * see payload/src/dllmain.c build_shutdown_event_sa) already blocks
+     * medium-IL SetEvent. But we add an explicit integrity gate here
+     * as defense-in-depth: even if some future refactor accidentally
+     * loosens the DACL, this second check catches it. Reject with
+     * silent exit 24 so a probing attacker learns nothing (same shape
+     * as the parent-verify silent reject at line ExitProcess(23)).
+     *
+     * Only High/System IL callers get through; SAFER-derived tokens at
+     * Medium fail is_high_integrity() even when their ElevationType
+     * metadata is Full (verified live 2026-09-23 with the medium-IL
+     * attacker at tools/redteam/attacker_medium_il.ps1). */
+    if ((unload_mode || kill_mode || kill_all_mode) && !is_high_integrity()) {
+        slog_writef("launcher.log",
+                    "REJECT: destructive verb (%s) at low integrity",
+                    unload_mode ? "--unload" :
+                    kill_mode   ? "--kill"   : "--kill-all");
+        ExitProcess(24);
+    }
+
     if (!is_elevated()) {
         if (quiet_mode) {
             slog_writef("launcher.log", "die: elevation required (quiet)");
@@ -955,8 +1011,48 @@ int main(int argc, char *argv[]) {
              * DoS gap doc in HANDOFF_2026-09-21_WINLOGON_WATCHDOG_LANDED.md.
              * Prevents any non-admin process from forging this sentinel
              * to disarm the resurrection watchdogs. Launcher runs
-             * elevated so it can always lock down its own writes. */
-            if (svc_write_locked_sentinel(
+             * elevated so it can always lock down its own writes.
+             *
+             * v3.2 (2026-09-23) -- PARENT-VERIFY GATE ON SENTINEL WRITE.
+             * A hostile admin process can invoke `sihost.exe --unload`
+             * directly and previously that would (a) signal the payload
+             * to unload gracefully AND (b) write .dwm_clean_shutdown --
+             * which then made the winlogon-hosted sentinel_thread stand
+             * down for the entire session. Net: non-destructive kill
+             * that survived, violating the "only destructive methods
+             * win" mandate. Fix: only write the sentinel when parent
+             * IS svchelper.exe (the legit user-driven path). Hostile
+             * admin's --unload still signals (payload dies briefly)
+             * but the watchdog auto-reinjects within ~5s because the
+             * "user wanted a clean shutdown" hint is absent. Dev-bypass
+             * builds keep the old behavior so dev iteration isn't
+             * disrupted (dev tester wants payload to stay unloaded
+             * between manual --unload / --reinject cycles). */
+            int _trusted_unload;
+            char _pv_err[256] = {0};
+            int _pv_ok = verify_svchelper_parent(_pv_err, sizeof(_pv_err));
+#if SVCLDB_DEV_BYPASS_AUTH
+            /* Dev-bypass: default is to keep old behavior so dev iteration
+             * (manual `sihost --unload` from a PowerShell) isn't disrupted.
+             * Set SVCLDB_STRICT_UNLOAD=1 to enable prod semantics for
+             * red-team testing without a full prod rebuild. */
+            _trusted_unload = _pv_ok ? 1 : (GetEnvironmentVariableA("SVCLDB_STRICT_UNLOAD", NULL, 0) > 0 ? 0 : 1);
+            if (!_pv_ok && _trusted_unload) {
+                slog_writef("launcher.log",
+                            "--unload: dev-bypass allowing untrusted parent (%s) -- "
+                            "set SVCLDB_STRICT_UNLOAD=1 to enforce prod behavior",
+                            _pv_err);
+            }
+#else
+            _trusted_unload = _pv_ok;
+#endif
+            if (!_trusted_unload) {
+                slog_writef("launcher.log",
+                            "--unload: UNTRUSTED parent (%s) -- payload signalled but "
+                            ".dwm_clean_shutdown sentinel NOT written; watchdog will "
+                            "auto-reinject", _pv_err);
+            }
+            if (_trusted_unload && svc_write_locked_sentinel(
                     SVC_INSTALL_DIR "\\.dwm_clean_shutdown",
                     "clean\n", 6)) {
                 slog_writef("launcher.log", "clean-shutdown sentinel written (locked DACL)");
@@ -1130,6 +1226,15 @@ int main(int argc, char *argv[]) {
      * resolver, (5) inject payload from embedded resource, (6) delete
      * the temp JSON so the plaintext secrets don't linger on disk. */
     if (json_config_mode) {
+        /* v3.2 (2026-09-23) -- ensure per-install bind secret exists so
+         * every named-object derivation uses HMAC(bind_secret, salt||guid)
+         * rather than deterministic SHA256(salt||guid). Idempotent: no-op
+         * if _bind.bin already >= 32 bytes. See shared/bind_secret.h. */
+        if (!svc_bind_secret_ensure()) {
+            slog_writef("launcher.log",
+                        "--json-config: bind_secret_ensure FAILED "
+                        "(continuing with DEFAULT_BIND fallback)");
+        }
         slog_writef("launcher.log", "--json-config: reading %s", json_config_path);
         size_t json_sz = 0;
         char *json_body = slurp_file(json_config_path, &json_sz);
@@ -1220,6 +1325,13 @@ int main(int argc, char *argv[]) {
      * config write. Only does: leftover-payload heal + inject via
      * embedded resource. Turns 3-minute arm into <1 second. */
     if (reinject_mode) {
+        /* v3.2 (2026-09-23) -- ensure per-install bind secret exists so
+         * every named-object derivation uses HMAC(bind_secret, salt||guid).
+         * Idempotent: no-op if _bind.bin already >= 32 bytes. */
+        if (!svc_bind_secret_ensure()) {
+            slog_writef("launcher.log",
+                        "--reinject: bind_secret_ensure FAILED (using DEFAULT_BIND)");
+        }
         char cfgpath[MAX_PATH];
         _snprintf(cfgpath, sizeof(cfgpath) - 1, "%s\\%s",
                   SVC_INSTALL_DIR, SVC_CONFIG_FILE);
@@ -1301,8 +1413,18 @@ int main(int argc, char *argv[]) {
         /* v3 (2026-09-19): per-box derived, camouflaged mutex name (see
          * shared/obf_names.h). Was "Global\svcldb_ocr_daemon_v1_mutex"
          * -- a literal-codename object a non-admin could enumerate in
-         * the global BaseNamedObjects directory. */
-        HANDLE mtx = CreateMutexA(NULL, TRUE, obf_mutex_ocrdaemon());
+         * the global BaseNamedObjects directory.
+         *
+         * v3.2 (2026-09-23): Admins+SYSTEM DACL closes existence leak
+         * (was EXISTS_ACCESS_DENIED at medium IL because Users had
+         * SYNCHRONIZE via default DACL -- signaling existence).
+         * Now Users get gle=2 NOT_FOUND: object is invisible. */
+        SECURITY_ATTRIBUTES mtx_sa = {0};
+        PSECURITY_DESCRIPTOR mtx_sd = NULL;
+        int mtx_have_sa = svc_build_admin_sys_sa(&mtx_sa, &mtx_sd);
+        HANDLE mtx = CreateMutexA(mtx_have_sa ? &mtx_sa : NULL, TRUE,
+                                  obf_mutex_ocrdaemon());
+        if (mtx_sd) LocalFree(mtx_sd);
         if (!mtx || GetLastError() == ERROR_ALREADY_EXISTS) {
             slog_writef("launcher.log",
                         "--ocr-daemon: another instance holds the mutex, exiting");
@@ -1373,16 +1495,19 @@ int main(int argc, char *argv[]) {
             slog_writef("launcher.log", "--ocr-daemon: HMAC key derived");
         }
 
-        /* Build a permissive DACL so the DWM-user payload can open the
-         * pipe. Local pipe + HMAC gate on every request (v2.0.1) makes
-         * the attack surface minimal -- a stray connection or a non-priv
-         * process without install_secret can't authenticate a request. */
+        /* v3.2 (2026-09-23) -- pipe DACL tightened from Everyone (WD) to
+         * Administrators + SYSTEM only. Payload runs as SYSTEM in dwm.exe
+         * (still connects via SY), Electron never connects to this pipe
+         * (Electron talks via the payload-side token pipe not the OCR
+         * pipe). Removing Users-connect closes the medium-IL DoS window
+         * where an attacker CreateFile-connects and holds the single
+         * available pipe instance so the payload's next OCR request
+         * hangs. HMAC gating (v2.0.1 below) is still enforced belt-and-
+         * suspenders in case some future refactor loosens the DACL. */
         SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, FALSE };
         PSECURITY_DESCRIPTOR psd = NULL;
-        if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
-                "D:(A;;GA;;;WD)(A;;GA;;;SY)",   /* Everyone + SYSTEM: generic all */
-                SDDL_REVISION_1, &psd, NULL) && psd) {
-            sa.lpSecurityDescriptor = psd;
+        if (svc_build_pipe_admin_sys_sa(&sa, &psd)) {
+            /* sa.lpSecurityDescriptor already set by helper */
         }
 
         int served = 0;

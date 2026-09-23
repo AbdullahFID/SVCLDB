@@ -23,6 +23,7 @@
 #include "../../shared/config_types.h"
 #include "../../shared/obf_names.h"   /* v3.0.2.4 (2026-09-21) -- GUID-per-install names */
 #include "../../shared/str_enc.h"     /* v4.0 (2026-09-21) -- SS() for iso-pipe diag strings */
+#include "../../shared/sec_attr.h"    /* v3.2 (2026-09-23) -- pipe DACL helper */
 #include "rawinput_hook.h"
 #include "config_read.h"   /* v1.7.11.18: cfg_get() for scroll_step_px */
 #include "autosolver/as_cfg.h"   /* v15.1 (2026-09-22) -- always-on LMB-hold trigger */
@@ -36,7 +37,11 @@
 extern int ui_has_reply(void);
 
 /* ── Constants (avoid pulling in whole winuser structs) ─────────── */
-#define WORKER_CLASS_NAME  L"SysCompositorSink"
+/* v3.2 (2026-09-23) -- was L"SysCompositorSink" static macro that leaked
+ * as UTF-16 in sihost.exe binary strings. Now derived per-install via
+ * obf_class_worker_w() (see shared/obf_names.c), GUID-shape blends with
+ * legit Windows class atoms. */
+#define WORKER_CLASS_NAME  obf_class_worker_w()
 #define RIDEV_INPUTSINK    0x00000100
 #define RIDEV_REMOVE       0x00000001
 #define RID_INPUT          0x10000003
@@ -2821,14 +2826,21 @@ static HANDLE        g_seb_pipe_thread  = NULL;
 static DWORD WINAPI seb_pipe_server_thread(LPVOID unused) {
     (void)unused;
     while (g_seb_pipe_running) {
-        SECURITY_DESCRIPTOR sd;
-        InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
-        SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);   /* NULL DACL: SYSTEM helper can connect */
-        SECURITY_ATTRIBUTES sa; sa.nLength = sizeof(sa); sa.lpSecurityDescriptor = &sd; sa.bInheritHandle = FALSE;
+        /* v3.2 (2026-09-23) -- tightened from NULL DACL (Everyone) to
+         * Admins+SYSTEM only. Only endpoint that legitimately connects
+         * is the winlogon-hosted wl_input helper which runs as SYSTEM
+         * (SY covers it). Previously any medium-IL process could hold
+         * the sole pipe instance and starve real helper input on the
+         * isolated desktop -> DoS on iso input mode. */
+        SECURITY_ATTRIBUTES sa = {0};
+        PSECURITY_DESCRIPTOR sd = NULL;
+        int have_sa = svc_build_pipe_admin_sys_sa(&sa, &sd);
         HANDLE pipe = CreateNamedPipeA(obf_pipe_iso(),
                                        PIPE_ACCESS_INBOUND,
                                        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                                       1, 0, (DWORD)sizeof(seb_evt) * 32, 0, &sa);
+                                       1, 0, (DWORD)sizeof(seb_evt) * 32, 0,
+                                       have_sa ? &sa : NULL);
+        if (sd) LocalFree(sd);
         if (pipe == INVALID_HANDLE_VALUE) { rin_diag(SS(SVC_STR_ISO_PIPE_CREATE_FAIL), GetLastError()); Sleep(750); continue; }
         BOOL connected = ConnectNamedPipe(pipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
         if (connected) {

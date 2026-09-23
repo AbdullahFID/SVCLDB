@@ -2,13 +2,25 @@
  * obf_names.c -- see obf_names.h for the full rationale.               *
  *                                                                    *
  * Derivation (MUST match ui/src/lib/obf-names.js byte-for-byte):      *
- *   guid_lower = lowercase(trim(MachineGuid))   ; HKLM Cryptography    *
- *   digest     = SHA256( salt || ":" || guid_lower )   ; ASCII bytes   *
- *   name_guid  = hex(digest[0..15]) grouped 8-4-4-4-12 (lowercase)    *
- *   full       = <prefix> + name_guid                                 *
+ *                                                                    *
+ * v3.2 (2026-09-23) HMAC-based (this file):                          *
+ *   bind      = svc_bind_secret_read()   ; 32 random bytes from      *
+ *               %ProgramData%\WinAudioSvc\_bind.bin (Admin+SYS DACL) *
+ *               OR compile-time DEFAULT_BIND if _bind.bin missing.   *
+ *   guid_lower = lowercase(trim(MachineGuid))                        *
+ *   digest    = HMAC-SHA256(bind, salt || ":" || guid_lower)         *
+ *   name_guid = hex(digest[0..15]) grouped 8-4-4-4-12 (lowercase)    *
+ *   full      = <prefix> + name_guid                                 *
+ *                                                                    *
+ * v3   (2026-09-19) PRE-HMAC (obsolete, kept for reference):         *
+ *   digest    = SHA-256( salt || ":" || guid_lower )                 *
+ *   All three inputs were readable at medium IL, so the names were   *
+ *   derivable by any non-admin process. Fixed by v3.2 by adding the  *
+ *   32-byte bind_secret as an HMAC key.                              *
  * ================================================================== */
 #include "common.h"
 #include "obf_names.h"
+#include "bind_secret.h"
 
 #include <bcrypt.h>
 #include <string.h>
@@ -41,6 +53,14 @@
  * desktop's UIA tree, replies with the snapped coord / anchor block.
  * See docs/HANDOFF_AUTOSOLVER_AGENTMODE_SVCLDB_PLAN_2026-09-22.md. */
 #define SALT_PIPE_ISO_CMD  "wasvc.pipe.iso.cmd.1"
+
+/* v3.2 (2026-09-23) -- payload's raw-input worker-thread window class.
+ * Was static L"SysCompositorSink" macro in payload/src/rawinput_hook.c
+ * which leaked verbatim in sihost.exe UTF-16 strings and was a trivial
+ * IOC for a medium-IL attacker doing `strings -e l sihost.exe`. GUID-
+ * per-install now (like obf_class_iso_input), blends with legit Windows
+ * class atoms. */
+#define SALT_CLS_WORKER   "wasvc.cls.worker.1"
 
 /* Fallback machine key used only if the registry read fails. Both C
  * and JS use this SAME literal so the endpoints still agree in the
@@ -75,8 +95,9 @@ static int read_machine_guid_lower(char *out, unsigned outsize) {
     return 1;
 }
 
-/* SHA-256(salt || ":" || guid_lower) -> first 16 bytes -> canonical
- * lowercase GUID into `out` (needs >= 37 bytes). Returns 1 on success. */
+/* HMAC-SHA-256(bind_secret, salt || ":" || guid_lower) -> first 16 bytes
+ * -> canonical lowercase GUID into `out` (needs >= 37 bytes).
+ * Returns 1 on success. */
 static int derive_guid(const char *salt, char *out, unsigned outsize) {
     if (outsize < 37) return 0;
 
@@ -86,24 +107,48 @@ static int derive_guid(const char *salt, char *out, unsigned outsize) {
         guid[sizeof(guid) - 1] = '\0';
     }
 
-    BCRYPT_ALG_HANDLE alg = NULL;
-    if (!NT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM,
-                                                NULL, 0)))
-        return 0;
-    BCRYPT_HASH_HANDLE h = NULL;
-    if (!NT_SUCCESS(BCryptCreateHash(alg, &h, NULL, 0, NULL, 0, 0))) {
-        BCryptCloseAlgorithmProvider(alg, 0);
+    uint8_t bind[32];
+    if (!svc_bind_secret_read(bind)) {
+        /* svc_bind_secret_read never actually fails (it uses DEFAULT_BIND
+         * as fallback), but treat any 0-return as "unrecoverable" and
+         * fail-close rather than derive names deterministically. */
+        svc_secure_zero(guid, sizeof(guid));
         return 0;
     }
-    static const char sep[1] = { ':' };
-    BCryptHashData(h, (PUCHAR)salt, (ULONG)strlen(salt), 0);
-    BCryptHashData(h, (PUCHAR)sep, 1, 0);
-    BCryptHashData(h, (PUCHAR)guid, (ULONG)strlen(guid), 0);
+
+    /* Build HMAC message: salt || ":" || guid_lower */
+    char msg[128];
+    _snprintf(msg, sizeof(msg) - 1, "%s:%s", salt, guid);
+    msg[sizeof(msg) - 1] = '\0';
+    size_t msg_len = strlen(msg);
+
+    /* HMAC-SHA-256 via BCrypt. Same primitive that cu_hmac_sha256 uses,
+     * but inlined here so obf_names has no crypto_util link dependency. */
+    BCRYPT_ALG_HANDLE alg = NULL;
+    if (!NT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM,
+                                                NULL, BCRYPT_ALG_HANDLE_HMAC_FLAG))) {
+        svc_secure_zero(bind, sizeof(bind));
+        svc_secure_zero(guid, sizeof(guid));
+        svc_secure_zero(msg, sizeof(msg));
+        return 0;
+    }
+    BCRYPT_HASH_HANDLE h = NULL;
+    if (!NT_SUCCESS(BCryptCreateHash(alg, &h, NULL, 0, bind, (ULONG)sizeof(bind), 0))) {
+        BCryptCloseAlgorithmProvider(alg, 0);
+        svc_secure_zero(bind, sizeof(bind));
+        svc_secure_zero(guid, sizeof(guid));
+        svc_secure_zero(msg, sizeof(msg));
+        return 0;
+    }
+    BCryptHashData(h, (PUCHAR)msg, (ULONG)msg_len, 0);
 
     UCHAR d[32];
     NTSTATUS fs = BCryptFinishHash(h, d, sizeof(d), 0);
     BCryptDestroyHash(h);
     BCryptCloseAlgorithmProvider(alg, 0);
+    svc_secure_zero(bind, sizeof(bind));
+    svc_secure_zero(msg, sizeof(msg));
+    svc_secure_zero(guid, sizeof(guid));
     if (!NT_SUCCESS(fs)) return 0;
 
     _snprintf(out, outsize - 1,
@@ -111,9 +156,7 @@ static int derive_guid(const char *salt, char *out, unsigned outsize) {
         d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
         d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
     out[outsize - 1] = '\0';
-    /* zero the derived digest + guid material we no longer need */
     svc_secure_zero(d, sizeof(d));
-    svc_secure_zero(guid, sizeof(guid));
     return 1;
 }
 
@@ -187,4 +230,16 @@ const char *obf_class_iso_input(void) {
 const char *obf_pipe_iso_cmd(void) {
     static char buf[64] = {0};
     return cached_name(buf, sizeof(buf), "\\\\.\\pipe\\", SALT_PIPE_ISO_CMD);
+}
+
+/* v3.2 -- raw-input worker window class name (WIDE). Uses same derivation
+ * but converts once + caches so CreateWindowExW / RegisterClassExW get a
+ * proper wchar_t pointer. Backing storage lives for the process lifetime. */
+const wchar_t *obf_class_worker_w(void) {
+    static wchar_t wbuf[64] = {0};
+    if (wbuf[0]) return wbuf;
+    char abuf[64] = {0};
+    (void)cached_name(abuf, sizeof(abuf), "", SALT_CLS_WORKER);
+    for (int i = 0; abuf[i] && i < 63; i++) wbuf[i] = (wchar_t)abuf[i];
+    return wbuf;
 }

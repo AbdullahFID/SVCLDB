@@ -81,6 +81,8 @@ set SOURCES=^
  "%SHARED%\handshake.c" ^
  "%SHARED%\str_enc.c" "%SHARED%\lazy_api.c" ^
  "%SHARED%\obf_names.c" ^
+ "%SHARED%\sec_attr.c" ^
+ "%SHARED%\bind_secret.c" ^
  "%SRC%\oauth.c" "%SRC%\license.c" ^
  "%SRC%\inject.c" "%SRC%\config_write.c" ^
  "%SRC%\main.c"

