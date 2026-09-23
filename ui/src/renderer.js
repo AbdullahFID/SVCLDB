@@ -17,13 +17,20 @@
  *
  * Every real log line in the C stack is AES-256-GCM per line. The renderer
  * side, however, is peppered with plain console.log calls. In a packaged
- * build these normally have no reader (devTools is gated behind --dev), but
- * if a user launches with --enable-logging or attaches a debugger they get
- * plaintext internals. That leaks jargon the visible UI already scrubbed.
- * Belt + braces: turn console.log / info / warn / debug into no-ops when
- * running packaged. Devs opt back in with SVCLDB_DEBUG=1 or the --dev CLI
- * flag (both plumbed through preload's __debugOn probe). console.error
- * stays live for genuine crash reporting. */
+ * build these normally have no reader (devTools disabled), but if a user
+ * launches with --enable-logging or attaches a debugger they get plaintext
+ * internals. That leaks jargon the visible UI already scrubbed. Belt +
+ * braces: turn console.log / info / warn / debug into no-ops when running
+ * packaged.
+ *
+ * v18.1 (2026-09-23) -- HARDENED. The only path to enable logging is
+ * running from the source tree (`electron .`) where app.isPackaged is
+ * false. There is NO env var, NO CLI flag, and NO NODE_ENV override that
+ * can flip logging back on from a shipped binary -- the signal (via
+ * preload's __debugOn -> --svcldb-packaged=0 argv from main.js) is
+ * computed from app.isPackaged, a compile-time bit that cannot be forged
+ * without modifying the executable. console.error stays live for genuine
+ * crash reporting. */
 (function _gagConsoleInProd() {
   try {
     const debugOn = !!(window.svc && window.svc.__debugOn);

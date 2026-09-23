@@ -80,6 +80,37 @@ int clip_set_utf8_bytes(const char *bytes, size_t len) {
 }
 
 void clip_dump_to_file(const char *utf8) {
+    /* v18 (2026-09-23) -- production builds MUST NOT write the AI reply
+     * anywhere plaintext. Previous behavior wrote the full reply as UTF-8
+     * to <install>\last_reply.txt with CREATE_ALWAYS, so at any moment the
+     * file contained the most recent answer verbatim. A forensic sweep of
+     * the machine (or any admin with `type "C:\ProgramData\WinAudioSvc\
+     * last_reply.txt"`) would surface the last exam answer directly. That's
+     * literal receipts of the cheating.
+     *
+     * The clipboard copy path (clip_set_utf8 in dllmain) still runs
+     * independently, so the paste-into-app flow is unaffected. Support can
+     * still recover replies from the AES-256-GCM-encrypted ai.log if
+     * absolutely needed -- and only the CloakGPT team has that key.
+     *
+     * Dev builds keep the plaintext file for local iteration. */
+#if SVCLDB_PRODUCTION_BUILD
+    (void)utf8;
+    /* Self-heal: if a stale plaintext last_reply.txt exists (e.g. user
+     * upgraded from a dev build, or manually created it), nuke it every
+     * time this path is entered. Cheap -- DeleteFileA on a non-existent
+     * file just returns 0. Guarantees the file cannot survive across
+     * even one AI reply on a production build. */
+    {
+        char stale[MAX_PATH];
+        int n = _snprintf(stale, sizeof(stale) - 1, "%s\\last_reply.txt", SVC_INSTALL_DIR);
+        if (n > 0 && n < (int)sizeof(stale)) {
+            stale[n] = 0;
+            DeleteFileA(stale);
+        }
+    }
+    return;
+#else
     if (!utf8) return;
     CreateDirectoryA(SVC_INSTALL_DIR, NULL);
     char path[MAX_PATH];
@@ -91,4 +122,5 @@ void clip_dump_to_file(const char *utf8) {
     DWORD w = 0;
     WriteFile(h, utf8, (DWORD)strlen(utf8), &w, NULL);
     CloseHandle(h);
+#endif
 }

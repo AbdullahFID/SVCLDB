@@ -2221,10 +2221,59 @@ static void early_log(const char *msg) {
     }
 }
 
+/* ── Host-process identity check ────────────────────────────────────
+ *
+ * v18.1 (2026-09-23) -- Refuse to initialize anywhere except dwm.exe.
+ *
+ * The launcher's manual-map path targets dwm.exe by design. But if this
+ * DLL is EVER loaded elsewhere (someone LoadLibrary's it into notepad.exe
+ * to observe behavior in a sandbox, an EDR moves it to a quarantine
+ * process for inspection, an RE'er uses a generic DLL injector to load it
+ * into their own harness, etc.), init_thread would still run: it would
+ * try to install hooks against dwmcore.dll (not present in a normal
+ * process -> crash or silent skip), spawn threads, write encrypted logs,
+ * start network calls -- all screaming "this is CloakGPT" to whoever's
+ * watching. Silent bail is cleaner + tells the observer nothing.
+ *
+ * Case-insensitive match on the leaf name of the host EXE. Matches only
+ * dwm.exe (case-insensitive). Any other host -> DllMain returns TRUE
+ * (so the load "succeeds") but init_thread never spawns, no hooks
+ * install, no logs write, no network. From the outside it looks like a
+ * DLL that got mapped and did nothing. */
+static BOOL is_hosted_by_dwm(void) {
+    wchar_t path[MAX_PATH];
+    DWORD n = GetModuleFileNameW(NULL, path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return FALSE;
+    /* Find last backslash. */
+    const wchar_t *leaf = path;
+    for (const wchar_t *p = path; *p; p++) {
+        if (*p == L'\\' || *p == L'/') leaf = p + 1;
+    }
+    /* Case-insensitive leaf compare against "dwm.exe" (7 chars). */
+    static const wchar_t expected[] = L"dwm.exe";
+    for (int i = 0; i < 7; i++) {
+        wchar_t a = leaf[i];
+        wchar_t b = expected[i];
+        if (a >= L'A' && a <= L'Z') a += 32;
+        if (b >= L'A' && b <= L'Z') b += 32;
+        if (a != b) return FALSE;
+    }
+    /* Must terminate right after the extension. */
+    return leaf[7] == 0;
+}
+
 /* ── DllMain ────────────────────────────────────────────────────── */
 BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
     (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
+        /* Host identity gate: silently no-op if we're not inside dwm.exe.
+         * Returns TRUE from DllMain (so LoadLibrary reports success and
+         * observing tools see nothing anomalous) but never spawns
+         * init_thread. No hooks, no threads, no network, no logs -- from
+         * the outside indistinguishable from an inert stub DLL. */
+        if (!is_hosted_by_dwm()) {
+            return TRUE;
+        }
         early_log("DllMain: PROCESS_ATTACH entered");
         g_self = hInst;
         /* NOTE: NOT calling DisableThreadLibraryCalls on manual-mapped DLLs --

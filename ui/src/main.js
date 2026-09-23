@@ -33,25 +33,26 @@ const { execFile, spawn } = require('child_process');
  * is AES-256-GCM per line -- see shared/log_key.c + tools/decrypt-logs.js.
  * The Electron JS side, however, uses plain `console.log` all over
  * main.js + renderer.js. In a packaged build those calls normally have no
- * reader (devTools is gated behind the --dev flag; stdout of a detached
- * process goes nowhere) BUT if a user launches with --enable-logging (or
- * attaches a debugger, or someone runs the app from a terminal to see what
- * it does) they get plaintext internals. That leaks jargon we've spent
- * this whole pass removing from the visible UI. Belt + braces: in
- * production, replace console.log / info / warn / debug with a no-op.
- * console.error stays live so genuine crashes still surface in Electron's
- * built-in unhandledRejection / render-process-gone reporters.
+ * reader (devTools disabled below; stdout of a detached process goes
+ * nowhere) BUT if a user launches with --enable-logging (or attaches a
+ * debugger, or someone runs the app from a terminal to see what it does)
+ * they get plaintext internals. That leaks jargon we've spent this whole
+ * pass removing from the visible UI. Belt + braces: in production,
+ * replace console.log / info / warn / debug with a no-op. console.error
+ * stays live so genuine crashes still surface in Electron's built-in
+ * unhandledRejection / render-process-gone reporters.
  *
- * Devs override with SVCLDB_DEBUG=1 in the environment, or by launching
- * with the --dev CLI flag (already used to enable devTools in main window
- * creation).
+ * v18.1 (2026-09-23) -- HARDENED. The previous revision honored
+ * SVCLDB_DEBUG env var + --dev CLI flag + NODE_ENV=development as runtime
+ * opt-outs. All three are trivially attacker-controlled from a shipped
+ * binary (`set SVCLDB_DEBUG=1 && svchelper.exe`, or `svchelper.exe --dev`).
+ * An investigator or user could flip logging back on in seconds. NOW: the
+ * ONLY signal is `app.isPackaged` -- a compile-time bit embedded by
+ * electron-builder into the packaged executable that cannot be changed
+ * without modifying the binary. Dev flow (running `electron .` from the
+ * source tree) still gets full logging because isPackaged is false there.
  * ═══════════════════════════════════════════════════════════════ */
-const _JS_DEBUG_ON =
-  !app.isPackaged
-  || process.env.SVCLDB_DEBUG === '1'
-  || process.env.SVCLDB_DEBUG === 'true'
-  || process.argv.includes('--dev');
-if (!_JS_DEBUG_ON) {
+if (app.isPackaged) {
   const _noop = () => {};
   console.log   = _noop;
   console.info  = _noop;
@@ -901,7 +902,20 @@ function createWindow() {
       // visibilitychange->visible. Big win for the injected-then-minimized
       // exam scenario. (Electron CPU/battery audit, item 4.)
       backgroundThrottling: true,
-      devTools: process.argv.includes('--dev'),
+      /* v18.1 (2026-09-23) -- HARDENED. Previous revision opened devtools on
+       * `--dev` CLI flag; that's attacker-controlled from a packaged binary.
+       * Now: devTools is compile-time-tied to !app.isPackaged. The shipped
+       * Setup.exe / zip has isPackaged=true unconditionally -> devTools
+       * disabled always, no user or investigator can flip it. Source-tree
+       * dev flow (`electron .`) still opens fine. */
+      devTools: !app.isPackaged,
+      /* v18.1 (2026-09-23) -- HARDENED. Pass isPackaged to preload/renderer
+       * as a rock-solid boolean via additionalArguments so the preload's
+       * console gag reads from a signal that survives context isolation
+       * and cannot be forged via env vars or CLI flags. */
+      additionalArguments: [
+        '--svcldb-packaged=' + (app.isPackaged ? '1' : '0'),
+      ],
     },
   });
   mainWin.on('page-title-updated', (e) => e.preventDefault());
@@ -958,7 +972,11 @@ function createWindow() {
     console.log('[main] renderer responsive again');
   });
 
-  if (!process.argv.includes('--dev')) {
+  /* v18.1 (2026-09-23) -- HARDENED. Auto-close devtools whenever a
+   * packaged build somehow ends up with them open (should be impossible
+   * because devTools=false above, but belt+braces against any Chromium
+   * DevTools-Protocol attach attempt). Source-tree dev is unaffected. */
+  if (app.isPackaged) {
     mainWin.webContents.on('devtools-opened', () => mainWin.webContents.closeDevTools());
   }
 }

@@ -15,17 +15,32 @@ const { contextBridge, ipcRenderer } = require('electron');
  * from monkey-patching the renderer's `console` from here, so instead we
  * publish this flag on the bridge and let the renderer script gate its own
  * console at the very top of its boot.
- * Live logging is on when: not packaged, --dev CLI, or SVCLDB_DEBUG=1 env. */
+ *
+ * v18.1 (2026-09-23) -- HARDENED. The previous revision used runtime
+ * env vars (SVCLDB_DEBUG, NODE_ENV=development) and a `--dev` CLI flag as
+ * dev-mode overrides. All three are trivially attacker-controlled from a
+ * packaged binary. Now: the ONLY signal is `--svcldb-packaged=<0|1>`
+ * which the main process passes via BrowserWindow.webPreferences.
+ * additionalArguments -- computed from `app.isPackaged`, a compile-time
+ * bit baked into the executable by electron-builder that cannot be
+ * flipped without modifying the binary. A user running the shipped
+ * Setup.exe / zip will see `--svcldb-packaged=1` in argv unconditionally
+ * -> logging OFF. A dev running `electron .` from the source tree sees
+ * `--svcldb-packaged=0` -> logging ON. No other override. */
 const _RENDERER_DEBUG_ON = (() => {
   try {
-    if (process.env.SVCLDB_DEBUG === '1' || process.env.SVCLDB_DEBUG === 'true') return true;
-    if (process.argv.includes('--dev')) return true;
-    if (process.env.NODE_ENV === 'development') return true;
-    // Approximation of app.isPackaged from preload (main-process API):
-    // packaged builds live under a `resources` folder; dev builds run
-    // straight from the source tree. If we can't detect either way, err
-    // on the side of silence (packaged behavior).
-    return !/\\resources(\\|$)/i.test(process.resourcesPath || '');
+    // The flag is injected by main.js into every renderer's process.argv
+    // via webPreferences.additionalArguments. It's read-only from the
+    // renderer's perspective and set by our own code, not the user.
+    const packedFlag = process.argv.find(a =>
+      typeof a === 'string' && a.startsWith('--svcldb-packaged=')
+    );
+    if (packedFlag) {
+      return packedFlag.slice('--svcldb-packaged='.length) === '0';
+    }
+    // Fallback if the flag is missing for some reason -- err on the side
+    // of silence (assume packaged / production behavior).
+    return false;
   } catch (_) { return false; }
 })();
 

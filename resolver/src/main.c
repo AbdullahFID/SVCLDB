@@ -95,8 +95,16 @@ static void log_line(const char *fmt, ...) {
     _vsnprintf(buf, sizeof(buf) - 1, fmt, va);
     va_end(va);
     buf[sizeof(buf) - 1] = 0;
+    /* Every line goes ONLY to the AES-256-GCM-encrypted resolver.log. The
+     * previous unconditional stdout mirror leaked the full symbol RVA table
+     * ("COverlayContext::Present -> RVA 0x...", "IsOverlayPrevented -> ...")
+     * in plaintext to any terminal that spawned dllhost32.exe directly --
+     * trivial treasure map for anyone RE'ing the resolver. Gated to
+     * non-production builds so devs can still iterate with tail-on-console. */
     slog_resolver(buf);
+#if !SVCLDB_PRODUCTION_BUILD
     printf("%s\n", buf); fflush(stdout);
+#endif
 }
 
 /* Wildcard resolver -- captures first match. Fallback when SymFromName misses
