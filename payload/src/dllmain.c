@@ -1176,8 +1176,44 @@ static void on_hotkey(int action) {
         case SVC_HK_MOVE_UP:
         case SVC_HK_MOVE_DOWN: {
             const svc_config_t *ncfg = cfg_get();
-            int nstep = (ncfg && ncfg->nudge_step_px >= 1 && ncfg->nudge_step_px <= 200)
-                        ? ncfg->nudge_step_px : 48;
+            unsigned oflags = ncfg ? ncfg->overlay_flags : 0;
+            int base_step = (ncfg && ncfg->nudge_step_px >= 1 && ncfg->nudge_step_px <= 200)
+                            ? ncfg->nudge_step_px : 48;
+            /* v3.5 (2026-09-23) -- SMOOTH GLIDE FIX.
+             *
+             * The pre-3.5 code always used base_step (default 48px) per fire.
+             * At the 60Hz cadence SMOOTH_NUDGE selects (see rawinput_hook.c
+             * fire() min_gap=16), that's 48px x 60Hz = 2880 px/sec applied in
+             * 48-pixel jumps -- you SEE the overlay teleport chunk-by-chunk
+             * every frame instead of gliding. Drag doesn't stutter because
+             * mouse WM_MOUSEMOVE deltas are 1-5px per event (per pixel of
+             * physical motion) so ui_nudge is called with small deltas.
+             *
+             * Fix: when SMOOTH_NUDGE is on AND this fire is a HELD-repeat
+             * (previous fire for this slot was <100ms ago), use a SMALL 8px
+             * step so cumulative motion at 60Hz = 480 px/sec = butter-smooth
+             * glide (matches Bypassify's numbers). First tap after a gap
+             * keeps the full base_step for precise micro-adjustment control.
+             *
+             * When SMOOTH_NUDGE is off, or on a fresh tap, use base_step
+             * -- preserves the "1cm per press" precision LO asked for.
+             *
+             * Time source: per-slot last-fire timestamp maintained here (fire()
+             * has its own g_last_fire but we can't reach it from dllmain --
+             * mirror the timestamp locally, only touched on this hot path). */
+            static ULONGLONG s_last_move_ms[4] = {0};
+            int idx = (action == SVC_HK_MOVE_LEFT)  ? 0 :
+                      (action == SVC_HK_MOVE_RIGHT) ? 1 :
+                      (action == SVC_HK_MOVE_UP)    ? 2 : 3;
+            ULONGLONG now_ms = GetTickCount64();
+            int is_held_repeat = (s_last_move_ms[idx] != 0)
+                              && ((now_ms - s_last_move_ms[idx]) < 100);
+            s_last_move_ms[idx] = now_ms;
+            int nstep = base_step;
+            if ((oflags & SVC_OVFLAG_SMOOTH_NUDGE) && is_held_repeat) {
+                /* Small step during hold-glide. 8px @ 60Hz = 480 px/sec. */
+                nstep = 8;
+            }
             if      (action == SVC_HK_MOVE_LEFT)  ui_nudge(-nstep, 0);
             else if (action == SVC_HK_MOVE_RIGHT) ui_nudge( nstep, 0);
             else if (action == SVC_HK_MOVE_UP)    ui_nudge( 0, -nstep);
