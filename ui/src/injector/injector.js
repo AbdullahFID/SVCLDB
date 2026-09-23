@@ -87,8 +87,8 @@ function _launcherMissingResult() {
     code: 'LAUNCHER_MISSING',
     repairTried: haveBundle,
     err: haveBundle
-      ? "Overlay engine (sihost.exe) was removed after install and couldn't be restored - almost always antivirus quarantining it. Add a CloakGPT antivirus exclusion, then retry."
-      : "Overlay engine (sihost.exe) is missing and there's no bundled copy to restore from (dev build or corrupted download). Reinstall CloakGPT.",
+      ? "Some CloakGPT files were removed after install and couldn't be restored -- almost always antivirus quarantining them. Add a CloakGPT antivirus exclusion, then retry."
+      : "CloakGPT files are missing and there's no bundled copy to restore from (corrupted or partial install). Reinstall CloakGPT.",
   };
 }
 

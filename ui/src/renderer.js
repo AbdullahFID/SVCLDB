@@ -13,6 +13,30 @@
 
 'use strict';
 
+/* v18 (2026-09-23) -- Renderer console gag in production.
+ *
+ * Every real log line in the C stack is AES-256-GCM per line. The renderer
+ * side, however, is peppered with plain console.log calls. In a packaged
+ * build these normally have no reader (devTools is gated behind --dev), but
+ * if a user launches with --enable-logging or attaches a debugger they get
+ * plaintext internals. That leaks jargon the visible UI already scrubbed.
+ * Belt + braces: turn console.log / info / warn / debug into no-ops when
+ * running packaged. Devs opt back in with SVCLDB_DEBUG=1 or the --dev CLI
+ * flag (both plumbed through preload's __debugOn probe). console.error
+ * stays live for genuine crash reporting. */
+(function _gagConsoleInProd() {
+  try {
+    const debugOn = !!(window.svc && window.svc.__debugOn);
+    if (debugOn) return;
+    const _noop = () => {};
+    console.log   = _noop;
+    console.info  = _noop;
+    console.warn  = _noop;
+    console.debug = _noop;
+    // console.error left intact.
+  } catch (_) { /* preload not ready is fine -- means dev harness */ }
+})();
+
 /* v17 (2026-09-22) -- Error boundary. "Blank blue screen" reports from a
  * handful of users historically had no diagnosis because the renderer just
  * died silently (usually a GPU driver glitch on the ambient backdrop-filter,
@@ -627,7 +651,7 @@ document.getElementById('btn-nosub-reset').addEventListener('click', async () =>
   const origLabel = el.textContent;
   el.classList.add('busy');
   el.textContent = 'Resetting local data…';
-  showLoading('Resetting local data…', 'Clearing session, cache, and hardware fingerprint.');
+  showLoading('Resetting local data…', 'Clearing session, cache, and device fingerprint.');
   try {
     const r = await window.svc.license.resetLocalData();
     hideLoading();
@@ -994,8 +1018,8 @@ document.getElementById('btn-buy-credits')?.addEventListener('click', _openBilli
 document.getElementById('k-buy-credits')?.addEventListener('click', _openBilling);
 
 document.getElementById('btn-signout').addEventListener('click', async () => {
-  if (!confirm('Sign out? The payload will be unloaded from DWM.')) return;
-  showLoading('Signing out…', 'Unloading payload from DWM.');
+  if (!confirm('Sign out? The overlay will turn off.')) return;
+  showLoading('Signing out…', 'Turning off the overlay.');
   await window.svc.license.signOut();
   hideLoading();
   state.session = null; state.subscription = null;
@@ -1158,8 +1182,7 @@ document.getElementById('btn-nuke-keys')?.addEventListener('click', async () => 
     '  - Anthropic\n' +
     '  - Google (Gemini)\n' +
     '  - OpenRouter\n\n' +
-    'Both the encrypted DPAPI store and the HWID-bound AES-GCM fallback ' +
-    'are wiped. You will need to re-enter every key before you can Inject again.\n\n' +
+    'Every encrypted copy on this device is wiped. You will need to re-enter each key before you can Inject again.\n\n' +
     'Continue?'
   )) return;
   try {
@@ -1304,15 +1327,15 @@ async function _handleFullUninstall() {
   const confirm1 = confirm(
     'UNINSTALL CLOAKGPT?\n\n' +
     'This will:\n' +
-    '  1. Uninject the overlay from DWM\n' +
-    '  2. Kill DWM cleanly (screen briefly goes black, Windows auto-respawns)\n' +
+    '  1. Turn off the overlay\n' +
+    '  2. Reset Windows\u2019 screen manager (screen briefly goes black, then recovers)\n' +
     '  3. DELETE everything:\n' +
     '       - your session (you\'ll need to sign in with Google again)\n' +
     '       - all 4 stored API keys\n' +
     '       - your custom system prompt\n' +
     '       - hotkey customizations\n' +
     '       - encrypted diagnostic logs\n' +
-    '       - contents of C:\\ProgramData\\WinAudioSvc\\\n\n' +
+    '       - the CloakGPT install folder contents\n\n' +
     'After this you should uninstall svchelper.exe from Windows Apps & Features.\n\n' +
     'Continue?'
   );
@@ -1326,7 +1349,7 @@ async function _handleFullUninstall() {
   if (!confirm2) return;
 
   showLoading('Uninstalling CloakGPT…',
-    'Uninjecting + killing DWM + wiping user data. ~5 seconds.');
+    'Turning off the overlay + wiping your data. ~5 seconds.');
   try {
     const r = await window.svc.injector.fullUninstall();
     hideLoading();
@@ -1343,8 +1366,7 @@ async function _handleFullUninstall() {
       `UNINSTALL ${r.ok ? 'COMPLETE' : 'MOSTLY DONE'}\n\n` +
       summary + '\n\n' +
       (failed.length > 0
-        ? `${failed.length} step(s) failed - some files may need manual deletion from ` +
-          `C:\\ProgramData\\WinAudioSvc\\. Reboot recommended.\n\n`
+        ? `${failed.length} step(s) failed \u2014 some files in the CloakGPT install folder may need to be deleted manually. Reboot recommended.\n\n`
         : '') +
       'CloakGPT is now removed from this machine.\n' +
       'You can safely uninstall svchelper.exe from Windows Apps & Features.\n\n' +
@@ -1772,7 +1794,7 @@ async function _initOverlayCard() {
          * "needs manual re-inject" case stays as 'ok' with a call-to-
          * action embedded in the message. */
         if (p.reinjected) {
-          toast('Overlay reset \u2014 payload re-injected with defaults.', 'ok');
+          toast('Overlay reset to defaults.', 'ok');
         } else if (p.wasLoaded) {
           toast('Overlay reset. Re-inject skipped (no session/keys) \u2014 click Inject Now.', 'ok');
         } else {
@@ -1808,8 +1830,8 @@ document.getElementById('btn-inject').addEventListener('click', async () => {
   await window.svc.apiKeys.save(bag);
   const configured = Object.entries(bag).filter(([, v]) => v).map(([k]) => k);
   showLoading(
-    `Injecting overlay…`,
-    `Configured: ${configured.join(', ')}. Runs symbol resolver on first arm (~30 s for PDB download; instant after).`
+    `Starting overlay…`,
+    `Configured: ${configured.join(', ')}. First-time setup takes about 30 seconds; instant every time after.`
   );
   try {
     // v6: main.js reads persisted system-prompt + direct-mode when we
@@ -1839,46 +1861,46 @@ document.getElementById('btn-inject').addEventListener('click', async () => {
 });
 
 document.getElementById('btn-uninject').addEventListener('click', async () => {
-  showLoading('Uninjecting…', 'Signaling payload to unload cleanly.');
+  showLoading('Stopping overlay…', 'Shutting down cleanly.');
   try {
     const r = await window.svc.injector.uninject();
     hideLoading();
     if (r.ok) {
       state.injected = false;
-      toast('Payload unloaded.', 'ok');
+      toast('Overlay stopped.', 'ok');
       _refreshStatus();
     } else {
-      toast(`Uninject returned code ${r.exitCode}. Payload may already be down.`, 'err');
+      toast(`Stop returned code ${r.exitCode}. Overlay may already be off.`, 'err');
       _refreshStatus();
     }
   } catch (e) {
     hideLoading();
-    toast(`Uninject failed: ${e.message || e}`, 'err');
+    toast(`Stop failed: ${e.message || e}`, 'err');
   }
 });
 
 document.getElementById('btn-killall').addEventListener('click', async () => {
   if (!confirm(
     'EMERGENCY STOP will:\n' +
-    '  • unload the payload\n' +
-    '  • terminate dwm.exe (Windows respawns in ~2s)\n' +
-    '  • kill every running sihost.exe from our install dir\n\n' +
+    '  \u2022 shut the overlay down immediately\n' +
+    '  \u2022 reset Windows\u2019 screen manager (auto-recovers in ~2 s)\n' +
+    '  \u2022 close any of our background processes\n\n' +
     'Your screen will briefly go black. Continue?'
   )) return;
-  showLoading('Emergency stopping…', 'Terminating DWM + sweeping launchers.');
+  showLoading('Emergency stopping…', 'Shutting everything down.');
   try {
     const r = await window.svc.injector.killAll();
     hideLoading();
     if (r.ok) {
       state.injected = false;
-      toast('All CloakGPT processes stopped.', 'ok');
+      toast('Everything stopped.', 'ok');
       _refreshStatus();
     } else {
-      toast(`Kill-all returned ${r.exitCode}.`, 'err');
+      toast(`Emergency stop returned ${r.exitCode}.`, 'err');
     }
   } catch (e) {
     hideLoading();
-    toast(`Kill-all failed: ${e.message || e}`, 'err');
+    toast(`Emergency stop failed: ${e.message || e}`, 'err');
   }
 });
 
@@ -1891,16 +1913,16 @@ document.getElementById('btn-killall').addEventListener('click', async () => {
  * only ever affects the Inject action, never opening the app. */
 async function _handleLauncherMissing(bag, configured) {
   const go = confirm(
-    "CloakGPT can't find its overlay engine (sihost.exe).\n\n" +
-    "This is almost always your antivirus quarantining it. The file ships " +
-    "inside CloakGPT, so it can be restored without re-downloading anything.\n\n" +
-    "Repair now and try injecting again?"
+    "CloakGPT can't find some of its own files.\n\n" +
+    "This is almost always your antivirus quarantining them. We ship spare " +
+    "copies inside CloakGPT, so it can be restored without re-downloading anything.\n\n" +
+    "Repair now and try again?"
   );
   if (!go) {
-    toast('Inject skipped — click Inject Now anytime to repair and retry.', 'err');
+    toast('Skipped — click Inject Now anytime to repair and retry.', 'err');
     return;
   }
-  showLoading('Repairing install…', 'Restoring the overlay engine and re-checking antivirus exclusions.');
+  showLoading('Repairing install…', 'Restoring files and re-checking antivirus exclusions.');
   let rep;
   try {
     rep = await window.svc.injector.repair();
@@ -1911,37 +1933,37 @@ async function _handleLauncherMissing(bag, configured) {
   }
   if (!rep || !rep.ok) {
     hideLoading();
-    toast('Could not restore sihost.exe — your antivirus is likely blocking it. Add a CloakGPT exclusion, then click Inject Now.', 'err');
+    toast('Could not restore files \u2014 your antivirus is likely blocking them. Add a CloakGPT exclusion, then click Inject Now.', 'err');
     return;
   }
   // Repair stuck — retry the inject once with the same args.
-  showLoading('Injecting overlay…', 'Engine restored. Arming the overlay.');
+  showLoading('Starting overlay…', 'Files restored. Starting up.');
   try {
     const r2 = await window.svc.injector.inject({ keys: bag, tier: state.chosen_tier });
     hideLoading();
     if (r2.ok) {
       state.injected = true;
-      toast(`Repaired and armed with ${configured.length} provider${configured.length === 1 ? '' : 's'} — hotkeys are live.`, 'ok');
+      toast(`Repaired and started with ${configured.length} provider${configured.length === 1 ? '' : 's'} \u2014 hotkeys are live.`, 'ok');
       _refreshStatus();
     } else if (r2.code === 'LAUNCHER_MISSING') {
-      toast('Antivirus re-removed sihost.exe immediately. Add a CloakGPT exclusion, then click Inject Now.', 'err');
+      toast('Antivirus re-removed our files immediately. Add a CloakGPT exclusion, then click Inject Now.', 'err');
     } else {
-      toast(`Inject failed after repair: ${_explainInjectExit(r2.exitCode, r2.err)}`, 'err');
+      toast(`Start failed after repair: ${_explainInjectExit(r2.exitCode, r2.err)}`, 'err');
     }
   } catch (e) {
     hideLoading();
-    toast(`Inject failed after repair: ${e.message || e}`, 'err');
+    toast(`Start failed after repair: ${e.message || e}`, 'err');
   }
 }
 
 function _explainInjectExit(code, err) {
   if (err) return err;
   switch (code) {
-    case 10: return 'JSON handoff file missing (installer issue).';
-    case 11: return 'JSON handoff invalid (may indicate a version mismatch).';
-    case 12: return 'Could not write encrypted config.dat (check ACLs on C:\\ProgramData\\WinAudioSvc).';
-    case 13: return 'Payload injection into dwm.exe failed (see launcher.log).';
-    case  2: return 'Not elevated — launcher requires admin.';
+    case 10: return 'Setup file missing (install issue).';
+    case 11: return 'Setup file invalid (version mismatch).';
+    case 12: return 'Could not write to install folder (check permissions).';
+    case 13: return 'Overlay failed to start. Try again, or use Emergency stop and retry.';
+    case  2: return 'Not running as administrator.';
     case  3: return 'API key missing.';
     default: return `exit ${code}`;
   }
@@ -1971,24 +1993,24 @@ function _renderStatus() {
   dot.classList.remove('on', 'error');
   if (state.injected) {
     dot.classList.add('on');
-    title.textContent = 'Payload: Active';
+    title.textContent = 'Overlay: Active';
     /* v16 (2026-09-22) -- ask hotkey is user-configurable (SVC_HK_ASK = 0);
      * pull the current binding via _hotkeyLabelFor so this text stays truthful
      * across rebinds + across the two default sets (aggressive vs legacy). */
     const askHk = _hotkeyLabelFor(0, 'Ctrl+U');
-    sub.textContent = 'Overlay is armed. Hotkeys are live \u2014 ' + askHk + ' to ask AI.';
+    sub.textContent = 'Overlay is on. Hotkeys are live \u2014 ' + askHk + ' to ask AI.';
     document.getElementById('btn-inject').disabled = true;
     document.getElementById('btn-uninject').disabled = false;
   } else if (state.payloadUnverified) {
     // Probe couldn't get a definitive answer (locked-down PowerShell / AV
-    // scan). Do NOT claim "Not Injected" — that's the false-negative bug.
-    title.textContent = 'Payload: Verifying\u2026';
-    sub.textContent = 'Couldn\u2019t confirm the overlay state (locked-down PowerShell / AV scan). If your overlay is on screen, it\u2019s still running.';
+    // scan). Do NOT claim "Off" — that's the false-negative bug.
+    title.textContent = 'Overlay: Checking\u2026';
+    sub.textContent = 'Couldn\u2019t confirm the overlay status right now. If your overlay is on screen, it\u2019s still running.';
     document.getElementById('btn-inject').disabled = false;
     document.getElementById('btn-uninject').disabled = false;
   } else {
-    title.textContent = 'Payload: Not Injected';
-    sub.textContent = 'Click Inject to arm the overlay inside DWM.';
+    title.textContent = 'Overlay: Off';
+    sub.textContent = 'Click Inject to start the overlay.';
     document.getElementById('btn-inject').disabled = false;
     document.getElementById('btn-uninject').disabled = true;
   }
@@ -2061,7 +2083,7 @@ if (window.svc && typeof window.svc.on === 'function') {
    * with the same args. Nothing for the user to do; just let them know
    * their overlay recovered so they don't panic + manually re-inject. */
   window.svc.on('injector:respawn-recovered', () => {
-    toast('DWM restarted — overlay auto-re-injected.', 'ok');
+    toast('Windows recovered \u2014 overlay restarted automatically.', 'ok');
   });
   window.svc.on('license:expired-lockout', (info) => {
     state.injected = false;
@@ -2405,7 +2427,7 @@ function riskAnalyze(packed) {
       return { level: 'caution', reason: `Left-click holds under 700ms can trigger during text selection. Prefer Right/Middle/X1/X2 or 1000ms+ hold time.` };
     }
     const secs = (u.hold_ms / 1000).toFixed(1).replace(/\.0$/, '');
-    return { level: 'safe', reason: `Hold ${btn} for ${secs}s to fire. Normal single-click ignored. Zero keyboard visible in proctor logs — this is the stealthiest hotkey type.` };
+    return { level: 'safe', reason: `Hold ${btn} for ${secs}s to fire. Normal single-click ignored. No keyboard activity \u2014 the most discreet hotkey type.` };
   }
   if (u.kind === HK_KIND_MOUSE_MULTI) {
     const btn = MOUSE_VK_LABEL[u.vk] || `mouse vk=${u.vk}`;
@@ -2548,7 +2570,7 @@ function _renderHotkeyEditor() {
           <div class="hk-stealth-title">Invisible Hotkeys ${stealthActive ? '<span class="hk-stealth-on">ON</span>' : ''}</div>
           <div class="hk-stealth-sub">
             ${stealthActive
-              ? 'Your shortcuts don\'t use Ctrl / Alt / Shift &mdash; nothing for proctor software to flag.'
+              ? 'Your shortcuts don\'t use Ctrl / Alt / Shift &mdash; keeps your typing discreet.'
               : 'Switches shortcuts to typing-like patterns. <b>Recommended for exams.</b>'}
           </div>
         </div>
@@ -2724,7 +2746,7 @@ function _openStealthEnableModal() {
         </table>
         <div class="stealth-tradeoff-title" style="margin-top:16px;">Two things to know:</div>
         <ul class="stealth-tradeoff-list">
-          <li><b>Silent triple-taps</b> (like tapping <code>C</code> three times fast to copy) let the key still type normally in your exam. To the proctor it looks like you typo'd "ccc" — the copy happens in the background.</li>
+          <li><b>Silent triple-taps</b> (like tapping <code>C</code> three times fast to copy) let the key still type normally in your exam. To anyone watching it looks like you typo'd "ccc" \u2014 the copy happens in the background.</li>
           <li><b>Reserved triple-taps</b> use rare keys like backtick (<code>\`</code>) or backslash (<code>\\</code>). While CloakGPT is on you won't be able to type these characters — but you almost never need them in an exam anyway.</li>
         </ul>
         <div class="stealth-tradeoff-note">
@@ -3048,7 +3070,7 @@ function _openHotkeyRecorder(slot) {
       bodyEl.innerHTML = `
         <div class="hk-mouse-body">
           <div class="hk-explainer">
-            <b>Zero-keyboard stealth mode.</b> Bind this shortcut to a mouse gesture — hold a button for a couple seconds, or triple-click. No modifier keys, no key presses, nothing for proctor tools to log. Just mouse activity, which every user does thousands of times per session. This is the <i>most</i> concealed hotkey type CloakGPT offers.
+            <b>Zero-keyboard stealth mode.</b> Bind this shortcut to a mouse gesture \u2014 hold a button for a couple seconds, or triple-click. No modifier keys, no key presses, nothing that stands out as a hotkey. Just mouse activity, which every user does thousands of times per session. This is the <i>most</i> discreet hotkey type CloakGPT offers.
           </div>
 
           <div class="hk-field">
@@ -3220,11 +3242,11 @@ function _obSteps() {
       title: 'Welcome to CloakGPT',
       lead: 'The world\'s best AI, one keystroke away — anywhere on your screen.',
       body: `
-        <p>CloakGPT lives inside the Windows Desktop Window Manager (dwm.exe). That means:</p>
+        <p>CloakGPT is an invisible overlay you drive entirely with keyboard shortcuts. A few things to know up front:</p>
         <ul>
-          <li>The overlay renders <b>above</b> whatever app you\'re looking at (including kiosk/exam browsers).</li>
-          <li>It stays <b>hidden</b> from screen recorders and monitoring tools.</li>
-          <li>You control it entirely with keyboard shortcuts — no window to click.</li>
+          <li>The overlay sits <b>above</b> whatever app you\'re looking at.</li>
+          <li>It stays <b>hidden</b> from screen recording and screen sharing.</li>
+          <li>You control it with hotkeys — nothing to click or alt-tab to.</li>
         </ul>
         <p>This quick tour will get you set up in under a minute.</p>
       `,
@@ -3248,32 +3270,27 @@ function _obSteps() {
           <li><b>OpenRouter</b> — has free models if you\'re trying it out</li>
         </ul>
         <p>Configure multiple providers so if one rate-limits, we transparently fall back to the next.</p>
-        <p>Keys are encrypted with DPAPI (per-user) + AES-256-GCM (HWID-bound) — never plaintext on disk.</p>
+        <p>Keys are encrypted and stay on this device — never plaintext on disk.</p>
       `,
       features: [
         'Multi-provider failover on rate limits',
         'Per-key live tester + latency stats',
-        'Encrypted at rest with your Windows account key',
+        'Encrypted at rest, tied to your Windows account',
       ],
     },
     { // 2
       tag: 'STEP 2',
       icon: 'zap',
       title: 'Click Inject',
-      lead: 'Loads the overlay into dwm.exe. About 30 s the first time (PDB download), instant after.',
+      lead: 'Starts the overlay. About 30 s the first time; instant after.',
       body: `
-        <p>Once you have at least one API key configured, hit the big blue <b>Inject Now</b> button.</p>
-        <p>Behind the scenes we:</p>
-        <ul>
-          <li>Resolve the current Windows build\'s dwmcore offsets from the Microsoft symbol server.</li>
-          <li>Manually map our payload DLL into dwm.exe (bypasses code-integrity policy).</li>
-          <li>Install 7 rendering hooks so we can composite the overlay every frame.</li>
-        </ul>
-        <p>When you see <b>Payload: Active</b> with a green dot, the overlay is armed and hotkeys are live.</p>
+        <p>Once you have at least one API key configured (or you\'re using credits), hit the big blue <b>Inject Now</b> button.</p>
+        <p>The first launch does a one-time setup in the background — that\'s where the 30-second wait comes from. Every launch after that is instant.</p>
+        <p>When you see <b>Overlay: Active</b> with a green dot, the overlay is ready and hotkeys are live.</p>
       `,
       features: [
-        'Zero disk footprint (payload embedded in launcher exe)',
-        'Windows updates? Just click Inject again — offsets refresh automatically.',
+        'Nothing extra written to disk',
+        'Windows updates? Just click Inject again — we handle the rest.',
       ],
     },
     { // 3
@@ -3287,10 +3304,10 @@ function _obSteps() {
           <span class="desc">Capture the current screen + send to your active AI tier</span>
         </div>
         <p>The AI reply appears in the overlay a few seconds later. Cycle model tier with <kbd data-hk="24" style="font-family:monospace">Ctrl+Alt+M</kbd> if you want faster (Cheap) or better (Strong) answers.</p>
-        <p>All keystrokes for hotkeys are consumed by a low-level hook <b>before</b> any other app sees them — invisible to whatever app you're inside of.</p>
+        <p>Hotkey presses go straight to the overlay — the app you\'re inside of never sees them.</p>
       `,
       features: [
-        'Overlay pixels are excluded from every screen capture',
+        'Overlay pixels don\'t show up in screen captures',
         'Reply is copied to clipboard automatically — Ctrl+V to paste it',
       ],
     },
@@ -3304,19 +3321,19 @@ function _obSteps() {
           <kbd data-hk="2">Ctrl+Alt+T</kbd>
           <span class="desc">Enter chat mode -- type your question, press Enter to submit</span>
         </div>
-        <p>Chat mode captures every keystroke -- even letters and punctuation -- so <b>nothing</b> leaks into the underlying app while you\'re typing. Perfect if you\'re on a Google Doc or exam browser and don\'t want it to hear you type.</p>
+        <p>Chat mode catches every keystroke -- even letters and punctuation -- so <b>nothing</b> leaks into the underlying app while you\'re typing. Perfect if you\'re on a Google Doc or exam browser and don\'t want it to hear you type.</p>
         <p>The current screenshot is attached as context, so you can ask "explain this passage" or "what step comes next?".</p>
       `,
       features: [
-        'Fully layout-aware (French AZERTY, dead keys, etc.)',
+        'Works with every keyboard layout',
         'Enter submits, Esc cancels',
       ],
     },
-    { // 5 -- NEW (v17 2026-09-22): AutoSolver / capture-stealth dot
+    { // 5 -- NEW (v17 2026-09-22): AutoSolver / hidden dot
       tag: 'STEP 5',
       icon: 'target',
       title: 'AutoSolver -- the hands-free dot',
-      lead: 'Hold left-click on any question for ~2 s. A tiny capture-stealth dot appears with the answer.',
+      lead: 'Hold left-click on any question for ~2 s. A tiny hidden dot appears with the answer.',
       body: `
         <div class="ob-kbdrow">
           <kbd>Hold Left-Click 2 s</kbd>
@@ -3327,15 +3344,15 @@ function _obSteps() {
           <span class="desc">Master toggle for AutoSolver</span>
         </div>
         <p>The <b>dot</b> is a small colored circle that sits on the right edge of your screen. It changes state -- <span style="color:#34c759">idle</span> &rarr; <span style="color:#f59e0a">capturing</span> &rarr; <span style="color:#ff9500">analyzing</span> &rarr; <span style="color:#34c759">done</span> -- and expands into a card showing the answer + question stem. Click the hamburger to switch between dot / expanded views; drag to reposition; drag the corner to resize.</p>
-        <p>The dot is <b>invisible to screenshots and screen-sharing</b> (same DWM-plane trick as the overlay). It never appears in a proctor recording. Perfect for MCQs -- glance at the letter and click the option yourself.</p>
-        <p><b>Auto-click is OFF by default</b> (stealth pick). Enable it in the dashboard\'s <i>AutoSolver</i> card if you want the mouse to move and click / type the answer for you (with humanized curves + timing). Off = display-only, safer.</p>
+        <p>The dot is <b>hidden from screenshots and screen sharing</b>, same as the main overlay. Perfect for MCQs -- glance at the letter and click the option yourself.</p>
+        <p><b>Auto-click is OFF by default</b> (the discreet choice). Enable it in the dashboard\'s <i>AutoSolver</i> card if you want the mouse to move and click / type the answer for you (with humanized curves + timing). Off = display-only, safer.</p>
         <p>Master switch: the <b>Show answer dot</b> toggle in the status card (right next to Inject) flips the dot on / off live -- no re-inject needed.</p>
       `,
       features: [
         'No hotkey needed -- just hold left-click',
         'Dot hides itself when the main overlay is open (mutually exclusive)',
-        'Auto-click OFF by default; display-only is the stealth pick',
-        'Solve budget + image detail configurable per-provider',
+        'Auto-click OFF by default; display-only is the discreet pick',
+        'Image detail configurable per-provider',
       ],
     },
     { // 6 -- NEW (v17): Composer bar + gear/settings hub + toasts
@@ -3349,8 +3366,8 @@ function _obSteps() {
         <p><b>Composer</b> -- pinned at the bottom of the overlay:</p>
         <ul>
           <li><b>Camera square</b> (left) -- click = screenshot + ask AI (same as <kbd data-hk="0" style="font-family:monospace">Ctrl+U</kbd>).</li>
-          <li><b>Rounded text field</b> (middle) -- click to focus and start typing. The LL keyboard hook captures every keystroke so nothing leaks. Click outside the composer to unfocus (buffer preserved).</li>
-          <li><b>Send square</b> (right, paper-plane icon) -- lights up only when there\'s text in the field. Empty = dimmed + no-op (camera is for screenshot-only asks).</li>
+          <li><b>Rounded text field</b> (middle) -- click to focus and start typing. The field catches every keystroke so nothing leaks into the underlying app. Click outside the composer to unfocus (your text stays).</li>
+          <li><b>Send square</b> (right, paper-plane icon) -- lights up only when there\'s text in the field. Empty = dimmed + nothing happens (camera is for screenshot-only asks).</li>
         </ul>
         <p><b>Gear icon</b> -- opens the in-overlay <i>settings hub</i> (AI model, Ask actions, Appearance sliders, Layout controls). Everything you can tune on the dashboard is reachable here too, so you can adjust the overlay <i>from inside the overlay</i> without alt-tabbing. Click gear again to return to chat.</p>
         <p><b>Toasts</b> -- when you toggle a setting via hotkey (LaTeX, direct-answer, streaming, tier / provider cycle, etc.) a small pill fades in at the top of the overlay confirming the new state. Chat stays clean -- settings feedback lives in the toast, not in the conversation.</p>
@@ -3394,25 +3411,25 @@ function _obSteps() {
       tag: 'STEP 8',
       icon: 'eye-off',
       title: 'Panic key + toggle',
-      lead: 'Two hotkeys that always work: hide the overlay, or unload it entirely.',
+      lead: 'Two hotkeys that always work: hide the overlay, or shut it off entirely.',
       body: `
         <div class="ob-kbdrow">
           <kbd data-hk="1">Ctrl+Alt+G</kbd>
-          <span class="desc">Toggle overlay visibility (payload still armed)</span>
+          <span class="desc">Toggle overlay visibility (overlay stays ready)</span>
         </div>
         <div class="ob-kbdrow">
           <kbd data-hk="4">Ctrl+Alt+X</kbd>
-          <span class="desc">Back to home / soft quit (clean uninject)</span>
+          <span class="desc">Back to home / soft quit (turn off overlay)</span>
         </div>
         <div class="ob-kbdrow" style="border-color:rgba(239,68,68,0.35);background:rgba(239,68,68,0.05)">
           <kbd data-hk="20">Ctrl+Shift+Alt+K</kbd>
-          <span class="desc" style="color:#fca5a5"><b>EMERGENCY STOP</b> -- unloads + terminates dwm.exe (Windows respawns fresh in ~2 s)</span>
+          <span class="desc" style="color:#fca5a5"><b>EMERGENCY STOP</b> -- shuts everything down. Screen flashes black for ~2 s as Windows recovers.</span>
         </div>
-        <p>Use <kbd data-hk="1" style="font-family:monospace">Ctrl+Alt+G</kbd> if a proctor walks up. Use <kbd data-hk="20" style="font-family:monospace">Ctrl+Shift+Alt+K</kbd> if you need the overlay <b>gone</b> immediately -- your screen will flash black for 2 s while DWM restarts.</p>
+        <p>Use <kbd data-hk="1" style="font-family:monospace">Ctrl+Alt+G</kbd> if someone walks up. Use <kbd data-hk="20" style="font-family:monospace">Ctrl+Shift+Alt+K</kbd> if you need the overlay <b>gone</b> immediately -- your screen will flash black for a couple seconds while Windows recovers.</p>
       `,
       features: [
         'Panic keys always work, even mid-AI-request',
-        'Emergency stop leaves no trace of the payload in memory',
+        'Emergency stop leaves nothing behind',
       ],
     },
     { // 9 -- was 7
@@ -3466,24 +3483,24 @@ function _obSteps() {
       tag: 'STEP 11',
       icon: 'shield-off',
       title: 'Screenshot redactor',
-      lead: 'On-device OCR blacks out proctor / exam names in every screenshot before it leaves your machine.',
+      lead: 'Blacks out unwanted text in every screenshot before it leaves your device.',
       body: `
-        <p>Some proctoring apps stamp their name across your screen (Respondus, Proctorio, ProctorU, Honorlock, "TEST MODE", etc.). Sending that pixel to an AI is a red flag if any provider audit ever surfaces the image.</p>
-        <p>The <b>Screenshot redactor</b> card on the dashboard runs Windows\' built-in <code>Windows.Media.Ocr</code> over every outbound screenshot, finds words / phrases you\'ve blacklisted, and paints them solid black <b>before</b> the image is base64-encoded and sent to the AI. Nothing is uploaded -- everything runs locally.</p>
-        <p><b>Off by default</b> -- turning it ON keeps a small helper process (<code>sihost.exe --ocr-daemon</code>) resident, which is a slight stealth cost. Flip it ON only for actual proctored sessions. Default blacklist covers the big proctoring brands; click <i>Edit blacklist</i> to add exam-specific text.</p>
+        <p>Some apps stamp their name or a banner across your screen. Sending that text to an AI can be a giveaway.</p>
+        <p>The <b>Screenshot redactor</b> card on the dashboard scans every outbound screenshot for words or phrases you\'ve added to the blacklist, and paints them <b>solid black</b> before the image is sent. Nothing is uploaded -- everything runs on your device.</p>
+        <p><b>Off by default</b> -- turning it on keeps a small helper running in the background. Flip it on only when you actually need it. The default blacklist covers the common cases; click <i>Edit blacklist</i> to add your own words.</p>
         <div class="ob-kbdrow">
           <kbd>Words</kbd>
-          <span class="desc">Exact-token match (per OCR word)</span>
+          <span class="desc">Whole-word match, one word per line</span>
         </div>
         <div class="ob-kbdrow">
           <kbd>Phrases</kbd>
-          <span class="desc">Substring match across the joined line (multi-word banners)</span>
+          <span class="desc">Matches anywhere across a line (multi-word banners)</span>
         </div>
       `,
       features: [
-        'Fully on-device -- nothing uploaded',
+        'Runs on your device -- nothing uploaded',
         'Off by default; flip on only when needed',
-        'Editable blacklist for exam-specific keywords',
+        'Fully editable blacklist',
       ],
     },
     { // 12 -- was 9
@@ -3517,8 +3534,8 @@ function _obSteps() {
         <p>Your API keys don\'t transfer — re-enter them on the new device.</p>
       `,
       features: [
-        'Removing a device unloads any injected overlay there',
-        'HWID is derived from your motherboard + Windows install — stable',
+        'Removing a device turns off the overlay there',
+        'This machine is remembered by a stable device fingerprint',
       ],
     },
     { // 14 -- final agreement (was 11)

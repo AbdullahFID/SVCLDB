@@ -62,7 +62,7 @@
             </svg>
           </div>
           <h1>Sign in to CloakGPT</h1>
-          <p class="tagline">Authenticate with your Google account to unlock <b>overlay injection</b>. Your session is bound to this device and refreshes every 24 hours.</p>
+          <p class="tagline">Authenticate with your Google account to unlock the <b>overlay</b>. Your session is bound to this device and refreshes every 24 hours.</p>
           <div class="error-banner" id="login-error"></div>
           <button id="btn-signin" class="btn btn-primary btn-block">
             <svg viewBox="0 0 24 24" width="18" height="18">
@@ -94,14 +94,14 @@
             <div class="avatar" id="susp-avatar">?</div>
             <div class="email" id="susp-email">&nbsp;</div>
           </div>
-          <p class="tagline" id="susp-tagline">This CloakGPT account has been suspended and can no longer inject the overlay.</p>
+          <p class="tagline" id="susp-tagline">This CloakGPT account has been suspended and can no longer use the overlay.</p>
           <div class="susp-reason" id="susp-reason">
             <div class="susp-reason-label">Suspension reason</div>
             <div class="susp-reason-body" id="susp-reason-body">&mdash;</div>
             <div class="susp-reason-when" id="susp-reason-when"></div>
           </div>
           <div class="susp-explainer">
-            <p><b>What this means:</b> the overlay has been unloaded from DWM automatically. Sign-in attempts will keep landing on this screen until the suspension is lifted.</p>
+            <p><b>What this means:</b> the overlay has been turned off automatically. Sign-in attempts will keep landing on this screen until the suspension is lifted.</p>
             <p><b>Common causes:</b> chargeback initiated against a purchase, terms-of-service violation, or account compromise flagged by our fraud detection.</p>
           </div>
           <div class="actions-row">
@@ -147,7 +147,7 @@
             </div>
           </div>
           <div class="dl-explain">
-            Removing a device signs it out of CloakGPT the next time it tries to reach the license server. Any injected overlay there will unload within about 30 minutes.
+            Removing a device signs it out of CloakGPT the next time it tries to reach the license server. The overlay on that device will turn off within about 30 minutes.
           </div>
           <div class="actions-row">
             <button id="btn-dl-cancel" class="btn btn-secondary">Cancel &amp; sign out</button>
@@ -213,13 +213,13 @@
           <button class="signout" id="btn-signout">Sign out</button>
         </div>
 
-        <!-- Status + inject/uninject -->
+        <!-- Status + start/stop -->
         <div class="status-card">
           <div class="status-row">
             <div class="status-dot" id="d-status-dot"></div>
-            <div class="status-title" id="d-status-title">Payload: Not Injected</div>
+            <div class="status-title" id="d-status-title">Overlay: Off</div>
           </div>
-          <div class="status-sub" id="d-status-sub">Click Inject to arm the overlay inside DWM.</div>
+          <div class="status-sub" id="d-status-sub">Click Inject to start the overlay.</div>
           <div class="status-actions">
             <button id="btn-inject" class="btn btn-primary">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg>
@@ -229,7 +229,7 @@
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
               Uninject
             </button>
-            <button id="btn-killall" class="btn btn-danger kill" title="Emergency stop — unload payload + terminate DWM + sweep launchers">
+            <button id="btn-killall" class="btn btn-danger kill" title="Emergency stop — shut everything down cleanly">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>
               Emergency Stop
             </button>
@@ -237,7 +237,7 @@
           <div class="badges-row">
             <div class="badge">
               <div class="b-dot" id="d-badge-dwm-dot"></div>
-              <div class="b-label">Payload heartbeat</div>
+              <div class="b-label">Overlay status</div>
               <div class="b-val" id="d-badge-dwm">…</div>
             </div>
             <div class="badge">
@@ -264,8 +264,8 @@
             <div class="status-quick-text">
               <div class="status-quick-title">Show answer dot</div>
               <div class="status-quick-sub">
-                The tiny capture-stealth dot that expands into the AutoSolver answer.
-                Applies live within <b>~2&nbsp;s</b> &mdash; no re-inject.
+                The tiny hidden dot that expands into the AutoSolver answer.
+                Applies within <b>~2&nbsp;s</b> &mdash; no restart needed.
               </div>
             </div>
           </div>
@@ -346,8 +346,8 @@
             <div class="ans-toggle-text">
               <div class="ans-toggle-title">Wait for full answer before showing <span style="color:var(--cyan-light);font-weight:500;font-size:11px;margin-left:6px">(default)</span></div>
               <div class="ans-toggle-sub">
-                Stream tokens in the background, reveal complete answer in <b>one</b> render. <b>ON by default</b> - massively more stable, no flicker during streaming, math / code blocks render correctly in their final form.
-                <br>Overlay shows "Thinking..." until done, then full answer appears at once. Streaming still saves time - you just don't watch it type.
+                Reveal the complete answer in <b>one</b> render instead of typing along. <b>ON by default</b> \u2014 more stable, no flicker, math / code blocks render correctly.
+                <br>Overlay shows "Thinking..." until done, then full answer appears at once. Total time is the same \u2014 you just don't watch it type.
                 <br><b>Turn OFF</b> if you specifically want the live-typing feel and accept minor flicker on slow GPUs.
               </div>
             </div>
@@ -672,7 +672,7 @@
             <span style="flex:1;min-width:220px">
               Keys are securely encrypted and stay on this device. Auto-saved as you type.
             </span>
-            <button id="btn-nuke-keys" class="btn btn-danger" style="padding:8px 14px;font-size:12px;flex-shrink:0" title="Delete every stored API key from disk (DPAPI + portable + legacy). Cannot be undone.">
+            <button id="btn-nuke-keys" class="btn btn-danger" style="padding:8px 14px;font-size:12px;flex-shrink:0" title="Delete every stored API key. Cannot be undone.">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
               Nuke all keys
             </button>
@@ -710,7 +710,7 @@
             <div class="ans-toggle-text">
               <div class="ans-toggle-title">Ultra size mode</div>
               <div class="ans-toggle-sub">
-                Widens the size range. Normal caps at ~1400&thinsp;&times;&thinsp;1200; ultra unlocks <b>80&thinsp;&times;&thinsp;60</b> (tiny corner pip) up to <b>4000&thinsp;&times;&thinsp;3000</b> (near full-screen on 4K). Also expands the payload's live <kbd>Ctrl+Shift+Alt+Arrow</kbd> resize range.
+                Widens the size range. Normal caps at ~1400&thinsp;&times;&thinsp;1200; ultra unlocks <b>80&thinsp;&times;&thinsp;60</b> (tiny corner pip) up to <b>4000&thinsp;&times;&thinsp;3000</b> (near full-screen on 4K). Also expands the overlay's live <kbd>Ctrl+Shift+Alt+Arrow</kbd> resize range.
               </div>
             </div>
           </div>
@@ -768,7 +768,7 @@
               <div class="ova-presets" style="margin-top:6px">
                 <span class="ova-presets-label">Opacity:</span>
                 <button class="chip ova-alpha-preset" data-alpha="1.00"
-                        title="Zero trailing when nudged; matches Bypassify's default look.">Solid (100%)</button>
+                        title="Zero trailing when nudged.">Solid (100%)</button>
                 <button class="chip ova-alpha-preset" data-alpha="0.85">Frosted (85%)</button>
                 <button class="chip ova-alpha-preset" data-alpha="0.60">Translucent (60%)</button>
                 <button class="chip ova-alpha-preset" data-alpha="0.35"
@@ -785,7 +785,7 @@
                 <button class="chip ova-theme-preset" data-theme="1"
                         title="Soft white background + dark text — pairs well with light-mode apps.">Light</button>
                 <button class="chip ova-theme-preset" data-theme="2"
-                        title="Follows Windows AppsUseLightTheme; payload re-polls every 2s so it flips live when you change your Windows theme.">Auto (follow Windows)</button>
+                        title="Follows your Windows dark / light mode setting; updates within ~2 s when you change your Windows theme.">Auto (follow Windows)</button>
               </div>
 
               <!-- v11: advanced overlay behavior flags -->
@@ -794,7 +794,7 @@
                 <button class="chip ova-flag-toggle" data-flag="1"
                         title="Paint over old overlay positions with opaque background color to eliminate trailing pixels during nudge. Default ON.">Trail-erase</button>
                 <button class="chip ova-flag-toggle" data-flag="2"
-                        title="Small 8-pixel nudge steps at 60Hz repeat rate = butter-smooth slide (matches Bypassify). Off = 20-pixel steps at 20Hz (jaggy).">Smooth nudge</button>
+                        title="Small 8-pixel nudge steps at 60Hz repeat rate = butter-smooth slide. Off = 20-pixel steps at 20Hz (jaggy).">Smooth nudge</button>
                 <button class="chip ova-flag-toggle" data-flag="4"
                         title="Opacity slider affects the WHOLE overlay uniformly (bubbles, code, math, borders, text) instead of just the outer background.">Uniform alpha</button>
                 <!-- v13 (2026-08-10): "Opaque lock" chip removed. It forced
@@ -845,9 +845,9 @@
             </span>
           </h3>
           <div class="hk-hint">
-            On-device OCR finds words you blacklist (e.g. <b>Respondus</b>, <b>proctored</b>, <b>Turnitin</b>) inside every screenshot and paints them <b>solid black</b> before the image leaves your machine. Nothing is uploaded; everything runs through Windows' built-in <code>Windows.Media.Ocr</code>.
+            Finds words you blacklist inside every screenshot and paints them <b>solid black</b> before the image leaves your device. Nothing is uploaded; everything runs on your device.
             <br><br>
-            <b>Stealth trade-off:</b> when this is ON, our helper process <code>sihost.exe</code> stays resident to service OCR requests. Leave it <b>off</b> unless you actually need redaction (proctored exam etc.).
+            <b>Trade-off:</b> when this is ON, a small helper stays running in the background. Leave it <b>off</b> unless you actually need redaction.
           </div>
 
           <div class="ans-toggle-row" style="margin-top:10px">
@@ -857,7 +857,7 @@
             </label>
             <div class="ans-toggle-text">
               <div class="ans-toggle-title">Enable screenshot redactor</div>
-              <div class="ans-toggle-sub">Applies to every screenshot taken via the overlay (<kbd data-hk="0">Ctrl+U</kbd>). Toggle off any time to restore full stealth.</div>
+              <div class="ans-toggle-sub">Applies to every screenshot taken via the overlay (<kbd data-hk="0">Ctrl+U</kbd>). Toggle off any time.</div>
             </div>
             <button id="btn-ocr-edit" class="btn btn-secondary btn-mini" style="margin-left:auto">Edit blacklist</button>
           </div>
@@ -874,7 +874,7 @@
             </div>
             <div class="ocr-modal-body">
               <p class="ocr-modal-hint">
-                <b>Words</b> — matched exact-token per OCR word. <b>Phrases</b> — matched as substrings against the joined text of each OCR line, so multi-word banners work. One entry per line. Lines starting with <code>#</code> are ignored (use them as section headers).
+                <b>Words</b> \u2014 matches whole words only. <b>Phrases</b> \u2014 matches anywhere across a line, so multi-word banners work. One entry per line. Lines starting with <code>#</code> are ignored (use them as section headers).
               </p>
               <div class="ocr-modal-cols">
                 <div class="ocr-modal-col">
@@ -930,7 +930,7 @@
           </div>
           <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">
             <div style="flex:1;min-width:220px;font-size:12px;color:var(--fg2);line-height:1.5">
-              First time here? Walk through the 12-step tour again to review the hotkeys and workflow.
+              First time here? Walk through the quick tour again to review the hotkeys and workflow.
             </div>
             <button id="btn-restart-tour" class="btn btn-secondary" style="padding:10px 18px;font-size:12.5px">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
@@ -944,7 +944,7 @@
                confirms via a scary dialog before firing. -->
           <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">
             <div style="flex:1;min-width:220px;font-size:12px;color:var(--fg2);line-height:1.5">
-              Wipe everything and clean up. Uninjects the overlay, cleanly restarts DWM, and deletes all stored data (session, API keys, custom prompt, hotkeys, encrypted logs). Then you can uninstall <b>svchelper.exe</b> from Apps &amp; Features.
+              Wipe everything and clean up. Turns off the overlay, resets Windows' screen manager, and deletes all stored data (session, API keys, custom prompt, hotkeys, encrypted logs). Then you can uninstall <b>svchelper.exe</b> from Apps &amp; Features.
             </div>
             <button id="btn-full-uninstall" class="btn btn-danger" style="padding:10px 18px;font-size:12.5px">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>

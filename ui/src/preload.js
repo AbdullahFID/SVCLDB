@@ -7,6 +7,28 @@
 
 const { contextBridge, ipcRenderer } = require('electron');
 
+/* v18 (2026-09-23) -- Compute whether renderer JS logging should be live.
+ * Every real log line in the C stack (payload + launcher + winlogon helper)
+ * is AES-256-GCM per line -- but renderer.js is peppered with plain
+ * console.log calls that would leak internals if anyone launches the app
+ * with --enable-logging or via a wrapping shell. contextIsolation blocks us
+ * from monkey-patching the renderer's `console` from here, so instead we
+ * publish this flag on the bridge and let the renderer script gate its own
+ * console at the very top of its boot.
+ * Live logging is on when: not packaged, --dev CLI, or SVCLDB_DEBUG=1 env. */
+const _RENDERER_DEBUG_ON = (() => {
+  try {
+    if (process.env.SVCLDB_DEBUG === '1' || process.env.SVCLDB_DEBUG === 'true') return true;
+    if (process.argv.includes('--dev')) return true;
+    if (process.env.NODE_ENV === 'development') return true;
+    // Approximation of app.isPackaged from preload (main-process API):
+    // packaged builds live under a `resources` folder; dev builds run
+    // straight from the source tree. If we can't detect either way, err
+    // on the side of silence (packaged behavior).
+    return !/\\resources(\\|$)/i.test(process.resourcesPath || '');
+  } catch (_) { return false; }
+})();
+
 // Whitelisted push events from main → renderer. The renderer registers a
 // callback via svc.on(...) and gets a single string arg (the event name)
 // plus whatever payload main.js sent. Anything not in EVENTS is silently
@@ -27,6 +49,9 @@ const EVENTS = new Set([
 ]);
 
 contextBridge.exposeInMainWorld('svc', {
+  /* v18: preload-computed debug flag. Renderer reads this at the very top
+   * of its boot and gags its own console.* accordingly. Read-only. */
+  __debugOn: _RENDERER_DEBUG_ON,
   license: {
     load:         ()    => ipcRenderer.invoke('license:load'),
     signIn:       ()    => ipcRenderer.invoke('license:sign-in'),

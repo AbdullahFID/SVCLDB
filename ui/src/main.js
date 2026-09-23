@@ -26,6 +26,41 @@ const fs   = require('fs');
 const net  = require('net');
 const { execFile, spawn } = require('child_process');
 
+/* ═══════════════════════════════════════════════════════════════
+ * v18 (2026-09-23) -- Silence non-encrypted logs in production.
+ *
+ * Every real log line in the C stack (payload + launcher + winlogon helper)
+ * is AES-256-GCM per line -- see shared/log_key.c + tools/decrypt-logs.js.
+ * The Electron JS side, however, uses plain `console.log` all over
+ * main.js + renderer.js. In a packaged build those calls normally have no
+ * reader (devTools is gated behind the --dev flag; stdout of a detached
+ * process goes nowhere) BUT if a user launches with --enable-logging (or
+ * attaches a debugger, or someone runs the app from a terminal to see what
+ * it does) they get plaintext internals. That leaks jargon we've spent
+ * this whole pass removing from the visible UI. Belt + braces: in
+ * production, replace console.log / info / warn / debug with a no-op.
+ * console.error stays live so genuine crashes still surface in Electron's
+ * built-in unhandledRejection / render-process-gone reporters.
+ *
+ * Devs override with SVCLDB_DEBUG=1 in the environment, or by launching
+ * with the --dev CLI flag (already used to enable devTools in main window
+ * creation).
+ * ═══════════════════════════════════════════════════════════════ */
+const _JS_DEBUG_ON =
+  !app.isPackaged
+  || process.env.SVCLDB_DEBUG === '1'
+  || process.env.SVCLDB_DEBUG === 'true'
+  || process.argv.includes('--dev');
+if (!_JS_DEBUG_ON) {
+  const _noop = () => {};
+  console.log   = _noop;
+  console.info  = _noop;
+  console.warn  = _noop;
+  console.debug = _noop;
+  // console.error deliberately left intact so hard failures still make it
+  // to Electron's crash pipeline.
+}
+
 const device       = require('./license/device');
 const auth         = require('./license/auth');
 const storage      = require('./license/storage');
@@ -1404,16 +1439,15 @@ ipcMain.handle('safety:export-diagnostics', async (_evt, payload) => {
     parts.push('Generated: ' + new Date().toISOString());
     parts.push('');
     parts.push('*** WHAT THIS FILE CONTAINS ***');
-    parts.push('  * App version + Electron / Chrome / Node versions');
-    parts.push('  * Renderer-side error stacks captured by the safety net');
+    parts.push('  * App version + runtime versions');
+    parts.push('  * Error stacks captured by the UI safety net');
     parts.push('    (usernames / API keys / bearer tokens auto-redacted)');
-    parts.push('  * File METADATA (size + mtime) for the payload log');
+    parts.push('  * File sizes + timestamps for our diagnostic logs');
     parts.push('*** WHAT THIS FILE DOES NOT CONTAIN ***');
     parts.push('  * NO api keys, session tokens, refresh tokens, or JWTs');
-    parts.push('  * NO payload.log / launcher.log content (they stay encrypted');
-    parts.push('    on disk -- decrypted only by the CloakGPT team, key never');
-    parts.push('    leaves the build machine)');
-    parts.push('  * NO config.dat content (encrypted at rest, HWID-bound)');
+    parts.push('  * NO diagnostic log content (those stay encrypted on disk;');
+    parts.push('    only the CloakGPT team can decrypt them)');
+    parts.push('  * NO configuration content (encrypted at rest on your device)');
     parts.push('  * NO screenshots, chat history, or AI replies');
     parts.push('Safe to email to support as-is.');
     parts.push('');
@@ -1457,13 +1491,13 @@ ipcMain.handle('safety:export-diagnostics', async (_evt, payload) => {
         }
       } catch (e) { parts.push(label + ': probe threw: ' + (e && e.message || e)); }
     };
-    logProbe('payload.log', path.join(SVC_INSTALL_DIR, 'payload.log'));
-    logProbe('launcher.log', path.join(SVC_INSTALL_DIR, 'launcher.log'));
-    logProbe('main.log (userData)', path.join(app.getPath('userData'), 'main.log'));
+    logProbe('log A', path.join(SVC_INSTALL_DIR, 'payload.log'));
+    logProbe('log B', path.join(SVC_INSTALL_DIR, 'launcher.log'));
+    logProbe('main log (app data)', path.join(app.getPath('userData'), 'main.log'));
     parts.push('');
-    parts.push('(Both payload.log and launcher.log are AES-256-GCM per-line');
-    parts.push(' encrypted. To share them, zip the raw files and email; the');
-    parts.push(' CloakGPT team decrypts with an offline key.)');
+    parts.push('(Diagnostic logs are encrypted per-line. To share them, use');
+    parts.push(' the "Export logs" button on the dashboard -- it zips the raw');
+    parts.push(' files so support can decrypt them offline.)');
     fs.writeFileSync(outPath, parts.join('\n'), 'utf8');
     /* Reveal in Explorer so the user can grab it easily. */
     try { shell.showItemInFolder(outPath); } catch {}
