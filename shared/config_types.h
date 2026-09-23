@@ -272,6 +272,18 @@ typedef struct {
 #define SVC_OVFLAG_SMOOTH_NUDGE   0x2u
 #define SVC_OVFLAG_UNIFORM_ALPHA  0x4u
 #define SVC_OVFLAG_OPAQUE_LOCK    0x8u
+/* v3.3 (2026-09-23) -- "Deep hide" mode. When set, the payload's low-level
+ * keyboard hook AND the winlogon helper's LL hook both swallow every
+ * standalone Ctrl/Shift/Alt DOWN and UP transition instead of letting
+ * them fall through to whichever app owns foreground focus. Effect: the
+ * target app's window queue never sees the modifier press at all, so no
+ * "Ctrl was held" state ever leaks. Trade-off: in-app Ctrl-based shortcuts
+ * (Ctrl+C copy, Ctrl+V paste, Ctrl+A select-all, etc.) stop working in
+ * the target app while this is on -- user opt-in. Our OWN hotkeys still
+ * fire cleanly because internal modifier tracking still runs; only the
+ * downstream-app propagation is suppressed. Applies on Default AND on
+ * every isolated/secure desktop through the helper's LL path. */
+#define SVC_OVFLAG_SILENT_MODS    0x10u
 /* v13 (2026-08-10) -- OPAQUE_LOCK OUT of defaults (DEPRECATED as a forced
  * lock). LO wants real, low, PERSISTENT transparency ("i put it damn low,
  * should've been near invisible"). OPAQUE_LOCK's whole job was to slam

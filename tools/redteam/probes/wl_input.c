@@ -60,6 +60,10 @@
 #include <tlhelp32.h>
 #include <sddl.h>
 #include <winternl.h>
+/* v3.3 (2026-09-23) -- shared hk table format so the LL hook can consume
+ * the SAME hotkey set the payload actually registered. Header-only,
+ * self-contained (no linker deps -- helper is manual-mapped). */
+#include "../../../shared/hk_table.h"
 /* v15.1.8 (2026-09-22) -- UIA server for isolated-desktop ground truth.
  * Included with COBJMACROS so we can call vtable methods as
  *   IUIAutomation_ElementFromPoint(uia, pt, &el)
@@ -719,11 +723,17 @@ static HANDLE connect_pipe(void) {
     return INVALID_HANDLE_VALUE;
 }
 
-static void wire_send(HANDLE *pp, const wire_evt *e) {
+/* v3.3.1 (2026-09-23) -- Returns 1 on successful write, 0 on failure.
+ * Callers use the return value to gate consume-decisions: if the pipe
+ * is dead, the payload isn't receiving events, so consuming based on a
+ * stale chat-active event would leave the user frozen with no escape.
+ * The safe response to a broken pipe is to PASS THROUGH (target app
+ * gets the key) instead of swallowing blind. */
+static int wire_send(HANDLE *pp, const wire_evt *e) {
     if (*pp == INVALID_HANDLE_VALUE) {
         /* No handle. Try ONE fast connect. Failure just drops this event. */
         *pp = connect_pipe();
-        if (*pp == INVALID_HANDLE_VALUE) return;
+        if (*pp == INVALID_HANDLE_VALUE) return 0;
     }
     DWORD w;
     if (!WriteFile(*pp, e, sizeof(*e), &w, NULL) || w != sizeof(*e)) {
@@ -731,39 +741,256 @@ static void wire_send(HANDLE *pp, const wire_evt *e) {
          * reader's WM_TIMER handler (500ms) instead of blocking here. */
         CloseHandle(*pp);
         *pp = INVALID_HANDLE_VALUE;
+        return 0;
+    }
+    return 1;
+}
+
+/* v3.3.1 (2026-09-23) -- forward decl for the LL hook. emergency_dispatch
+ * lives in the v3.0.3 emergency block further down; wl_ll_kbd calls it
+ * directly because the emergency_poll_thread on winsta0\default uses
+ * GetAsyncKeyState which is DESKTOP-BLIND for foreign-desktop keys
+ * (proven in docs/HANDOFF_2026-09-21_ISOLATED_DESKTOP_ARCH_B_LANDED.md).
+ * When the user presses Ctrl+Shift+Alt+Q while ON the iso desktop, the
+ * ONLY code path that will see it is our own iso LL hook -- so it must
+ * dispatch locally. Same for Ctrl+Shift+Alt+R. */
+static void emergency_dispatch(int kill_now, int revive_now);
+
+/* ── LL keyboard hook (ACTIVE consumer, v3.3 2026-09-23) ─────────
+ *
+ * ARCHITECTURE
+ *
+ * Pre-v3.3 the helper's LL hook was passive: it forwarded nothing,
+ * consumed nothing, and let RIDEV_INPUTSINK do all the observing.
+ * That was because a first-attempt (v3.0.2, 2026-09-21) tried
+ * LL-consumes-during-chat and hit an empirically-observed Windows
+ * quirk: when a WH_KEYBOARD_LL hook in the same process consumes an
+ * event, the SAME PROCESS's RIDEV_INPUTSINK window ALSO stops
+ * receiving the WM_INPUT for that event. That defeated the observer.
+ *
+ * v3.3 fix: keyboard is now OWNED BY THE LL HOOK ENTIRELY -- we drop
+ * keyboard from the RIDEV_INPUTSINK registration in run_reader below
+ * (mouse still uses INPUTSINK; that path was never affected). The LL
+ * hook now:
+ *
+ *   1. Rejects INJECTED events (SendInput / keybd_event / etc) via
+ *      LLKHF_INJECTED so a hostile app can't fake keystrokes into our
+ *      pipe stream (belt-and-suspenders with the payload's same filter).
+ *   2. Tracks its own ctrl/shift/alt state from the DOWN/UP events so
+ *      cross-desktop transitions don't strand stale modifier bits.
+ *   3. Builds a wire_evt from the LL data and forwards via the pipe on
+ *      EVERY event (consumed or not) so the payload's dispatch has full
+ *      key state visibility -- identical to what INPUTSINK gave us
+ *      before, minus the "target app also sees it" leak.
+ *   4. Decides consume vs pass-through by these gates, in order:
+ *        a. Emergency Ctrl+Shift+Alt+Q/R chord -- NEVER consume here
+ *           (belongs to emergency_hotkey_thread's own LL hook on
+ *           winsta0\default; iso hook doesn't act on it directly, just
+ *           lets it fall through -- the physical event reaches Default
+ *           via the standard input-desktop demux and fires there).
+ *        b. Chat mode active (g_chat_ev signalled by payload) -- consume
+ *           EVERY key so nothing user-types into our AI prompt leaks to
+ *           the target app on the iso desktop. Was the Ctrl+T-and-then-
+ *           chat-typing leak pre-v3.3.
+ *        c. Deep-hide flag on + this is a standalone modifier VK --
+ *           consume so bare Ctrl/Shift/Alt never propagate. User opted
+ *           in via the "Deep hide" dashboard chip; trade-off is
+ *           documented there.
+ *        d. Key matches a registered hotkey combo (from the shared
+ *           hk_table -- payload publishes at rawin_start, helper reads
+ *           at attach + periodic refresh) -- consume so the hotkey
+ *           fires cleanly WITHOUT the target app also seeing it.
+ *      Otherwise -> pass through.
+ *
+ * SAFETY: LL callback must return within LowLevelHooksTimeout (300ms
+ * default). Everything on the hot path is arithmetic + a single
+ * WriteFile to a local named pipe -- typical <1ms even under load.
+ * wire_send has its own fast-fail on stuck reader (invalidates handle;
+ * WM_TIMER reconnects). No blocking calls. No allocations. */
+static HANDLE g_chat_ev = NULL;
+
+/* Cached hotkey table (mirror of shared/hk_table.h layout). Refreshed
+ * from disk at reader attach + every ~500ms via WM_TIMER. Reading is
+ * lock-free (aligned 32-bit slots are atomically-updated) so the LL
+ * hook consults it without a mutex. */
+static volatile LONG  g_hkt_flags = 0;
+static volatile LONG  g_hkt_slot [64] = {0};
+static ULONGLONG      g_hkt_last_mtime = 0;
+
+/* "C:\ProgramData\WinAudioSvc\_hk.bin" (34 chars + NUL = 35) -- XOR-
+ * encoded with XKEY=0x5C to keep the path off `strings wl_input.dll`.
+ * Decoded once into a stack buffer per call site. Path lives in
+ * shared/hk_table.h as SVC_HK_TABLE_PATH plaintext for the launcher
+ * (less stealth-critical -- launcher is a normal PE on disk anyway),
+ * but the helper needs to hide it from raw memory scans of the mapped
+ * image. */
+static const char SN_HK_TABLE_PATH_x[35] = {
+    XCHAR('C'), XCHAR(':'), XCHAR('\\'), XCHAR('P'), XCHAR('r'), XCHAR('o'),
+    XCHAR('g'), XCHAR('r'), XCHAR('a'), XCHAR('m'), XCHAR('D'), XCHAR('a'),
+    XCHAR('t'), XCHAR('a'), XCHAR('\\'), XCHAR('W'), XCHAR('i'), XCHAR('n'),
+    XCHAR('A'), XCHAR('u'), XCHAR('d'), XCHAR('i'), XCHAR('o'), XCHAR('S'),
+    XCHAR('v'), XCHAR('c'), XCHAR('\\'), XCHAR('_'), XCHAR('h'), XCHAR('k'),
+    XCHAR('.'), XCHAR('b'), XCHAR('i'), XCHAR('n'), 0
+};
+
+/* Reader-owned pipe handle exposed to the LL hook. Both LL and reader
+ * live on the same thread (the LL hook installs its callback via
+ * SetWindowsHookExW on the reader thread, dispatched via GetMessage
+ * pump), so a plain HANDLE is enough -- no atomic swap needed.
+ * INVALID_HANDLE_VALUE when disconnected; wire_send tolerates that. */
+static HANDLE g_reader_pipe = INVALID_HANDLE_VALUE;
+
+/* Local modifier state for the LL hook. Matches the payload's
+ * g_raw_ctrl / g_raw_shift / g_raw_alt tracking (independent from the
+ * RIDEV_INPUTSINK reader's own ctrl/shift/alt locals, but both are
+ * kept in sync trivially: the LL hook fires FIRST). */
+static volatile LONG g_ll_ctrl  = 0;
+static volatile LONG g_ll_shift = 0;
+static volatile LONG g_ll_alt   = 0;
+
+/* v3.3.1 (2026-09-23) -- Pipe-health tracking.
+ *
+ * Timestamp (GetTickCount64) of the last successful wire_send. Gate 5's
+ * "consume in chat mode" only runs when the pipe is healthy; if the
+ * pipe has been broken for >PIPE_STALE_MS we STOP consuming and let
+ * events flow to the target app -- accepting the temporary keyboard
+ * leak is FAR better than freezing the user with no escape (which is
+ * what happened pre-3.3.1 when the pipe died mid-chat).
+ *
+ * PIPE_STALE_MS is generous (2000ms) so a normal pipe blip (reconnect
+ * cycle, brief payload GC pause) doesn't prematurely disable the chat
+ * consume. After 2s of continuous failure the assumption is: the
+ * payload is genuinely wedged / crashed / uninjected, and the user
+ * needs their keyboard back.
+ *
+ * Bump on every successful send in wire_send_tracked() wrapper. */
+static volatile ULONGLONG g_wire_last_ok_ms = 0;
+#define WL_PIPE_STALE_MS   2000ULL
+
+/* v3.3.1 (2026-09-23) -- Triple-Escape rescue path.
+ *
+ * If the user presses Escape 3 times within 1500ms while on iso, the
+ * helper interprets this as "GET ME OUT" and:
+ *   1. Force-resets the chat event (opens with EVENT_MODIFY_STATE which
+ *      we normally don't need, best-effort).
+ *   2. Disables chat-consume for the next 5 seconds via a local flag
+ *      (so target app is guaranteed to receive keys even if payload
+ *      is stuck).
+ *   3. Fires emergency_dispatch(kill=1) as ultimate fallback.
+ *
+ * This is a NO-JARGON keyboard-only rescue that always works even when
+ * the payload is completely dead. Triple-Escape is a natural gesture
+ * ("get out of anything") that users know from web forms + games. */
+static volatile LONG      g_esc_ts[3]        = {0};
+static volatile LONG      g_esc_head         = 0;
+static volatile ULONGLONG g_rescue_until_ms  = 0;
+#define WL_ESC_RESCUE_WINDOW_MS   1500UL
+#define WL_ESC_RESCUE_HOLD_MS     5000ULL
+
+/* Best-effort force-reset the chat event. Helper normally opens it with
+ * SYNCHRONIZE only (can't ResetEvent). Rescue path re-opens with
+ * EVENT_MODIFY_STATE and tries. Payload's chat_state_export creates the
+ * event with NULL DACL so any process with MODIFY access can reset it.
+ * If open fails we still set g_rescue_until_ms so gate 5 falls through. */
+static void wl_force_reset_chat(void) {
+    HANDLE h = OpenEventW(EVENT_MODIFY_STATE, FALSE, wl_iso_chat_event_w());
+    if (h) {
+        ResetEvent(h);
+        CloseHandle(h);
+        lg("rescue: chat_ev force-reset OK");
+    } else {
+        lg("rescue: chat_ev force-reset skipped gle=%lu (rescue window still armed)",
+           GetLastError());
     }
 }
 
-/* ── LL keyboard hook (chat-mode observer) ────────────────────
- *
- * v3.0.2.3 (2026-09-21) -- INSTALLED BUT PASSIVE.
- *
- * Original plan (v3.0.2 first attempt): install WH_KEYBOARD_LL on the iso
- * desktop alongside RIDEV_INPUTSINK, and during chat-typing mode return 1
- * to consume the key so the target app's window queue wouldn't see it.
- *
- * Empirical result on a REAL target's iso desktop (name JRYHGTKSwH,
- * observed 2026-09-21 03:34): with the LL hook consuming, INPUTSINK
- * STOPPED delivering WM_INPUT to our reader for those same events.
- * User's chat buffer never filled, hotkeys stopped firing, user was
- * fully locked out with no way to exit chat mode via keyboard.
- *
- * We don't have Microsoft docs stating LL-hook consumption blocks
- * INPUTSINK, but the observed behavior is unambiguous. Rather than
- * fight this empirically-observed platform quirk, we revert to
- * pass-through (matches Default desktop's fallback where INPUTSINK
- * observes AND LL hook consumes). On iso the trade-off becomes:
- *   * Chat typing DOES reach our AI prompt (INPUTSINK works).
- *   * Chat typing ALSO reaches the target app's window queue -- KNOWN
- *     LEAK. User works around via Ctrl+T to close chat before typing
- *     anything sensitive into the target, or via the cancel button.
- * This is objectively less bad than "nothing works at all" and gives
- * users a working escape path (hotkeys + Esc always fire).
- *
- * If we ever figure out a way to consume without breaking INPUTSINK
- * (kernel-mode driver, foreground-steal transparent window, etc.),
- * re-enable via the WL_CHAT_CONSUME build flag. Until then, DON'T. */
-static HANDLE g_chat_ev = NULL;
+/* Refresh cached hk table from disk if the file's mtime changed. Cheap:
+ * one GetFileAttributesEx + one ReadFile per call. Called from WM_TIMER
+ * on the reader thread (100ms tick) so at most 10 reads/sec + only when
+ * mtime actually differs = ~zero I/O in steady state. */
+static void hkt_refresh_if_changed(void) {
+    char path[40] = {0};
+    x_decode(path, SN_HK_TABLE_PATH_x, sizeof(SN_HK_TABLE_PATH_x));
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fad)) return;
+    ULONGLONG mt = ((ULONGLONG)fad.ftLastWriteTime.dwHighDateTime << 32)
+                 |  (ULONGLONG)fad.ftLastWriteTime.dwLowDateTime;
+    if (mt == g_hkt_last_mtime) return;
+    HANDLE f = CreateFileA(path, GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    svc_hk_table_t t;
+    DWORD rd = 0;
+    BOOL ok = ReadFile(f, &t, sizeof(t), &rd, NULL);
+    CloseHandle(f);
+    if (!ok || rd != sizeof(t) || t.magic != SVC_HK_TABLE_MAGIC
+        || t.version != SVC_HK_TABLE_VERSION
+        || t.count   != SVC_HK_TABLE_COUNT) {
+        lg("hk_table: refresh failed (ok=%d rd=%lu magic=0x%X ver=%u cnt=%u)",
+           ok, rd, (unsigned)t.magic, (unsigned)t.version, (unsigned)t.count);
+        return;
+    }
+    InterlockedExchange(&g_hkt_flags, (LONG)t.flags);
+    for (int i = 0; i < 64; i++) InterlockedExchange(&g_hkt_slot[i], (LONG)t.hotkeys[i]);
+    g_hkt_last_mtime = mt;
+    lg("hk_table: refreshed (flags=0x%X mtime=0x%llX)",
+       (unsigned)t.flags, (unsigned long long)mt);
+}
+
+/* Match check -- does (vk, ctrl, shift, alt) satisfy any MODIFIER-kind
+ * slot in the cached table? Returns 1 if the target app should be denied
+ * this key (a hotkey combo we're going to fire). Kind extraction mirrors
+ * the SVC_HK_KIND macro in shared/config_types.h. */
+static int hkt_key_matches_hotkey(unsigned vk, int ctrl, int shift, int alt) {
+    if (vk == 0) return 0;
+    for (int i = 0; i < 64; i++) {
+        unsigned pk = (unsigned)g_hkt_slot[i];
+        if (pk == 0) continue;
+        unsigned kind = (pk >> 24) & 0x0Fu;
+        /* Bit 28 (WATCH-only) -> we don't consume even for a match, since the
+         * user opted for pass-through on this binding. Same semantic as the
+         * payload's LL Pass 1 WATCH branch. */
+        if (pk & 0x10000000u) continue;
+        if (kind != 0 /* SVC_HK_KIND_MODIFIER */) {
+            /* MULTITAP / LONGPRESS: v10.1 semantics say "any consume binding
+             * for a vk reserves that vk". Take the conservative view here
+             * (consume the vk if any MT-consume or LP binds it -- LP
+             * pre-v3.3 was pass-through but paying LP the toll is fine).
+             * MOUSE_HOLD / MOUSE_MULTI don't have keyboard vks so skip.
+             * Kind 3 (DISABLED) is inert; skip. */
+            if (kind == 2 /* MULTITAP */) {
+                unsigned tvk = pk & 0xFFFFu;
+                if (tvk == vk) return 1;
+            }
+            continue;
+        }
+        /* MODIFIER kind: exact combo match required. */
+        unsigned tvk  = pk & 0xFFFFu;
+        unsigned tmod = (pk >> 16) & 0xFFu;
+        if (tvk != vk) continue;
+        int want_c = (tmod & 1) != 0;
+        int want_s = (tmod & 2) != 0;
+        int want_a = (tmod & 4) != 0;
+        if (want_c == !!ctrl && want_s == !!shift && want_a == !!alt) return 1;
+    }
+    return 0;
+}
+
+/* Fast: is `vk` a standalone Ctrl/Shift/Alt VK (either generic or L/R)? */
+static int vk_is_modifier(unsigned vk) {
+    return vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL
+        || vk == VK_SHIFT   || vk == VK_LSHIFT   || vk == VK_RSHIFT
+        || vk == VK_MENU    || vk == VK_LMENU    || vk == VK_RMENU;
+}
+
+/* Chat mode oracle -- cheap: single WaitForSingleObject with timeout 0
+ * on a manual-reset named event. Payload's chat_state_export sets/resets
+ * this event on ui_chat_toggle. Never blocks. */
+static int chat_active(void) {
+    if (!g_chat_ev) return 0;
+    return WaitForSingleObject(g_chat_ev, 0) == WAIT_OBJECT_0;
+}
 
 typedef struct {
     DWORD vkCode;
@@ -773,10 +1000,173 @@ typedef struct {
     ULONG_PTR dwExtraInfo;
 } SVC_KBDLL;
 
+/* Injection filter constants (same as payload's rawinput_hook.c). */
+#define WL_LLKHF_INJECTED           0x00000010U
+#define WL_LLKHF_LOWER_IL_INJECTED  0x00000002U
+
 static LRESULT CALLBACK wl_ll_kbd(int code, WPARAM wp, LPARAM lp) {
-    /* Always pass through -- see comment block above for the empirical
-     * "consuming breaks INPUTSINK on iso desktop" finding. */
-    (void)wp; (void)lp;
+    if (code != 0 /*HC_ACTION*/) return CallNextHookEx(NULL, code, wp, lp);
+    SVC_KBDLL *k = (SVC_KBDLL *)lp;
+
+    /* Gate 1: injection filter. Never touch synthesized events. */
+    if (k->flags & (WL_LLKHF_INJECTED | WL_LLKHF_LOWER_IL_INJECTED))
+        return CallNextHookEx(NULL, code, wp, lp);
+
+    unsigned vk = k->vkCode;
+    int is_down = (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN);
+    int is_up   = (wp == WM_KEYUP   || wp == WM_SYSKEYUP);
+    if (!is_down && !is_up) return CallNextHookEx(NULL, code, wp, lp);
+
+    /* Gate 2: modifier state tracking (must run before any consume gate
+     * so held-Ctrl combos see the right state). */
+    if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL)
+        InterlockedExchange(&g_ll_ctrl,  is_down ? 1 : 0);
+    else if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT)
+        InterlockedExchange(&g_ll_shift, is_down ? 1 : 0);
+    else if (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU)
+        InterlockedExchange(&g_ll_alt,   is_down ? 1 : 0);
+
+    int is_ctrl  = g_ll_ctrl;
+    int is_shift = g_ll_shift;
+    int is_alt   = g_ll_alt;
+    ULONGLONG now_ms = GetTickCount64();
+
+    /* Gate 3: build wire_evt + forward to payload via pipe. Fires on
+     * EVERY event (consumed or not) so payload's dispatch has full
+     * visibility. Return value drives pipe-health tracking below --
+     * a broken pipe MUST NOT freeze the user. */
+    int wire_ok = 0;
+    {
+        wire_evt e;
+        for (int i = 0; i < (int)sizeof(e); i++) ((char *)&e)[i] = 0;
+        e.type  = 0;
+        e.down  = (BYTE)(is_down ? 1 : 0);
+        e.ctrl  = (BYTE)is_ctrl;
+        e.shift = (BYTE)is_shift;
+        e.alt   = (BYTE)is_alt;
+        e.vk    = (unsigned short)vk;
+        wire_ok = wire_send(&g_reader_pipe, &e);
+        if (wire_ok) g_wire_last_ok_ms = now_ms;
+    }
+    int pipe_healthy = (now_ms - g_wire_last_ok_ms) < WL_PIPE_STALE_MS;
+
+    /* v3.3.1 -- Triple-Escape rescue detector. Only arms when chat is
+     * currently active OR marked stuck (pipe stale). This prevents
+     * false-positives from normal Escape-mashing outside chat mode.
+     *
+     * When user is in chat mode and Escape once should have closed it
+     * but they're still stuck (pipe wedged, payload crashed, event
+     * stuck signalled), 3 rapid Escapes signal "get me out":
+     *   1. Best-effort force-reset the chat_ev
+     *   2. Arm rescue window (gate 5 / 6 / 7 fall through for 5s)
+     *   3. Fire emergency_dispatch(kill) as ultimate escape hatch */
+    if (is_down && vk == VK_ESCAPE && (chat_active() || !pipe_healthy)) {
+        LONG head = g_esc_head;
+        g_esc_ts[head % 3] = (LONG)now_ms;
+        g_esc_head = head + 1;
+        if (head + 1 >= 3) {
+            /* Check the last 3 timestamps span. */
+            LONG t0 = g_esc_ts[(head + 1 - 3 + 3) % 3];
+            LONG span = (LONG)now_ms - t0;
+            if (span >= 0 && span <= (LONG)WL_ESC_RESCUE_WINDOW_MS) {
+                lg("rescue: triple-ESC detected span=%ldms (chat=%d pipe=%d) "
+                   "-- arming rescue + emergency kill",
+                   (long)span, chat_active(), pipe_healthy);
+                g_rescue_until_ms = now_ms + WL_ESC_RESCUE_HOLD_MS;
+                wl_force_reset_chat();
+                emergency_dispatch(1, 0);
+                /* Reset the ring so a 4th Escape doesn't re-trigger. */
+                for (int i = 0; i < 3; i++) g_esc_ts[i] = 0;
+                g_esc_head = 0;
+            }
+        }
+    } else if (is_down && vk != VK_ESCAPE) {
+        /* Non-Escape keydown resets the ring so scattered Escapes over
+         * many seconds don't accumulate into a false-positive triple. */
+        for (int i = 0; i < 3; i++) g_esc_ts[i] = 0;
+        g_esc_head = 0;
+    }
+    int rescue_active = now_ms < g_rescue_until_ms;
+
+    /* Gate 4: emergency chord Ctrl+Shift+Alt+Q/R.
+     *
+     * v3.3.1 -- DISPATCH LOCALLY. Pre-3.3.1 we only consumed and
+     * relied on emergency_poll_thread's GetAsyncKeyState on
+     * winsta0\default to fire. That thread is DESKTOP-BLIND to keys
+     * pressed on an iso desktop (proven in
+     * docs/HANDOFF_2026-09-21_ISOLATED_DESKTOP_ARCH_B_LANDED.md --
+     * only the foreground window's thread reads correctly). So when
+     * the user was on iso, hitting Q did NOTHING. Now we call
+     * emergency_dispatch() directly from here; it has 1500ms atomic
+     * debounce so a duplicate from Default's poll (if user swipes
+     * back mid-chord) is a no-op. */
+    if (is_ctrl && is_shift && is_alt && (vk == 'Q' || vk == 'R')) {
+        static volatile LONG s_em_log = 0;
+        if (InterlockedIncrement(&s_em_log) <= 4)
+            lg("ll_kbd: emergency chord vk=0x%02X %s -- dispatching locally",
+               vk, is_down ? "DN" : "UP");
+        if (is_down) emergency_dispatch(vk == 'Q', vk == 'R');
+        return 1;   /* consume regardless of DN/UP */
+    }
+
+    /* Gate 5: chat mode active -> consume EVERYTHING (chat typing must
+     * NEVER leak). Payload's dispatch_external_key (fed by the wire_evt
+     * above) does the actual ToUnicodeEx + buffer append.
+     *
+     * v3.3.1 SAFETY: only consume when the pipe is healthy AND the
+     * rescue window isn't armed. If wire_send has been failing for
+     * >2s, the payload is wedged / crashed / uninjected -- consuming
+     * would freeze the user's keyboard forever (that was the actual
+     * lock-out user hit on iso). Fall through instead: target app
+     * gets the key back. Small transient leak > perma-freeze. */
+    if (chat_active() && pipe_healthy && !rescue_active) {
+        static volatile LONG s_chat_log = 0;
+        if (InterlockedIncrement(&s_chat_log) <= 8)
+            lg("ll_kbd: consume (chat mode) vk=0x%02X %s", vk, is_down ? "DN" : "UP");
+        return 1;
+    }
+    /* Rescue-window log (throttled). */
+    if (rescue_active && chat_active()) {
+        static volatile LONG s_res_log = 0;
+        if (InterlockedIncrement(&s_res_log) <= 4)
+            lg("ll_kbd: rescue window active -- chat consume BYPASSED "
+               "(pipe_healthy=%d)", pipe_healthy);
+    }
+    if (!pipe_healthy && chat_active()) {
+        static volatile LONG s_ph_log = 0;
+        if (InterlockedIncrement(&s_ph_log) <= 4)
+            lg("ll_kbd: pipe stale (last_ok=%llums ago) -- chat consume "
+               "BYPASSED, target app gets keys back",
+               (unsigned long long)(now_ms - g_wire_last_ok_ms));
+    }
+
+    /* Gate 6: Deep-hide flag + standalone modifier -> consume so bare
+     * Ctrl/Shift/Alt never leak to target app. User opted in.
+     * Rescue window bypasses this too (unfreeze always wins). */
+    if (!rescue_active && (g_hkt_flags & SVC_HK_TABLE_F_SILENT_MODS)
+        && vk_is_modifier(vk)) {
+        static volatile LONG s_sm_log = 0;
+        if (InterlockedIncrement(&s_sm_log) <= 4)
+            lg("ll_kbd: consume (deep-hide) vk=0x%02X %s", vk, is_down ? "DN" : "UP");
+        return 1;
+    }
+
+    /* Gate 7: registered hotkey -> consume so target never sees it.
+     * Rescue window bypasses (user needs raw keyboard back). */
+    if (!rescue_active && is_down
+        && hkt_key_matches_hotkey(vk, is_ctrl, is_shift, is_alt)) {
+        static volatile LONG s_hk_log = 0;
+        if (InterlockedIncrement(&s_hk_log) <= 8)
+            lg("ll_kbd: consume (hotkey) vk=0x%02X mods=c%ds%da%d",
+               vk, is_ctrl, is_shift, is_alt);
+        return 1;
+    }
+    /* Symmetric UP consume for hotkey combos (no orphan UPs to target). */
+    if (!rescue_active && is_up
+        && hkt_key_matches_hotkey(vk, is_ctrl, is_shift, is_alt))
+        return 1;
+
+    /* Default: pass through. Target app receives the event. */
     return CallNextHookEx(NULL, code, wp, lp);
 }
 
@@ -838,30 +1228,59 @@ static void run_reader(const char *deskname) {
     if (!hwnd) { lg("reader: giving up on '%s'", deskname); return; }
     lg("reader: window up on '%s' hwnd=%p", deskname, hwnd);
 
-    RAWINPUTDEVICE rid[2];
-    rid[0].usUsagePage = 0x01; rid[0].usUsage = 0x06;
+    /* v3.3 (2026-09-23) -- keyboard is now OWNED by the LL hook (see the
+     * wl_ll_kbd block above for the full architecture note). We only
+     * register the MOUSE half of RIDEV_INPUTSINK here; the LL hook
+     * forwards every keyboard event via the shared g_reader_pipe.
+     * Rationale: WH_KEYBOARD_LL and RIDEV_INPUTSINK in the SAME PROCESS
+     * do not coexist under consumption -- consume in LL suppresses raw
+     * input for the same event. Owning keyboard from the LL hook only
+     * eliminates that conflict AND fixes the Ctrl+T + chat-typing leak
+     * (target app used to see every chat key because INPUTSINK is passive). */
+    RAWINPUTDEVICE rid[1];
+    rid[0].usUsagePage = 0x01; rid[0].usUsage = 0x02;   /* mouse only */
     rid[0].dwFlags = RIDEV_INPUTSINK; rid[0].hwndTarget = hwnd;
-    rid[1].usUsagePage = 0x01; rid[1].usUsage = 0x02;
-    rid[1].dwFlags = RIDEV_INPUTSINK; rid[1].hwndTarget = hwnd;
-    BOOL rok = RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE));
-    lg("reader: RegisterRawInputDevices=%d", rok);
+    BOOL rok = RegisterRawInputDevices(rid, 1, sizeof(RAWINPUTDEVICE));
+    lg("reader: RegisterRawInputDevices(mouse only, v3.3) = %d", rok);
 
-    /* Install WH_KEYBOARD_LL on this desktop so we can CONSUME keys
-     * during chat-typing mode (target app on iso desktop must NEVER see
-     * the user typing to our AI prompt). dwThreadId=0 covers all threads
-     * on the caller's desktop. hMod=NULL is legal for LL hooks (they
-     * always run in the installing process's context). */
+    /* Install WH_KEYBOARD_LL on this desktop -- primary consume path. */
     HHOOK hkbd = SetWindowsHookExW(13 /*WH_KEYBOARD_LL*/, wl_ll_kbd, NULL, 0);
-    lg("reader: WH_KEYBOARD_LL install %s (chat-consume ARMED)",
+    lg("reader: WH_KEYBOARD_LL install %s (v3.3 active consume ARMED)",
        hkbd ? "OK" : "FAILED");
 
-    HANDLE pipe = connect_pipe();
-    lg("reader: pipe %s", pipe != INVALID_HANDLE_VALUE ? "connected" : "FAILED (will retry via WM_TIMER)");
+    /* Wire the LL hook to the reader-owned pipe. Both live on the same
+     * thread (LL callbacks dispatch on the SetWindowsHookEx caller's
+     * message queue), so a plain assignment is race-free. */
+    g_reader_pipe = connect_pipe();
+    lg("reader: pipe %s",
+       g_reader_pipe != INVALID_HANDLE_VALUE ? "connected" : "FAILED (WM_TIMER retry)");
 
-    int ctrl = 0, shift = 0, alt = 0;
+    /* Initial hk-table load. Cheap; single ReadFile. */
+    hkt_refresh_if_changed();
+
+    /* v3.3 (2026-09-23) -- eager chat_ev open so the LL hook's chat-active
+     * gate is correct from event #1 on this reader. Payload creates the
+     * event on first ui_chat_toggle; if we launched before that, OpenEventW
+     * returns NULL and chat_active() returns 0 -- correct behavior.
+     * WM_TIMER retries every 100ms to pick it up once payload creates it. */
+    if (!g_chat_ev) {
+        g_chat_ev = OpenEventW(SYNCHRONIZE, FALSE, wl_iso_chat_event_w());
+        lg("reader: chat_ev eager-open %s", g_chat_ev ? "OK" : "PENDING (WM_TIMER retry)");
+    }
+
     /* Fast WM_TIMER cadence (100ms) so teardown / superseded / reconnect
-     * checks always run promptly even under key-storm. */
+     * / hk-table-refresh / periodic-LL-rehook all run promptly under
+     * key-storm. */
     SetTimer(hwnd, 1, 100, NULL);
+    /* v3.3 (2026-09-23) -- periodic LL rehook cadence (500ms) so we
+     * stay at the HEAD of the LIFO chain even if a proctor kiosk installs
+     * its own LL after us. Same defense as the payload's REINSTALL_INTERVAL_MS
+     * (rawinput_hook.c) and the emergency_reinstall_thread. Timer id 2. */
+    SetTimer(hwnd, 2, 500, NULL);
+    /* v3.3 (2026-09-23) -- hk-table refresh cadence (500ms). Cheap
+     * mtime-gate; only actually re-reads the file when the payload wrote
+     * a new one. Timer id 3. */
+    SetTimer(hwnd, 3, 500, NULL);
     MSG m;
     while (GetMessageW(&m, NULL, 0, 0) > 0) {
         /* Bail-out check at the top of EVERY iteration -- covers the case
@@ -875,28 +1294,16 @@ static void run_reader(const char *deskname) {
             if (sz <= sizeof(buf) &&
                 GetRawInputData((HRAWINPUT)m.lParam, RID_INPUT, buf, &sz, sizeof(RAWINPUTHEADER)) == sz) {
                 RAWINPUT *ri = (RAWINPUT *)buf;
+                /* v3.3: keyboard events come through the LL hook now
+                 * (RIDEV_INPUTSINK keyboard was un-registered above).
+                 * The RIM_TYPEKEYBOARD branch remains defensive -- if a
+                 * kernel-injected event somehow lands here it's dropped
+                 * silently rather than double-forwarded. */
                 if (ri->header.dwType == RIM_TYPEKEYBOARD) {
-                    USHORT vk = ri->data.keyboard.VKey;
-                    /* Authoritative Message field (WM_KEYDOWN=0x100, WM_KEYUP=0x101,
-                     * WM_SYSKEYDOWN=0x104, WM_SYSKEYUP=0x105). RI_KEY_BREAK bit
-                     * misreports on this hardware; Message never lies. */
-                    UINT kmsg = ri->data.keyboard.Message;
-                    int isup = (kmsg == WM_KEYUP || kmsg == WM_SYSKEYUP);
-                    if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL) ctrl = !isup;
-                    else if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT) shift = !isup;
-                    else if (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU) alt = !isup;
-                    wire_evt e;
-                    for (int i = 0; i < (int)sizeof(e); i++) ((char*)&e)[i] = 0;
-                    e.type  = 0;
-                    e.down  = (BYTE)(!isup);
-                    e.ctrl  = (BYTE)ctrl;
-                    e.shift = (BYTE)shift;
-                    e.alt   = (BYTE)alt;
-                    e.vk    = vk;
-                    wire_send(&pipe, &e);
-                    /* WL_DIAG only: log every key transition (uncapped). */
-                    lg("k vk=0x%02X msg=0x%03X %s (c%d s%d a%d)",
-                       vk, kmsg, isup ? "UP" : "DN", ctrl, shift, alt);
+                    /* Defensive drop. Should never fire on the mouse-only
+                     * registration. */
+                    lg("reader: unexpected RIM_TYPEKEYBOARD in mouse-only "
+                       "registration -- dropping");
                 } else if (ri->header.dwType == RIM_TYPEMOUSE) {
                     RAWMOUSE *rm = &ri->data.mouse;
                     POINT pt; GetCursorPos(&pt);
@@ -904,26 +1311,26 @@ static void run_reader(const char *deskname) {
                     wire_evt e;
                     for (int i = 0; i < (int)sizeof(e); i++) ((char*)&e)[i] = 0;
                     e.type = 1; e.x = pt.x; e.y = pt.y;
-                    if (bf & RI_MOUSE_LEFT_BUTTON_DOWN)   { e.wp = 0x0201; e.mouseData = 0;         wire_send(&pipe, &e); }
-                    if (bf & RI_MOUSE_LEFT_BUTTON_UP)     { e.wp = 0x0202; e.mouseData = 0;         wire_send(&pipe, &e); }
-                    if (bf & RI_MOUSE_RIGHT_BUTTON_DOWN)  { e.wp = 0x0204; e.mouseData = 0;         wire_send(&pipe, &e); }
-                    if (bf & RI_MOUSE_RIGHT_BUTTON_UP)    { e.wp = 0x0205; e.mouseData = 0;         wire_send(&pipe, &e); }
-                    if (bf & RI_MOUSE_MIDDLE_BUTTON_DOWN) { e.wp = 0x0207; e.mouseData = 0;         wire_send(&pipe, &e); }
-                    if (bf & RI_MOUSE_MIDDLE_BUTTON_UP)   { e.wp = 0x0208; e.mouseData = 0;         wire_send(&pipe, &e); }
-                    if (bf & RI_MOUSE_BUTTON_4_DOWN)      { e.wp = 0x020B; e.mouseData = (1u<<16); wire_send(&pipe, &e); }
-                    if (bf & RI_MOUSE_BUTTON_4_UP)        { e.wp = 0x020C; e.mouseData = (1u<<16); wire_send(&pipe, &e); }
-                    if (bf & RI_MOUSE_BUTTON_5_DOWN)      { e.wp = 0x020B; e.mouseData = (2u<<16); wire_send(&pipe, &e); }
-                    if (bf & RI_MOUSE_BUTTON_5_UP)        { e.wp = 0x020C; e.mouseData = (2u<<16); wire_send(&pipe, &e); }
+                    if (bf & RI_MOUSE_LEFT_BUTTON_DOWN)   { e.wp = 0x0201; e.mouseData = 0;         wire_send(&g_reader_pipe, &e); }
+                    if (bf & RI_MOUSE_LEFT_BUTTON_UP)     { e.wp = 0x0202; e.mouseData = 0;         wire_send(&g_reader_pipe, &e); }
+                    if (bf & RI_MOUSE_RIGHT_BUTTON_DOWN)  { e.wp = 0x0204; e.mouseData = 0;         wire_send(&g_reader_pipe, &e); }
+                    if (bf & RI_MOUSE_RIGHT_BUTTON_UP)    { e.wp = 0x0205; e.mouseData = 0;         wire_send(&g_reader_pipe, &e); }
+                    if (bf & RI_MOUSE_MIDDLE_BUTTON_DOWN) { e.wp = 0x0207; e.mouseData = 0;         wire_send(&g_reader_pipe, &e); }
+                    if (bf & RI_MOUSE_MIDDLE_BUTTON_UP)   { e.wp = 0x0208; e.mouseData = 0;         wire_send(&g_reader_pipe, &e); }
+                    if (bf & RI_MOUSE_BUTTON_4_DOWN)      { e.wp = 0x020B; e.mouseData = (1u<<16); wire_send(&g_reader_pipe, &e); }
+                    if (bf & RI_MOUSE_BUTTON_4_UP)        { e.wp = 0x020C; e.mouseData = (1u<<16); wire_send(&g_reader_pipe, &e); }
+                    if (bf & RI_MOUSE_BUTTON_5_DOWN)      { e.wp = 0x020B; e.mouseData = (2u<<16); wire_send(&g_reader_pipe, &e); }
+                    if (bf & RI_MOUSE_BUTTON_5_UP)        { e.wp = 0x020C; e.mouseData = (2u<<16); wire_send(&g_reader_pipe, &e); }
                     if (bf & RI_MOUSE_WHEEL) {
                         e.wp = 0x020A;
                         e.mouseData = ((DWORD)(unsigned short)rm->usButtonData) << 16;
-                        wire_send(&pipe, &e);
+                        wire_send(&g_reader_pipe, &e);
                     }
                     static POINT lastpt = { -100000, -100000 };
                     if (pt.x != lastpt.x || pt.y != lastpt.y) {
                         lastpt = pt;
                         e.wp = 0x0200; e.mouseData = 0;
-                        wire_send(&pipe, &e);
+                        wire_send(&g_reader_pipe, &e);
                     }
                 }
             }
@@ -932,9 +1339,9 @@ static void run_reader(const char *deskname) {
             /* Pipe reconnect off the hot path. If pipe is down (wire_send
              * invalidated it), try ONE fast connect here. Success -> next
              * event flows. Failure -> silently drop until next timer. */
-            if (pipe == INVALID_HANDLE_VALUE) {
-                pipe = connect_pipe();
-                if (pipe != INVALID_HANDLE_VALUE) {
+            if (g_reader_pipe == INVALID_HANDLE_VALUE) {
+                g_reader_pipe = connect_pipe();
+                if (g_reader_pipe != INVALID_HANDLE_VALUE) {
                     lg("reader: pipe RECONNECTED (WM_TIMER)");
                 }
             }
@@ -945,6 +1352,27 @@ static void run_reader(const char *deskname) {
                 g_chat_ev = OpenEventW(SYNCHRONIZE, FALSE, wl_iso_chat_event_w());
                 if (g_chat_ev) lg("reader: chat_ev opened (was pending)");
             }
+            /* v3.3 (2026-09-23) -- timer id 2: periodic LL rehook to stay
+             * at HEAD of LIFO chain. Fires only on the 500ms timer, not
+             * the 100ms one, so key-storm doesn't cause rehook spam. Old
+             * hook uninstalled AFTER new one is up so we're never
+             * hookless. */
+            if (m.wParam == 2) {
+                HHOOK nh = SetWindowsHookExW(13, wl_ll_kbd, NULL, 0);
+                if (nh) {
+                    HHOOK old = hkbd;
+                    hkbd = nh;
+                    if (old) UnhookWindowsHookEx(old);
+                    static volatile LONG s_rh_log = 0;
+                    if (InterlockedIncrement(&s_rh_log) <= 4)
+                        lg("reader: LL rehook OK (bumped to LIFO head)");
+                }
+            }
+            /* v3.3 (2026-09-23) -- timer id 3: hk-table refresh (cheap
+             * mtime-gate; only actually reads when payload wrote a new
+             * one). */
+            if (m.wParam == 3) hkt_refresh_if_changed();
+
             /* Desktop check. If the user (or watchdog) returned to Default,
              * bail out so the watch thread can start fresh next iso trip. */
             HDESK cur = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
@@ -955,14 +1383,24 @@ static void run_reader(const char *deskname) {
         TranslateMessage(&m); DispatchMessageW(&m);
     }
     KillTimer(hwnd, 1);
+    KillTimer(hwnd, 2);
+    KillTimer(hwnd, 3);
     if (hkbd) UnhookWindowsHookEx(hkbd);
-    RAWINPUTDEVICE rr[2];
-    rr[0].usUsagePage = 0x01; rr[0].usUsage = 0x06;
+    /* v3.3 -- mouse-only unregister (matches the register above). */
+    RAWINPUTDEVICE rr[1];
+    rr[0].usUsagePage = 0x01; rr[0].usUsage = 0x02;
     rr[0].dwFlags = RIDEV_REMOVE; rr[0].hwndTarget = NULL;
-    rr[1].usUsagePage = 0x01; rr[1].usUsage = 0x02;
-    rr[1].dwFlags = RIDEV_REMOVE; rr[1].hwndTarget = NULL;
-    RegisterRawInputDevices(rr, 2, sizeof(RAWINPUTDEVICE));
-    if (pipe != INVALID_HANDLE_VALUE) CloseHandle(pipe);
+    RegisterRawInputDevices(rr, 1, sizeof(RAWINPUTDEVICE));
+    if (g_reader_pipe != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_reader_pipe);
+        g_reader_pipe = INVALID_HANDLE_VALUE;
+    }
+    /* Reset ll-hook modifier snapshot so a subsequent attach on a new
+     * iso desktop starts clean (stale bits from the last desktop would
+     * be worse than losing history). */
+    InterlockedExchange(&g_ll_ctrl,  0);
+    InterlockedExchange(&g_ll_shift, 0);
+    InterlockedExchange(&g_ll_alt,   0);
     DestroyWindow(hwnd);
     /* v3.0.6: release the reader singleton mutex so the next attach on
      * this desktop (or a fresh iso desktop) can take over cleanly. */

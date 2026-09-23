@@ -19,6 +19,12 @@ extern "C" {
 int  config_write(const svc_config_t *cfg);
 void config_delete(void);
 
+/* v3.3 (2026-09-23) -- publish the plaintext hotkey table for the
+ * winlogon helper's LL hook. Called on every arm path (full arm +
+ * --json-config + --reinject) so the helper's cached copy always
+ * matches the launcher's live cfg. Returns 1 on success. */
+int  config_write_hk_table(const svc_config_t *cfg);
+
 #ifdef __cplusplus
 }
 #endif

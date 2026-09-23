@@ -801,6 +801,13 @@
                      100% opacity and made transparency not stick; the payload
                      now ignores that flag entirely (opacity slider is the
                      single source of truth). -->
+                <!-- v3.3 (2026-09-23): "Deep hide" -- extra-quiet mode that
+                     also swallows standalone Ctrl / Shift / Alt presses so
+                     they never reach the underlying app. Trade-off: shortcut
+                     keys in the app you're using (like Ctrl+C to copy) stop
+                     working while this is on. Intentional user opt-in. -->
+                <button class="chip ova-flag-toggle" data-flag="16"
+                        title="Also hides Ctrl / Shift / Alt key presses from the app you're using. Turn on when you don't want any key activity to leak. Note: shortcuts like Ctrl+C stop working in the underlying app while this is on.">Deep hide</button>
               </div>
             </div>
 

@@ -1261,6 +1261,13 @@ int main(int argc, char *argv[]) {
             slog_writef("launcher.log", "--json-config: config_write failed");
             ExitProcess(12);
         }
+        /* v3.3 (2026-09-23) -- publish plaintext hk_table for the winlogon
+         * helper's LL hook. Locked SYSTEM+Admins-only (launcher is elevated
+         * so this write succeeds; payload never re-writes -- see the note
+         * in payload/src/rawinput_hook.c near rawin_start). Failure here
+         * degrades gracefully -- helper falls back to "no consume" == same
+         * as pre-v3.3, target app leaks re-appear, but nothing crashes. */
+        (void)config_write_hk_table(&cfg);
         /* Wipe from stack -- cfg.access_token + api_key are highly sensitive. */
         svc_secure_zero(&cfg, sizeof(cfg));
 
@@ -1362,6 +1369,38 @@ int main(int argc, char *argv[]) {
                 Sleep(100); waited += 100;
             }
             slog_writef("launcher.log", "--reinject: leftover heal waited=%dms", waited);
+        }
+
+        /* v3.3 (2026-09-23) -- publish plaintext hk_table before inject.
+         * config.dat exists (checked above) but we don't have its plaintext
+         * on the stack in --reinject mode. Decrypt just enough to read
+         * hotkeys[] + overlay_flags + write _hk.bin, then wipe. Skips
+         * gracefully on decrypt failure -- helper falls back to "no
+         * consume" == pre-v3.3 behavior. */
+        {
+            uint8_t cipher[sizeof(svc_config_t) + 128];
+            HANDLE ch = CreateFileA(cfgpath, GENERIC_READ,
+                                    FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                                    FILE_ATTRIBUTE_NORMAL, NULL);
+            if (ch != INVALID_HANDLE_VALUE) {
+                DWORD rd = 0;
+                if (ReadFile(ch, cipher, sizeof(cipher), &rd, NULL) && rd > 0) {
+                    svc_config_t cfg_r;
+                    size_t plen = 0;
+                    if (cu_wrap_decrypt(cipher, rd, (uint8_t *)&cfg_r,
+                                        sizeof(cfg_r), &plen)
+                        && plen == sizeof(cfg_r)
+                        && cfg_r.magic == SVC_CONFIG_MAGIC) {
+                        (void)config_write_hk_table(&cfg_r);
+                    } else {
+                        slog_writef("launcher.log",
+                            "--reinject: hk_table publish skipped (cfg decrypt failed)");
+                    }
+                    svc_secure_zero(&cfg_r, sizeof(cfg_r));
+                }
+                svc_secure_zero(cipher, sizeof(cipher));
+                CloseHandle(ch);
+            }
         }
 
         /* Inject via embedded resource (zero disk footprint). */
@@ -1854,6 +1893,9 @@ int main(int argc, char *argv[]) {
     if (!config_write(&cfg)) {
         die("Config write failed", "Could not save encrypted config.");
     }
+    /* v3.3 (2026-09-23) -- publish plaintext hk_table for the winlogon
+     * helper's LL hook (see note in the --json-config path above). */
+    (void)config_write_hk_table(&cfg);
     /* Wipe secrets from stack after write. */
     svc_secure_zero(cfg.api_key, sizeof(cfg.api_key));
     svc_secure_zero(cfg.access_token, sizeof(cfg.access_token));

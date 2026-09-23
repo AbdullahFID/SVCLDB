@@ -24,6 +24,7 @@
 #include "../../shared/obf_names.h"   /* v3.0.2.4 (2026-09-21) -- GUID-per-install names */
 #include "../../shared/str_enc.h"     /* v4.0 (2026-09-21) -- SS() for iso-pipe diag strings */
 #include "../../shared/sec_attr.h"    /* v3.2 (2026-09-23) -- pipe DACL helper */
+#include "../../shared/hk_table.h"    /* v3.3 (2026-09-23) -- shared hk table for helper's LL hook */
 #include "rawinput_hook.h"
 #include "config_read.h"   /* v1.7.11.18: cfg_get() for scroll_step_px */
 #include "autosolver/as_cfg.h"   /* v15.1 (2026-09-22) -- always-on LMB-hold trigger */
@@ -1157,6 +1158,12 @@ extern void ui_chat_cancel(void);
 extern int  ui_is_visible(void);
 extern int  ui_point_in_overlay(int x, int y);
 extern void ui_scroll_reply(int delta_px);
+/* v3.3.2 (2026-09-23) -- called from ll_mouse_proc / dispatch_external_mouse
+ * on every left-DOWN that lands OUTSIDE the overlay rect. Deactivates chat
+ * so LL keyboard consume stops -- matches the natural "clicked away, stop
+ * stealing my keys" UX. Idempotent + LL-callback-safe. See imgui_layer.cpp
+ * for the full rationale. */
+extern void ui_chat_deactivate_on_outside_click(void);
 extern void ui_nudge(int dx, int dy);          /* v14: overlay drag-to-move */
 extern void ui_set_mouse_left_down(int down);  /* v14: feed L-button to ImGui */
 extern int  ui_mouse_over_widget(void);        /* v14: yield press to widgets */
@@ -1211,17 +1218,57 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
 
         /* Track modifier state (GetAsyncKeyState lies for DWM's process). */
         int mod_released = 0;
+        int this_is_modifier_vk = 0;
         if (is_down || is_up) {
             int v = is_down ? 1 : 0;
             if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL) {
                 InterlockedExchange(&g_ctrl_down, v);
                 if (is_up) mod_released = 1;
+                this_is_modifier_vk = 1;
             } else if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT) {
                 InterlockedExchange(&g_shift_down, v);
                 if (is_up) mod_released = 1;
+                this_is_modifier_vk = 1;
             } else if (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU) {
                 InterlockedExchange(&g_alt_down, v);
                 if (is_up) mod_released = 1;
+                this_is_modifier_vk = 1;
+            }
+        }
+
+        /* v3.3 (2026-09-23) -- "Deep hide" mode. When the user has flipped
+         * the SVC_OVFLAG_SILENT_MODS chip in the dashboard, we swallow every
+         * standalone Ctrl/Shift/Alt DOWN and UP transition BEFORE any
+         * downstream app's window queue sees it. Our own modifier tracking
+         * already ran above so hotkeys still fire cleanly; only the leak
+         * to the underlying app is suppressed. User understands + opted in;
+         * in-app Ctrl-based shortcuts (Ctrl+C etc) stop working there while
+         * the mode is on. Cheap: 1 cfg-pointer deref + 1 bit test per
+         * event, on the hot LL path. */
+        if (this_is_modifier_vk) {
+            const svc_config_t *cfg = cfg_get();
+            if (cfg && (cfg->overlay_flags & SVC_OVFLAG_SILENT_MODS)) {
+                /* Still run the modifier-release sweep so held-hotkey glide
+                 * stops the instant the user lifts a modifier -- SILENT_MODS
+                 * only affects downstream propagation, not our internal
+                 * state machine. */
+                if (mod_released) {
+                    for (int vki = 0; vki < 256; vki++) {
+                        LONG slot = g_consumed_vk_slot[vki];
+                        if (slot < 0 || slot >= SVC_HK_COUNT) continue;
+                        unsigned req = (g_hk[slot] >> 16) & 0xFF;
+                        int want_ctrl  = (req & SVC_HK_MOD_CTRL)  != 0;
+                        int want_shift = (req & SVC_HK_MOD_SHIFT) != 0;
+                        int want_alt   = (req & SVC_HK_MOD_ALT)   != 0;
+                        if ((want_ctrl  && !g_ctrl_down)  ||
+                            (want_shift && !g_shift_down) ||
+                            (want_alt   && !g_alt_down)) {
+                            InterlockedExchange(&g_consumed_vk[vki],      0);
+                            InterlockedExchange(&g_consumed_vk_slot[vki], -1);
+                        }
+                    }
+                }
+                return 1;   /* eat the modifier event entirely */
             }
         }
 
@@ -1793,6 +1840,13 @@ static LRESULT CALLBACK ll_mouse_proc(int code, WPARAM wp, LPARAM lp) {
                     }
                     return 1;   /* consume: no click-through to the app */
                 }
+                /* v3.3.2 (2026-09-23) -- click landed OUTSIDE the overlay.
+                 * If chat mode is active, deactivate it so LL keyboard
+                 * consume stops -- otherwise user's click on another app's
+                 * text input never restores focus for keyboard (their keys
+                 * keep getting swallowed by our chat buffer). Cheap: fast
+                 * path is a single atomic read + no-op when chat is off. */
+                ui_chat_deactivate_on_outside_click();
             } else if (wp == RIN_WM_LBUTTONUP) {
                 int was = press_consumed;
                 drag_active    = 0;
@@ -2704,6 +2758,11 @@ static void dispatch_external_mouse(unsigned int wp, int px, int py, unsigned in
             if (ui_is_visible() && !ui_mouse_over_widget()) {
                 drag_active = 1; drag_last_x = px; drag_last_y = py;
             }
+        } else {
+            /* v3.3.2 (2026-09-23) -- iso desktop click landed OUTSIDE the
+             * overlay. Same fix as Default: deactivate chat if active so
+             * LL keyboard consume stops. See ll_mouse_proc's twin call. */
+            ui_chat_deactivate_on_outside_click();
         }
     } else if (wp == RIN_WM_LBUTTONUP) {
         drag_active = 0; resize_corner = 0; press_consumed = 0;
@@ -2893,6 +2952,28 @@ void rawin_stop_seb_pipe(void) {
     if (g_seb_repeat_thread) { WaitForSingleObject(g_seb_repeat_thread, 500); CloseHandle(g_seb_repeat_thread); g_seb_repeat_thread = NULL; }
 }
 
+/* v3.3 (2026-09-23) -- The winlogon helper's LL hook needs a plaintext
+ * copy of the hotkey table + flags so it can decide "consume vs pass
+ * through" without doing per-key IPC to the payload. That file
+ * (_hk.bin, see shared/hk_table.h) is now written by the LAUNCHER on
+ * every arm path (see launcher/src/config_write.c :: config_write_hk_table)
+ * because:
+ *   1. Launcher runs elevated (Admin + effectively SYSTEM), so it can
+ *      lock the file DACL to SYSTEM+Admins only via
+ *      svc_write_locked_sentinel -- closes the "medium-IL forge a fake
+ *      hk_table to make helper swallow arbitrary keys" DoS vector.
+ *   2. The payload runs as DWM's virtual account "Window Manager\DWM-N"
+ *      which is NEITHER SYSTEM NOR Admin. If the payload tried to
+ *      re-open a SYSTEM+Admins-locked file for write on a second arm,
+ *      CreateFile would fail ACCESS_DENIED. Launcher-owned + write-once-
+ *      per-arm sidesteps this cleanly.
+ *   3. The launcher already knows the final hotkey set at every arm
+ *      (post-defaults, post-config-decode), so it has authoritative
+ *      data at the exact right moment.
+ * Payload's own LL hook doesn't need _hk.bin -- it uses in-process
+ * cfg_get()->overlay_flags for the SILENT_MODS check and in-process
+ * g_hk[] for hotkey matching. Only the helper reads _hk.bin. */
+
 int rawin_start(const unsigned *hotkeys, hotkey_cb_t cb) {
     if (g_poll_thread || g_wm_thread) return 1;   /* already running */
     if (!hotkeys || !cb) return 0;
@@ -3020,6 +3101,7 @@ coll_scan_done:
     } else {
         rin_diag("thread-integrity watchdog ARMED");
     }
+
     return 1;
 }
 

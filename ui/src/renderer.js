@@ -1417,9 +1417,15 @@ const OVFLAG_TRAIL_ERASE   = 0x1;
 const OVFLAG_SMOOTH_NUDGE  = 0x2;
 const OVFLAG_UNIFORM_ALPHA = 0x4;
 const OVFLAG_OPAQUE_LOCK   = 0x8;
+/* v3.3 (2026-09-23) — "Deep hide": swallow standalone Ctrl / Shift / Alt
+ * presses so bare modifier state never leaks to the target app. In-app
+ * shortcuts (Ctrl+C etc) stop working while on — intentional trade-off,
+ * user opt-in. Mirrored on payload side as SVC_OVFLAG_SILENT_MODS. */
+const OVFLAG_SILENT_MODS   = 0x10;
 /* v13 (2026-08-10) — OPAQUE_LOCK dropped (deprecated; payload ignores it).
  * Opacity slider is the single source of truth so transparency actually
- * sticks + can go near-invisible. TRAIL_ERASE stays off. */
+ * sticks + can go near-invisible. TRAIL_ERASE stays off. Deep hide is
+ * OFF by default too (opt-in for the "not even ctrl leaks" workflow). */
 const OVFLAG_DEFAULTS      = OVFLAG_SMOOTH_NUDGE | OVFLAG_UNIFORM_ALPHA;
 
 let _ovaState  = { size_mode: 0, w: 560, h: 420, alpha: 1.00, theme: 2, overlay_flags: OVFLAG_DEFAULTS, scroll_step_px: 80, nudge_step_px: 48 };

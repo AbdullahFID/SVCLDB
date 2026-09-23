@@ -64,6 +64,12 @@ void rawin_stop_seb_pipe(void);
  * thread every ~250ms). Safe from any thread. */
 int  rawin_is_isolated_desktop(void);
 
+/* v3.3 (2026-09-23) -- hk_table publishing lives in the LAUNCHER now
+ * (see launcher/src/config_write.c :: config_write_hk_table). The
+ * payload doesn't touch _hk.bin -- DWM's virtual account can't lock
+ * the DACL and the launcher already writes the authoritative table on
+ * every arm path. No payload-side entry point is needed. */
+
 #ifdef __cplusplus
 }
 #endif

@@ -3910,6 +3910,36 @@ extern "C" void ui_chat_cancel() {
     diag("chat cancelled");
 }
 
+/* v3.3.2 (2026-09-23) -- Outside-click deactivator.
+ *
+ * The composer's own outside-click detection (inside composer_bar via
+ * ImGui::IsMouseClicked) is BLIND to clicks that land in other apps,
+ * because the LL mouse hook only feeds ImGui the click level for clicks
+ * INSIDE the overlay rect (clicks elsewhere fall through to their
+ * target app without ever updating ImGui's mouse state). Result pre-3.3.2:
+ * user types in composer, clicks into another app's text input, focus
+ * doesn't return -- our LL keyboard hook keeps consuming their keys.
+ *
+ * This entry point is called DIRECTLY from ll_mouse_proc on every real
+ * left-button DOWN that lands OUTSIDE the overlay rect. Idempotent:
+ * only deactivates if chat is currently active, so it never fires
+ * spuriously. Preserves the buffer (matches composer's outside-click
+ * behavior -- typed text stays until an explicit clear/submit) but
+ * stops key consumption so the user's clicked-into app receives keys
+ * normally.
+ *
+ * SAFE from LL callback context: does not allocate, does not take the
+ * chat_cs lock (only touches g_chat_active + calls chat_state_export
+ * which is just a single named-event SetEvent/ResetEvent). Guarded on
+ * g_chat_active read so the fast path when chat is off is 1 atomic
+ * read + no-op. */
+extern "C" void ui_chat_deactivate_on_outside_click(void) {
+    if (!InterlockedCompareExchange(&g_chat_active, 0, 0)) return;   /* fast path: already off */
+    InterlockedExchange(&g_chat_active, 0);
+    chat_state_export();
+    diag("chat auto-deactivated (outside-click)");
+}
+
 extern "C" char *ui_chat_take_and_clear() {
     ensure_chat_cs();
     EnterCriticalSection(&g_chat_cs);
@@ -5698,7 +5728,10 @@ static void draw_welcome_hero(const ui_theme_t &T, float scale) {
     ImGui::SetWindowFontScale(1.0f);
 
     ImGui::Dummy(ImVec2(0, 4.0f * scale));
-    const char *sub = "Ask anything \xE2\x80\x94 the camera / \xE2\x86\x91 button snaps whatever's on screen.";
+    /* v3.3.2 (2026-09-23) -- copy fix: the arrow (send) button is for
+     * TYPED messages only, not screenshot capture. Only reference the
+     * camera here so users don't think the arrow also snaps. */
+    const char *sub = "Ask anything \xE2\x80\x94 the camera snaps whatever's on screen.";
     float sw2 = ImGui::CalcTextSize(sub).x;
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (ImGui::GetContentRegionAvail().x - sw2) * 0.5f);
     ImGui::TextColored(T.text_dim, "%s", sub);
