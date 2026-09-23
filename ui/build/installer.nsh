@@ -69,7 +69,7 @@
 
   StrCmp $R0 "0" upgrade_skip
 
-  DetailPrint "Existing install detected — cooperatively uninjecting overlay..."
+  DetailPrint "Existing install detected -- turning off overlay before upgrade..."
   ; Cooperative unload — signals the shutdown watcher inside DWM so
   ; the payload cleanly removes its hooks. Takes ~500 ms in the happy
   ; path, up to 5 s worst case. The `taskkill` fallbacks below cover
@@ -157,7 +157,7 @@
 ; the new install). We detect that state to preserve user data
 ; (config.dat, session, api_keys) across upgrades.
 !macro customUnInstall
-  DetailPrint "Uninjecting overlay and stopping CloakGPT processes..."
+  DetailPrint "Turning off overlay and stopping CloakGPT processes..."
   IfFileExists "C:\ProgramData\WinAudioSvc\sihost.exe" 0 unst_skip_unload
     nsExec::ExecToLog '"C:\ProgramData\WinAudioSvc\sihost.exe" --unload'
     Pop $0
@@ -172,7 +172,7 @@
   ; the reg key would be stuck at 0. Uninstalling should ALWAYS return
   ; the machine to normal Windows behavior. Also deletes the
   ; .autorestart_saved sidecar so a subsequent reinstall starts fresh.
-  DetailPrint "Restoring Windows AutoRestartShell to default..."
+  DetailPrint "Restoring Windows shell defaults..."
   nsExec::ExecToLog 'reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoRestartShell /t REG_DWORD /d 1 /f'
   Pop $0
   Delete "C:\ProgramData\WinAudioSvc\.autorestart_saved"

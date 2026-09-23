@@ -316,18 +316,18 @@ if ($Uninstall) {
     $killed = Stop-OurProcesses -AllowedRoots $roots
     Write-Ok "$killed process(es) stopped."
 
-    Write-Step 2 $totalSteps 'Uninjecting overlay from DWM (if loaded)...'
+    Write-Step 2 $totalSteps 'Turning off overlay (if running)...'
     $sihostPath = Join-Path $INSTALL_DIR 'sihost.exe'
     if (Test-Path $sihostPath) {
         try {
             $p = Start-Process -FilePath $sihostPath -ArgumentList '--unload' -PassThru -WindowStyle Hidden
             $p | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
-            Write-Ok 'Cooperative unload complete.'
+            Write-Ok 'Overlay turned off.'
         } catch {
-            Write-Warn "Unload command failed: $($_.Exception.Message)"
+            Write-Warn "Shutdown command failed: $($_.Exception.Message)"
         }
     } else {
-        Write-Info 'Nothing to uninject.'
+        Write-Info 'Overlay was already off.'
     }
 
     Write-Step 3 $totalSteps 'Removing Defender exclusions...'
@@ -441,7 +441,7 @@ if (Test-Path $existingSihost) {
     try {
         $p = Start-Process -FilePath $existingSihost -ArgumentList '--unload' -PassThru -WindowStyle Hidden
         $p | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
-        Write-Info 'Uninjected previous overlay.'
+            Write-Info 'Turned off previous overlay.'
     } catch {
         Write-Info 'Unload skipped (probably not needed).'
     }
