@@ -1020,12 +1020,27 @@ static int inject_helper_from_bytes_common(const BYTE *bytes, DWORD len,
     }
     /* Kick any existing helper instance -- wait ~600ms for its watch
      * thread's Sleep(75) + reader's 200ms WM_TIMER cadence to notice
-     * `superseded()` and unwind. */
+     * `superseded()` and unwind.
+     *
+     * v-next (2026-09-23) -- SKIP the 600ms when had_prior=0. Every
+     * helper generation opens + holds the halt event as long as it's
+     * alive, so had_prior=0 means "no helper generation currently
+     * exists in this winlogon". Waiting 600ms for a non-existent old
+     * instance to notice a signal it can't receive was pure wall-time
+     * waste -- consistently 600ms per helper inject on the common
+     * "fresh box / already-clean state" path. Combined with the
+     * v-next DllMain supersede-off-mainthread change (see wl_input.c),
+     * total helper inject wall-time drops from ~2100ms to ~50ms when
+     * had_prior=0. When had_prior=1 (racing an old instance mid-life),
+     * we still burn the 600ms to give its WM_TIMER ticks a chance to
+     * observe the halt event -- correctness > speed in that path. */
     int had_prior = inject_helper_signal_unload();
     slog_writef("launcher.log",
-                "helper: winlogon.pid=%lu prior_signal=%d -- waiting 600ms for old instance",
-                pid, had_prior);
-    Sleep(600);
+                "helper: winlogon.pid=%lu prior_signal=%d%s",
+                pid, had_prior,
+                had_prior ? " -- waiting 600ms for old instance"
+                          : " -- no prior helper, skipping wait");
+    if (had_prior) Sleep(600);
 
     HANDLE hProc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION |
                                PROCESS_VM_WRITE | PROCESS_VM_READ |

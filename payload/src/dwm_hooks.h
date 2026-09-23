@@ -63,6 +63,28 @@ int  hooks_install(const pl_offsets_t *off, present_cb_t present_cb);
  * hooks, reverts byte-patch. Safe to call from any thread. */
 void hooks_uninstall(void);
 
+/* v-next (2026-09-23) -- INSTANT overlay hide for shutdown / emergency-Q
+ * paths. Sets g_stop_draw = 1 IMMEDIATELY so the next Present frame
+ * (~16ms at 60Hz) skips our draw callback. Also bumps compose-grace
+ * so DWM keeps composing during the transition (clean pixels replace
+ * our overlay tiles).
+ *
+ * Unlike hooks_uninstall, this does NOT touch MinHook, does NOT sleep,
+ * does NOT revert byte-patches -- pure flag flip. Callers use it to get
+ * the overlay OFF SCREEN immediately, THEN do slow subsystem teardown
+ * (rawin/ldb/sub_check/token_refresh stops -- can total 2+ seconds), THEN
+ * call hooks_uninstall to actually tear down MinHook.
+ *
+ * WHY: pre v-next, g_stop_draw was set INSIDE hooks_uninstall which
+ * runs AFTER those sequential subsystem stops. Overlay stayed on screen
+ * for the ENTIRE stop window (2-5 seconds). Students hitting the
+ * emergency kill hotkey during an exam saw a 3-second linger before the
+ * overlay disappeared -- catastrophic UX. Now hide is ~16ms perceived.
+ *
+ * Idempotent + safe from any thread. Does not conflict with a
+ * subsequent hooks_uninstall (which has its own idempotency guard). */
+void hooks_begin_shutdown_hide(void);
+
 /* ── Force-wake API (Bypassify's "return TRUE from PN" pattern) ── */
 
 /* Set the wake counter to `frames`. While the counter is > 0, our PN1

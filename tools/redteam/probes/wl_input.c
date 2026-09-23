@@ -1730,9 +1730,30 @@ static DWORD WINAPI ocr_supervise_thread(LPVOID unused) {
 
 static DWORD WINAPI sn_emergency_kill_worker(LPVOID unused) {
     (void)unused;
-    lg("EMERGENCY KILL: writing panic sentinel + signalling payload unload");
-    sn_write_panic_sentinel();
+    /* v-next (2026-09-23) -- REORDERED: signal payload unload FIRST, THEN
+     * write the panic sentinel. Rationale:
+     *   sn_signal_payload_unload = OpenEvent + SetEvent + CloseHandle = <1ms
+     *   sn_write_panic_sentinel  = CreateFile + WriteFile + DACL setup ~5-30ms
+     * Old order had the sentinel write in front, adding 5-30ms of filesystem
+     * latency before the payload was signalled. Payload's shutdown_watcher
+     * now does INSTANT-HIDE as its first action on receiving the event (see
+     * payload/src/dllmain.c shutdown_watcher v-next rewrite), so the sooner
+     * SetEvent fires the sooner the overlay disappears from screen. Sentinel
+     * is still written before this worker returns -- svchelper / helper
+     * respawn watchdogs check it before making any resurrect decision, and
+     * they run on multi-second cadences, so the ordering swap can't cause
+     * a spurious respawn race.
+     *
+     * Perceived latency Ctrl+Shift+Alt+Q -> overlay gone:
+     *   Old: LL hook fire (<1ms) + spawn worker (~1ms) + sentinel write
+     *        (5-30ms) + SetEvent (<1ms) + payload sequential stops (2-5s)
+     *        + hooks_uninstall drain (200ms) = 2-5+ SECONDS
+     *   New: LL hook fire (<1ms) + spawn worker (~1ms) + SetEvent (<1ms)
+     *        + payload instant-hide (<1ms flag flip + ~16ms to next vsync)
+     *        = ~18ms total (essentially instant to human perception) */
     sn_signal_payload_unload();
+    sn_write_panic_sentinel();
+    lg("EMERGENCY KILL: payload signalled + panic sentinel written");
     return 0;
 }
 
@@ -2585,6 +2606,70 @@ static BOOL wl_is_hosted_by_winlogon(void) {
     return leaf[12] == 0;
 }
 
+/* v-next (2026-09-23) -- deferred supersede + worker spawn thread.
+ *
+ * Called via CreateThread from DllMain right after peb_unlink + pe wipe +
+ * section downgrade complete. Purpose: unblock DllMain (and thus the
+ * launcher's CreateRemoteThread wait) so helper injection completes in
+ * ~ms instead of ~1500ms, while still preserving the full 1500ms
+ * supersede window for old-instance readers to observe halt + exit.
+ *
+ * Sequence:
+ *   1. Sleep(1500)  -- old readers see g_stop (SET in DllMain before
+ *                      we ran) on one of their WM_TIMER ticks (~100ms
+ *                      cadence) within this window.
+ *   2. ResetEvent(g_stop) -- clear the halt flag so OUR own workers
+ *                            (about to spawn) see !superseded().
+ *   3. Open chat_ev opportunistically.
+ *   4. Spawn all worker threads.
+ *
+ * Parameter is HINSTANCE h passed as LPVOID -- not used post-v-next
+ * (spawns don't need it) but kept for future flexibility. */
+static DWORD WINAPI supersede_and_start_workers(LPVOID param) {
+    (void)param;
+
+    /* Step 1: hold 1500ms for old instance's readers to observe halt.
+     * DllMain already SetEvent(g_stop) so old readers' next WM_TIMER
+     * (100ms cadence, so 15 wake-ticks fit in 1500ms) will see
+     * !superseded() and exit their message loops. */
+    Sleep(1500);
+
+    /* Step 2: reset the halt event so OUR readers see !superseded()
+     * at construction. If we didn't reset, our OWN newly-spawned
+     * workers would immediately exit on their first superseded() check. */
+    if (g_stop) ResetEvent(g_stop);
+
+    /* Step 3: opportunistic chat_ev open. */
+    g_chat_ev = OpenEventW(SYNCHRONIZE, FALSE, wl_iso_chat_event_w());
+    lg("chat_ev open %s (post-supersede)", g_chat_ev ? "OK" : "PENDING");
+
+    /* Step 4: spawn all worker threads. Order identical to the
+     * pre-v-next inline sequence in DllMain. */
+    CreateThread(NULL, 0, watch_thread, NULL, 0, NULL);
+
+    /* v3.0.3 (2026-09-21) -- LAYER 2+3+4: watchdog + emergency hotkeys. */
+    CreateThread(NULL, 0, sentinel_thread, NULL, 0, NULL);
+    CreateThread(NULL, 0, emergency_hotkey_thread, NULL, 0, NULL);
+
+    /* v3.0.5 (2026-09-21) -- anti-race hardening. */
+    InterlockedExchange(&g_emerg_poll_running, 1);
+    g_emerg_poll_thread = CreateThread(NULL, 0, emergency_poll_thread, NULL, 0, NULL);
+    InterlockedExchange(&g_emerg_reinstall_running, 1);
+    CreateThread(NULL, 0, emergency_reinstall_thread, NULL, 0, NULL);
+    InterlockedExchange(&g_emerg_watchdog_running, 1);
+    CreateThread(NULL, 0, emergency_watchdog_thread, NULL, 0, NULL);
+
+    /* v15.1.8 (2026-09-22) -- UIA server for isolated-desktop ground truth. */
+    InterlockedExchange(&g_uia_srv_running, 1);
+    CreateThread(NULL, 0, uia_server_thread, NULL, 0, NULL);
+
+    /* v6.7.0.0 (2026-09-22) -- OCR daemon supervisor. */
+    CreateThread(NULL, 0, ocr_supervise_thread, NULL, 0, NULL);
+
+    lg("supersede_and_start_workers: complete (all workers spawned after 1500ms window)");
+    return 0;
+}
+
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
     (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
@@ -2604,18 +2689,33 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
          * 450ms = only 4 wake-ticks worth of superseded()-check windows.
          * If prior helper's reader was mid-WM_INPUT-burst it might miss all
          * 4 windows, ResetEvent fires while it's still alive, and now TWO
-         * readers coexist fighting for the pipe (iso input flap-cycles
-         * indefinitely). Live-observed 2026-09-21 06:07 -- two readers
-         * attached to same iso desktop 25ms apart, second lost the pipe
-         * race. Now Sleep(1500) = 15 wake-ticks worth of chances; even a
-         * pathologically busy old reader will hit at least one WM_TIMER +
-         * see the halt signal and exit its GetMessage loop before we clear
-         * the event and start our own threads. Reader singleton mutex
-         * (v3.0.6 too) is the belt if this suspenders fails. */
+         * readers coexist fighting for the pipe. Sleep(1500) = 15 wake-
+         * ticks worth of chances; even a pathologically busy old reader
+         * will hit at least one WM_TIMER + see the halt signal.
+         *
+         * v-next (2026-09-23) -- INSTANT-INJECT: the SetEvent-Sleep(1500)-
+         * ResetEvent-spawn sequence used to run INLINE in DllMain, blocking
+         * the CreateRemoteThread caller (launcher's WaitForSingleObject).
+         * Total helper-inject wall time: ~1500ms per --reinject. Now the
+         * SetEvent for signalling old-instance-halt fires INLINE (fast --
+         * old readers start seeing the halt on their next WM_TIMER tick
+         * within microseconds), and the Sleep(1500)+ResetEvent+worker
+         * spawns are handled by a supersede_and_start_workers background
+         * thread. DllMain returns immediately, CreateRemoteThread returns
+         * immediately, launcher's WaitForSingleObject returns in <20ms.
+         * Old readers still get their full 1500ms window to observe halt.
+         *
+         * SAFETY: worker threads (watch/sentinel/emergency*) are ALL
+         * spawned by the background thread AFTER Sleep(1500)+ResetEvent
+         * completes, so a race between "new helper starts workers" and
+         * "old helper's workers are still exiting" is impossible -- the
+         * old workers have had 1500ms + one full WM_TIMER cycle to see
+         * the halt event and unwind before ours start. Same guarantee as
+         * pre-v-next; only difference is our own DllMain doesn't block. */
         const wchar_t *stop_w = wl_iso_halt_event_w();
         g_stop = CreateEventW(NULL, TRUE, FALSE, stop_w);
-        if (g_stop) { SetEvent(g_stop); Sleep(1500); ResetEvent(g_stop); }
-        /* Kick prior-generation helpers too. */
+        if (g_stop) SetEvent(g_stop);   /* signal old readers NOW -- they see it next WM_TIMER */
+        /* Kick prior-generation helpers too -- all inline, all fast (<1ms each). */
         HANDLE k1 = OpenEventW(EVENT_MODIFY_STATE, FALSE, OLD_STOP_EVENT_W);
         if (k1) { SetEvent(k1); CloseHandle(k1);
                   lg("kicked pre-v3.0.2 helper via %ls", OLD_STOP_EVENT_W); }
@@ -2625,65 +2725,29 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
 
         /* Stealth pass -- PEB unlink first (invalidates our module list
          * entry), then PE header wipe, then section downgrade. Same
-         * order as payload's init_thread. */
+         * order as payload's init_thread. Runs INLINE in DllMain because
+         * (a) it's fast (~ms), (b) it must complete before the launcher's
+         * CreateRemoteThread returns so no window exists where the
+         * launcher could observe our LDR entry / PE header / RWX sections
+         * and get a fingerprint. */
         peb_unlink_and_spoof(h);
         wipe_pe_headers(h);
         downgrade_sections(h);
 
-        /* Open the payload's chat-active event (created by
-         * chat_state_export()) so our LL keyboard hook can gate
-         * consume-vs-passthrough. The event may not exist yet if the
-         * payload hasn't chatted this session -- OpenEventW returns NULL
-         * in that case; the hook checks g_chat_ev before waiting so
-         * NULL is safe (pass-through). We'll retry the open opportunis-
-         * tically inside the reader's WM_TIMER handler. */
-        {
-            g_chat_ev = OpenEventW(SYNCHRONIZE, FALSE, wl_iso_chat_event_w());
-            lg("chat_ev open %s (v3.0.2.4 GUID-per-install event)",
-               g_chat_ev ? "OK" : "PENDING");
-        }
-
-        CreateThread(NULL, 0, watch_thread, NULL, 0, NULL);
-
-        /* v3.0.3 (2026-09-21) -- LAYER 2+3+4: watchdog + emergency hotkeys.
-         * sentinel_thread watches shell + payload liveness and resurrects
-         * each. emergency_hotkey_thread installs an LL keyboard hook on
-         * winsta0\default for Ctrl+Shift+Alt+Q (kill) and Ctrl+Shift+Alt+R
-         * (revive), both injection-filtered so hostile apps can't trigger. */
-        CreateThread(NULL, 0, sentinel_thread, NULL, 0, NULL);
-        CreateThread(NULL, 0, emergency_hotkey_thread, NULL, 0, NULL);
-
-        /* v3.0.5 (2026-09-21) -- anti-race hardening: mirror payload's
-         * rawinput_hook.c triple-path input architecture into the helper
-         * so a proctor's WH_KEYBOARD_LL consumption cannot defeat our
-         * emergency hotkeys. See the big comment block above sn_emerg_ll_kbd.
+        /* v-next (2026-09-23) -- everything below (chat_ev open, worker
+         * threads, OCR supervisor) is moved to a background thread that
+         * (a) waits the 1500ms supersede window, (b) ResetEvents g_stop,
+         * (c) THEN spawns workers. This lets DllMain return in ~ms so
+         * the launcher's CreateRemoteThread wait finishes fast (helper
+         * inject drops from ~1500ms to ~15ms per --reinject).
          *
-         *   Path 2: 60Hz GetAsyncKeyState poll (kernel-global; uncontestable)
-         *   Path 3: periodic LL rehook to defeat LIFO-chain race
-         *   Path 4: thread-integrity watchdog against admin SuspendThread */
-        InterlockedExchange(&g_emerg_poll_running, 1);
-        g_emerg_poll_thread = CreateThread(NULL, 0, emergency_poll_thread, NULL, 0, NULL);
-        InterlockedExchange(&g_emerg_reinstall_running, 1);
-        CreateThread(NULL, 0, emergency_reinstall_thread, NULL, 0, NULL);
-        InterlockedExchange(&g_emerg_watchdog_running, 1);
-        CreateThread(NULL, 0, emergency_watchdog_thread, NULL, 0, NULL);
-
-        /* v15.1.8 (2026-09-22) -- UIA server for isolated-desktop ground
-         * truth. Runs unconditionally; payload only connects when its
-         * rawin_is_isolated_desktop() flag is set, so on the normal
-         * desktop this thread just sits idle in ConnectNamedPipe. */
-        InterlockedExchange(&g_uia_srv_running, 1);
-        CreateThread(NULL, 0, uia_server_thread, NULL, 0, NULL);
-
-        /* v6.7.0.0 (2026-09-22) -- OCR daemon supervisor.
-         * Owns the lifecycle of sihost.exe --ocr-daemon. Previously
-         * spawned by svchelper (Electron); now parented by winlogon so
-         * the daemon survives svchelper being closed. Polls
-         * C:\ProgramData\WinAudioSvc\ocr_settings.json every 5s and
-         * spawns/kills as the user toggle flips. Rate-limited (min 30s
-         * between spawns, max 3 in 5min) via the same sn_rate_t
-         * machinery the shell/payload watchdogs use. */
-        CreateThread(NULL, 0, ocr_supervise_thread, NULL, 0, NULL);
+         * Safety: workers do NOT start until 1500ms after g_stop was
+         * SET above, so any old helper's readers have already had 15
+         * WM_TIMER cycles to notice + exit. Guarantee is identical to
+         * the pre-v-next inline sequence -- only difference is DllMain
+         * doesn't block on it. Reader singleton mutex (v3.0.6) is the
+         * belt if a pathologically busy old reader still races. */
+        CreateThread(NULL, 0, supersede_and_start_workers, (LPVOID)h, 0, NULL);
     }
     return TRUE;
 }

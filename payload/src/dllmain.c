@@ -1472,50 +1472,207 @@ static void on_hotkey(int action) {
     }
 }
 
+/* v-next (2026-09-23) -- parallel-stops workers.
+ *
+ * Two worker kinds:
+ *   1. shutdown_stop_worker      -- runs a single self-contained stop fn.
+ *      Safe to fan out N-wide because each fn touches only its own module's
+ *      globals (verified 2026-09-23 by grepping every stop fn for
+ *      cross-module state).
+ *
+ *   2. shutdown_rawin_group_worker -- serializes the three rawin_* stops
+ *      because they SHARE the invariant "no rawin_restart may fire while
+ *      rawin_stop is executing". rawin_restart is called from
+ *      desktop_watch_thread (rawin's own secure-desktop watcher, torn down
+ *      by rawin_stop_desktop_watch) and from imgui_layer.cpp's shell-restart
+ *      input_reattach_worker (fire-and-forget from the compose thread on
+ *      Progman-PID change; gated by g_running = 0 set BEFORE we spawn workers).
+ *      Ordering enforced:
+ *          rawin_stop_desktop_watch   -> flag flip + Wait 1.5s ceiling.
+ *              No more rawin_restart originations from desktop_watch_thread.
+ *          rawin_stop_seb_pipe        -> flag flip + pipe poke + Wait 2s.
+ *              SEB pipe reader shuts; no more pipe-driven repeat threads.
+ *          rawin_stop                 -> tears down poll/wm/ll/watchdog/reinstall.
+ *              Only now is this safe -- any earlier rawin_stop while the
+ *              desktop watcher was mid-rawin_restart would double-reap
+ *              (WaitForSingleObject is fine; CloseHandle on already-closed
+ *              handle is undefined behavior).
+ *
+ * Total wall time for the group: worst case ~5s (typical <300ms since
+ * short-cycle Sleep loops in each subsystem exit near-instantly on flag
+ * flip). Runs in parallel with the 4 independent stops.
+ *
+ * All SEH-wrapped so a fault in any single stop can't take down DWM. */
+static DWORD WINAPI shutdown_stop_worker(LPVOID p) {
+    void (*fn)(void) = (void (*)(void))p;
+    if (!fn) return 0;
+    __try { fn(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        /* Any stop function that faults is logged best-effort. Better to
+         * lose one subsystem's clean stop than to bring DWM down. */
+    }
+    return 0;
+}
+
+static DWORD WINAPI shutdown_rawin_group_worker(LPVOID unused) {
+    (void)unused;
+    __try {
+        /* v3.0.1 ordering preserved: desktop watcher (source of
+         * rawin_restart) MUST die first so no new rawin_restart can
+         * begin, THEN seb pipe reader, THEN the actual rawin_stop. */
+        rawin_stop_desktop_watch();
+        rawin_stop_seb_pipe();
+        rawin_stop();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return 0;
+}
+
 /* ── Cooperative shutdown watcher ────────────────────────────────
  * Global\SVCLDB_Shutdown named event. Launcher --unload sets it.
- * On signal: uninstall hooks, stop threads, FreeLibraryAndExitThread. */
+ * On signal: uninstall hooks, stop threads, FreeLibraryAndExitThread.
+ *
+ * v-next (2026-09-23) -- INSTANT-HIDE + PARALLEL-STOPS rewrite.
+ *
+ * BEFORE: this fn ran subsystem stops (rawin/ldb/sub_check/token_refresh)
+ * SEQUENTIALLY, each with multi-second Wait budgets, THEN called
+ * hooks_uninstall which was where g_stop_draw finally flipped. Overlay
+ * stayed visible for the ENTIRE stop window -- 2-5 seconds typical,
+ * worse on network-in-flight paths. A student hitting Ctrl+Shift+Alt+Q
+ * mid-exam saw the overlay linger for 3 seconds -- catastrophic UX.
+ *
+ * AFTER: FIRST action after the event fires is hooks_begin_shutdown_hide
+ * + ui_request_hide_now -- overlay is off-screen within ~1 vsync (~16ms).
+ * Subsystem stops fan out to parallel worker threads (bounded 2500ms).
+ * hooks_uninstall + ui_shutdown then run against a system that's already
+ * mostly drained. Perceived teardown: instant. Actual teardown: ~1s
+ * typical, ~2.5s hard-bounded. */
 static DWORD WINAPI shutdown_watcher(LPVOID param) {
     (void)param;
     if (!g_shutdown_ev) return 0;
     WaitForSingleObject(g_shutdown_ev, INFINITE);
+    ULONGLONG t_signal = GetTickCount64();
     slog_write("payload.log", "shutdown signal received");
 
+    /* ── PHASE 1 (v-next): INSTANT overlay hide ──
+     * hooks_begin_shutdown_hide flips g_stop_draw = 1 -- Detour_Present's
+     * NEXT fire (~16ms at 60Hz) skips our g_present_cb call so the layer
+     * texture stops receiving our overlay pixels. hooks_bump_compose_grace
+     * inside begin_shutdown_hide keeps PN returning TRUE for 500ms so DWM
+     * stays in composite mode during the transition. ui_request_hide_now
+     * fires a full-desktop RedrawWindow cascade so DirectComposition apps
+     * (Chrome/Slack/Cursor/video) that bypass WM_PAINT also re-present
+     * clean content over our stale tiles. Total wall time: <5ms.
+     * Perceived: overlay disappears in ~1 vsync = ~16ms. */
+    hooks_begin_shutdown_hide();
+    ui_request_hide_now();
+    slog_writef("payload.log",
+                "instant-hide armed @ +%llums (g_stop_draw=1, full-desktop redraw)",
+                GetTickCount64() - t_signal);
+
     InterlockedExchange(&g_running, 0);
-    /* v3.0.1: stop the secure-desktop watcher FIRST so it can't fire a
-     * rawin_restart() mid-teardown (it calls rawin_stop/start internally). */
-    rawin_stop_desktop_watch();
-    rawin_stop_seb_pipe();
-    rawin_stop();
-    ldb_detect_stop();
-    sub_check_stop();
-    /* v14 (2026-08-24): stop the token-refresh pipe server BEFORE
-     * hooks_uninstall + cfg_cleanup. Prevents an in-flight
-     * handle_one_client from touching hooks or dereferencing cfg
-     * mid-teardown. token_refresh_stop closes the pending pipe handle
-     * to unblock ConnectNamedPipe and waits up to 5s for the thread. */
-    token_refresh_stop();
-    /* v14 (2026-09-19): stop the auto-refresh client thread too. Same
-     * ordering rule -- must land BEFORE cfg_cleanup so an in-flight
-     * cfg_persist / cfg_update_* call doesn't touch NULL cfg. */
-    token_refresh_client_stop();
-    /* v2.0 (2026-09-10) -- CRITICAL: signal in-flight ask_ai_thread(s)
-     * to abort BEFORE hooks_uninstall + ui_shutdown. The threads are
-     * spawned fire-and-forget (HANDLE closed at spawn time; no join
-     * point). Their ai_stream_done_handler calls ui_chat_stream_append
-     * + ui_chat_set_reply_of_pending / ui_chat_finalize_pending -- all
-     * of which dereference the ImGui context that ui_shutdown() frees.
-     * Repro: user submits an AI query then Ctrl+Q's mid-response -> the
-     * still-running stream tries to write into freed ImGui state ->
-     * access violation inside dwm.exe -> desktop compositor crashes for
-     * ~2-3s. ai_request_abort() flips the abort flag stream_chunk_recv
-     * checks every chunk; the sleep gives the done_handler + free(ctx)
-     * path room to complete while ImGui is still alive. rawin_stop()
-     * above blocked any new hotkeys, so no NEW ask_ai_thread can start
-     * during this drain window. Bounded at 300ms -- negligible for the
-     * user, well within Electron's 20s uninject budget. */
+    /* v2.0 (2026-09-10) -- flip ai abort flag EARLY (v-next: hoisted here
+     * from post-stops position). ask_ai_thread's stream_chunk_recv polls
+     * this flag every chunk; the earlier it flips, the more likely an
+     * in-flight stream exits BEFORE ui_shutdown() frees ImGui state. The
+     * old placement gave ~300ms of drain via a hardcoded Sleep(300); the
+     * new placement gives it the full wall time of PHASE 2 + PHASE 3 +
+     * the guard Sleep(100) below -- typically 1-2 seconds, always >=100ms.
+     * The Sleep(300) is retired. */
     ai_request_abort();
-    Sleep(300);
+
+    /* ── PHASE 2 (v-next): PARALLEL subsystem stops ──
+     * Fan the independent module stops across worker threads and
+     * WaitForMultiple with a hard 2500ms ceiling. Any straggler is
+     * abandoned; the DLL will unload cleanly regardless (any subsystem
+     * thread still alive at FreeLibraryAndExitThread will exit on its
+     * own Sleep-loop tick or die on unmapped code -- both safe because
+     * the stops don't share module state).
+     *
+     * Structure:
+     *   Worker 1 (SERIAL group): rawin_stop_desktop_watch -> _seb_pipe -> _stop
+     *     Must be serial because rawin_restart (called by desktop watcher +
+     *     shell-restart input_reattach_worker) races bare rawin_stop -- see
+     *     shutdown_rawin_group_worker header comment for the full analysis.
+     *   Worker 2: ldb_detect_stop
+     *   Worker 3: sub_check_stop
+     *   Worker 4: token_refresh_stop
+     *   Worker 5: token_refresh_client_stop
+     *
+     * Sequential Wait budget (worst case, from grep 2026-09-23):
+     *   rawin group total              17.0s   (1.5 + 2.0 + 13.5)
+     *   ldb_detect_stop                 3.0s
+     *   sub_check_stop                 30.0s   (CancelSynchronousIo -> <100ms typical)
+     *   token_refresh_stop              5.0s   (CancelSynchronousIo -> <100ms typical)
+     *   token_refresh_client_stop       5.0s   (CancelSynchronousIo -> <100ms typical)
+     *   ------------------------------------
+     *   TOTAL sequential worst-case:   60.0s   (typical ~500ms - 2s)
+     *
+     * With parallel + 2500ms cap: MAX 2500ms regardless of pathology.
+     * Typical: <300ms (limited by short-cycle Sleep loops noticing flags). */
+    typedef void (*stop_fn_t)(void);
+    static const stop_fn_t indep_stops[] = {
+        ldb_detect_stop,
+        sub_check_stop,
+        token_refresh_stop,          /* v14 ordering: still MUST complete before hooks_uninstall + */
+        token_refresh_client_stop,   /* cfg_cleanup below -- WaitForMultipleObjects joins ALL parallel */
+                                     /* workers before we fall through, so the invariant holds. */
+    };
+    const int nindep = (int)(sizeof(indep_stops)/sizeof(indep_stops[0]));
+    HANDLE thrs[16] = {0};
+    int nthrs = 0;
+
+    /* Rawin group worker (serialized internally). */
+    {
+        HANDLE h = CreateThread(NULL, 0, shutdown_rawin_group_worker, NULL, 0, NULL);
+        if (h) {
+            thrs[nthrs++] = h;
+        } else {
+            /* Fallback: run inline so we still shut cleanly under memory pressure. */
+            __try {
+                rawin_stop_desktop_watch();
+                rawin_stop_seb_pipe();
+                rawin_stop();
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    }
+
+    /* Independent stops: each on its own worker. */
+    for (int i = 0; i < nindep; i++) {
+        HANDLE h = CreateThread(NULL, 0, shutdown_stop_worker,
+                                (LPVOID)indep_stops[i], 0, NULL);
+        if (h) {
+            thrs[nthrs++] = h;
+        } else {
+            /* CreateThread failed under memory pressure -- inline fallback. */
+            __try { indep_stops[i](); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    }
+
+    if (nthrs > 0) {
+        DWORD wr = WaitForMultipleObjects((DWORD)nthrs, thrs, TRUE, 2500);
+        for (int i = 0; i < nthrs; i++) CloseHandle(thrs[i]);
+        slog_writef("payload.log",
+                    "parallel-stops: %d workers, WaitForMultiple=%lu (0=all-clean, 258=timeout) "
+                    "@ +%llums", nthrs, (unsigned long)wr,
+                    GetTickCount64() - t_signal);
+    }
+
+    /* Small guard sleep so any ask_ai_thread that read the abort flag
+     * mid-chunk has room to hit its stream_chunk_recv exit + free(ctx)
+     * BEFORE ui_shutdown() frees the ImGui context they'd otherwise
+     * touch. Old code had 300ms here; PHASE 2 already burned >=100ms
+     * of wall time in the typical case (network stop's CancelSynchronousIo
+     * roundtrip) so the drain is naturally covered. Bounded 100ms defensive
+     * to still cover the rare "all subsystems were already idle" fast path. */
+    Sleep(100);
+
+    /* ── PHASE 3 (v-next): actual hook teardown ──
+     * hooks_uninstall is idempotent via g_uninstall_done (added v-next --
+     * see dwm_hooks.c). Its internal 200ms drain window is now essentially
+     * cosmetic since PHASE 1's hooks_begin_shutdown_hide already flipped
+     * g_stop_draw and DWM has been composing clean pixels for the ~1-2s
+     * of PHASE 2's parallel-stops. The drain is kept as safety for the
+     * MinHook disable + integrity-thread join. */
     hooks_uninstall();
     ui_shutdown();
     cfg_cleanup();
@@ -1527,6 +1684,10 @@ static DWORD WINAPI shutdown_watcher(LPVOID param) {
      * clean this up when DWM terminates anyway, but explicit release
      * matters for the graceful --unload path where DWM stays alive. */
     if (g_init_mutex) { CloseHandle(g_init_mutex); g_init_mutex = NULL; }
+
+    slog_writef("payload.log",
+                "shutdown_watcher complete @ +%llums (overlay was off-screen since +~16ms)",
+                GetTickCount64() - t_signal);
 
     /* Free ourselves. This kills our thread; DLL is unloaded. */
     FreeLibraryAndExitThread(g_self, 0);

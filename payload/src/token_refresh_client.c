@@ -73,6 +73,26 @@ static HANDLE  g_trc_thread  = NULL;
 static volatile LONG g_trc_running = 0;
 static HANDLE  g_trc_stop_ev = NULL;    /* payload's shutdown event handle (SYNCHRONIZE) */
 
+/* v-next (2026-09-23) -- private wake event, guaranteed openable by our
+ * own thread regardless of the shared shutdown event's DACL. Fixes the
+ * "will sleep uninterruptibly" fallback that used to leave trc_thread
+ * stuck in Sleep(90s) when OpenEventA on the shared shutdown event fails
+ * (which happens whenever the shared event's DACL is tightened past
+ * DWM-N's implicit access -- our current SYSTEM+Admins DACL does exactly
+ * that, so the fallback was firing 100% of the time in practice).
+ *
+ * Consequence pre-fix: `token_refresh_client_stop`'s WaitForSingleObject
+ * on g_trc_thread would block the full 5s ceiling (thread was in
+ * Sleep(90s), CancelSynchronousIo is a no-op on Sleep). In the v-next
+ * parallel-stops shutdown design, that 5s block was capping the
+ * WaitForMultipleObjects window at 2500ms with WAIT_TIMEOUT, aborting
+ * cleanup early and abandoning the trc worker.
+ *
+ * With this private event: token_refresh_client_stop signals it, trc_thread
+ * wakes from its next trc_sleep_or_stop call within microseconds, exits
+ * cleanly, thread handle is joined, parallel-stops completes cleanly. */
+static HANDLE  g_trc_wake_ev = NULL;    /* private, always openable */
+
 /* Tracks the last time we saw a valid refresh_token in cfg. If cfg
  * never has one (upgrade from a pre-v14 install where user hasn't
  * re-injected yet), we log ONCE and then idle so we don't spam the log. */
@@ -86,15 +106,33 @@ static long long trc_now_s(void) {
     return (long long)time(NULL);
 }
 
-/* Rough sleep with interruption via the shutdown event. Returns 1 if
- * the shutdown event fired (caller should exit), 0 on natural timeout. */
+/* Rough sleep with interruption via the shutdown event OR the private
+ * wake event. Returns 1 if either fired (caller should exit), 0 on
+ * natural timeout.
+ *
+ * v-next (2026-09-23) -- wait on BOTH events via WaitForMultipleObjects
+ * so token_refresh_client_stop can guarantee wake even when
+ * OpenEventA(shared shutdown event) failed at start-up (DACL blocks
+ * DWM-N's opener). g_trc_wake_ev is created by token_refresh_client_start
+ * with no name / default DACL so it's always openable within this process.
+ * Old "uninterruptibly Sleep(wait_ms)" fallback made shutdown_watcher's
+ * WaitForSingleObject on g_trc_thread block the full 5s ceiling, which
+ * in parallel-stops was aborting the wait at 2500ms with WAIT_TIMEOUT. */
 static int trc_sleep_or_stop(unsigned wait_ms) {
-    if (!g_trc_stop_ev) {
-        Sleep(wait_ms);
-        return 0;
+    HANDLE waits[2];
+    DWORD  count = 0;
+    if (g_trc_stop_ev) waits[count++] = g_trc_stop_ev;
+    if (g_trc_wake_ev) waits[count++] = g_trc_wake_ev;
+    if (count == 0) {
+        /* Both events failed to be created. Should never happen post
+         * v-next since g_trc_wake_ev creation is unconditional and
+         * DACL-immune, but guard defensively so we don't hard-hang. */
+        Sleep(wait_ms > 200 ? 200 : wait_ms);   /* cap at 200ms so g_trc_running check happens often */
+        return InterlockedCompareExchange(&g_trc_running, 0, 0) == 0;
     }
-    DWORD wr = WaitForSingleObject(g_trc_stop_ev, wait_ms);
-    return (wr == WAIT_OBJECT_0);
+    DWORD wr = WaitForMultipleObjects(count, waits, FALSE, wait_ms);
+    /* WAIT_OBJECT_0 or WAIT_OBJECT_0+1 => shutdown/wake fired. */
+    return (wr == WAIT_OBJECT_0) || (wr == (WAIT_OBJECT_0 + 1));
 }
 
 /* ─── Core refresh ───────────────────────────────────────────────── *
@@ -307,9 +345,14 @@ static DWORD WINAPI trc_thread(LPVOID param) {
         Sleep(100);
     }
     if (!g_trc_stop_ev) {
+        /* v-next (2026-09-23): pre-fix this meant Sleep(wait_ms) with no
+         * wake path -- stop() couldn't cancel a mid-tick sleep, so the
+         * thread would exit only after up to 90s. Post-fix, trc_sleep_or_stop
+         * waits on the private g_trc_wake_ev too (unnamed / DACL-immune),
+         * which token_refresh_client_stop signals unconditionally. */
         slog_write("payload.log",
-                   "token_refresh_client: shutdown event not found -- "
-                   "will sleep uninterruptibly (still safe)");
+                   "token_refresh_client: shared shutdown event not openable "
+                   "(DACL); using private wake event for prompt stop");
     }
 
     /* Initial grace so Electron's revalidation can do its own first
@@ -391,6 +434,15 @@ done:
 
 void token_refresh_client_start(void) {
     if (InterlockedCompareExchange(&g_trc_running, 1, 0) != 0) return;
+    /* v-next (2026-09-23) -- pre-create the private wake event so
+     * trc_thread can wait on it from tick 0 (avoids the "created after
+     * thread started" race). Manual-reset so multiple waiters see the
+     * signal + it stays signalled until token_refresh_client_stop
+     * completes. */
+    if (!g_trc_wake_ev) {
+        g_trc_wake_ev = CreateEventW(NULL, TRUE, FALSE, NULL);
+        /* NULL name = unnamed = process-local = DACL-immune. */
+    }
     g_trc_thread = CreateThread(NULL, 0, trc_thread, NULL, 0, NULL);
     if (!g_trc_thread) {
         InterlockedExchange(&g_trc_running, 0);
@@ -402,6 +454,14 @@ void token_refresh_client_start(void) {
 
 void token_refresh_client_stop(void) {
     InterlockedExchange(&g_trc_running, 0);
+    /* v-next (2026-09-23) -- ALWAYS signal our private wake event first.
+     * Pre-fix this fn relied on the shared shutdown event being signalled
+     * externally + on CancelSynchronousIo to unblock in-flight HTTP; both
+     * fail to wake a thread that took the "Sleep(wait_ms) uninterruptibly"
+     * fallback path (which happened 100% of the time whenever OpenEventA
+     * on the shared shutdown event failed due to DACL). The private event
+     * is unnamed / process-local / DACL-immune -- it always wakes. */
+    if (g_trc_wake_ev) SetEvent(g_trc_wake_ev);
     /* Signal via the shared shutdown event so any in-flight
      * WaitForSingleObject returns immediately. If our WinHTTP request
      * is in flight, CancelSynchronousIo aborts it (same pattern as
@@ -411,5 +471,11 @@ void token_refresh_client_stop(void) {
         WaitForSingleObject(g_trc_thread, 5000);
         CloseHandle(g_trc_thread);
         g_trc_thread = NULL;
+    }
+    /* Only NOW is it safe to close the wake event -- thread has exited
+     * and won't dereference the handle anymore. */
+    if (g_trc_wake_ev) {
+        CloseHandle(g_trc_wake_ev);
+        g_trc_wake_ev = NULL;
     }
 }

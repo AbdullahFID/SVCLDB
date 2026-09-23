@@ -289,6 +289,22 @@ void ui_agent_set_status(const char *line, int active);
 /* Shutdown. */
 void ui_shutdown(void);
 
+/* v-next (2026-09-23) -- Force a full-desktop RedrawWindow cascade + bump
+ * compose grace. Paired with hooks_begin_shutdown_hide() in shutdown_watcher
+ * so the moment g_stop_draw goes high, every top-level window is asked to
+ * emit WM_PAINT/WM_NCPAINT + DWM stays in composite mode for 500ms -- the
+ * combination makes DWM re-sample underlying app content over the tiles
+ * that were holding our stale overlay pixels, so the overlay VISIBLY
+ * disappears within ~1 vsync (~16ms @ 60Hz) instead of waiting for slow
+ * subsystem teardown to finish before hooks_uninstall's own drain window
+ * finally invalidates.
+ *
+ * Wrapper over the internal invalidate_last_overlay_region("shutdown") --
+ * exposed to dllmain.c so shutdown_watcher can call it as its second
+ * action (right after hooks_begin_shutdown_hide). SEH-wrapped internally
+ * so a repaint-cascade fault never takes down DWM. Safe from any thread. */
+void ui_request_hide_now(void);
+
 /* v3.2 (P0: overlay dies on explorer/shell restart). In-process render-layer
  * teardown for the soft-reinject worker: tears down the ImGui context + DX11/
  * Win32 backends + RTV cache + resets the layer target, WITHOUT deleting the UI

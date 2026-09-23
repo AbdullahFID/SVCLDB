@@ -8215,6 +8215,17 @@ extern "C" void ui_reinit(void) {
     diag("ui_reinit: render layer torn down -- next present rebuilds ImGui fresh (shell-restart soft-reinject)");
 }
 
+/* v-next (2026-09-23) -- Public wrapper over invalidate_last_overlay_region.
+ * Called from shutdown_watcher in dllmain.c right after
+ * hooks_begin_shutdown_hide() -- the pair makes the overlay VISIBLY
+ * disappear in ~1 vsync (~16ms @ 60Hz) instead of the 2-5s pre-fix window
+ * during which sequential subsystem stops ran BEFORE hooks_uninstall
+ * finally flipped g_stop_draw. See dwm_hooks.h hooks_begin_shutdown_hide
+ * for the full "why". */
+extern "C" void ui_request_hide_now(void) {
+    invalidate_last_overlay_region("shutdown-instant-hide");
+}
+
 extern "C" void ui_shutdown() {
     /* v1.7.8: FIRST -- force underlying apps to repaint at the last
      * overlay rect so DWM re-composes over our stale pixels. Fixes

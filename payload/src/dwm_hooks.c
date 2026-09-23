@@ -443,6 +443,12 @@ static volatile void *g_legacy_rt  = NULL;
  *   Then MH_DisableHook removes the detours entirely. */
 static volatile LONG g_active     = 0;   /* 1 while payload is alive (RUNNING + DRAINING) */
 static volatile LONG g_stop_draw  = 0;   /* 1 = Present skips our draw callback */
+/* v-next (2026-09-23) -- separate hooks_uninstall idempotency guard from
+ * g_stop_draw so a caller can flip g_stop_draw for INSTANT overlay hide
+ * (hooks_begin_shutdown_hide) without wedging a subsequent hooks_uninstall
+ * into its "already done" early-return branch. Reset to 0 in hooks_install
+ * to permit re-inject cycles. */
+static volatile LONG g_uninstall_done = 0;
 
 /* v3.5 (P0 explorer-restart) -- the shell-restart recovery lives ENTIRELY in
  * imgui_layer.cpp: ensure_fake_hwnd_valid() detects a restart (Progman HWND *or
@@ -1614,6 +1620,12 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
      * stale flags -- defensive; unlikely with FreeLibraryAndExitThread). */
     InterlockedExchange(&g_stop_draw, 0);
     InterlockedExchange(&g_wake_frames, 0);   /* no longer used; keep 0 */
+    /* v-next (2026-09-23) -- reset the separated hooks_uninstall idempotency
+     * guard. Was previously conflated with g_stop_draw (see the guard in
+     * hooks_uninstall below); now separate so hooks_begin_shutdown_hide can
+     * flip g_stop_draw for instant overlay hide WITHOUT wedging a subsequent
+     * hooks_uninstall into the "already done" early-return branch. */
+    InterlockedExchange(&g_uninstall_done, 0);
 
     /* Set g_active LAST -- from now, PN detours return TRUE unconditionally,
      * DWM composites at native vsync, our Detour_Present's draw callback
@@ -1675,11 +1687,47 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
     return 1;
 }
 
+/* v-next (2026-09-23) -- INSTANT overlay hide, decoupled from teardown.
+ *
+ * Sets g_stop_draw = 1 so Detour_Present's next fire (typically <16ms at
+ * 60Hz) skips the g_present_cb call -- our overlay is instantly gone from
+ * the layer texture. Bumps compose-grace so DWM keeps forcing composition
+ * (via PN still returning TRUE for the grace window), which guarantees
+ * DWM's compositor actually paints the underlying-app pixels over our
+ * stale overlay tiles instead of going lazy and leaving them on screen.
+ *
+ * See hooks_begin_shutdown_hide header comment in dwm_hooks.h for the full
+ * "why" -- essentially, this exists so shutdown_watcher can hide the
+ * overlay AT t=0 (event fires) rather than at t=~2500ms (after sequential
+ * subsystem stops). */
+void hooks_begin_shutdown_hide(void) {
+    /* Flip the "skip our draw callback" flag. Detour_Present's next
+     * fire (typically 1 vsync = 16ms @ 60Hz) will see g_stop_draw = 1
+     * and take the orig-only path -- overlay pixels stop being written
+     * to the layer texture. Idempotent -- safe if already 1. */
+    InterlockedExchange(&g_stop_draw, 1);
+    /* Force DWM to keep composing for 500ms so it actually paints
+     * underlying app pixels over the tiles that were holding our stale
+     * overlay. Without this, DWM's lazy compose leaves our old pixels
+     * on screen until something else triggers a compose pass. Same
+     * mechanism ui_toggle_visible / ui_nudge use post-change. */
+    hooks_bump_compose_grace(500);
+    hook_diag("hooks_begin_shutdown_hide: g_stop_draw=1, compose grace=500ms "
+              "(overlay off screen in ~1 vsync)");
+}
+
 void hooks_uninstall(void) {
-    /* Idempotent + install-required guard: set g_stop_draw atomically;
-     * bail if already shut down (returns non-zero old value) OR if
-     * hooks were never installed (g_active == 0). */
-    if (InterlockedExchange(&g_stop_draw, 1) != 0) return;
+    /* v-next (2026-09-23) -- idempotency guard is now separated from
+     * g_stop_draw. Old pattern:
+     *   if (InterlockedExchange(&g_stop_draw, 1) != 0) return;
+     * fused "someone else set g_stop_draw" with "we already tore down"
+     * -- which is fine when hooks_uninstall is the ONLY writer of the
+     * flag, but wrong now that hooks_begin_shutdown_hide sets it early
+     * to make the overlay disappear before slow subsystem teardown runs.
+     * Split gives us: hooks_begin_shutdown_hide -> hide only; then
+     * hooks_uninstall -> real teardown (idempotent via g_uninstall_done). */
+    if (InterlockedExchange(&g_uninstall_done, 1) != 0) return;
+    InterlockedExchange(&g_stop_draw, 1);   /* idempotent; may already be 1 */
     if (!g_active) return;   /* never installed, nothing to do */
 
     hook_diag("hooks_uninstall: entering -- g_stop_draw set (Phase B: DRAINING)");
