@@ -18,7 +18,7 @@ typedef struct {
 } ring_slot_t;
 
 static CRITICAL_SECTION g_cs;
-static int              g_cs_init = 0;
+static volatile LONG    g_cs_state = 0;   /* v-audit-hardening: 3-state (see ensure_cs) */
 static ring_slot_t      g_slots[CLIP_RING_MAX];
 static volatile LONG    g_started = 0;
 static volatile LONG    g_cycle_idx = 0;         /* 0 = fresh (start at 1 on next press) */
@@ -26,8 +26,16 @@ static volatile LONG64  g_cycle_last_tick = 0;
 
 #define CYCLE_RESET_MS  2000LL
 
+/* v-audit-hardening (2026-09-23) -- P1 (opus-4.7 Audit E).  3-state
+ * CAS pattern.  See notes.c::ensure_cs header comment for the full
+ * "prior was non-atomic + racy" analysis.  Same fix here. */
 static void ensure_cs(void) {
-    if (!g_cs_init) { InitializeCriticalSection(&g_cs); g_cs_init = 1; }
+    if (InterlockedCompareExchange(&g_cs_state, 1, 0) == 0) {
+        InitializeCriticalSection(&g_cs);
+        InterlockedExchange(&g_cs_state, 2);
+    } else {
+        while (g_cs_state != 2) Sleep(0);
+    }
 }
 
 /* Shift entries down by one (newest becomes idx 1 -> 2 etc). Assumes lock held. */

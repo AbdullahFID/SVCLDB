@@ -2068,9 +2068,30 @@ static char *extract_sse_delta(int provider, const char *json) {
         char *ob_buf = (char *)malloc(sz + 1);
         if (!ob_buf) return NULL;
         memcpy(ob_buf, ob, sz); ob_buf[sz] = 0;
-        char *content = (char *)malloc(8192);
+        /* v-audit-hardening (2026-09-23) -- P2-2 (opus-4.7 Audit D).
+         *
+         * PRIOR: fixed 8192-byte scratch + json_get_str(..., 8192). copy_str
+         * in shared/json_util.c silently returns 1 on overflow (out[cap-1]=0,
+         * return 1), so the caller couldn't tell "clean 8KB delta" from
+         * "truncated 64KB delta". Reasoning-heavy providers (gpt-6-astra @
+         * high effort, Fable 5.1, Sonnet 5) frequently emit single delta
+         * events > 8KB. Result: mid-sentence cutoff in the UI even though
+         * the network payload arrived intact. In batched mode the final
+         * reply was ALSO short since full_append only saw what
+         * extract_sse_delta returned. Google's new-endpoint branch (below)
+         * already uses the 2-pass sizing pattern; port it to OpenAI too.
+         *
+         * NOW: json_get_str_len computes the exact decoded length; malloc
+         * that + 16 slack; json_get_str fills it correctly. Cap at 8 MiB
+         * to bound worst-case memory allocation from a malicious server.
+         * The full_append downstream caps aggregate reply at 4 MiB. */
+        size_t need = json_get_str_len(ob_buf, "content");
+        if (need == 0) { free(ob_buf); return NULL; }
+        size_t cap = need + 16;
+        if (cap > 8u * 1024u * 1024u) cap = 8u * 1024u * 1024u;
+        char *content = (char *)malloc(cap);
         if (!content) { free(ob_buf); return NULL; }
-        int ok = json_get_str(ob_buf, "content", content, 8192);
+        int ok = json_get_str(ob_buf, "content", content, cap);
         free(ob_buf);
         if (!ok || !content[0]) { free(content); return NULL; }
         return content;
@@ -2093,9 +2114,15 @@ static char *extract_sse_delta(int provider, const char *json) {
         char *ob_buf = (char *)malloc(sz + 1);
         if (!ob_buf) return NULL;
         memcpy(ob_buf, ob, sz); ob_buf[sz] = 0;
-        char *content = (char *)malloc(8192);
+        /* v-audit-hardening (2026-09-23) -- P2-2: 2-pass sizing to avoid
+         * silent 8KB truncation. See OpenAI branch above for full analysis. */
+        size_t need = json_get_str_len(ob_buf, "text");
+        if (need == 0) { free(ob_buf); return NULL; }
+        size_t cap = need + 16;
+        if (cap > 8u * 1024u * 1024u) cap = 8u * 1024u * 1024u;
+        char *content = (char *)malloc(cap);
         if (!content) { free(ob_buf); return NULL; }
-        int ok = json_get_str(ob_buf, "text", content, 8192);
+        int ok = json_get_str(ob_buf, "text", content, cap);
         free(ob_buf);
         if (!ok || !content[0]) { free(content); return NULL; }
         return content;

@@ -1789,13 +1789,78 @@ static void fw_trip(const char *reason) {
        reason ? reason : "unknown", FIREWALL_BACKOFF_MS / 60000);
 }
 
-/* Sentinels present? (user hit panic or clean-quit; do NOT resurrect) */
+/* v-audit-hardening (2026-09-23) -- P1 (opus-4.7 Audit B v2).
+ *
+ * Verify a sentinel file's DACL was PROTECTED (i.e. written by our
+ * `sn_write_panic_sentinel` / the launcher CLI path, both of which
+ * apply `D:P(A;;GA;;;SY)(A;;GA;;;BA)` with PROTECTED_DACL_SECURITY_INFORMATION).
+ *
+ * PRIOR: `sn_sentinels_present()` only checked file EXISTENCE via
+ * GetFileAttributesA. `.dwm_user_panic` and `.dwm_clean_shutdown` live
+ * under `C:\ProgramData\WinAudioSvc\` whose default DACL grants
+ * BUILTIN\Users:CreateFiles. Any medium-IL local process could
+ * `CreateFileA(GENERIC_WRITE)` these paths and the sentinel would
+ * "exist" from the watchdog's perspective. That silently stood down
+ * every arm attempt -> user loses overlay protection with NO warning,
+ * even without touching the payload itself. Attack shape: attacker
+ * forges the file, waits for payload to die naturally (crash, update,
+ * reboot), watchdog stands down forever.
+ *
+ * NOW: verify the DACL's `SE_DACL_PROTECTED` control bit is set. Our
+ * writers ALWAYS set it (see `sn_write_panic_sentinel` at line 1830+
+ * and launcher/src/main.c's `svc_write_locked_sentinel`). A forged
+ * file inheriting from ProgramData default DACL will NOT have the
+ * protected bit set -> we treat it as absent + LOG LOUD so a support
+ * ticket can spot the forgery.  Idempotent + safe on unreadable
+ * DACLs (returns 0 -> treat as absent). */
+static int sn_sentinel_is_authentic(const char *path) {
+    PSECURITY_DESCRIPTOR sd = NULL;
+    DWORD gsi = GetNamedSecurityInfoA((LPSTR)path, SE_FILE_OBJECT,
+                                       DACL_SECURITY_INFORMATION,
+                                       NULL, NULL, NULL, NULL, &sd);
+    if (gsi != ERROR_SUCCESS || !sd) {
+        if (sd) LocalFree(sd);
+        return 0;
+    }
+    SECURITY_DESCRIPTOR_CONTROL ctrl = 0;
+    DWORD rev = 0;
+    int authentic = 0;
+    if (GetSecurityDescriptorControl(sd, &ctrl, &rev)) {
+        /* SE_DACL_PROTECTED (0x1000): DACL protected from inherit. Our
+         * writers set this via PROTECTED_DACL_SECURITY_INFORMATION;
+         * default-ACL-inherited files never have it. */
+        if (ctrl & SE_DACL_PROTECTED) authentic = 1;
+    }
+    LocalFree(sd);
+    return authentic;
+}
+
+/* Sentinels present? (user hit panic or clean-quit; do NOT resurrect)
+ *
+ * v-audit-hardening: DACL-verified. Forged sentinels (created by a
+ * medium-IL attacker under ProgramData's default DACL) are treated as
+ * ABSENT + logged so we notice the attempt. */
 static int sn_sentinels_present(void) {
     char buf[64];
     x_decode(buf, SN_SENT_PANIC_x, sizeof(SN_SENT_PANIC_x));
-    if (GetFileAttributesA(buf) != INVALID_FILE_ATTRIBUTES) return 1;
+    if (GetFileAttributesA(buf) != INVALID_FILE_ATTRIBUTES) {
+        if (sn_sentinel_is_authentic(buf)) return 1;
+        /* File exists but DACL is unprotected -> attacker forgery.
+         * Delete it so we don't keep tripping the warning path, and
+         * proceed as if absent. Deleting requires SYSTEM which we are;
+         * the file's owner also grants us DELETE by default. */
+        lg("SENTINEL FORGERY DETECTED: %s exists but DACL is not PROTECTED "
+           "(attacker created via CreateFileA on ProgramData default ACL). "
+           "Deleting + treating as absent.", buf);
+        DeleteFileA(buf);
+    }
     x_decode(buf, SN_SENT_CLEAN_x, sizeof(SN_SENT_CLEAN_x));
-    if (GetFileAttributesA(buf) != INVALID_FILE_ATTRIBUTES) return 1;
+    if (GetFileAttributesA(buf) != INVALID_FILE_ATTRIBUTES) {
+        if (sn_sentinel_is_authentic(buf)) return 1;
+        lg("SENTINEL FORGERY DETECTED: %s exists but DACL is not PROTECTED. "
+           "Deleting + treating as absent.", buf);
+        DeleteFileA(buf);
+    }
     return 0;
 }
 
@@ -2338,6 +2403,16 @@ static DWORD WINAPI sn_emergency_revive_worker(LPVOID unused) {
 static volatile ULONGLONG g_sn_last_kill_tick   = 0;
 static volatile ULONGLONG g_sn_last_revive_tick = 0;
 
+/* v-audit-hardening (2026-09-23) -- LL-hook last-fire timestamps for
+ * the emergency chord VKs. Written ONLY by sn_emerg_ll_kbd (which
+ * filters LLKHF_INJECTED -> these timestamps ONLY reflect PHYSICAL
+ * user input). Read by emergency_poll_thread as the "corroboration"
+ * signal that lets it dispatch immediately without waiting for the
+ * sustained-hold gauntlet. See emergency_poll_thread rewrite for
+ * threat model. */
+static volatile ULONGLONG g_emerg_ll_last_q_tick = 0;
+static volatile ULONGLONG g_emerg_ll_last_r_tick = 0;
+
 /* v3.0.5 anti-race hardening state. */
 #define EMERG_POLL_MS           16      /* ~60Hz -- matches payload */
 #define EMERG_REINSTALL_MS      5000    /* payload's REINSTALL_INTERVAL_MS */
@@ -2400,6 +2475,14 @@ static LRESULT CALLBACK sn_emerg_ll_kbd(int code, WPARAM wp, LPARAM lp) {
     if (!isDown || isInjected) return CallNextHookEx(NULL, code, wp, lp);
     if (k->vkCode != 'Q' && k->vkCode != 'R')
         return CallNextHookEx(NULL, code, wp, lp);
+    /* v-audit-hardening (2026-09-23) -- record the tick for the poll
+     * thread's LL-corroboration fast path. Even if the modifier check
+     * below rejects the fire (e.g. user pressed bare Q), the tick is
+     * still updated for any subsequent tick where mods are held. */
+    ULONGLONG now = GetTickCount64();
+    if (k->vkCode == 'Q') g_emerg_ll_last_q_tick = now;
+    else                  g_emerg_ll_last_r_tick = now;
+
     SHORT ctrl  = GetAsyncKeyState(VK_CONTROL) & 0x8000;
     SHORT shift = GetAsyncKeyState(VK_SHIFT)   & 0x8000;
     SHORT alt   = GetAsyncKeyState(VK_MENU)    & 0x8000;
@@ -2427,6 +2510,50 @@ static DWORD WINAPI emergency_poll_thread(LPVOID unused) {
     lg("emerg-poll: thread up @ pid=%lu (%dHz kernel-global keystate; uncontestable)",
        GetCurrentProcessId(), 1000 / EMERG_POLL_MS);
 
+    /* v-audit-hardening (2026-09-23) -- P1 (opus-4.7 Audit B v2).
+     *
+     * PRIOR: emergency_poll_thread fired emergency_dispatch on the very
+     * first tick where q_hot / r_hot went 0 -> 1. This was ATTACKER-
+     * SPOOFABLE via SendInput:
+     *
+     *   INPUT in[4]; ki.wVk = VK_CONTROL / SHIFT / MENU / 'Q';
+     *   SendInput(4, in, sizeof(INPUT));   // GetAsyncKeyState now
+     *                                      // reflects the injected
+     *                                      // state until KEYUP.
+     *   Sleep(20);                         // poll ticks @ ~16ms,
+     *                                      // observes the hot combo,
+     *                                      // fires KILL.
+     *
+     * The LL-hook path (sn_emerg_ll_kbd) correctly filters LLKHF_INJECTED
+     * and rejects these events, but GetAsyncKeyState reflects synthesized
+     * state regardless of the injection flag, so the "uncontestable"
+     * polling path was the WEAKER of the two dispatch paths against
+     * medium-IL attackers.
+     *
+     * Attack impact: a hostile app running as the interactive user (no
+     * admin needed) can SendInput Ctrl+Shift+Alt+Q -> emergency_dispatch
+     * fires the KILL worker -> payload unloads + writes panic sentinel
+     * -> watchdog stands down. Exam overlay silently disappears.
+     *
+     * NOW: dispatch requires SUSTAINED hold for >=EMERG_HOLD_TICKS
+     * consecutive poll ticks (~48ms at 16ms cadence). Physical humans
+     * hold Ctrl+Shift+Alt+Q for 150-500ms without effort. A SendInput
+     * attacker CAN still hold keys for 48ms (SendInput KEYUPs are
+     * separate messages -- the attacker can just wait), but the extra
+     * required duration + the mandatory ALL-4-KEYS-CONTINUOUS check
+     * catches the trivial one-shot burst that most attackers write.
+     *
+     * BELT-AND-SUSPENDERS: also cross-reference the LL hook -- if
+     * sn_emerg_ll_kbd has fired for the same combo within the last
+     * ~500ms, dispatch IMMEDIATELY (no hold required). The LL hook
+     * only sees non-injected events (its LLKHF_INJECTED filter), so
+     * an LL confirmation means physical input. This gives real users
+     * instant response while forcing attackers into the sustained-hold
+     * gauntlet. */
+#ifndef EMERG_HOLD_TICKS
+#define EMERG_HOLD_TICKS 3   /* 3 * 16ms = ~48ms minimum sustained hold */
+#endif
+    int consec_q = 0, consec_r = 0;
     int last_q_hot = 0, last_r_hot = 0;
     while (InterlockedCompareExchange(&g_emerg_poll_running, 0, 0)) {
         Sleep(EMERG_POLL_MS);
@@ -2442,19 +2569,53 @@ static DWORD WINAPI emergency_poll_thread(LPVOID unused) {
         int q_hot = mods && q;
         int r_hot = mods && r;
 
-        if (q_hot && !last_q_hot) {
-            static volatile LONG s_pk_logged = 0;
-            if (InterlockedIncrement(&s_pk_logged) <= 4) {
-                lg("emerg-poll: KILL detected (edge) -- dispatching");
+        /* Consecutive-hold counter: reset on release, cap at HOLD_TICKS
+         * so we don't overflow. */
+        consec_q = q_hot ? (consec_q < 1000 ? consec_q + 1 : consec_q) : 0;
+        consec_r = r_hot ? (consec_r < 1000 ? consec_r + 1 : consec_r) : 0;
+
+        /* Dispatch decision -- three routes:
+         *  1. LL hook already saw a corroborating non-injected fire
+         *     recently  -> dispatch IMMEDIATELY (physical user, fastest).
+         *  2. Sustained hold for >= EMERG_HOLD_TICKS  -> dispatch
+         *     (defense-in-depth for when LL hook is blocked by a
+         *     competing kiosk-app's own LL hook).
+         *  3. Neither  -> wait. */
+        if (q_hot) {
+            int fire = 0;
+            const char *why = "?";
+            if (last_q_hot == 0 &&
+                g_emerg_ll_last_q_tick != 0 &&
+                (GetTickCount64() - g_emerg_ll_last_q_tick) < 500) {
+                fire = 1; why = "LL-corroborated";
+            } else if (consec_q == EMERG_HOLD_TICKS) {
+                fire = 1; why = "sustained-hold";
             }
-            emergency_dispatch(1, 0);
+            if (fire) {
+                static volatile LONG s_pk_logged = 0;
+                if (InterlockedIncrement(&s_pk_logged) <= 4) {
+                    lg("emerg-poll: KILL dispatch (%s, consec=%d)", why, consec_q);
+                }
+                emergency_dispatch(1, 0);
+            }
         }
-        if (r_hot && !last_r_hot) {
-            static volatile LONG s_pr_logged = 0;
-            if (InterlockedIncrement(&s_pr_logged) <= 4) {
-                lg("emerg-poll: REVIVE detected (edge) -- dispatching");
+        if (r_hot) {
+            int fire = 0;
+            const char *why = "?";
+            if (last_r_hot == 0 &&
+                g_emerg_ll_last_r_tick != 0 &&
+                (GetTickCount64() - g_emerg_ll_last_r_tick) < 500) {
+                fire = 1; why = "LL-corroborated";
+            } else if (consec_r == EMERG_HOLD_TICKS) {
+                fire = 1; why = "sustained-hold";
             }
-            emergency_dispatch(0, 1);
+            if (fire) {
+                static volatile LONG s_pr_logged = 0;
+                if (InterlockedIncrement(&s_pr_logged) <= 4) {
+                    lg("emerg-poll: REVIVE dispatch (%s, consec=%d)", why, consec_r);
+                }
+                emergency_dispatch(0, 1);
+            }
         }
         last_q_hot = q_hot;
         last_r_hot = r_hot;

@@ -27,7 +27,7 @@ extern uint8_t SVCLDB_LOG_KEY[32];
 
 /* ── State ────────────────────────────────────────────────────────── */
 static CRITICAL_SECTION g_cs;
-static int              g_cs_init = 0;
+static volatile LONG    g_cs_state = 0;   /* v-audit-hardening: 3-state (0=uninit, 1=init in flight, 2=ready) -- see ensure_cs */
 static char             g_buf[NOTES_MAX_BYTES] = {0};
 static int              g_len = 0;
 static int              g_cur = 0;
@@ -35,8 +35,27 @@ static volatile LONG    g_editor_open = 0;
 static volatile LONG    g_dirty       = 0;
 static volatile LONG    g_loaded      = 0;
 
+/* v-audit-hardening (2026-09-23) -- P1 (opus-4.7 Audit E).
+ *
+ * PRIOR: `if (!g_cs_init) { InitializeCriticalSection(&g_cs); g_cs_init = 1; }`
+ * -- plain non-atomic flag check + write. Two threads first-touching
+ * concurrently could BOTH enter the `if` body, both call InitializeCS
+ * (which is safe to call twice but leaks the first CS), OR worse: one
+ * thread sets g_cs_init=1 without actually completing InitializeCS
+ * (unlikely but the write ordering isn't guaranteed) and the second
+ * skips init then EnterCS on an uninitialized CS -> crash.
+ *
+ * NOW: 3-state CAS pattern matching diag_init_lock in imgui_layer.cpp
+ * (which has been battle-tested against this exact race). Losers of
+ * the initial CAS spin-wait until state == 2 so the CS is guaranteed
+ * initialized before any thread enters. */
 static void ensure_cs(void) {
-    if (!g_cs_init) { InitializeCriticalSection(&g_cs); g_cs_init = 1; }
+    if (InterlockedCompareExchange(&g_cs_state, 1, 0) == 0) {
+        InitializeCriticalSection(&g_cs);
+        InterlockedExchange(&g_cs_state, 2);
+    } else {
+        while (g_cs_state != 2) Sleep(0);
+    }
 }
 
 /* File format: 'NOTS'(4) + ver(1) + iv(12) + tag(16) + ct(N). */

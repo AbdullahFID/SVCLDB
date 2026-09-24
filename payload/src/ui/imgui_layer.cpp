@@ -942,22 +942,43 @@ static bool             g_last_reply_cs_init = false;
 static char            *g_last_reply_snapshot = NULL;
 
 static void ensure_chat_msgs_cs(void) {
-    if (!g_chat_msgs_cs_init) {
+    /* v-audit-hardening (2026-09-23) -- 3-state CAS pattern (opus-4.7
+     * Audit E). Prior code was a plain `if (!flag) init(); flag = true;`
+     * -- two threads first-touching concurrently could both proceed to
+     * EnterCriticalSection on an uninitialized CS. Upgraded to match
+     * diag_init_lock's 3-state pattern (0=uninit, 1=initializing,
+     * 2=ready). Losers of the CAS spin-wait until state==2 so the CS
+     * is guaranteed initialized before any caller enters. */
+    static volatile LONG s_state = 0;
+    if (InterlockedCompareExchange(&s_state, 1, 0) == 0) {
         InitializeCriticalSection(&g_chat_msgs_cs);
         g_chat_msgs_cs_init = true;
         for (int i = 0; i < CHAT_MAX_MSGS; i++) g_chat_msgs[i].id = -1;
+        InterlockedExchange(&s_state, 2);
+    } else {
+        while (s_state != 2) Sleep(0);
     }
 }
 static void ensure_status_cs(void) {
-    if (!g_status_cs_init) {
+    /* v-audit-hardening -- 3-state CAS. See ensure_chat_msgs_cs above. */
+    static volatile LONG s_state = 0;
+    if (InterlockedCompareExchange(&s_state, 1, 0) == 0) {
         InitializeCriticalSection(&g_status_cs);
         g_status_cs_init = true;
+        InterlockedExchange(&s_state, 2);
+    } else {
+        while (s_state != 2) Sleep(0);
     }
 }
 static void ensure_last_reply_cs(void) {
-    if (!g_last_reply_cs_init) {
+    /* v-audit-hardening -- 3-state CAS. See ensure_chat_msgs_cs above. */
+    static volatile LONG s_state = 0;
+    if (InterlockedCompareExchange(&s_state, 1, 0) == 0) {
         InitializeCriticalSection(&g_last_reply_cs);
         g_last_reply_cs_init = true;
+        InterlockedExchange(&s_state, 2);
+    } else {
+        while (s_state != 2) Sleep(0);
     }
 }
 
@@ -1224,8 +1245,16 @@ static float               g_last_pushed_h = 0.0f;
 static volatile LONG g_hide_grace_frames = 0;
 
 static void ensure_trail_cs(void) {
+    /* v-audit-hardening (2026-09-23) -- 3-state CAS (opus-4.7 Audit E).
+     * Prior: `if (CAS(0->1)) init;` -- second thread arriving mid-init
+     * saw flag=1 and skipped init but then EnterCriticalSection'd on
+     * an uninitialized CS. Now 0->1 (initializing) -> 2 (ready) with
+     * spin-wait for losers. */
     if (InterlockedCompareExchange(&g_trail_cs_inited, 1, 0) == 0) {
         InitializeCriticalSection(&g_trail_cs);
+        InterlockedExchange(&g_trail_cs_inited, 2);
+    } else {
+        while (g_trail_cs_inited != 2) Sleep(0);
     }
 }
 
@@ -2700,8 +2729,13 @@ static volatile LONGLONG g_toast_expire_tick = 0;
 static volatile LONGLONG g_toast_show_tick   = 0;
 
 static void ensure_toast_cs(void) {
-    if (InterlockedCompareExchange(&g_toast_cs_init, 1, 0) == 0)
+    /* v-audit-hardening (2026-09-23) -- 3-state CAS (opus-4.7 Audit E). */
+    if (InterlockedCompareExchange(&g_toast_cs_init, 1, 0) == 0) {
         InitializeCriticalSection(&g_toast_cs);
+        InterlockedExchange(&g_toast_cs_init, 2);
+    } else {
+        while (g_toast_cs_init != 2) Sleep(0);
+    }
 }
 
 extern "C" void ui_show_toast(const char *text, unsigned ms) {
@@ -7120,8 +7154,13 @@ static volatile LONG      g_dot_rect_h = 0;
 static volatile LONG      g_dot_rect_valid = 0;   /* 1 = dot is currently rendered */
 
 static void dot_ensure_cs(void) {
-    if (InterlockedCompareExchange(&g_dot_cs_init, 1, 0) == 0)
+    /* v-audit-hardening (2026-09-23) -- 3-state CAS (opus-4.7 Audit E). */
+    if (InterlockedCompareExchange(&g_dot_cs_init, 1, 0) == 0) {
         InitializeCriticalSection(&g_dot_cs);
+        InterlockedExchange(&g_dot_cs_init, 2);
+    } else {
+        while (g_dot_cs_init != 2) Sleep(0);
+    }
 }
 
 static void dot_load_prefs_once(void) {
