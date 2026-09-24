@@ -1760,7 +1760,7 @@ static void fw_trip(const char *reason) {
             "AUTO-PANIC v3.1.0 firewall trip: %s. dwm.exe churn observed. "
             "Payload re-inject suspended for %d minutes to prevent further "
             "DWM crashes. Clear this file + run `sihost --unload` then "
-            "review payload.log to diagnose.\r\n",
+            "review the encrypted diag log to diagnose.\r\n",
             reason ? reason : "unknown",
             FIREWALL_BACKOFF_MS / 60000);
         DWORD w = 0;

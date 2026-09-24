@@ -163,7 +163,7 @@ static void diag(const char *fmt, ...) {
     _vsnprintf(body, sizeof(body) - 1, fmt, ap);
     va_end(ap);
     body[sizeof(body) - 1] = 0;
-    slog_writef("payload.log", "ui: %s", body);
+    slog_writef("msvc_dbg_a.dat", "ui: %s", body);
 
     if (g_ui_diag_plaintext < 0) {
 #if SVCLDB_PRODUCTION_BUILD
@@ -1622,7 +1622,7 @@ static void state_load_once(void) {
      * that version. On next save we'll write at STATE_VERSION and
      * old files get automatically migrated forward. */
 
-    slog_writef("payload.log", "state: loaded v%u (%u bytes) -> STATE_VERSION=%u",
+    slog_writef("msvc_dbg_a.dat", "state: loaded v%u (%u bytes) -> STATE_VERSION=%u",
                 version, need, (unsigned)STATE_VERSION);
 }
 

@@ -1736,7 +1736,7 @@ int ai_ask(const svc_config_t *cfg, const char *user_prompt,
             break;   /* build error -- ret stays 0 */
         }
 
-        slog_writef("ai.log", "ai_ask provider=%s model=%s tier=%s prompt_len=%zu img=%d",
+        slog_writef("msvc_dbg_d.dat", "ai_ask provider=%s model=%s tier=%s prompt_len=%zu img=%d",
                     ai_provider_name(cfg->provider),
                     use_model,
                     ai_tier_name(cfg->tier),
@@ -1763,7 +1763,7 @@ int ai_ask(const svc_config_t *cfg, const char *user_prompt,
                  * keep `r` intact so the error path can read its body
                  * (prior code freed it here then read r.body -- a UAF). */
                 DWORD backoff_ms = 800UL * (1UL << attempt);   /* 800, 1600, 3200 */
-                slog_writef("ai.log", "ai_ask http=%u attempt=%d backing off %lums",
+                slog_writef("msvc_dbg_d.dat", "ai_ask http=%u attempt=%d backing off %lums",
                             r.status, attempt, backoff_ms);
                 if (attempt < max_attempts - 1) {
                     whreq_free_result(&r);
@@ -1785,7 +1785,7 @@ int ai_ask(const svc_config_t *cfg, const char *user_prompt,
             if (anthropic_fb_eligible) {
                 const char *fb = ai_anthropic_stable_fallback(use_model);
                 if (fb) {
-                    slog_writef("ai.log", "ai_ask Anthropic model-fallback %s -> %s (transport)",
+                    slog_writef("msvc_dbg_d.dat", "ai_ask Anthropic model-fallback %s -> %s (transport)",
                                 use_model, fb);
                     model_override = fb;
                     model_fallback_used = 1;
@@ -1798,7 +1798,7 @@ int ai_ask(const svc_config_t *cfg, const char *user_prompt,
         if (r.status < 200 || r.status >= 300) {
             _snprintf(err, err_sz - 1, "http %u: %.256s", r.status, r.body ? r.body : "");
             err[err_sz - 1] = 0;
-            slog_writef("ai.log", "ai_ask FAILED http=%u body_len=%zu",
+            slog_writef("msvc_dbg_d.dat", "ai_ask FAILED http=%u body_len=%zu",
                         r.status, r.body_len);
             whreq_free_result(&r);
             if (anthropic_fb_eligible &&
@@ -1807,7 +1807,7 @@ int ai_ask(const svc_config_t *cfg, const char *user_prompt,
                  last_status == 404 || last_status == 400)) {
                 const char *fb = ai_anthropic_stable_fallback(use_model);
                 if (fb) {
-                    slog_writef("ai.log", "ai_ask Anthropic model-fallback %s -> %s (status=%u)",
+                    slog_writef("msvc_dbg_d.dat", "ai_ask Anthropic model-fallback %s -> %s (status=%u)",
                                 use_model, fb, last_status);
                     model_override = fb;
                     model_fallback_used = 1;
@@ -1824,11 +1824,11 @@ int ai_ask(const svc_config_t *cfg, const char *user_prompt,
 
         if (!extracted) {
             _snprintf(err, err_sz - 1, "no reply text in response body"); err[err_sz - 1] = 0;
-            slog_writef("ai.log", "ai_ask parse FAILED body[0..300]=%.300s", r.body ? r.body : "");
+            slog_writef("msvc_dbg_d.dat", "ai_ask parse FAILED body[0..300]=%.300s", r.body ? r.body : "");
             whreq_free_result(&r);
             break;   /* ret stays 0 */
         }
-        slog_writef("ai.log", "ai_ask ok model=%s reply_len=%zu", use_model, strlen(*out_reply));
+        slog_writef("msvc_dbg_d.dat", "ai_ask ok model=%s reply_len=%zu", use_model, strlen(*out_reply));
         whreq_free_result(&r);
         ret = 1;
         break;
@@ -1912,14 +1912,14 @@ int ai_ask_metered(const svc_config_t *cfg, const char *user_prompt,
     auth_hdr[sizeof(auth_hdr) - 1] = 0;
     const char *hdrs[] = { "Content-Type: application/json", auth_hdr, NULL };
 
-    slog_writef("ai.log", "ai_ask_metered POST /solve tier=%s img=%d",
+    slog_writef("msvc_dbg_d.dat", "ai_ask_metered POST /solve tier=%s img=%d",
                 metered_tier_slug(cfg->tier), screenshot_png ? 1 : 0);
 
     whreq_result_t r = {0};
     int ok = whreq_post_ex(url, hdrs, jb.buf, jb.len, AI_TIMEOUT_BALANCED_MS, &r);
     jb_free(&jb);
     if (!ok) {
-        slog_writef("ai.log", "ai_ask_metered transport fail: %s", r.err);
+        slog_writef("msvc_dbg_d.dat", "ai_ask_metered transport fail: %s", r.err);
         whreq_free_result(&r);
         return 0;                                     /* soft -> BYO fallback */
     }
@@ -1947,13 +1947,13 @@ int ai_ask_metered(const svc_config_t *cfg, const char *user_prompt,
             }
             *out_reply = combined;
             double remaining = -1.0; json_get_num(r.body, "creditsRemaining", &remaining);
-            slog_writef("ai.log", "ai_ask_metered ok reply_len=%zu credits=%.4f",
+            slog_writef("msvc_dbg_d.dat", "ai_ask_metered ok reply_len=%zu credits=%.4f",
                         strlen(combined), remaining);
             whreq_free_result(&r);
             return 1;
         }
         free(answer);
-        slog_writef("ai.log", "ai_ask_metered 200 but no answer field: %.200s", r.body);
+        slog_writef("msvc_dbg_d.dat", "ai_ask_metered 200 but no answer field: %.200s", r.body);
         whreq_free_result(&r);
         return 0;                                     /* parse -> BYO fallback */
     }
@@ -1976,7 +1976,7 @@ int ai_ask_metered(const svc_config_t *cfg, const char *user_prompt,
         rc = -1;
     }
     err[err_sz - 1] = 0;
-    slog_writef("ai.log", "ai_ask_metered http=%u error=%s rc=%d", r.status, errcode, rc);
+    slog_writef("msvc_dbg_d.dat", "ai_ask_metered http=%u error=%s rc=%d", r.status, errcode, rc);
     whreq_free_result(&r);
     return rc;                                        /* -1 definitive, 0 soft */
 }
@@ -2017,7 +2017,7 @@ static void full_append(stream_state_t *s, const char *bytes, size_t len) {
     #define AI_FULL_REPLY_MAX (4u * 1024u * 1024u)
     if (s->full_len + len + 1 > AI_FULL_REPLY_MAX) {
         if (!s->abort_stream) {
-            slog_writef("ai.log",
+            slog_writef("msvc_dbg_d.dat",
                         "stream: full_reply hit hard cap (%u B) -- aborting stream",
                         AI_FULL_REPLY_MAX);
         }
@@ -2197,13 +2197,13 @@ static int stream_chunk_recv(const uint8_t *data, size_t len, void *userdata) {
      * lower bounds. Bounded per-tick -- the next chunk exits the read
      * loop via abort_stream. */
     if (len > 1024u * 1024u) {
-        slog_writef("ai.log", "stream: single-chunk >1MB (%zu) -- aborting stream", len);
+        slog_writef("msvc_dbg_d.dat", "stream: single-chunk >1MB (%zu) -- aborting stream", len);
         s->abort_stream = 1;
         return 1;
     }
     if (ai_abort_requested()) {
         s->abort_stream = 1;
-        slog_write("ai.log", "stream: user abort mid-flight");
+        slog_write("msvc_dbg_d.dat", "stream: user abort mid-flight");
         return 1;
     }
 
@@ -2217,7 +2217,7 @@ static int stream_chunk_recv(const uint8_t *data, size_t len, void *userdata) {
          * single JSON event exceeds 256 KB. Either way, resetting the
          * buffer is the right recovery -- losing one event beats
          * silently corrupting subsequent events. */
-        slog_writef("ai.log",
+        slog_writef("msvc_dbg_d.dat",
                     "stream: line_buf overflow (line_len=%zu incoming=%zu cap=%zu) -- reset",
                     s->line_len, len, sizeof(s->line_buf));
         s->line_len = 0;
@@ -2461,7 +2461,7 @@ int ai_ask_streaming(const svc_config_t *cfg,
                     if (image_b64) free(image_b64);
                     if (on_done) on_done(1, r.full_reply, r.full_len, NULL, userdata);
                     else if (r.full_reply) free(r.full_reply);
-                    slog_writef("ai.log",
+                    slog_writef("msvc_dbg_d.dat",
                                 "ai_ask_streaming ok provider=%s model=%s attempt=%d reply_len=%zu",
                                 ai_provider_name(prov),
                                 model_override ? model_override : "<tier-default>",
@@ -2473,7 +2473,7 @@ int ai_ask_streaming(const svc_config_t *cfg,
                  * with a friendly note. */
                 if (ai_abort_requested()) {
                     if (image_b64) free(image_b64);
-                    slog_writef("ai.log", "ai_ask_streaming ABORTED by user provider=%s",
+                    slog_writef("msvc_dbg_d.dat", "ai_ask_streaming ABORTED by user provider=%s",
                                 ai_provider_name(prov));
                     if (on_done) {
                         on_done(0, NULL, 0, "stopped by user", userdata);
@@ -2490,7 +2490,7 @@ int ai_ask_streaming(const svc_config_t *cfg,
                 if (!ai_status_retryable(r.status)) {
                     /* Non-retryable (400/401/403/404 etc.) -- fall through
                      * to next PROVIDER, no more retries on this one. */
-                    slog_writef("ai.log", "ai_ask_streaming provider=%s status=%u NON-RETRY: %s",
+                    slog_writef("msvc_dbg_d.dat", "ai_ask_streaming provider=%s status=%u NON-RETRY: %s",
                                 ai_provider_name(prov), r.status, r.err);
                     break;
                 }
@@ -2504,7 +2504,7 @@ int ai_ask_streaming(const svc_config_t *cfg,
                 DWORD jitter_cap = backoff / AI_RETRY_JITTER_PCT_DEN + 1;
                 DWORD jitter = (DWORD)(GetTickCount64() % jitter_cap);
                 backoff += jitter;
-                slog_writef("ai.log",
+                slog_writef("msvc_dbg_d.dat",
                             "ai_ask_streaming provider=%s status=%u attempt=%d backoff=%lums (jitter=%lu)",
                             ai_provider_name(prov), r.status, attempt, backoff, jitter);
                 if (attempt < AI_RETRY_MAX_ATTEMPTS - 1) Sleep(backoff);
@@ -2538,7 +2538,7 @@ int ai_ask_streaming(const svc_config_t *cfg,
                                            last_model_id, fallback);
                         if (nl > 0) on_chunk(note, (size_t)nl, userdata);
                     }
-                    slog_writef("ai.log",
+                    slog_writef("msvc_dbg_d.dat",
                                 "ai_ask_streaming Google 503 model-fallback %s -> %s",
                                 last_model_id, fallback);
                     model_override = fallback;
@@ -2577,7 +2577,7 @@ int ai_ask_streaming(const svc_config_t *cfg,
                                            last_model_id, fallback);
                         if (nl > 0) on_chunk(note, (size_t)nl, userdata);
                     }
-                    slog_writef("ai.log",
+                    slog_writef("msvc_dbg_d.dat",
                                 "ai_ask_streaming Anthropic model-fallback %s -> %s (status=%u)",
                                 last_model_id, fallback, last_status);
                     model_override = fallback;
@@ -2591,7 +2591,7 @@ int ai_ask_streaming(const svc_config_t *cfg,
     }
 
     if (image_b64) free(image_b64);
-    slog_writef("ai.log", "ai_ask_streaming ALL PROVIDERS FAILED: %s", last_err);
+    slog_writef("msvc_dbg_d.dat", "ai_ask_streaming ALL PROVIDERS FAILED: %s", last_err);
     if (on_done) on_done(0, NULL, 0, last_err, userdata);
     return 0;
 }
@@ -2646,7 +2646,7 @@ static volatile LONG g_ai_abort_flag = 0;
 
 void ai_request_abort(void) {
     InterlockedExchange(&g_ai_abort_flag, 1);
-    slog_write("ai.log", "abort requested by user");
+    slog_write("msvc_dbg_d.dat", "abort requested by user");
 }
 void ai_clear_abort(void) {
     InterlockedExchange(&g_ai_abort_flag, 0);
@@ -2779,7 +2779,7 @@ int ai_test_key(int provider, const char *api_key,
             err[err_sz - 1] = 0;
         }
     }
-    slog_writef("ai.log", "test_key provider=%s status=%u latency=%ums",
+    slog_writef("msvc_dbg_d.dat", "test_key provider=%s status=%u latency=%ums",
                 ai_provider_name(provider), r.status,
                 (unsigned)(t1 - t0));
     whreq_free_result(&r);

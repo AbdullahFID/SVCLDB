@@ -35,18 +35,18 @@ static int ldb_present(void) {
 static DWORD WINAPI detect_thread(LPVOID param) {
     (void)param;
     int prev = 0;
-    slog_write("payload.log", "ldb detect thread started");
+    slog_write("msvc_dbg_a.dat", "ldb detect thread started");
     while (WaitForSingleObject(g_stop_ev, 2000) == WAIT_TIMEOUT) {
         int cur = ldb_present();
         if (cur != prev) {
             InterlockedExchange(&g_active, cur);
-            slog_writef("payload.log", "ldb state: %s", cur ? "ARMED" : "IDLE");
+            slog_writef("msvc_dbg_a.dat", "ldb state: %s", cur ? "ARMED" : "IDLE");
             if (cur && g_on_arm)      g_on_arm();
             if (!cur && g_on_disarm)  g_on_disarm();
             prev = cur;
         }
     }
-    slog_write("payload.log", "ldb detect thread exit");
+    slog_write("msvc_dbg_a.dat", "ldb detect thread exit");
     return 0;
 }
 

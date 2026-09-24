@@ -19,7 +19,7 @@ int pl_offsets_load(pl_offsets_t *out) {
     HANDLE h = CreateFileA(BLOB_PATH, GENERIC_READ, FILE_SHARE_READ, NULL,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) {
-        slog_writef("payload.log", "blob: none at %s (GLE=%lu)", BLOB_PATH, GetLastError());
+        slog_writef("msvc_dbg_a.dat", "blob: none at %s (GLE=%lu)", BLOB_PATH, GetLastError());
         return 0;
     }
     DWORD sz = GetFileSize(h, NULL);
@@ -27,7 +27,7 @@ int pl_offsets_load(pl_offsets_t *out) {
      * (pre-v1.6.2 resolver output). This lets users upgrade the payload
      * without needing to re-run the resolver first. */
     if (sz != sizeof(pl_offsets_t) && sz != PL_OFFSETS_LEGACY_SIZE) {
-        slog_writef("payload.log", "blob: bad size %lu (expected %zu or %zu legacy)",
+        slog_writef("msvc_dbg_a.dat", "blob: bad size %lu (expected %zu or %zu legacy)",
                     sz, sizeof(pl_offsets_t), (size_t)PL_OFFSETS_LEGACY_SIZE);
         CloseHandle(h);
         return 0;
@@ -37,7 +37,7 @@ int pl_offsets_load(pl_offsets_t *out) {
     BOOL ok = ReadFile(h, out, to_read, &r, NULL);
     CloseHandle(h);
     if (!ok || r != to_read) return 0;
-    slog_writef("payload.log", "blob: present=0x%llx overlay-prev=0x%llx "
+    slog_writef("msvc_dbg_a.dat", "blob: present=0x%llx overlay-prev=0x%llx "
                 "gpb=0x%llx gd3d=0x%llx acc=0x%llx (size=%lu)",
                 (unsigned long long)out->cOverlayContextPresent,
                 (unsigned long long)out->isOverlayPrevented,

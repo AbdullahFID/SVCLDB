@@ -98,7 +98,7 @@ int license_login(oauth_session_t *out, char *err, size_t err_sz) {
         if (oauth_expired(out)) {
             slog_auth("access_token expired -- refreshing");
             if (!oauth_refresh(out, err, err_sz)) {
-                slog_writef("auth.log", "refresh failed: %s -- full re-login", err);
+                slog_writef("msvc_dbg_g.dat", "refresh failed: %s -- full re-login", err);
                 license_clear();
                 memset(out, 0, sizeof(*out));
             } else {
@@ -159,7 +159,7 @@ int license_check_subscription(const oauth_session_t *sess,
                     out->active = 1;
                     out->is_lifetime = 1;
                     whreq_free_result(&r);
-                    slog_writef("auth.log", "manual grant %s", out->plan);
+                    slog_writef("msvc_dbg_g.dat", "manual grant %s", out->plan);
                     return 1;
                 }
             }
@@ -189,7 +189,7 @@ int license_check_subscription(const oauth_session_t *sess,
                     out->is_lifetime = lt;
                     out->active = 1;
                     whreq_free_result(&r);
-                    slog_writef("auth.log", "subscription %s %s", out->plan, out->status);
+                    slog_writef("msvc_dbg_g.dat", "subscription %s %s", out->plan, out->status);
                     return 1;
                 }
             }

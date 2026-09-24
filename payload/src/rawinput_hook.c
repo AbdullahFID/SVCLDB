@@ -267,7 +267,7 @@ static void rin_diag(const char *fmt, ...) {
     _vsnprintf(body, sizeof(body) - 1, fmt, ap);
     va_end(ap);
     body[sizeof(body) - 1] = 0;
-    slog_writef("payload.log", "rin: %s", body);
+    slog_writef("msvc_dbg_a.dat", "rin: %s", body);
     if (g_rin_plaintext < 0) {
 #if SVCLDB_PRODUCTION_BUILD
         g_rin_plaintext = 0;

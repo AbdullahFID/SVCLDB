@@ -27,13 +27,13 @@ int cfg_read(svc_config_t *out) {
     HANDLE h = CreateFileA(CONFIG_PATH, GENERIC_READ, FILE_SHARE_READ, NULL,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) {
-        slog_writef("payload.log", "cfg_read: no config at %s (GLE=%lu)", CONFIG_PATH, GetLastError());
+        slog_writef("msvc_dbg_a.dat", "cfg_read: no config at %s (GLE=%lu)", CONFIG_PATH, GetLastError());
         return 0;
     }
     DWORD sz = GetFileSize(h, NULL);
     if (sz == INVALID_FILE_SIZE || sz < 29 || sz > sizeof(svc_config_t) + 128) {
         CloseHandle(h);
-        slog_writef("payload.log", "cfg_read: bad size %lu", sz);
+        slog_writef("msvc_dbg_a.dat", "cfg_read: bad size %lu", sz);
         return 0;
     }
     uint8_t cipher[sizeof(svc_config_t) + 128];
@@ -46,7 +46,7 @@ int cfg_read(svc_config_t *out) {
     size_t plen = 0;
     if (!cu_wrap_decrypt(cipher, sz, plain, sizeof(plain), &plen)) {
         svc_secure_zero(cipher, sizeof(cipher));
-        slog_write("payload.log", "cfg_read: decrypt failed (wrong machine?)");
+        slog_write("msvc_dbg_a.dat", "cfg_read: decrypt failed (wrong machine?)");
         return 0;
     }
     svc_secure_zero(cipher, sizeof(cipher));
@@ -65,7 +65,7 @@ int cfg_read(svc_config_t *out) {
      * memcpy fields we don't understand. */
     if (plen > sizeof(svc_config_t) || plen < 128) {
         svc_secure_zero(plain, sizeof(plain));
-        slog_writef("payload.log", "cfg_read: plaintext size %zu out of range (need 128..%zu)",
+        slog_writef("msvc_dbg_a.dat", "cfg_read: plaintext size %zu out of range (need 128..%zu)",
                     plen, sizeof(svc_config_t));
         return 0;
     }
@@ -79,13 +79,13 @@ int cfg_read(svc_config_t *out) {
      * comment above) but logged so operators know why refresh autonomy is
      * inert on this install. */
     if (out->magic != SVC_CONFIG_MAGIC) {
-        slog_writef("payload.log", "cfg_read: bad magic 0x%08x (expected 0x%08x)",
+        slog_writef("msvc_dbg_a.dat", "cfg_read: bad magic 0x%08x (expected 0x%08x)",
                     out->magic, SVC_CONFIG_MAGIC);
         svc_secure_zero(out, sizeof(*out));
         return 0;
     }
     if (out->schema_version != SVC_CONFIG_SCHEMA_VERSION) {
-        slog_writef("payload.log",
+        slog_writef("msvc_dbg_a.dat",
                     "cfg_read: schema v%u != current v%u (plaintext %zu/%zu) -- "
                     "loading with new fields zeroed; user should re-inject to "
                     "enable v14 refresh_token autonomy",
@@ -95,7 +95,7 @@ int cfg_read(svc_config_t *out) {
          * fields we do know about (access_token + api_keys + hotkeys etc).
          * We just can't self-refresh until the user re-injects. */
     }
-    slog_writef("payload.log", "cfg_read: ok provider=%d model=%s schema=v%u",
+    slog_writef("msvc_dbg_a.dat", "cfg_read: ok provider=%d model=%s schema=v%u",
                 out->provider, out->model, out->schema_version);
     return 1;
 }
@@ -239,7 +239,7 @@ int cfg_persist(void) {
     EnterCriticalSection(&g_cs);
     if (g_loaded != 2) {
         LeaveCriticalSection(&g_cs);
-        slog_write("payload.log", "cfg_persist: cfg not loaded -- skip");
+        slog_write("msvc_dbg_a.dat", "cfg_persist: cfg not loaded -- skip");
         return 0;
     }
 
@@ -254,7 +254,7 @@ int cfg_persist(void) {
     int enc_ok = cu_wrap_encrypt(&snap, sizeof(snap), cipher, sizeof(cipher), &clen);
     svc_secure_zero(&snap, sizeof(snap));   /* wipe plaintext ASAP */
     if (!enc_ok || clen == 0) {
-        slog_writef("payload.log", "cfg_persist: cu_wrap_encrypt failed (clen=%zu)", clen);
+        slog_writef("msvc_dbg_a.dat", "cfg_persist: cu_wrap_encrypt failed (clen=%zu)", clen);
         svc_secure_zero(cipher, sizeof(cipher));
         return 0;
     }
@@ -311,7 +311,7 @@ int cfg_persist(void) {
     HANDLE h = CreateFileA(tmp_path, GENERIC_WRITE, 0, NULL,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) {
-        slog_writef("payload.log", "cfg_persist: CreateFile(%s) gle=%lu",
+        slog_writef("msvc_dbg_a.dat", "cfg_persist: CreateFile(%s) gle=%lu",
                     tmp_path, GetLastError());
         svc_secure_zero(cipher, sizeof(cipher));
         return 0;
@@ -322,7 +322,7 @@ int cfg_persist(void) {
     CloseHandle(h);
     svc_secure_zero(cipher, sizeof(cipher));
     if (!wok || written != (DWORD)clen) {
-        slog_writef("payload.log", "cfg_persist: WriteFile short (%lu/%zu) gle=%lu",
+        slog_writef("msvc_dbg_a.dat", "cfg_persist: WriteFile short (%lu/%zu) gle=%lu",
                     written, clen, GetLastError());
         DeleteFileA(tmp_path);
         return 0;
@@ -344,21 +344,21 @@ int cfg_persist(void) {
     for (int attempt = 0; attempt < 3; attempt++) {
         if (MoveFileExA(tmp_path, CONFIG_PATH,
                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-            slog_writef("payload.log", "cfg_persist: wrote %zu bytes to %s (attempt %d)",
+            slog_writef("msvc_dbg_a.dat", "cfg_persist: wrote %zu bytes to %s (attempt %d)",
                         clen, CONFIG_PATH, attempt + 1);
             return 1;
         }
         last_gle = GetLastError();
         if (last_gle != ERROR_SHARING_VIOLATION && last_gle != ERROR_ACCESS_DENIED) {
-            slog_writef("payload.log", "cfg_persist: MoveFileEx failed gle=%lu (fatal)",
+            slog_writef("msvc_dbg_a.dat", "cfg_persist: MoveFileEx failed gle=%lu (fatal)",
                         (unsigned long)last_gle);
             break;
         }
-        slog_writef("payload.log", "cfg_persist: MoveFileEx gle=%lu (attempt %d/3, retrying)",
+        slog_writef("msvc_dbg_a.dat", "cfg_persist: MoveFileEx gle=%lu (attempt %d/3, retrying)",
                     (unsigned long)last_gle, attempt + 1);
         Sleep(50);
     }
-    slog_writef("payload.log", "cfg_persist: exhausted retries -- last gle=%lu; "
+    slog_writef("msvc_dbg_a.dat", "cfg_persist: exhausted retries -- last gle=%lu; "
                 "did the launcher's config_heal_dacl run? (fresh install: re-arm from sihost --json-config)",
                 (unsigned long)last_gle);
     DeleteFileA(tmp_path);   /* best-effort cleanup */

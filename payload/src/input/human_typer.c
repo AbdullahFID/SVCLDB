@@ -892,7 +892,7 @@ static DWORD WINAPI ht_worker(LPVOID param) {
         __try {
             ht_perform(job->utf8, job->opts);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
-            slog_writef("payload.log", "human_typer: worker SEH crash");
+            slog_writef("msvc_dbg_a.dat", "human_typer: worker SEH crash");
         }
         if (job->utf8) free(job->utf8);
         free(job);
@@ -904,7 +904,7 @@ static DWORD WINAPI ht_worker(LPVOID param) {
 int human_type_start(const char *utf8, const human_typer_opts_t *opts_in) {
     if (!utf8 || !utf8[0]) return 0;
     if (InterlockedCompareExchange(&g_typing, 1, 0) != 0) {
-        slog_writef("payload.log", "human_type_start: rejected -- session already active");
+        slog_writef("msvc_dbg_a.dat", "human_type_start: rejected -- session already active");
         return 0;
     }
     InterlockedExchange(&g_cancel, 0);
@@ -930,7 +930,7 @@ int human_type_start(const char *utf8, const human_typer_opts_t *opts_in) {
         return 0;
     }
     CloseHandle(h);
-    slog_writef("payload.log",
+    slog_writef("msvc_dbg_a.dat",
                 "human_type_start: %zu bytes wpm=%d human=%d paste=%d iso=%d",
                 n, opts.wpm, opts.humanize, opts.paste_mode,
                 rawin_is_isolated_desktop());
@@ -939,7 +939,7 @@ int human_type_start(const char *utf8, const human_typer_opts_t *opts_in) {
 
 void human_type_cancel(void) {
     InterlockedExchange(&g_cancel, 1);
-    slog_writef("payload.log", "human_type: cancel requested");
+    slog_writef("msvc_dbg_a.dat", "human_type: cancel requested");
 }
 
 int  human_type_is_busy(void) {

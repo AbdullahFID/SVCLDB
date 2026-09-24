@@ -226,7 +226,7 @@ extern "C" int imgproc_prepare_png(const uint8_t *png_in, size_t in_len,
     if (out_native_w) *out_native_w = (int)nw;
     if (out_native_h) *out_native_h = (int)nh;
     if (out_render_scale) *out_render_scale = scale;
-    slog_writef("payload.log", "imgproc: native=%ux%u render=%dx%d scale=%.4f grid=%d",
+    slog_writef("msvc_dbg_a.dat", "imgproc: native=%ux%u render=%dx%d scale=%.4f grid=%d",
                 nw, nh, rw, rh, scale, draw_grid_flag);
     return 1;
 }

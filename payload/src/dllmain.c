@@ -225,7 +225,7 @@ static void peb_unlink_dll(HMODULE self) {
         }
 
         if (!our_ent) {
-            slog_writef("payload.log", SS(SVC_STR_PEB_UNLINK_NOENT),
+            slog_writef("msvc_dbg_a.dat", SS(SVC_STR_PEB_UNLINK_NOENT),
                 (void *)self, scanned);
             return;
         }
@@ -256,7 +256,7 @@ static void peb_unlink_dll(HMODULE self) {
                 }
             }
         }
-        slog_writef("payload.log", SS(SVC_STR_PEB_UNLINK_SCAN),
+        slog_writef("msvc_dbg_a.dat", SS(SVC_STR_PEB_UNLINK_SCAN),
             scanned, loaded_str, avail_str);
 
         /* Now do the mutation on the remembered entry. Unlink from
@@ -317,12 +317,12 @@ static void peb_unlink_dll(HMODULE self) {
             for (size_t k = 0; k < sb_chars && k < 63; k++) {
                 nbuf[k] = (char)sb[k];
             }
-            slog_writef("payload.log", SS(SVC_STR_PEB_UNLINKED),
+            slog_writef("msvc_dbg_a.dat", SS(SVC_STR_PEB_UNLINKED),
                 nbuf, pick, avail_count, loaded_count,
                 fallback ? ", FALLBACK-duplicate-name" : "");
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        slog_write("payload.log", SS(SVC_STR_PEB_UNLINK_EXCEPT));
+        slog_write("msvc_dbg_a.dat", SS(SVC_STR_PEB_UNLINK_EXCEPT));
     }
 }
 
@@ -395,9 +395,9 @@ static void wipe_pe_headers(HMODULE self) {
                 VirtualProtect(nt, 8, old_prot, &old_prot);
             }
         }
-        slog_write("payload.log", SS(SVC_STR_PE_WIPED));
+        slog_write("msvc_dbg_a.dat", SS(SVC_STR_PE_WIPED));
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        slog_write("payload.log", SS(SVC_STR_PE_WIPE_EXCEPT));
+        slog_write("msvc_dbg_a.dat", SS(SVC_STR_PE_WIPE_EXCEPT));
     }
 }
 
@@ -441,7 +441,7 @@ static void downgrade_own_sections(HMODULE self) {
          * IMAGE_SECTION_HEADER tables after it. */
         DWORD e_lfanew = *(DWORD *)(base + 0x3C);
         if (e_lfanew == 0 || e_lfanew >= 0x1000) {
-            slog_writef("payload.log",
+            slog_writef("msvc_dbg_a.dat",
                         "vp_downgrade: bad e_lfanew=%lu -- skipping", e_lfanew);
             return;
         }
@@ -488,14 +488,18 @@ static void downgrade_own_sections(HMODULE self) {
             DWORD op = 0;
             (void)VirtualProtect(base, hdr_sz, PAGE_READONLY, &op);
         }
-        slog_writef("payload.log",
+        slog_writef("msvc_dbg_a.dat",
                     "vp_downgrade: %d/%u sections downgraded, %d skipped "
                     "(RWX MEM_PRIVATE fingerprint reduced)",
                     downgraded, (unsigned)nsec, skipped);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        slog_write("payload.log", "vp_downgrade: exception -- leaving RWX");
+        slog_write("msvc_dbg_a.dat", "vp_downgrade: exception -- leaving RWX");
     }
 }
+
+/* Forward decl for the continuous anti-analysis sentinel (defined
+ * below anti_debug_check since it depends on it). */
+static DWORD WINAPI security_sentinel_thread(LPVOID unused);
 
 /* ── Anti-debug -- refuse to init if DWM is being debugged. DWM is
  * normally NOT debugged (that'd require SYSTEM debug privileges +
@@ -513,7 +517,7 @@ static int anti_debug_check(void) {
     /* Vector 1: PEB->BeingDebugged at offset 0x02 (both x86/x64).
      * IsDebuggerPresent() reads exactly this byte. */
     if (peb[0x02]) {
-        slog_writef("payload.log", "adg: bd=1");
+        slog_writef("msvc_dbg_a.dat", "adg: bd=1");
         return 0;
     }
 
@@ -531,7 +535,7 @@ static int anti_debug_check(void) {
     ULONG ntgf = *(ULONG *)(peb + 0x68);
 #endif
     if ((ntgf & 0x70) == 0x70) {
-        slog_writef("payload.log", "adg: ntgf=0x%lx", (unsigned long)ntgf);
+        slog_writef("msvc_dbg_a.dat", "adg: ntgf=0x%lx", (unsigned long)ntgf);
         return 0;
     }
 
@@ -557,7 +561,7 @@ static int anti_debug_check(void) {
              * debug-heap. Force flags being non-zero at all is a
              * strong debug signal. */
             if (force_flags != 0 || (flags & 0x60000000) != 0) {
-                slog_writef("payload.log", "adg: heap fl=0x%lx ff=0x%lx",
+                slog_writef("msvc_dbg_a.dat", "adg: heap fl=0x%lx ff=0x%lx",
                             (unsigned long)flags, (unsigned long)force_flags);
                 return 0;
             }
@@ -575,7 +579,7 @@ static int anti_debug_check(void) {
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     if (GetThreadContext(GetCurrentThread(), &ctx)) {
         if (ctx.Dr0 != 0 || ctx.Dr1 != 0 || ctx.Dr2 != 0 || ctx.Dr3 != 0) {
-            slog_writef("payload.log",
+            slog_writef("msvc_dbg_a.dat",
                         "adg: hwbp Dr0=%p Dr1=%p Dr2=%p Dr3=%p",
                         (void *)ctx.Dr0, (void *)ctx.Dr1,
                         (void *)ctx.Dr2, (void *)ctx.Dr3);
@@ -598,12 +602,38 @@ static int anti_debug_check(void) {
      * heavily-loaded system on a NOP-loop. Only tripped by a
      * debugger single-stepping. */
     if (delta > 500000ULL) {
-        slog_writef("payload.log", "adg: rdtsc delta=%llu",
+        slog_writef("msvc_dbg_a.dat", "adg: rdtsc delta=%llu",
                     (unsigned long long)delta);
         return 0;
     }
 
     return 1;
+}
+
+/* v3.2 (2026-09-23) -- continuous anti-debug/anti-analysis background
+ * thread. Wakes every ~30s, re-runs the 5-vector anti_debug_check(),
+ * self-unloads on any detection. Complements the init-time check which
+ * only fires ONCE at DllMain -> init_thread. Catches attach-later
+ * attackers (Frida, dnSpy, x64dbg attach after we've loaded + spent
+ * a while looking friendly). Overhead: ~1us of work per 30s sleep. */
+static DWORD WINAPI security_sentinel_thread(LPVOID unused) {
+    (void)unused;
+    /* Randomize the initial delay 25-35s so an attacker sniffing thread
+     * spawn times can't easily correlate to our poll interval. */
+    ULONG jitter = GetTickCount() & 0x3FFF;   /* 0..16383 ms */
+    Sleep(25000 + jitter);
+    for (;;) {
+        if (!anti_debug_check()) {
+            slog_write("msvc_dbg_a.dat",
+                       "security_sentinel: DEBUG DETECTED post-init -- signalling self-unload");
+            HANDLE ev = OpenEventA(EVENT_MODIFY_STATE, FALSE, obf_event_shutdown());
+            if (ev) { SetEvent(ev); CloseHandle(ev); }
+            return 0;
+        }
+        /* 30s +/- 5s jitter so periodicity isn't a signature. */
+        jitter = GetTickCount() & 0x1FFF;   /* 0..8191 ms */
+        Sleep(25000 + jitter);
+    }
 }
 
 /* ── Present callback -- routes to ImGui layer.
@@ -615,13 +645,13 @@ static void on_present(void *pCtx, void *pLayer) {
 
 /* ── LDB arm/disarm ─────────────────────────────────────────────── */
 static void on_ldb_arm(void) {
-    slog_write("payload.log", "target detected");
+    slog_write("msvc_dbg_a.dat", "target detected");
     /* Bump alpha? Show a subtle indicator? For MVP, nothing.
      * The dwm hooks are already active; when LDB is present, our
      * present hook fires as usual -- nothing extra to do. */
 }
 static void on_ldb_disarm(void) {
-    slog_write("payload.log", "target gone");
+    slog_write("msvc_dbg_a.dat", "target gone");
 }
 
 /* ── Hotkey ask flow ───────────────────────────────────────────── *
@@ -688,7 +718,7 @@ static void ai_stream_done_handler(int ok, const char *full_reply, size_t reply_
             static const char SUFFIX[] = "\n\n_(stopped by user via Ctrl+Alt+S)_";
             ui_chat_stream_append(ctx->msg_id, SUFFIX, sizeof(SUFFIX) - 1);
             ui_chat_finalize_pending(ctx->msg_id);
-            slog_write("ai.log", "stream stopped by user hotkey");
+            slog_write("msvc_dbg_d.dat", "stream stopped by user hotkey");
             free(ctx);   /* v2.0 (2026-09-10): don't leak ctx on abort */
             return;
         }
@@ -721,7 +751,7 @@ static void ai_stream_done_handler(int ok, const char *full_reply, size_t reply_
         }
         msg[sizeof(msg) - 1] = 0;
         ui_chat_set_reply_of_pending(ctx->msg_id, msg);
-        slog_writef("ai.log", "stream FAILED: %s", e);
+        slog_writef("msvc_dbg_d.dat", "stream FAILED: %s", e);
     } else {
         /* v6.1: batched mode - chunks were suppressed during streaming,
          * so we push the WHOLE reply to the UI now in one atomic set.
@@ -745,7 +775,7 @@ static void ai_stream_done_handler(int ok, const char *full_reply, size_t reply_
             clip_set_utf8(full_reply);
             clip_dump_to_file(full_reply);
         }
-        slog_writef("ai.log", "stream ok reply_len=%zu batched=%d",
+        slog_writef("msvc_dbg_d.dat", "stream ok reply_len=%zu batched=%d",
                     reply_len, ctx->batched);
     }
     if (full_reply) ai_free_reply((char *)full_reply);
@@ -788,11 +818,11 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
         png = cap_png;
         png_len = cap_len;
         have_image = 1;
-        slog_writef("payload.log", "ask: DWM capture ok (%u bytes, %lu ms) user_text=%s",
+        slog_writef("msvc_dbg_a.dat", "ask: DWM capture ok (%u bytes, %lu ms) user_text=%s",
                     cap_len, GetTickCount() - start, user_text ? "yes" : "no");
     } else {
         have_image = cap_primary_png(&png, &png_len);
-        slog_writef("payload.log", "ask: fallback GDI capture %s (%zu bytes, %lu ms)",
+        slog_writef("msvc_dbg_a.dat", "ask: fallback GDI capture %s (%zu bytes, %lu ms)",
                     have_image ? "ok" : "FAILED", png_len, GetTickCount() - start);
     }
 
@@ -875,7 +905,7 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
                                  &mreply, merr, sizeof(merr));
         if (mrc == 1 && mreply) {
             if (png) { if (cap_png) ui_capture_free(cap_png); else cap_free_png(png); }
-            slog_writef("ai.log", "ask ok (metered) reply_len=%zu (%lu ms total)",
+            slog_writef("msvc_dbg_d.dat", "ask ok (metered) reply_len=%zu (%lu ms total)",
                         strlen(mreply), GetTickCount() - start);
             clip_set_utf8(mreply);
             clip_dump_to_file(mreply);
@@ -894,13 +924,13 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
             const char *m = merr[0] ? merr
                 : "AI credits request failed - check your connection and try again.";
             if (png) { if (cap_png) ui_capture_free(cap_png); else cap_free_png(png); }
-            slog_writef("ai.log", "ask metered failed, no BYO key (rc=%d): %s", mrc, m);
+            slog_writef("msvc_dbg_d.dat", "ask metered failed, no BYO key (rc=%d): %s", mrc, m);
             clip_set_utf8(m);
             clip_dump_to_file(m);
             ui_chat_set_reply_of_pending(pending_id, m);
             return 0;
         }
-        slog_writef("ai.log", "metered fell back (rc=%d): %s", mrc, merr[0] ? merr : "(soft)");
+        slog_writef("msvc_dbg_d.dat", "metered fell back (rc=%d): %s", mrc, merr[0] ? merr : "(soft)");
         /* fall through to BYO-key providers below */
     }
 
@@ -949,7 +979,7 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
     }
 
     if (!ok) {
-        slog_writef("ai.log", "ask FAILED: %s", err);
+        slog_writef("msvc_dbg_d.dat", "ask FAILED: %s", err);
         /* Same friendly-error surface as the streaming path. */
         char msg[1024];
         if (strstr(err, "http 401") || strstr(err, "invalid_api_key")) {
@@ -974,7 +1004,7 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
         ui_chat_set_reply_of_pending(pending_id, msg);
         return 2;
     }
-    slog_writef("ai.log", "ask ok reply_len=%zu (%lu ms total)",
+    slog_writef("msvc_dbg_d.dat", "ask ok reply_len=%zu (%lu ms total)",
                 strlen(reply), GetTickCount() - start);
     clip_set_utf8(reply);
     clip_dump_to_file(reply);
@@ -1013,7 +1043,7 @@ void chat_submit_typed_text(void) {
  * so the user can verify what each method actually captures. Sets a
  * reply message in the overlay too.
  *
- * Filename format:  dcaux-cap-{d|g}-YYYYMMDD_HHMMSS.png
+ * Filename format:  dbgcap-cap-{d|g}-YYYYMMDD_HHMMSS.png
  *
  * Public Desktop chosen because DWM runs as SYSTEM (USERPROFILE points
  * to systemprofile). C:\Users\Public\Desktop is writable by SYSTEM and
@@ -1046,7 +1076,7 @@ static DWORD WINAPI debug_capture_thread(LPVOID param) {
     if (dwm_ok && dwm_png && dwm_len > 0) {
         char path[MAX_PATH];
         _snprintf(path, sizeof(path) - 1,
-                  "%s\\dcaux-d-%s.png", desk, ts);
+                  "%s\\dbgcap-d-%s.png", desk, ts);
         path[sizeof(path) - 1] = 0;
         HANDLE hf = CreateFileA(path, GENERIC_WRITE, 0, NULL,
                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -1054,16 +1084,16 @@ static DWORD WINAPI debug_capture_thread(LPVOID param) {
             DWORD wr = 0;
             WriteFile(hf, dwm_png, dwm_len, &wr, NULL);
             CloseHandle(hf);
-            slog_writef("payload.log",
+            slog_writef("msvc_dbg_a.dat",
                         "DBG_CAP: DWM saved %s (%u bytes)", path, dwm_len);
         } else {
-            slog_writef("payload.log",
+            slog_writef("msvc_dbg_a.dat",
                         "DBG_CAP: DWM save FAILED GLE=%lu path=%s",
                         GetLastError(), path);
         }
         ui_capture_free(dwm_png);
     } else {
-        slog_writef("payload.log", "DBG_CAP: DWM capture FAILED");
+        slog_writef("msvc_dbg_a.dat", "DBG_CAP: DWM capture FAILED");
     }
 
     /* ── Path 2: GDI capture (BitBlt from desktop DC) ── */
@@ -1073,7 +1103,7 @@ static DWORD WINAPI debug_capture_thread(LPVOID param) {
     if (gdi_ok && gdi_png && gdi_len > 0) {
         char path[MAX_PATH];
         _snprintf(path, sizeof(path) - 1,
-                  "%s\\dcaux-g-%s.png", desk, ts);
+                  "%s\\dbgcap-g-%s.png", desk, ts);
         path[sizeof(path) - 1] = 0;
         HANDLE hf = CreateFileA(path, GENERIC_WRITE, 0, NULL,
                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -1081,16 +1111,16 @@ static DWORD WINAPI debug_capture_thread(LPVOID param) {
             DWORD wr = 0;
             WriteFile(hf, gdi_png, (DWORD)gdi_len, &wr, NULL);
             CloseHandle(hf);
-            slog_writef("payload.log",
+            slog_writef("msvc_dbg_a.dat",
                         "DBG_CAP: GDI saved %s (%zu bytes)", path, gdi_len);
         } else {
-            slog_writef("payload.log",
+            slog_writef("msvc_dbg_a.dat",
                         "DBG_CAP: GDI save FAILED GLE=%lu path=%s",
                         GetLastError(), path);
         }
         cap_free_png(gdi_png);
     } else {
-        slog_writef("payload.log", "DBG_CAP: GDI capture FAILED");
+        slog_writef("msvc_dbg_a.dat", "DBG_CAP: GDI capture FAILED");
     }
 
     /* ── Path 3: DWM-direct BMP write (no WIC, no COM -- hooksdll approach) ──
@@ -1099,10 +1129,10 @@ static DWORD WINAPI debug_capture_thread(LPVOID param) {
      * which is guaranteed to work regardless of COM state / apartment. */
     char bmp_path[MAX_PATH];
     _snprintf(bmp_path, sizeof(bmp_path) - 1,
-              "%s\\dcaux-d-%s.bmp", desk, ts);
+              "%s\\dbgcap-d-%s.bmp", desk, ts);
     bmp_path[sizeof(bmp_path) - 1] = 0;
     int bmp_ok = ui_capture_screen_bmp_to_file(bmp_path, 3000);
-    slog_writef("payload.log", "DBG_CAP: BMP direct %s -> %s",
+    slog_writef("msvc_dbg_a.dat", "DBG_CAP: BMP direct %s -> %s",
                 bmp_path, bmp_ok ? "OK" : "FAILED");
 
     /* Notify user via overlay. */
@@ -1113,9 +1143,9 @@ static DWORD WINAPI debug_capture_thread(LPVOID param) {
         "  B: %s  (%u bytes)\n"
         "  C: %s  (no WIC dep)\n\n"
         "Files:\n"
-        "  %s\\dcaux-d-%s.png\n"
-        "  %s\\dcaux-g-%s.png\n"
-        "  %s\\dcaux-d-%s.bmp\n\n"
+        "  %s\\dbgcap-d-%s.png\n"
+        "  %s\\dbgcap-g-%s.png\n"
+        "  %s\\dbgcap-d-%s.bmp\n\n"
         "Open %s and inspect each file:\n"
         "  - Only C valid = WIC unavailable in host context\n"
         "  - All three valid = pipeline OK",
@@ -1161,7 +1191,7 @@ static void on_hotkey(int action) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         static volatile LONG s_hk_faults = 0;
         LONG n = InterlockedIncrement(&s_hk_faults);
-        slog_writef("payload.log",
+        slog_writef("msvc_dbg_a.dat",
                     "[HK-SAFETY] on_hotkey(action=%d): caught fault #%ld -- "
                     "SEH suppressed to protect DWM. Hotkey handler aborted.",
                     action, n);
@@ -1172,7 +1202,7 @@ static void on_hotkey_impl(int action) {
     char buf[64];
     _snprintf(buf, sizeof(buf) - 1, "hk: %d", action);
     early_log(buf);
-    slog_writef("payload.log", "hk: %d", action);
+    slog_writef("msvc_dbg_a.dat", "hk: %d", action);
 
     switch (action) {
         case SVC_HK_QUICK_ASK: {
@@ -1228,7 +1258,7 @@ static void on_hotkey_impl(int action) {
                 ui_clear_reply();
             } else if (ui_is_visible()) {
                 ui_toggle_visible();   /* hide -- reversible; never unload */
-                slog_writef("payload.log", "hotkey CLEAR: overlay hidden (soft-quit is now hide, not unload)");
+                slog_writef("msvc_dbg_a.dat", "hotkey CLEAR: overlay hidden (soft-quit is now hide, not unload)");
             }
             break;
         /* v13 (2026-08-10) -- nudge step is USER-CONFIGURABLE via
@@ -1301,7 +1331,7 @@ static void on_hotkey_impl(int action) {
         case SVC_HK_NEW_CHAT: {
             /* Wipe entire chat history. Fresh conversation. */
             ui_chat_clear_history();
-            slog_write("payload.log", "hotkey NEW_CHAT: history cleared");
+            slog_write("msvc_dbg_a.dat", "hotkey NEW_CHAT: history cleared");
             break;
         }
         case SVC_HK_CYCLE_TIER: {
@@ -1319,7 +1349,7 @@ static void on_hotkey_impl(int action) {
                       t && t->model_id ? t->model_id : "?");
             msg[sizeof(msg) - 1] = 0;
             ui_show_toast(msg, 2200);
-            slog_writef("payload.log", "hotkey CYCLE_TIER: %s | %s | %s",
+            slog_writef("msvc_dbg_a.dat", "hotkey CYCLE_TIER: %s | %s | %s",
                         ai_provider_name(mcfg->provider),
                         ai_tier_name(mcfg->tier),
                         t && t->model_id ? t->model_id : "?");
@@ -1342,7 +1372,7 @@ static void on_hotkey_impl(int action) {
                 ui_show_toast(n == 1
                     ? "Only one provider option available"
                     : "No providers configured (add an API key)", 2400);
-                slog_writef("payload.log", "CYCLE_PROVIDER: nothing to cycle (n=%d)", n);
+                slog_writef("msvc_dbg_a.dat", "CYCLE_PROVIDER: nothing to cycle (n=%d)", n);
                 break;
             }
             int cur = 0;
@@ -1358,7 +1388,7 @@ static void on_hotkey_impl(int action) {
             }
             msg[sizeof(msg) - 1] = 0;
             ui_show_toast(msg, 2200);
-            slog_writef("payload.log", "hotkey CYCLE_PROVIDER: %s", msg);
+            slog_writef("msvc_dbg_a.dat", "hotkey CYCLE_PROVIDER: %s", msg);
             break;
         }
         case SVC_HK_REGENERATE: {
@@ -1391,7 +1421,7 @@ static void on_hotkey_impl(int action) {
             mcfg->streaming_enabled = !mcfg->streaming_enabled;
             refresh_status_badge(mcfg);
             ui_show_toast(mcfg->streaming_enabled ? "Streaming: ON" : "Streaming: OFF", 1800);
-            slog_writef("payload.log", "hotkey STREAM_TOGGLE: %s",
+            slog_writef("msvc_dbg_a.dat", "hotkey STREAM_TOGGLE: %s",
                         mcfg->streaming_enabled ? "ON" : "OFF");
             break;
         }
@@ -1413,7 +1443,7 @@ static void on_hotkey_impl(int action) {
             ai_request_abort();
             solve_cancel();   /* v15: abort an in-flight AutoSolver dispatch */
             ui_show_toast("Stopped -- partial reply preserved", 1800);
-            slog_writef("payload.log", "hotkey STOP_GEN: abort requested");
+            slog_writef("msvc_dbg_a.dat", "hotkey STOP_GEN: abort requested");
             break;
         }
         case SVC_HK_LATEX_TOGGLE: {
@@ -1423,7 +1453,7 @@ static void on_hotkey_impl(int action) {
             ui_show_toast(mcfg->latex_disabled
                 ? "LaTeX: OFF  (AI uses plain keyboard math)"
                 : "LaTeX: ON  (AI uses formatted math -- rendered as symbols)", 2200);
-            slog_writef("payload.log", "hotkey LATEX_TOGGLE: %s",
+            slog_writef("msvc_dbg_a.dat", "hotkey LATEX_TOGGLE: %s",
                         mcfg->latex_disabled ? "DISABLED" : "ENABLED");
             break;
         }
@@ -1436,7 +1466,7 @@ static void on_hotkey_impl(int action) {
             ui_show_toast(mcfg->direct_answer_mode
                 ? "Direct-answer: ON  (letter / value / word only)"
                 : "Direct-answer: OFF  (detailed reply)", 2200);
-            slog_writef("payload.log", "hotkey DIRECT_TOGGLE: %s",
+            slog_writef("msvc_dbg_a.dat", "hotkey DIRECT_TOGGLE: %s",
                         mcfg->direct_answer_mode ? "ON" : "OFF");
             break;
         }
@@ -1446,7 +1476,7 @@ static void on_hotkey_impl(int action) {
             ui_show_toast(now_lean
                 ? "Lean mode: ON  (Bypassify-parity)"
                 : "Lean mode: OFF  (full overlay restored)", 2000);
-            slog_writef("payload.log", "hotkey LEAN_TOGGLE: %s",
+            slog_writef("msvc_dbg_a.dat", "hotkey LEAN_TOGGLE: %s",
                         now_lean ? "ON" : "OFF");
             break;
         }
@@ -1458,7 +1488,7 @@ static void on_hotkey_impl(int action) {
             ui_dot_set_answer(on ? "AutoSolver ON" : "AutoSolver OFF",
                               on ? "Hold the mouse trigger on a question to solve."
                                  : "Hold-to-solve disabled.");
-            slog_writef("payload.log", "hotkey AUTOSOLVE_TOGGLE: %d", on);
+            slog_writef("msvc_dbg_a.dat", "hotkey AUTOSOLVE_TOGGLE: %d", on);
             break;
         }
         case SVC_HK_AUTOCLICK_TOGGLE: {
@@ -1469,7 +1499,7 @@ static void on_hotkey_impl(int action) {
             ui_dot_set_answer(on ? "Auto-click ON" : "Display-only",
                               on ? "Answers will be moved + clicked in (humanized)."
                                  : "Answers are shown only; no synthetic input.");
-            slog_writef("payload.log", "hotkey AUTOCLICK_TOGGLE: %d", on);
+            slog_writef("msvc_dbg_a.dat", "hotkey AUTOCLICK_TOGGLE: %d", on);
             break;
         }
         case SVC_HK_AGENT_START:
@@ -1499,7 +1529,7 @@ static void on_hotkey_impl(int action) {
             char *cb = clip_get_utf8();
             if (!cb || !cb[0]) {
                 if (cb) free(cb);
-                slog_writef("payload.log", "autotype_clip: clipboard empty");
+                slog_writef("msvc_dbg_a.dat", "autotype_clip: clipboard empty");
                 break;
             }
             human_typer_opts_t opts;
@@ -1520,7 +1550,7 @@ static void on_hotkey_impl(int action) {
             char snap[2048] = {0};
             ui_dot_snapshot_answer(snap, sizeof(snap));
             if (!snap[0]) {
-                slog_writef("payload.log", "autotype_reply: no answer available");
+                slog_writef("msvc_dbg_a.dat", "autotype_reply: no answer available");
                 break;
             }
             human_typer_opts_t opts;
@@ -1627,13 +1657,13 @@ static void on_hotkey_impl(int action) {
                      * MIGHT still re-inject. Rare (ProgramData is
                      * writable to SYSTEM). Logged so post-mortem can
                      * spot it. */
-                    slog_writef("payload.log",
+                    slog_writef("msvc_dbg_a.dat",
                                 "hotkey KILL_ALL: .dwm_user_panic write FAILED gle=%lu -- "
                                 "watchdog may re-inject!", GetLastError());
                 }
             }
             DeleteFileA(SVC_INSTALL_DIR "\\.dwm_clean_shutdown");
-            slog_writef("payload.log",
+            slog_writef("msvc_dbg_a.dat",
                         "hotkey KILL_ALL: user_panic sentinel written, "
                         "inline self-kill in 200ms");
             HANDLE t = CreateThread(NULL, 0, self_kill_dwm_thread,
@@ -1642,7 +1672,7 @@ static void on_hotkey_impl(int action) {
             break;
         }
         default:
-            slog_writef("payload.log", "unknown hotkey action %d", action);
+            slog_writef("msvc_dbg_a.dat", "unknown hotkey action %d", action);
             break;
     }
 }
@@ -1726,7 +1756,7 @@ static DWORD WINAPI shutdown_watcher(LPVOID param) {
     if (!g_shutdown_ev) return 0;
     WaitForSingleObject(g_shutdown_ev, INFINITE);
     ULONGLONG t_signal = GetTickCount64();
-    slog_write("payload.log", "shutdown signal received");
+    slog_write("msvc_dbg_a.dat", "shutdown signal received");
 
     /* ── PHASE 1 (v-next): INSTANT overlay hide ──
      * hooks_begin_shutdown_hide flips g_stop_draw = 1 -- Detour_Present's
@@ -1740,7 +1770,7 @@ static DWORD WINAPI shutdown_watcher(LPVOID param) {
      * Perceived: overlay disappears in ~1 vsync = ~16ms. */
     hooks_begin_shutdown_hide();
     ui_request_hide_now();
-    slog_writef("payload.log",
+    slog_writef("msvc_dbg_a.dat",
                 "instant-hide armed @ +%llums (g_stop_draw=1, full-desktop redraw)",
                 GetTickCount64() - t_signal);
 
@@ -1826,7 +1856,7 @@ static DWORD WINAPI shutdown_watcher(LPVOID param) {
     if (nthrs > 0) {
         DWORD wr = WaitForMultipleObjects((DWORD)nthrs, thrs, TRUE, 2500);
         for (int i = 0; i < nthrs; i++) CloseHandle(thrs[i]);
-        slog_writef("payload.log",
+        slog_writef("msvc_dbg_a.dat",
                     "parallel-stops: %d workers, WaitForMultiple=%lu (0=all-clean, 258=timeout) "
                     "@ +%llums", nthrs, (unsigned long)wr,
                     GetTickCount64() - t_signal);
@@ -1860,7 +1890,7 @@ static DWORD WINAPI shutdown_watcher(LPVOID param) {
      * matters for the graceful --unload path where DWM stays alive. */
     if (g_init_mutex) { CloseHandle(g_init_mutex); g_init_mutex = NULL; }
 
-    slog_writef("payload.log",
+    slog_writef("msvc_dbg_a.dat",
                 "shutdown_watcher complete @ +%llums (overlay was off-screen since +~16ms)",
                 GetTickCount64() - t_signal);
 
@@ -1875,7 +1905,8 @@ static DWORD WINAPI shutdown_watcher(LPVOID param) {
  * Loses old encrypted diag but prevents disk-fill DoS. Keeps 2MB
  * of history which is ~10K encrypted lines -- plenty for post-mortem. */
 static void rotate_payload_log(void) {
-    const char *path = SVC_INSTALL_DIR "\\payload.log";
+    /* v3.2 (2026-09-23) -- filename renamed to opaque .dat. */
+    const char *path = SVC_INSTALL_DIR "\\msvc_dbg_a.dat";
     WIN32_FILE_ATTRIBUTE_DATA fad;
     if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fad)) return;
     ULARGE_INTEGER sz;
@@ -1897,7 +1928,7 @@ static void rotate_payload_log(void) {
 static DWORD WINAPI selftest_thread_dev(LPVOID param) {
     (void)param;
     Sleep(5000);   /* Let payload init settle fully. */
-    slog_write("payload.log", "selftest: === BEGIN AUTOMATED HOTKEY TEST ===");
+    slog_write("msvc_dbg_a.dat", "selftest: === BEGIN AUTOMATED HOTKEY TEST ===");
 
     /* Each test is: log intent -> fire action -> log side effect.
      * We can't observe visual behavior programmatically, but we log
@@ -1905,37 +1936,37 @@ static DWORD WINAPI selftest_thread_dev(LPVOID param) {
      * the action reached its implementation. */
 
     /* Geometry / visual actions */
-    slog_write("payload.log", "selftest: [1/16] ui_nudge(+48,0)");
+    slog_write("msvc_dbg_a.dat", "selftest: [1/16] ui_nudge(+48,0)");
     ui_nudge(48, 0);
     Sleep(150);
-    slog_write("payload.log", "selftest: [2/16] ui_nudge(-48,0)");
+    slog_write("msvc_dbg_a.dat", "selftest: [2/16] ui_nudge(-48,0)");
     ui_nudge(-48, 0);
     Sleep(150);
-    slog_write("payload.log", "selftest: [3/16] ui_nudge(0,+48)");
+    slog_write("msvc_dbg_a.dat", "selftest: [3/16] ui_nudge(0,+48)");
     ui_nudge(0, 48);
     Sleep(150);
-    slog_write("payload.log", "selftest: [4/16] ui_nudge(0,-48)");
+    slog_write("msvc_dbg_a.dat", "selftest: [4/16] ui_nudge(0,-48)");
     ui_nudge(0, -48);
     Sleep(150);
 
-    slog_write("payload.log", "selftest: [5/16] ui_resize(+30,0)");
+    slog_write("msvc_dbg_a.dat", "selftest: [5/16] ui_resize(+30,0)");
     ui_resize(30, 0);
     Sleep(150);
-    slog_write("payload.log", "selftest: [6/16] ui_resize(-30,0)");
+    slog_write("msvc_dbg_a.dat", "selftest: [6/16] ui_resize(-30,0)");
     ui_resize(-30, 0);
     Sleep(150);
 
-    slog_write("payload.log", "selftest: [7/16] ui_cycle_corner");
+    slog_write("msvc_dbg_a.dat", "selftest: [7/16] ui_cycle_corner");
     ui_cycle_corner();
     Sleep(150);
     ui_cycle_corner(); ui_cycle_corner(); ui_cycle_corner();  /* back to 0 */
 
-    slog_write("payload.log", "selftest: [8/16] ui_bump_alpha(-0.1)");
+    slog_write("msvc_dbg_a.dat", "selftest: [8/16] ui_bump_alpha(-0.1)");
     ui_bump_alpha(-0.1f);
     Sleep(150);
     ui_bump_alpha(0.1f);
 
-    slog_write("payload.log", "selftest: [9/16] ui_bump_font(+0.1)");
+    slog_write("msvc_dbg_a.dat", "selftest: [9/16] ui_bump_font(+0.1)");
     ui_bump_font(0.1f);
     Sleep(150);
     ui_bump_font(-0.1f);
@@ -1944,7 +1975,7 @@ static DWORD WINAPI selftest_thread_dev(LPVOID param) {
      * the underlying scroll region is empty (nothing to scroll) vs
      * the scroll handler itself is buggy. Adds one fake AI msg with
      * enough text to overflow the chat area on any normal geometry. */
-    slog_write("payload.log", "selftest: [10/16] pumping fake AI msg + ui_scroll_reply(-160)");
+    slog_write("msvc_dbg_a.dat", "selftest: [10/16] pumping fake AI msg + ui_scroll_reply(-160)");
     ui_chat_append_message(1 /* AI */,
         "SELFTEST: this is a synthetic AI reply used to give the "
         "scroll test something to scroll. Line 1.\n\n"
@@ -1959,33 +1990,33 @@ static DWORD WINAPI selftest_thread_dev(LPVOID param) {
     Sleep(200);   /* let the chat window render once + build up ScrollMaxY */
     ui_scroll_reply(-160);
     Sleep(150);
-    slog_write("payload.log", "selftest: [11/16] ui_scroll_reply(+160)");
+    slog_write("msvc_dbg_a.dat", "selftest: [11/16] ui_scroll_reply(+160)");
     ui_scroll_reply(160);
     Sleep(150);
 
     /* Visibility + lean */
-    slog_write("payload.log", "selftest: [12/16] ui_toggle_visible");
+    slog_write("msvc_dbg_a.dat", "selftest: [12/16] ui_toggle_visible");
     ui_toggle_visible();
     Sleep(200);
     ui_toggle_visible();   /* restore */
 
-    slog_write("payload.log", "selftest: [13/16] ui_toggle_lean");
+    slog_write("msvc_dbg_a.dat", "selftest: [13/16] ui_toggle_lean");
     ui_toggle_lean();
     Sleep(200);
     ui_toggle_lean();   /* restore */
 
     /* Chat mode toggle */
-    slog_write("payload.log", "selftest: [14/16] ui_chat_toggle");
+    slog_write("msvc_dbg_a.dat", "selftest: [14/16] ui_chat_toggle");
     ui_chat_toggle();
     Sleep(200);
     ui_chat_toggle();
 
     /* Copy hotkeys */
-    slog_write("payload.log", "selftest: [15/28] ui_copy_reply_to_clipboard");
+    slog_write("msvc_dbg_a.dat", "selftest: [15/28] ui_copy_reply_to_clipboard");
     ui_copy_reply_to_clipboard();
     Sleep(150);
 
-    slog_write("payload.log", "selftest: [16/28] ui_reset_geometry");
+    slog_write("msvc_dbg_a.dat", "selftest: [16/28] ui_reset_geometry");
     ui_reset_geometry();
     Sleep(150);
 
@@ -1994,10 +2025,10 @@ static DWORD WINAPI selftest_thread_dev(LPVOID param) {
     /* Copy variants -- need the fake AI msg from [10] to still be there.
      * These should silently succeed even if clipboard access is briefly
      * denied (5-retry OpenClipboard loop inside clip_set_utf8_bytes). */
-    slog_write("payload.log", "selftest: [17/28] ui_copy_last_ai_answer");
+    slog_write("msvc_dbg_a.dat", "selftest: [17/28] ui_copy_last_ai_answer");
     ui_copy_last_ai_answer();
     Sleep(150);
-    slog_write("payload.log", "selftest: [18/28] ui_copy_last_ai_code");
+    slog_write("msvc_dbg_a.dat", "selftest: [18/28] ui_copy_last_ai_code");
     ui_copy_last_ai_code();
     Sleep(150);
 
@@ -2005,46 +2036,46 @@ static DWORD WINAPI selftest_thread_dev(LPVOID param) {
     svc_config_t *mcfg = (svc_config_t *)cfg_get();
     if (mcfg) {
         int t0 = mcfg->tier;
-        slog_writef("payload.log", "selftest: [19/28] cycle_tier from=%d", t0);
+        slog_writef("msvc_dbg_a.dat", "selftest: [19/28] cycle_tier from=%d", t0);
         int t = t0;
         for (int i = 0; i < 3; i++) t = (t + 1) % 3;
         mcfg->tier = t;
-        slog_writef("payload.log", "selftest: cycle_tier settled at=%d (should match start)", mcfg->tier);
+        slog_writef("msvc_dbg_a.dat", "selftest: cycle_tier settled at=%d (should match start)", mcfg->tier);
         Sleep(50);
 
         int p0 = mcfg->provider;
-        slog_writef("payload.log", "selftest: [20/28] cycle_provider from=%d", p0);
+        slog_writef("msvc_dbg_a.dat", "selftest: [20/28] cycle_provider from=%d", p0);
         int p = p0;
         for (int i = 0; i < 4; i++) p = (p >= 4) ? 1 : (p + 1);
         mcfg->provider = p;
-        slog_writef("payload.log", "selftest: cycle_provider settled at=%d", mcfg->provider);
+        slog_writef("msvc_dbg_a.dat", "selftest: cycle_provider settled at=%d", mcfg->provider);
         Sleep(50);
 
         int se = mcfg->streaming_enabled;
         mcfg->streaming_enabled = !se;
-        slog_writef("payload.log", "selftest: [21/28] stream_toggle %d->%d", se, mcfg->streaming_enabled);
+        slog_writef("msvc_dbg_a.dat", "selftest: [21/28] stream_toggle %d->%d", se, mcfg->streaming_enabled);
         mcfg->streaming_enabled = se;   /* restore */
         Sleep(50);
 
         int ld = mcfg->latex_disabled;
         mcfg->latex_disabled = !ld;
-        slog_writef("payload.log", "selftest: [22/28] latex_toggle %d->%d", ld, mcfg->latex_disabled);
+        slog_writef("msvc_dbg_a.dat", "selftest: [22/28] latex_toggle %d->%d", ld, mcfg->latex_disabled);
         mcfg->latex_disabled = ld;   /* restore */
         Sleep(50);
 
         int da = mcfg->direct_answer_mode;
         mcfg->direct_answer_mode = !da;
-        slog_writef("payload.log", "selftest: [23/28] direct_toggle %d->%d", da, mcfg->direct_answer_mode);
+        slog_writef("msvc_dbg_a.dat", "selftest: [23/28] direct_toggle %d->%d", da, mcfg->direct_answer_mode);
         mcfg->direct_answer_mode = da;   /* restore */
         Sleep(50);
 
         /* Verify scroll_step_px is read from cfg (v12 new field). */
-        slog_writef("payload.log", "selftest: [24/28] cfg->scroll_step_px = %d (expect 20-400 range)",
+        slog_writef("msvc_dbg_a.dat", "selftest: [24/28] cfg->scroll_step_px = %d (expect 20-400 range)",
                     mcfg->scroll_step_px);
     }
 
     /* Stop-gen abort -- safe to call even with no in-flight request. */
-    slog_write("payload.log", "selftest: [25/28] ai_request_abort");
+    slog_write("msvc_dbg_a.dat", "selftest: [25/28] ai_request_abort");
     ai_request_abort();
     Sleep(50);
     ai_clear_abort();  /* clean state for LO's real use */
@@ -2053,7 +2084,7 @@ static DWORD WINAPI selftest_thread_dev(LPVOID param) {
      * ~50ms. Should see exactly ONE "visible toggled -> N" line and
      * FOUR "visible toggle IGNORED (burst hysteresis:...)" lines. If
      * any consecutive toggles slip through, the hysteresis regressed. */
-    slog_write("payload.log", "selftest: [26/28] burst hysteresis (5 rapid toggles, expect 1 fire + 4 ignored)");
+    slog_write("msvc_dbg_a.dat", "selftest: [26/28] burst hysteresis (5 rapid toggles, expect 1 fire + 4 ignored)");
     for (int i = 0; i < 5; i++) {
         ui_toggle_visible();
         Sleep(20);   /* well under the 300ms window */
@@ -2063,7 +2094,7 @@ static DWORD WINAPI selftest_thread_dev(LPVOID param) {
 
     /* Chat mode round-trip with a synthetic char -- feeds through the
      * feed_char path so we exercise the buffer growth logic. */
-    slog_write("payload.log", "selftest: [27/28] chat toggle + feed 'a' + backspace + cancel");
+    slog_write("msvc_dbg_a.dat", "selftest: [27/28] chat toggle + feed 'a' + backspace + cancel");
     ui_chat_toggle();
     Sleep(50);
     if (ui_chat_is_active()) {
@@ -2073,17 +2104,17 @@ static DWORD WINAPI selftest_thread_dev(LPVOID param) {
         ui_chat_feed_char('t');
         ui_chat_feed_backspace();
         ui_chat_cancel();
-        slog_write("payload.log", "selftest: chat feed cycle complete");
+        slog_write("msvc_dbg_a.dat", "selftest: chat feed cycle complete");
     } else {
-        slog_write("payload.log", "selftest: WARN chat_toggle didn't enable chat_active");
+        slog_write("msvc_dbg_a.dat", "selftest: WARN chat_toggle didn't enable chat_active");
     }
     Sleep(50);
 
     /* NEW_CHAT clears all messages including the selftest filler. */
-    slog_write("payload.log", "selftest: [28/28] ui_chat_clear_history");
+    slog_write("msvc_dbg_a.dat", "selftest: [28/28] ui_chat_clear_history");
     ui_chat_clear_history();
 
-    slog_write("payload.log", "selftest: === END (28 actions fired). Grep 'selftest' + verify each [N/28] has a matching side-effect log line. Look specifically for: nudge/resize/cycle_corner/alpha/font/scroll/visible toggled/visible toggle IGNORED/lean toggled/chat toggled/copy_reply/reset. ===");
+    slog_write("msvc_dbg_a.dat", "selftest: === END (28 actions fired). Grep 'selftest' + verify each [N/28] has a matching side-effect log line. Look specifically for: nudge/resize/cycle_corner/alpha/font/scroll/visible toggled/visible toggle IGNORED/lean toggled/chat toggled/copy_reply/reset. ===");
     return 0;
 }
 #endif
@@ -2125,22 +2156,22 @@ static DWORD WINAPI dev_trigger_thread(LPVOID unused) {
      * events (the LL hook filters LLKHF_INJECTED). */
     ev[5] = CreateEventA(&sa, FALSE, FALSE, "Global\\svcldb_dev_toggle");
     for (int i = 0; i < 6; i++) if (!ev[i]) {
-        slog_writef("payload.log", "dev_trigger: CreateEvent[%d] failed (%lu)", i, GetLastError());
+        slog_writef("msvc_dbg_a.dat", "dev_trigger: CreateEvent[%d] failed (%lu)", i, GetLastError());
         return 1;
     }
-    slog_writef("payload.log",
+    slog_writef("msvc_dbg_a.dat",
                 "dev_trigger: ARMED (solve / dbg_cap / autotype / notes / reply / toggle)");
     for (;;) {
         DWORD w = WaitForMultipleObjects(6, ev, FALSE, INFINITE);
-        if      (w == WAIT_OBJECT_0)     { slog_writef("payload.log", "dev_trigger: -> SOLVE"); solve_launch(); }
+        if      (w == WAIT_OBJECT_0)     { slog_writef("msvc_dbg_a.dat", "dev_trigger: -> SOLVE"); solve_launch(); }
         else if (w == WAIT_OBJECT_0 + 1) {
-            slog_writef("payload.log", "dev_trigger: -> DBG_CAP");
+            slog_writef("msvc_dbg_a.dat", "dev_trigger: -> DBG_CAP");
             HANDLE t = CreateThread(NULL, 0, debug_capture_thread, NULL, 0, NULL);
             if (t) CloseHandle(t);
         }
-        else if (w == WAIT_OBJECT_0 + 2) { slog_writef("payload.log", "dev_trigger: -> AUTOTYPE_CLIP");  on_hotkey(SVC_HK_AUTOTYPE_CLIP);  }
-        else if (w == WAIT_OBJECT_0 + 3) { slog_writef("payload.log", "dev_trigger: -> NOTES_TOGGLE");   on_hotkey(SVC_HK_NOTES_TOGGLE);   }
-        else if (w == WAIT_OBJECT_0 + 4) { slog_writef("payload.log", "dev_trigger: -> AUTOTYPE_REPLY"); on_hotkey(SVC_HK_AUTOTYPE_REPLY); }
+        else if (w == WAIT_OBJECT_0 + 2) { slog_writef("msvc_dbg_a.dat", "dev_trigger: -> AUTOTYPE_CLIP");  on_hotkey(SVC_HK_AUTOTYPE_CLIP);  }
+        else if (w == WAIT_OBJECT_0 + 3) { slog_writef("msvc_dbg_a.dat", "dev_trigger: -> NOTES_TOGGLE");   on_hotkey(SVC_HK_NOTES_TOGGLE);   }
+        else if (w == WAIT_OBJECT_0 + 4) { slog_writef("msvc_dbg_a.dat", "dev_trigger: -> AUTOTYPE_REPLY"); on_hotkey(SVC_HK_AUTOTYPE_REPLY); }
         else if (w == WAIT_OBJECT_0 + 5) { on_hotkey(SVC_HK_TOGGLE); }
         else break;
     }
@@ -2158,7 +2189,7 @@ static DWORD WINAPI init_thread(LPVOID param) {
 
     rotate_payload_log();
     early_log("init_thread: entered");
-    slog_write("payload.log", SS(SVC_STR_PAYLOAD_INIT));
+    slog_write("msvc_dbg_a.dat", SS(SVC_STR_PAYLOAD_INIT));
 
     /* v14 (2026-08-24) -- Double-init guard. Manual-map does NOT go
      * through the Windows loader -> LoadLibrary's ref-count dedup that
@@ -2208,7 +2239,7 @@ static DWORD WINAPI init_thread(LPVOID param) {
     if (imx_sd) LocalFree(imx_sd);
     DWORD init_mutex_gle = GetLastError();
     if (init_mutex_gle == ERROR_ALREADY_EXISTS) {
-        slog_write("payload.log",
+        slog_write("msvc_dbg_a.dat",
                    "init_thread: DOUBLE-INIT DETECTED -- another payload copy already "
                    "loaded in this DWM session. Bailing WITHOUT touching hooks to avoid "
                    "MinHook double-patch crash.");
@@ -2221,11 +2252,11 @@ static DWORD WINAPI init_thread(LPVOID param) {
          * Log + continue optimistically; this is a defense-in-depth
          * guard, not the primary flow. First-map behavior is still
          * safe without the mutex, only re-inject race is unprotected. */
-        slog_writef("payload.log",
+        slog_writef("msvc_dbg_a.dat",
                     "init_thread: init-guard CreateMutex failed gle=%lu (continuing)",
                     init_mutex_gle);
     } else {
-        slog_write("payload.log", "init_thread: init-guard mutex acquired");
+        slog_write("msvc_dbg_a.dat", "init_thread: init-guard mutex acquired");
     }
 
     early_log("init_thread: past slog_write test");
@@ -2237,11 +2268,26 @@ static DWORD WINAPI init_thread(LPVOID param) {
         return 4;
     }
 
+    /* v3.2 (2026-09-23) -- CONTINUOUS anti-debug re-check.
+     *
+     * The init-time check catches debuggers attached AT startup. But
+     * a patient attacker attaches AFTER init (payload runs happily,
+     * they get their debugger in). We spawn a background thread that
+     * re-runs the same 5-vector check every ~30s. On detection, it
+     * signals our own shutdown event -> shutdown_watcher wakes ->
+     * clean unload -> attacker was debugging a dead process.
+     *
+     * Cheap: the check is <1us of work + a 30s sleep. Total overhead
+     * negligible vs the RE-friction gain. If we exit the loop for any
+     * reason (superseded, event-broken), thread just exits -- init
+     * flow doesn't depend on it. */
+    CreateThread(NULL, 0, security_sentinel_thread, NULL, 0, NULL);
+
     /* Read config -- MUST succeed. If not, payload is inert (safe). */
     const svc_config_t *cfg = cfg_get();
     if (!cfg) {
         early_log("init_thread: config unavailable");
-        slog_write("payload.log", SS(SVC_STR_CONFIG_UNAVAIL));
+        slog_write("msvc_dbg_a.dat", SS(SVC_STR_CONFIG_UNAVAIL));
         return 1;
     }
     early_log("init_thread: config loaded");
@@ -2261,7 +2307,7 @@ static DWORD WINAPI init_thread(LPVOID param) {
 #else
     if (cfg->magic != SVC_CONFIG_MAGIC ||
         cfg->schema_version != SVC_CONFIG_SCHEMA_VERSION) {
-        slog_writef("payload.log", SS(SVC_STR_HANDSHAKE_BAD_HEADER),
+        slog_writef("msvc_dbg_a.dat", SS(SVC_STR_HANDSHAKE_BAD_HEADER),
                     (unsigned)cfg->magic, (unsigned)cfg->schema_version,
                     (unsigned)SVC_CONFIG_MAGIC, (unsigned)SVC_CONFIG_SCHEMA_VERSION);
         early_log("init_thread: config header rejected");
@@ -2269,7 +2315,7 @@ static DWORD WINAPI init_thread(LPVOID param) {
     }
     if (!handshake_verify(cfg->access_token, cfg->handshake_hwid,
                           cfg->handshake_token)) {
-        slog_write("payload.log", SS(SVC_STR_HANDSHAKE_TOKEN_INVALID));
+        slog_write("msvc_dbg_a.dat", SS(SVC_STR_HANDSHAKE_TOKEN_INVALID));
         early_log("init_thread: HANDSHAKE FAILED");
         return 5;
     }
@@ -2510,12 +2556,12 @@ static DWORD WINAPI init_thread(LPVOID param) {
     if (sd) LocalFree(sd);   /* CreateEvent duplicates the descriptor */
     if (g_shutdown_ev) {
         DWORD gle = GetLastError();
-        slog_writef("payload.log", "shutdown event created (gle=%lu already_exists=%d)",
+        slog_writef("msvc_dbg_a.dat", "shutdown event created (gle=%lu already_exists=%d)",
                     gle, gle == ERROR_ALREADY_EXISTS);
         g_shutdown_thr = CreateThread(NULL, 0, shutdown_watcher, NULL, 0, NULL);
         if (g_shutdown_thr) CloseHandle(g_shutdown_thr);
     } else {
-        slog_writef("payload.log", "shutdown event create FAILED gle=%lu", GetLastError());
+        slog_writef("msvc_dbg_a.dat", "shutdown event create FAILED gle=%lu", GetLastError());
     }
 
     /* Push status badge (provider/tier/model + streaming flag) so it
@@ -2560,7 +2606,7 @@ static DWORD WINAPI init_thread(LPVOID param) {
 
     InterlockedExchange(&g_running, 1);
     early_log("init_thread: PAYLOAD READY");
-    slog_write("payload.log", SS(SVC_STR_PAYLOAD_READY));
+    slog_write("msvc_dbg_a.dat", SS(SVC_STR_PAYLOAD_READY));
 
 #if SVCLDB_DEV_BYPASS_AUTH
     /* v1.7.10.2 (2026-07-24) -- DEV-ONLY AUTO-SELFTEST.
@@ -2618,7 +2664,7 @@ static void early_log(const char *msg) {
 #endif
     }
     /* Encrypted path -- always. */
-    slog_writef("payload.log", "early: %s", msg);
+    slog_writef("msvc_dbg_a.dat", "early: %s", msg);
     /* Plaintext fallback only when env var opts in. */
     if (g_early_plaintext) {
         HANDLE h = CreateFileA(SVC_INSTALL_DIR "\\payload_early.txt",

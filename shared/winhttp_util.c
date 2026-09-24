@@ -126,7 +126,7 @@ static void proto_cache_note(const wchar_t *host, DWORD proto) {
     const char *label = "h1.1";
     if (proto & WINHTTP_PROTOCOL_FLAG_HTTP3)      label = "h3";
     else if (proto & WINHTTP_PROTOCOL_FLAG_HTTP2) label = "h2";
-    slog_writef("http.log", "http: negotiated %s host=%s", label, host_u8);
+    slog_writef("msvc_dbg_c.dat", "http: negotiated %s host=%s", label, host_u8);
 }
 
 static void query_and_log_protocol_used(HINTERNET req, const wchar_t *host) {

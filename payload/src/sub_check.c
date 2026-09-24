@@ -140,7 +140,7 @@ static int query_supabase_active(const char *access_token) {
     const char *base = sb_url();
     const char *anon = sb_anon_key();
     if (!base || !anon) {
-        slog_write("payload.log", "sub_check: sb_url/anon unavailable");
+        slog_write("msvc_dbg_a.dat", "sub_check: sb_url/anon unavailable");
         return -1;
     }
 
@@ -174,7 +174,7 @@ static int query_supabase_active(const char *access_token) {
         whreq_free_result(&rr);
         if (auth_error) {
             /* v1.9.2: 401/403 = expired/invalid token, not "no grant". */
-            slog_writef("payload.log", "sub_check: manual_grants %u -> auth error (stale token?)", http_status);
+            slog_writef("msvc_dbg_a.dat", "sub_check: manual_grants %u -> auth error (stale token?)", http_status);
             return -2;
         }
     } else {
@@ -195,14 +195,14 @@ static int query_supabase_active(const char *access_token) {
     if (whreq_get(url, headers, &rr)) {
         if (rr.status == 200 && rr.body) {
             int has = json_has_nonempty_array_or_object(rr.body);
-            slog_writef("payload.log", "sub_check: subs %u -> %s", rr.status,
+            slog_writef("msvc_dbg_a.dat", "sub_check: subs %u -> %s", rr.status,
                         has ? "ACTIVE" : "empty");
             whreq_free_result(&rr);
             return has ? 1 : 0;
         }
         if (rr.status == 401 || rr.status == 403) {
             /* v1.9.2: 401/403 = expired/invalid token, not "inactive". */
-            slog_writef("payload.log", "sub_check: subs %u -> auth error (stale token?)", rr.status);
+            slog_writef("msvc_dbg_a.dat", "sub_check: subs %u -> auth error (stale token?)", rr.status);
             whreq_free_result(&rr);
             return -2;
         }
@@ -218,13 +218,13 @@ static int query_supabase_active(const char *access_token) {
  * We open by name (not the local HANDLE from dllmain) so this module
  * doesn't have to reach into another translation unit's globals. */
 static void trigger_self_unload(const char *reason) {
-    slog_writef("payload.log", SS(SVC_STR_SUBCHK_SELF_UNLOAD), reason);
+    slog_writef("msvc_dbg_a.dat", SS(SVC_STR_SUBCHK_SELF_UNLOAD), reason);
     HANDLE ev = OpenEventA(EVENT_MODIFY_STATE, FALSE, obf_event_shutdown());
     if (ev) {
         SetEvent(ev);
         CloseHandle(ev);
     } else {
-        slog_writef("payload.log",
+        slog_writef("msvc_dbg_a.dat",
                     "sub_check: OpenEvent(%s) failed gle=%lu -- payload may not unload cleanly",
                     obf_event_shutdown(), GetLastError());
     }
@@ -232,7 +232,7 @@ static void trigger_self_unload(const char *reason) {
 
 static DWORD WINAPI sub_check_thread(LPVOID param) {
     (void)param;
-    slog_write("payload.log", SS(SVC_STR_SUBCHK_THREAD_UP));
+    slog_write("msvc_dbg_a.dat", SS(SVC_STR_SUBCHK_THREAD_UP));
     sc_prng_seed_once();
 
     /* Wait for the shutdown event to exist -- it's created by
@@ -245,7 +245,7 @@ static DWORD WINAPI sub_check_thread(LPVOID param) {
         Sleep(100);
     }
     if (!stop) {
-        slog_write("payload.log", "sub_check: shutdown event never appeared -- thread bailing");
+        slog_write("msvc_dbg_a.dat", "sub_check: shutdown event never appeared -- thread bailing");
         return 1;
     }
 
@@ -269,15 +269,15 @@ static DWORD WINAPI sub_check_thread(LPVOID param) {
         unsigned wait_ms;
         if (consecutive_auth_fails > 0) {
             wait_ms = SUB_CHECK_AUTH_RETRY_MS;
-            slog_writef("payload.log", "sub_check: auth-retry wait=%u ms (auth_fails=%d)",
+            slog_writef("msvc_dbg_a.dat", "sub_check: auth-retry wait=%u ms (auth_fails=%d)",
                         wait_ms, consecutive_auth_fails);
         } else if (consecutive_net_fails > 0) {
             wait_ms = sc_backoff_ms(consecutive_net_fails);
-            slog_writef("payload.log", "sub_check: backoff wait=%u ms (net_fails=%d)",
+            slog_writef("msvc_dbg_a.dat", "sub_check: backoff wait=%u ms (net_fails=%d)",
                         wait_ms, consecutive_net_fails);
         } else {
             wait_ms = sc_next_interval_ms(SUB_CHECK_INTERVAL_MS);
-            slog_writef("payload.log", "sub_check: jittered wait=%u ms", wait_ms);
+            slog_writef("msvc_dbg_a.dat", "sub_check: jittered wait=%u ms", wait_ms);
         }
 
         DWORD wr = WaitForSingleObject(stop, wait_ms);
@@ -286,7 +286,7 @@ static DWORD WINAPI sub_check_thread(LPVOID param) {
 
         const svc_config_t *cfg = cfg_get();
         if (!cfg) {
-            slog_write("payload.log", "sub_check: cfg not loaded -- skipping this tick");
+            slog_write("msvc_dbg_a.dat", "sub_check: cfg not loaded -- skipping this tick");
             continue;
         }
         /* v2.0.1 (2026-09-10) -- snapshot the JWT under the config CS to
@@ -298,14 +298,14 @@ static DWORD WINAPI sub_check_thread(LPVOID param) {
         char access_token_local[4200];
         size_t at_len = cfg_copy_access_token(access_token_local, sizeof(access_token_local));
         if (at_len == 0) {
-            slog_write("payload.log", "sub_check: no cfg/token -- skipping this tick");
+            slog_write("msvc_dbg_a.dat", "sub_check: no cfg/token -- skipping this tick");
             continue;
         }
         int r = query_supabase_active(access_token_local);
         svc_secure_zero(access_token_local, sizeof(access_token_local));
         if (r == 1) {
             if (consecutive_net_fails > 0 || consecutive_auth_fails > 0) {
-                slog_writef("payload.log", "sub_check: recovered (net_fails=%d auth_fails=%d)",
+                slog_writef("msvc_dbg_a.dat", "sub_check: recovered (net_fails=%d auth_fails=%d)",
                             consecutive_net_fails, consecutive_auth_fails);
             }
             consecutive_net_fails = 0;
@@ -345,7 +345,7 @@ static DWORD WINAPI sub_check_thread(LPVOID param) {
             unsigned grace_remain_min = (elapsed_ms >= SUB_CHECK_AUTH_GRACE_MS)
                 ? 0u
                 : (unsigned)((SUB_CHECK_AUTH_GRACE_MS - elapsed_ms) / 60000u);
-            slog_writef("payload.log",
+            slog_writef("msvc_dbg_a.dat",
                         "sub_check: auth/expired-token fail #%d (grace_remaining=%um; "
                         "awaiting token_refresh_client + Electron pipe push)",
                         consecutive_auth_fails, grace_remain_min);
@@ -353,7 +353,7 @@ static DWORD WINAPI sub_check_thread(LPVOID param) {
              * based check is retained as a fallback but the wall-clock is
              * the dominant condition. */
             if (elapsed_ms >= SUB_CHECK_AUTH_GRACE_MS) {
-                slog_writef("payload.log",
+                slog_writef("msvc_dbg_a.dat",
                             "sub_check: 6h wall-clock auth grace expired "
                             "(elapsed=%llums, fails=%d) -- self-unload",
                             elapsed_ms, consecutive_auth_fails);
@@ -368,13 +368,13 @@ static DWORD WINAPI sub_check_thread(LPVOID param) {
          * max forever instead of overflowing. */
         consecutive_net_fails++;
         if (consecutive_net_fails > 32) consecutive_net_fails = 32;
-        slog_writef("payload.log",
+        slog_writef("msvc_dbg_a.dat",
                     "sub_check: net fail %d (backing off, no self-unload; "
                     "matches v1.6 revalidation.js kind=network policy)",
                     consecutive_net_fails);
     }
     CloseHandle(stop);
-    slog_write("payload.log", "sub_check: thread exiting");
+    slog_write("msvc_dbg_a.dat", "sub_check: thread exiting");
     return 0;
 }
 
@@ -383,7 +383,7 @@ void sub_check_start(void) {
     g_sc_thread = CreateThread(NULL, 0, sub_check_thread, NULL, 0, NULL);
     if (!g_sc_thread) {
         InterlockedExchange(&g_sc_running, 0);
-        slog_writef("payload.log", "sub_check: CreateThread failed gle=%lu", GetLastError());
+        slog_writef("msvc_dbg_a.dat", "sub_check: CreateThread failed gle=%lu", GetLastError());
     }
 }
 

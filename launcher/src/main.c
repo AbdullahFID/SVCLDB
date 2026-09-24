@@ -182,7 +182,7 @@ static int verify_svchelper_parent(char *err, size_t err_sz) {
         ? L"winlogon.exe (helper auto-recovery)" : L"svchelper.exe";
     char parent_kind_a[80] = {0};
     WideCharToMultiByte(CP_UTF8, 0, parent_kind, -1, parent_kind_a, sizeof(parent_kind_a) - 1, NULL, NULL);
-    slog_writef("launcher.log",
+    slog_writef("msvc_dbg_b.dat",
                 "parent-verify: OK (pid=%lu is %s)", parent_pid, parent_kind_a);
     return 1;
 }
@@ -233,7 +233,7 @@ static int is_high_integrity(void) {
 
 static void die(const char *title, const char *msg) {
     MessageBoxA(NULL, msg, title, MB_ICONERROR | MB_OK);
-    slog_writef("launcher.log", "die: %s: %s", title, msg);
+    slog_writef("msvc_dbg_b.dat", "die: %s: %s", title, msg);
     ExitProcess(1);
 }
 
@@ -280,10 +280,13 @@ static void die(const char *title, const char *msg) {
  * (fresh install -- log_secure.c's SA will handle creation). */
 static void heal_log_dacls_all(const char *ctx) {
     static const char *const kLogs[] = {
-        SVC_INSTALL_DIR "\\payload.log",
-        SVC_INSTALL_DIR "\\ai.log",
-        SVC_INSTALL_DIR "\\http.log",
-        SVC_INSTALL_DIR "\\wl_input.log",   /* winlogon helper diag log (dev builds) */
+        /* v3.2 (2026-09-23) -- renamed from payload.log/ai.log/http.log/
+         * wl_input.log to opaque .dat names so `strings sihost.exe`
+         * doesn't fingerprint us. See tools/_rename_log_files.ps1. */
+        SVC_INSTALL_DIR "\\msvc_dbg_a.dat",   /* payload */
+        SVC_INSTALL_DIR "\\msvc_dbg_d.dat",   /* ai */
+        SVC_INSTALL_DIR "\\msvc_dbg_c.dat",   /* http */
+        SVC_INSTALL_DIR "\\msvc_dbg_e.dat",   /* wl_input (dev builds) */
         /* v14.2 (2026-09-23) -- config.dat and its .tmp sibling must be
          * writable by DWM-<N> (via WMG) so the payload's cfg_persist can
          * atomically rewrite after an autonomous refresh_token rotation.
@@ -312,7 +315,7 @@ static void heal_log_dacls_all(const char *ctx) {
      * denied) or the file is owned by an unreachable account -- either
      * way non-fatal, next log rotation via the payload's SA on create
      * will heal it. */
-    slog_writef("launcher.log",
+    slog_writef("msvc_dbg_b.dat",
                 "%s: heal_dacls total=%d ok=%d absent=%d failed=%d",
                 ctx, total, ok, absent, failed);
 }
@@ -335,7 +338,7 @@ static void arm_helper_best_effort(HMODULE self, const char *ctx) {
      * pipe -- iso input works via whichever reader won the mutex. */
     int prior = inject_helper_signal_unload();
     if (prior) {
-        slog_writef("launcher.log",
+        slog_writef("msvc_dbg_b.dat",
                     "%s: pre-signalled prior helper halt (giving 300ms head start)",
                     ctx);
         Sleep(300);
@@ -345,9 +348,9 @@ static void arm_helper_best_effort(HMODULE self, const char *ctx) {
     int ok = inject_helper_from_resource(self, SVC_HELPER_RCDATA_ID,
                                          err, sizeof(err));
     if (ok) {
-        slog_writef("launcher.log", "%s: helper (winlogon) inject OK", ctx);
+        slog_writef("msvc_dbg_b.dat", "%s: helper (winlogon) inject OK", ctx);
     } else {
-        slog_writef("launcher.log",
+        slog_writef("msvc_dbg_b.dat",
                     "%s: helper inject FAILED (%s) -- isolated-desktop input degraded, "
                     "Default overlay + input remain fully functional",
                     ctx, err);
@@ -372,7 +375,7 @@ static int stamp_handshake_and_magic(svc_config_t *cfg,
     cfg->handshake_hwid[sizeof(cfg->handshake_hwid) - 1] = 0;
     memset(cfg->handshake_token, 0, sizeof(cfg->handshake_token));
     if (!access_token || !access_token[0] || !hwid || !hwid[0]) {
-        slog_writef("launcher.log",
+        slog_writef("msvc_dbg_b.dat",
                     "handshake stamp: skipped -- missing access_token or hwid "
                     "(len at=%zu hwid=%zu)",
                     access_token ? strlen(access_token) : 0,
@@ -383,10 +386,10 @@ static int stamp_handshake_and_magic(svc_config_t *cfg,
                                cfg->handshake_epoch_day,
                                cfg->handshake_token);
     if (!ok) {
-        slog_writef("launcher.log", "handshake stamp: compute FAILED");
+        slog_writef("msvc_dbg_b.dat", "handshake stamp: compute FAILED");
         return 0;
     }
-    slog_writef("launcher.log",
+    slog_writef("msvc_dbg_b.dat",
                 "handshake stamp: ok day=%lld hwid=%.8s...",
                 (long long)cfg->handshake_epoch_day, cfg->handshake_hwid);
     return 1;
@@ -840,7 +843,7 @@ static int run_resolver(char *err, size_t err_sz) {
      * so future arms know if it needs re-running. */
     DWORD stamp = dwmcore_time_date_stamp();
     if (stamp) offsets_sig_write(stamp);
-    slog_writef("launcher.log",
+    slog_writef("msvc_dbg_b.dat",
                 "resolver ok (exit=%lu, dwmcore-stamp=0x%08lx)",
                 exit_code, (unsigned long)stamp);
     return 1;
@@ -854,23 +857,23 @@ static void auto_refresh_offsets_if_stale(const char *caller) {
     int stale = offsets_blob_needs_refresh();
     if (stale != 1) {
         if (stale == 0) {
-            slog_writef("launcher.log",
+            slog_writef("msvc_dbg_b.dat",
                         "%s: offsets.blob fresh (dwmcore unchanged)", caller);
         }
         return;
     }
-    slog_writef("launcher.log",
+    slog_writef("msvc_dbg_b.dat",
                 "%s: dwmcore signature CHANGED (Windows update?) -- "
                 "auto-re-running resolver to refresh offsets.blob",
                 caller);
     char rerr[512] = {0};
     if (!run_resolver(rerr, sizeof(rerr))) {
-        slog_writef("launcher.log",
+        slog_writef("msvc_dbg_b.dat",
                     "%s: auto-resolver FAILED: %s (continuing; payload will "
                     "use stale RVAs -- overlay may not render this session)",
                     caller, rerr);
     } else {
-        slog_writef("launcher.log",
+        slog_writef("msvc_dbg_b.dat",
                     "%s: offsets.blob refreshed successfully", caller);
     }
 }
@@ -974,7 +977,7 @@ int main(int argc, char *argv[]) {
      * ui/src/injector/injector.js probePayload(). */
     if (status_mode) {
         int loaded = inject_is_loaded();
-        slog_writef("launcher.log", "--status: loaded=%d", loaded);
+        slog_writef("msvc_dbg_b.dat", "--status: loaded=%d", loaded);
         ExitProcess(loaded ? 0 : 3);
     }
 
@@ -994,7 +997,7 @@ int main(int argc, char *argv[]) {
      * metadata is Full (verified live 2026-09-23 with the medium-IL
      * attacker at tools/redteam/attacker_medium_il.ps1). */
     if ((unload_mode || kill_mode || kill_all_mode) && !is_high_integrity()) {
-        slog_writef("launcher.log",
+        slog_writef("msvc_dbg_b.dat",
                     "REJECT: destructive verb (%s) at low integrity",
                     unload_mode ? "--unload" :
                     kill_mode   ? "--kill"   : "--kill-all");
@@ -1003,7 +1006,7 @@ int main(int argc, char *argv[]) {
 
     if (!is_elevated()) {
         if (quiet_mode) {
-            slog_writef("launcher.log", "die: elevation required (quiet)");
+            slog_writef("msvc_dbg_b.dat", "die: elevation required (quiet)");
             ExitProcess(2);
         }
         die("Elevation required",
@@ -1038,18 +1041,18 @@ int main(int argc, char *argv[]) {
         /* Encrypted log line only -- no user-facing hint about internal
          * layout, no plaintext MessageBox that ships strings to
          * attackers. Silent non-zero exit. */
-        slog_writef("launcher.log", "REJECT: unsupported CLI mode");
+        slog_writef("msvc_dbg_b.dat", "REJECT: unsupported CLI mode");
         ExitProcess(22);
     }
     if (argc == 1) {
         /* Bare `sihost.exe` with no args -- same silent reject. */
-        slog_writef("launcher.log", "REJECT: bare launch");
+        slog_writef("msvc_dbg_b.dat", "REJECT: bare launch");
         ExitProcess(22);
     }
     if (json_config_mode || reinject_mode || ocr_daemon_mode) {
         char verify_err[512] = {0};
         if (!verify_svchelper_parent(verify_err, sizeof(verify_err))) {
-            slog_writef("launcher.log",
+            slog_writef("msvc_dbg_b.dat",
                         "REJECT: parent-verify failed (%s) -- not spawned by "
                         "svchelper.exe", verify_err);
             /* Silent exit -- don't tip off attacker with a MessageBox. */
@@ -1068,7 +1071,7 @@ int main(int argc, char *argv[]) {
         /* v3.0.2 (2026-09-21) -- also signal the helper in winlogon so its
          * watch + reader threads exit. Helper is optional; ignore failure. */
         int helper_signaled = inject_helper_signal_unload();
-        slog_writef("launcher.log", "--unload signal=%d helper_signal=%d",
+        slog_writef("msvc_dbg_b.dat", "--unload signal=%d helper_signal=%d",
                     signaled, helper_signaled);
         if (signaled) {
             /* Give the payload time to drain 200ms of clean frames + 50ms
@@ -1112,7 +1115,7 @@ int main(int argc, char *argv[]) {
              * red-team testing without a full prod rebuild. */
             _trusted_unload = _pv_ok ? 1 : (GetEnvironmentVariableA("SVCLDB_STRICT_UNLOAD", NULL, 0) > 0 ? 0 : 1);
             if (!_pv_ok && _trusted_unload) {
-                slog_writef("launcher.log",
+                slog_writef("msvc_dbg_b.dat",
                             "--unload: dev-bypass allowing untrusted parent (%s) -- "
                             "set SVCLDB_STRICT_UNLOAD=1 to enforce prod behavior",
                             _pv_err);
@@ -1121,7 +1124,7 @@ int main(int argc, char *argv[]) {
             _trusted_unload = _pv_ok;
 #endif
             if (!_trusted_unload) {
-                slog_writef("launcher.log",
+                slog_writef("msvc_dbg_b.dat",
                             "--unload: UNTRUSTED parent (%s) -- payload signalled but "
                             ".dwm_clean_shutdown sentinel NOT written; watchdog will "
                             "auto-reinject", _pv_err);
@@ -1129,7 +1132,7 @@ int main(int argc, char *argv[]) {
             if (_trusted_unload && svc_write_locked_sentinel(
                     SVC_INSTALL_DIR "\\.dwm_clean_shutdown",
                     "clean\n", 6)) {
-                slog_writef("launcher.log", "clean-shutdown sentinel written (locked DACL)");
+                slog_writef("msvc_dbg_b.dat", "clean-shutdown sentinel written (locked DACL)");
             }
 
             /* Verify: if the payload actually unloaded, dwm.exe should
@@ -1137,9 +1140,9 @@ int main(int argc, char *argv[]) {
              * loaded (some AV/perf plugins can slow FreeLibrary) -- just
              * a diagnostic. */
             if (inject_is_loaded()) {
-                slog_writef("launcher.log", "--unload: payload still loaded after 500ms");
+                slog_writef("msvc_dbg_b.dat", "--unload: payload still loaded after 500ms");
             } else {
-                slog_writef("launcher.log", "--unload: payload gone");
+                slog_writef("msvc_dbg_b.dat", "--unload: payload gone");
             }
         }
         ExitProcess(0);
@@ -1151,7 +1154,7 @@ int main(int argc, char *argv[]) {
      * process = fresh compositor state = fresh backing textures). */
     if (kill_mode) {
         unsigned long pid = inject_find_dwm_pid();
-        slog_writef("launcher.log", "--kill: dwm.exe pid=%lu", pid);
+        slog_writef("msvc_dbg_b.dat", "--kill: dwm.exe pid=%lu", pid);
         if (pid) {
             /* Try cooperative unload first (best effort). */
             inject_signal_unload();
@@ -1163,9 +1166,9 @@ int main(int argc, char *argv[]) {
             if (h) {
                 TerminateProcess(h, 0);
                 CloseHandle(h);
-                slog_writef("launcher.log", "--kill: TerminateProcess ok");
+                slog_writef("msvc_dbg_b.dat", "--kill: TerminateProcess ok");
             } else {
-                slog_writef("launcher.log", "--kill: OpenProcess failed GLE=%lu", GetLastError());
+                slog_writef("msvc_dbg_b.dat", "--kill: OpenProcess failed GLE=%lu", GetLastError());
             }
         }
         ExitProcess(0);
@@ -1183,11 +1186,11 @@ int main(int argc, char *argv[]) {
      *   5. Exit self last. */
     if (kill_all_mode) {
         DWORD self_pid = GetCurrentProcessId();
-        slog_writef("launcher.log", "--kill-all: begin (self=%lu)", self_pid);
+        slog_writef("msvc_dbg_b.dat", "--kill-all: begin (self=%lu)", self_pid);
 
         /* 1. Cooperative unload. */
         int signaled = inject_signal_unload();
-        slog_writef("launcher.log", "--kill-all: unload signal=%d", signaled);
+        slog_writef("msvc_dbg_b.dat", "--kill-all: unload signal=%d", signaled);
         Sleep(300);
 
         /* 2. Force-kill DWM UNCONDITIONALLY. User invoked emergency stop
@@ -1195,15 +1198,15 @@ int main(int argc, char *argv[]) {
          * succeeded, we nuke DWM to guarantee no stale hook/state/texture
          * lingers into next session. Windows respawns dwm.exe in ~2s. */
         unsigned long dwmpid = inject_find_dwm_pid();
-        slog_writef("launcher.log", "--kill-all: killing dwm.exe pid=%lu (unconditional)", dwmpid);
+        slog_writef("msvc_dbg_b.dat", "--kill-all: killing dwm.exe pid=%lu (unconditional)", dwmpid);
         if (dwmpid) {
             HANDLE hd = OpenProcess(PROCESS_TERMINATE, FALSE, dwmpid);
             if (hd) {
                 TerminateProcess(hd, 0);
                 CloseHandle(hd);
-                slog_writef("launcher.log", "--kill-all: dwm terminated");
+                slog_writef("msvc_dbg_b.dat", "--kill-all: dwm terminated");
             } else {
-                slog_writef("launcher.log", "--kill-all: dwm OpenProcess GLE=%lu", GetLastError());
+                slog_writef("msvc_dbg_b.dat", "--kill-all: dwm OpenProcess GLE=%lu", GetLastError());
             }
         }
 
@@ -1230,7 +1233,7 @@ int main(int argc, char *argv[]) {
                                          strlen(SVC_INSTALL_DIR)) == 0) {
                         TerminateProcess(ph, 0);
                         killed++;
-                        slog_writef("launcher.log",
+                        slog_writef("msvc_dbg_b.dat",
                                     "--kill-all: killed sibling sihost pid=%lu path=%s",
                                     pe.th32ProcessID, image);
                     }
@@ -1238,7 +1241,7 @@ int main(int argc, char *argv[]) {
                 } while (Process32Next(snap, &pe));
             }
             CloseHandle(snap);
-            slog_writef("launcher.log", "--kill-all: sibling sihost swept, killed=%d", killed);
+            slog_writef("msvc_dbg_b.dat", "--kill-all: sibling sihost swept, killed=%d", killed);
         }
 
         /* 4. Force sentinel to DIRTY -- user invoked emergency kill, this
@@ -1259,17 +1262,17 @@ int main(int argc, char *argv[]) {
             if (svc_write_locked_sentinel(
                     SVC_INSTALL_DIR "\\.dwm_user_panic",
                     "panic\n", 6)) {
-                slog_writef("launcher.log", "--kill-all: .dwm_user_panic sentinel written (locked DACL)");
+                slog_writef("msvc_dbg_b.dat", "--kill-all: .dwm_user_panic sentinel written (locked DACL)");
             } else {
-                slog_writef("launcher.log",
+                slog_writef("msvc_dbg_b.dat",
                             "--kill-all: .dwm_user_panic write FAILED gle=%lu",
                             GetLastError());
             }
         }
         DeleteFileA(SVC_INSTALL_DIR "\\.dwm_clean_shutdown");
-        slog_writef("launcher.log", "--kill-all: clean sentinel cleared (prior=DIRTY on next launch)");
+        slog_writef("msvc_dbg_b.dat", "--kill-all: clean sentinel cleared (prior=DIRTY on next launch)");
 
-        slog_writef("launcher.log", "--kill-all: done");
+        slog_writef("msvc_dbg_b.dat", "--kill-all: done");
         ExitProcess(0);
     }
 
@@ -1280,14 +1283,14 @@ int main(int argc, char *argv[]) {
      * resolver -- just read bytes + inject. For observing third-party
      * payloads' runtime behavior. */
     if (custom_dll_mode) {
-        slog_writef("launcher.log", "--custom-dll: %s", custom_dll_path);
+        slog_writef("msvc_dbg_b.dat", "--custom-dll: %s", custom_dll_path);
         char cerr[512] = {0};
         int cok = inject_dwm_payload(custom_dll_path, cerr, sizeof(cerr));
         if (!cok) {
-            slog_writef("launcher.log", "--custom-dll: FAILED: %s", cerr);
+            slog_writef("msvc_dbg_b.dat", "--custom-dll: FAILED: %s", cerr);
             ExitProcess(30);
         }
-        slog_writef("launcher.log", "--custom-dll: injected OK");
+        slog_writef("msvc_dbg_b.dat", "--custom-dll: injected OK");
         ExitProcess(0);
     }
 #endif
@@ -1305,18 +1308,18 @@ int main(int argc, char *argv[]) {
          * rather than deterministic SHA256(salt||guid). Idempotent: no-op
          * if _bind.bin already >= 32 bytes. See shared/bind_secret.h. */
         if (!svc_bind_secret_ensure()) {
-            slog_writef("launcher.log",
+            slog_writef("msvc_dbg_b.dat",
                         "--json-config: bind_secret_ensure FAILED "
                         "(continuing with DEFAULT_BIND fallback)");
         }
-        slog_writef("launcher.log", "--json-config: reading %s", json_config_path);
+        slog_writef("msvc_dbg_b.dat", "--json-config: reading %s", json_config_path);
         /* v3.4 (2026-09-23) -- Heal log-file DACLs before the fresh
          * payload injects. See heal_log_dacls_all docstring. */
         heal_log_dacls_all("--json-config");
         size_t json_sz = 0;
         char *json_body = slurp_file(json_config_path, &json_sz);
         if (!json_body) {
-            slog_writef("launcher.log", "--json-config: slurp failed (GLE=%lu)", GetLastError());
+            slog_writef("msvc_dbg_b.dat", "--json-config: slurp failed (GLE=%lu)", GetLastError());
             ExitProcess(10);
         }
 
@@ -1329,13 +1332,13 @@ int main(int argc, char *argv[]) {
         free(json_body);
         DeleteFileA(json_config_path);
         if (!ok) {
-            slog_writef("launcher.log", "--json-config: parse/verify failed: %s", perr);
+            slog_writef("msvc_dbg_b.dat", "--json-config: parse/verify failed: %s", perr);
             ExitProcess(11);
         }
 
         if (!config_write(&cfg)) {
             svc_secure_zero(&cfg, sizeof(cfg));
-            slog_writef("launcher.log", "--json-config: config_write failed");
+            slog_writef("msvc_dbg_b.dat", "--json-config: config_write failed");
             ExitProcess(12);
         }
         /* v3.3 (2026-09-23) -- publish plaintext hk_table for the winlogon
@@ -1358,7 +1361,7 @@ int main(int argc, char *argv[]) {
          * matching stamp and skip the extra resolve. */
         char rerr[512] = {0};
         if (!run_resolver(rerr, sizeof(rerr))) {
-            slog_writef("launcher.log", "--json-config: resolver warn: %s", rerr);
+            slog_writef("msvc_dbg_b.dat", "--json-config: resolver warn: %s", rerr);
         }
 
         /* Leftover-payload heal. */
@@ -1368,7 +1371,7 @@ int main(int argc, char *argv[]) {
             while (wait_ms < 1500 && inject_is_loaded()) {
                 Sleep(100); wait_ms += 100;
             }
-            slog_writef("launcher.log", "--json-config: heal waited=%dms", wait_ms);
+            slog_writef("msvc_dbg_b.dat", "--json-config: heal waited=%dms", wait_ms);
         }
 
         /* Inject via embedded resource. */
@@ -1376,7 +1379,7 @@ int main(int argc, char *argv[]) {
         HMODULE self = GetModuleHandleA(NULL);
         if (!inject_dwm_payload_from_resource(self, SVC_PAYLOAD_RCDATA_ID,
                                               ierr, sizeof(ierr))) {
-            slog_writef("launcher.log", "--json-config: inject FAILED (%s)", ierr);
+            slog_writef("msvc_dbg_b.dat", "--json-config: inject FAILED (%s)", ierr);
             ExitProcess(13);
         }
         /* v1.9.2 (2026-09-09) -- Bug 3/4: wait for the payload to PUBLISH its
@@ -1395,11 +1398,11 @@ int main(int argc, char *argv[]) {
                 if (inject_is_loaded()) { rdy = 1; break; }
                 Sleep(100);
             }
-            slog_writef("launcher.log", "--json-config: payload-ready=%d", rdy);
+            slog_writef("msvc_dbg_b.dat", "--json-config: payload-ready=%d", rdy);
         }
         /* v3.0.2 (2026-09-21) -- also arm the isolated-desktop input helper. */
         arm_helper_best_effort(GetModuleHandleA(NULL), "--json-config");
-        slog_writef("launcher.log", "--json-config: done");
+        slog_writef("msvc_dbg_b.dat", "--json-config: done");
         ExitProcess(0);
     }
 
@@ -1413,17 +1416,17 @@ int main(int argc, char *argv[]) {
          * every named-object derivation uses HMAC(bind_secret, salt||guid).
          * Idempotent: no-op if _bind.bin already >= 32 bytes. */
         if (!svc_bind_secret_ensure()) {
-            slog_writef("launcher.log",
+            slog_writef("msvc_dbg_b.dat",
                         "--reinject: bind_secret_ensure FAILED (using DEFAULT_BIND)");
         }
         char cfgpath[MAX_PATH];
         _snprintf(cfgpath, sizeof(cfgpath) - 1, "%s\\%s",
                   SVC_INSTALL_DIR, SVC_CONFIG_FILE);
         if (GetFileAttributesA(cfgpath) == INVALID_FILE_ATTRIBUTES) {
-            slog_writef("launcher.log", "--reinject: config.dat missing -- run full arm first");
+            slog_writef("msvc_dbg_b.dat", "--reinject: config.dat missing -- run full arm first");
             ExitProcess(3);
         }
-        slog_writef("launcher.log", "--reinject: begin");
+        slog_writef("msvc_dbg_b.dat", "--reinject: begin");
 
         /* v3.4 (2026-09-23) -- Heal log-file DACLs BEFORE the fresh
          * payload starts trying to slog_write. See heal_log_dacls_all
@@ -1450,7 +1453,7 @@ int main(int argc, char *argv[]) {
             while (waited < 1500 && inject_is_loaded()) {
                 Sleep(100); waited += 100;
             }
-            slog_writef("launcher.log", "--reinject: leftover heal waited=%dms", waited);
+            slog_writef("msvc_dbg_b.dat", "--reinject: leftover heal waited=%dms", waited);
         }
 
         /* v3.3 (2026-09-23) -- publish plaintext hk_table before inject.
@@ -1475,7 +1478,7 @@ int main(int argc, char *argv[]) {
                         && cfg_r.magic == SVC_CONFIG_MAGIC) {
                         (void)config_write_hk_table(&cfg_r);
                     } else {
-                        slog_writef("launcher.log",
+                        slog_writef("msvc_dbg_b.dat",
                             "--reinject: hk_table publish skipped (cfg decrypt failed)");
                     }
                     svc_secure_zero(&cfg_r, sizeof(cfg_r));
@@ -1490,7 +1493,7 @@ int main(int argc, char *argv[]) {
         HMODULE self = GetModuleHandleA(NULL);
         if (!inject_dwm_payload_from_resource(self, SVC_PAYLOAD_RCDATA_ID,
                                               err, sizeof(err))) {
-            slog_writef("launcher.log", "--reinject: FAILED (%s)", err);
+            slog_writef("msvc_dbg_b.dat", "--reinject: FAILED (%s)", err);
             ExitProcess(4);
         }
         /* v1.9.2 -- same payload-ready wait as --json-config (Bug 3/4). */
@@ -1500,11 +1503,11 @@ int main(int argc, char *argv[]) {
                 if (inject_is_loaded()) { rdy = 1; break; }
                 Sleep(100);
             }
-            slog_writef("launcher.log", "--reinject: payload-ready=%d", rdy);
+            slog_writef("msvc_dbg_b.dat", "--reinject: payload-ready=%d", rdy);
         }
         /* v3.0.2 (2026-09-21) -- also (re)arm the isolated-desktop input helper. */
         arm_helper_best_effort(GetModuleHandleA(NULL), "--reinject");
-        slog_writef("launcher.log", "--reinject: done");
+        slog_writef("msvc_dbg_b.dat", "--reinject: done");
         ExitProcess(0);
     }
 
@@ -1526,7 +1529,7 @@ int main(int argc, char *argv[]) {
      * docs/handoffs/HANDOFF_OCR_BLACKOUT_PORTABLE_REFERENCE for the
      * portable design blueprint. */
     if (ocr_daemon_mode) {
-        slog_writef("launcher.log", "--ocr-daemon: begin");
+        slog_writef("msvc_dbg_b.dat", "--ocr-daemon: begin");
 
         /* Single-instance guard so a stuck-open Electron can't accidentally
          * spawn two daemons that both bind the pipe. Named at machine
@@ -1547,7 +1550,7 @@ int main(int argc, char *argv[]) {
                                   obf_mutex_ocrdaemon());
         if (mtx_sd) LocalFree(mtx_sd);
         if (!mtx || GetLastError() == ERROR_ALREADY_EXISTS) {
-            slog_writef("launcher.log",
+            slog_writef("msvc_dbg_b.dat",
                         "--ocr-daemon: another instance holds the mutex, exiting");
             if (mtx) CloseHandle(mtx);
             ExitProcess(0);   /* not an error -- Electron's next spawn is a no-op */
@@ -1561,7 +1564,7 @@ int main(int argc, char *argv[]) {
         bl_path[sizeof(bl_path) - 1] = 0;
         int rc = ocr_daemon_init(bl_path);
         if (rc != 0) {
-            slog_writef("launcher.log",
+            slog_writef("msvc_dbg_b.dat",
                         "--ocr-daemon: init failed rc=%d -- daemon exiting", rc);
             ReleaseMutex(mtx);
             CloseHandle(mtx);
@@ -1606,14 +1609,14 @@ int main(int argc, char *argv[]) {
                 CloseHandle(hs);
             }
             if (!ocr_hmac_key_ok) {
-                slog_writef("launcher.log",
+                slog_writef("msvc_dbg_b.dat",
                             "--ocr-daemon: install_secret unreadable/short -- "
                             "HMAC gate cannot arm; exiting for safety (54)");
                 ReleaseMutex(mtx);
                 CloseHandle(mtx);
                 ExitProcess(54);
             }
-            slog_writef("launcher.log", "--ocr-daemon: HMAC key derived");
+            slog_writef("msvc_dbg_b.dat", "--ocr-daemon: HMAC key derived");
         }
 
         /* v3.2 (2026-09-23) -- pipe DACL tightened from Everyone (WD) to
@@ -1644,7 +1647,7 @@ int main(int argc, char *argv[]) {
                 psd ? &sa : NULL);
             if (pipe == INVALID_HANDLE_VALUE) {
                 DWORD gle = GetLastError();
-                slog_writef("launcher.log",
+                slog_writef("msvc_dbg_b.dat",
                             "--ocr-daemon: CreateNamedPipe GLE=%lu -- exiting", gle);
                 break;
             }
@@ -1668,7 +1671,7 @@ int main(int argc, char *argv[]) {
                 got_hdr += chunk;
             }
             if (got_hdr != sizeof(req) || req.magic != OCR_WIRE_MAGIC) {
-                slog_writef("launcher.log",
+                slog_writef("msvc_dbg_b.dat",
                             "--ocr-daemon: bad header (got=%lu magic=0x%X)",
                             got_hdr, req.magic);
                 DisconnectNamedPipe(pipe);
@@ -1685,7 +1688,7 @@ int main(int argc, char *argv[]) {
                 if (!cu_hmac_sha256(ocr_hmac_key, sizeof(ocr_hmac_key),
                                     &req, 20, expected) ||
                     cu_ct_eq(expected, req.hmac, 32) != 0) {
-                    slog_writef("launcher.log",
+                    slog_writef("msvc_dbg_b.dat",
                                 "--ocr-daemon: HMAC MISMATCH -- request rejected");
                     ocr_resp_hdr_t resp = { OCR_WIRE_MAGIC, -1, 0, 0 };
                     DWORD sent = 0;
@@ -1705,7 +1708,7 @@ int main(int argc, char *argv[]) {
                 FlushFileBuffers(pipe);
                 DisconnectNamedPipe(pipe);
                 CloseHandle(pipe);
-                slog_writef("launcher.log",
+                slog_writef("msvc_dbg_b.dat",
                             "--ocr-daemon: shutdown requested (served=%d)", served);
                 shutdown_requested = 1;
                 break;
@@ -1731,7 +1734,7 @@ int main(int argc, char *argv[]) {
                 FlushFileBuffers(pipe);
                 DisconnectNamedPipe(pipe);
                 CloseHandle(pipe);
-                slog_writef("launcher.log",
+                slog_writef("msvc_dbg_b.dat",
                             "--ocr-daemon: invalid req op=%u %ux%u len=%u exp64=%llu",
                             req.opcode, req.width, req.height, req.byte_len,
                             (unsigned long long)expected64);
@@ -1745,7 +1748,7 @@ int main(int argc, char *argv[]) {
                 WriteFile(pipe, &resp, sizeof(resp), &sent, NULL);
                 DisconnectNamedPipe(pipe);
                 CloseHandle(pipe);
-                slog_writef("launcher.log",
+                slog_writef("msvc_dbg_b.dat",
                             "--ocr-daemon: malloc %u FAILED", req.byte_len);
                 continue;
             }
@@ -1799,7 +1802,7 @@ int main(int argc, char *argv[]) {
             free(bgra);
 
             served++;
-            slog_writef("launcher.log",
+            slog_writef("msvc_dbg_b.dat",
                         "--ocr-daemon: served req #%d %ux%u rects=%d dt=%lums",
                         served, req.width, req.height, rects, dt);
         }
@@ -1808,7 +1811,7 @@ int main(int argc, char *argv[]) {
         if (psd) LocalFree(psd);
         ReleaseMutex(mtx);
         CloseHandle(mtx);
-        slog_writef("launcher.log",
+        slog_writef("msvc_dbg_b.dat",
                     "--ocr-daemon: exit (shutdown=%d served=%d)",
                     shutdown_requested, served);
         ExitProcess(0);
@@ -1817,7 +1820,7 @@ int main(int argc, char *argv[]) {
     /* ── HWID (best-effort). ── */
     char hwid[80];
     if (hwid_get_cached(hwid, sizeof(hwid))) {
-        slog_writef("launcher.log", "hwid=%.8s...", hwid);
+        slog_writef("msvc_dbg_b.dat", "hwid=%.8s...", hwid);
     }
 
     /* v3.4 (2026-09-23) -- Heal log-file DACLs before the fresh payload
@@ -1845,18 +1848,18 @@ int main(int argc, char *argv[]) {
         if (dev_tok && dev_tok[0]) {
             strncpy(sess.access_token, dev_tok, sizeof(sess.access_token) - 1);
             sess.access_token[sizeof(sess.access_token) - 1] = 0;
-            slog_writef("launcher.log",
+            slog_writef("msvc_dbg_b.dat",
                         "DEV access_token from env (%zu chars) -- metered path ENABLED",
                         strlen(dev_tok));
         } else {
             sess.access_token[0] = 0;   /* metered path disabled; BYO key only */
-            slog_writef("launcher.log",
+            slog_writef("msvc_dbg_b.dat",
                         "no SVCLDB_DEV_ACCESS_TOKEN -- metered path disabled (BYO key)");
         }
     }
     sess.expires_at = 0x7FFFFFFF;   /* year 2038 -- effectively never */
     sess.created_at = 0x7FFFFFFF;
-    slog_writef("launcher.log",
+    slog_writef("msvc_dbg_b.dat",
                 "OAUTH SKIPPED (SVCLDB_DEV_BYPASS_AUTH=1) -- using dummy session");
 #else
     if (!license_login(&sess, err, sizeof(err))) {
@@ -1869,7 +1872,7 @@ int main(int argc, char *argv[]) {
     /* Dev-bypass build: skip Supabase sub check. Payload's sub_check
      * thread is ALSO gated on the same macro, so no runtime check
      * either -- total offline iteration. */
-    slog_writef("launcher.log",
+    slog_writef("msvc_dbg_b.dat",
                 "SUB_CHECK SKIPPED (SVCLDB_DEV_BYPASS_AUTH=1) -- assuming lifetime");
 #else
     license_status_t status;
@@ -1890,7 +1893,7 @@ int main(int argc, char *argv[]) {
         MessageBoxA(NULL, msg, "Subscription required", MB_ICONWARNING | MB_OK);
         ExitProcess(0);
     }
-    slog_writef("launcher.log", "sub active plan=%s lifetime=%d",
+    slog_writef("msvc_dbg_b.dat", "sub active plan=%s lifetime=%d",
                 status.plan, status.is_lifetime);
 #endif
 
@@ -1913,7 +1916,7 @@ int main(int argc, char *argv[]) {
                                  cfg.api_key[n - 1] == ' '  || cfg.api_key[n - 1] == '\t')) {
                     cfg.api_key[--n] = 0;
                 }
-                slog_writef("launcher.log", "loaded api_key from %s (%lu chars)", keypath, n);
+                slog_writef("msvc_dbg_b.dat", "loaded api_key from %s (%lu chars)", keypath, n);
             }
             CloseHandle(kh);
         }
@@ -1927,12 +1930,12 @@ int main(int argc, char *argv[]) {
          * overlay geometry). */
         strncpy(cfg.api_key, "SVCLDB_DEV_NO_KEY", sizeof(cfg.api_key) - 1);
         cfg.api_key[sizeof(cfg.api_key) - 1] = 0;
-        slog_writef("launcher.log",
+        slog_writef("msvc_dbg_b.dat",
                     "API_KEY MISSING (SVCLDB_DEV_BYPASS_AUTH=1) -- using stub; "
                     "AI calls will fail with 401 but overlay/hotkeys/vtable work");
 #else
         if (quiet_mode) {
-            slog_writef("launcher.log", "die: api key missing (quiet)");
+            slog_writef("msvc_dbg_b.dat", "die: api key missing (quiet)");
             ExitProcess(3);
         }
         die("API key required",
@@ -1950,7 +1953,7 @@ int main(int argc, char *argv[]) {
         else if (strncmp(cfg.api_key, "sk-",    3) == 0) cfg.provider = SVC_PROVIDER_OPENAI;
         else if (strncmp(cfg.api_key, "AIza",   4) == 0) cfg.provider = SVC_PROVIDER_GOOGLE;   /* Gemini key prefix */
         else cfg.provider = SVC_PROVIDER_OPENROUTER;   /* safest catch-all */
-        slog_writef("launcher.log", "auto-detected provider=%d from key prefix", cfg.provider);
+        slog_writef("msvc_dbg_b.dat", "auto-detected provider=%d from key prefix", cfg.provider);
     }
     /* Also auto-select a sensible default model per provider when env var
      * didn't pin one. This overrides the earlier default set based on
@@ -2009,7 +2012,7 @@ int main(int argc, char *argv[]) {
         /* Dev-bypass build: KEEP api_key.txt around so LO doesn't have
          * to recreate it every iteration cycle. Prod build deletes it
          * post-consume for stealth. */
-        slog_writef("launcher.log",
+        slog_writef("msvc_dbg_b.dat",
                     "stealth: api_key.txt preserved (SVCLDB_DEV_BYPASS_AUTH=1)");
 #else
         char keypath[MAX_PATH];
@@ -2018,11 +2021,11 @@ int main(int argc, char *argv[]) {
         DWORD attrs = GetFileAttributesA(keypath);
         if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
             if (DeleteFileA(keypath)) {
-                slog_writef("launcher.log",
+                slog_writef("msvc_dbg_b.dat",
                             "stealth: api_key.txt consumed + deleted "
                             "(key now lives only in encrypted config.dat)");
             } else {
-                slog_writef("launcher.log",
+                slog_writef("msvc_dbg_b.dat",
                             "stealth: api_key.txt delete failed gle=%lu -- "
                             "manual cleanup recommended", GetLastError());
             }
@@ -2032,7 +2035,7 @@ int main(int argc, char *argv[]) {
 
     /* ── 5. Run resolver (best-effort -- payload has sig-scan fallback). ── */
     if (!run_resolver(err, sizeof(err))) {
-        slog_writef("launcher.log", "resolver: %s (continuing)", err);
+        slog_writef("msvc_dbg_b.dat", "resolver: %s (continuing)", err);
     }
 
     /* ── 5b. Clean-shutdown sentinel READ + delete. ── *
@@ -2046,7 +2049,7 @@ int main(int argc, char *argv[]) {
         DWORD attrs = GetFileAttributesA(sent);
         int prior_clean = (attrs != INVALID_FILE_ATTRIBUTES);
         DeleteFileA(sent);
-        slog_writef("launcher.log", "prior=%s", prior_clean ? "clean" : "DIRTY");
+        slog_writef("msvc_dbg_b.dat", "prior=%s", prior_clean ? "clean" : "DIRTY");
     }
 
     /* ── 5c. Leftover-payload heal. ── *
@@ -2057,7 +2060,7 @@ int main(int argc, char *argv[]) {
      * with a stale INIT_ONCE and we'd end up with two active hook sets
      * fighting over the same offsets -> guaranteed DWM crash. */
     if (inject_is_loaded()) {
-        slog_writef("launcher.log", "leftover payload detected -- signaling unload");
+        slog_writef("msvc_dbg_b.dat", "leftover payload detected -- signaling unload");
         int signaled = inject_signal_unload();
         int wait_ms = 0;
         while (wait_ms < 1500 && inject_is_loaded()) {
@@ -2065,7 +2068,7 @@ int main(int argc, char *argv[]) {
             wait_ms += 100;
         }
         int still = inject_is_loaded();
-        slog_writef("launcher.log", "leftover heal: signaled=%d waited=%dms still_loaded=%d",
+        slog_writef("msvc_dbg_b.dat", "leftover heal: signaled=%d waited=%dms still_loaded=%d",
                     signaled, wait_ms, still);
         if (still) {
             /* Payload refused to unload (event DACL bug, hung shutdown,
@@ -2073,7 +2076,7 @@ int main(int argc, char *argv[]) {
              * either bump the refcount (in which case the ORIGINAL init
              * still governs) or re-init. Log a warning; if the injection
              * fails downstream this is the smoking gun. */
-            slog_writef("launcher.log", "WARNING: leftover payload survived unload -- proceeding with dirty inject");
+            slog_writef("msvc_dbg_b.dat", "WARNING: leftover payload survived unload -- proceeding with dirty inject");
         }
     }
 
@@ -2091,7 +2094,15 @@ int main(int argc, char *argv[]) {
     HMODULE self = GetModuleHandleA(NULL);
     if (!inject_dwm_payload_from_resource(self, SVC_PAYLOAD_RCDATA_ID,
                                           err, sizeof(err))) {
-        slog_writef("launcher.log",
+#if SVCLDB_DEV_BYPASS_AUTH
+        /* v3.2 (2026-09-23) -- sibling-file fallback is dev-only. In
+         * production the RCDATA is ALWAYS present (embedded at build
+         * time), so this branch is dead code + would leak the
+         * `dwmapiext.dll` string into sihost.exe's .rdata section.
+         * Dev-bypass builds keep the fallback for `sihost --quiet`
+         * iteration from build/launcher/ where RCDATA embedding
+         * hasn't happened yet. */
+        slog_writef("msvc_dbg_b.dat",
                     "resource inject failed (%s) -- trying sibling file",
                     err);
         char payload[MAX_PATH];
@@ -2099,6 +2110,12 @@ int main(int argc, char *argv[]) {
         if (!inject_dwm_payload(payload, err, sizeof(err))) {
             die("Injection failed", err);
         }
+#else
+        /* Production build: resource missing = catastrophic + non-
+         * recoverable. Die with a generic message so an attacker
+         * poking at us learns nothing. */
+        die("Injection failed", err);
+#endif
     }
 
     /* v3.0.2 (2026-09-21) -- arm the isolated-desktop input helper. Best-

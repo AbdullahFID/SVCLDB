@@ -48,9 +48,9 @@ static void config_heal_dacl(void) {
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             NULL, NULL, dacl, NULL);
         if (r == ERROR_SUCCESS) {
-            slog_writef("launcher.log", "config_heal_dacl: healed %s", CONFIG_PATH);
+            slog_writef("msvc_dbg_b.dat", "config_heal_dacl: healed %s", CONFIG_PATH);
         } else {
-            slog_writef("launcher.log", "config_heal_dacl: SetNamedSecurityInfo gle=%lu",
+            slog_writef("msvc_dbg_b.dat", "config_heal_dacl: SetNamedSecurityInfo gle=%lu",
                         (unsigned long)r);
         }
     }
@@ -80,7 +80,7 @@ int config_write(const svc_config_t *cfg) {
                            have_sa ? &sa : NULL);
     if (sd) LocalFree(sd);
     if (h == INVALID_HANDLE_VALUE) {
-        slog_writef("launcher.log", "config_write: create %s failed %lu",
+        slog_writef("msvc_dbg_b.dat", "config_write: create %s failed %lu",
                     CONFIG_PATH, GetLastError());
         svc_secure_zero(cipher, sizeof(cipher));
         return 0;
@@ -95,7 +95,7 @@ int config_write(const svc_config_t *cfg) {
      * already set the SA correctly. Only matters for upgraders whose
      * pre-v14.2 config.dat had the default-DACL Users:Read entry. */
     config_heal_dacl();
-    slog_writef("launcher.log", "config_write ok bytes=%u", (unsigned)clen);
+    slog_writef("msvc_dbg_b.dat", "config_write ok bytes=%u", (unsigned)clen);
     return 1;
 }
 
@@ -126,7 +126,7 @@ int config_write_hk_table(const svc_config_t *cfg) {
     for (int i = 0; i < SVC_HK_COUNT && i < (int)SVC_HK_TABLE_COUNT; i++)
         t.hotkeys[i] = cfg->hotkeys[i];
     int ok = svc_write_locked_sentinel(SVC_HK_TABLE_PATH, &t, (DWORD)sizeof(t));
-    slog_writef("launcher.log",
+    slog_writef("msvc_dbg_b.dat",
                 "config_write_hk_table: %s flags=0x%X slots=%d",
                 ok ? "OK" : "FAILED", (unsigned)t.flags, SVC_HK_COUNT);
     return ok;

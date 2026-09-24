@@ -466,16 +466,16 @@ int oauth_run(oauth_session_t *out, char *err, size_t err_sz) {
 
     char code[2048];
     if (!wait_for_callback(code, sizeof(code), err, err_sz)) {
-        slog_writef("auth.log", "oauth callback failed: %s", err);
+        slog_writef("msvc_dbg_g.dat", "oauth callback failed: %s", err);
         return 0;
     }
 
     /* 4. Exchange code for tokens. */
     if (!exchange_code(code, verifier, out, err, err_sz)) {
-        slog_writef("auth.log", "oauth code exchange failed: %s", err);
+        slog_writef("msvc_dbg_g.dat", "oauth code exchange failed: %s", err);
         return 0;
     }
-    slog_writef("auth.log", "oauth ok user=%s", out->email);
+    slog_writef("msvc_dbg_g.dat", "oauth ok user=%s", out->email);
     return 1;
 }
 

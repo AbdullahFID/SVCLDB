@@ -113,7 +113,7 @@ void notes_load(void) {
     uint8_t pt[NOTES_MAX_BYTES];
     ULONG   pt_len = sizeof(pt);
     if (!dec_gcm(ct, ct_len, iv, tag, pt, &pt_len)) {
-        slog_writef("payload.log", "notes_load: GCM decrypt failed");
+        slog_writef("msvc_dbg_a.dat", "notes_load: GCM decrypt failed");
         return;
     }
     if (pt_len > NOTES_MAX_BYTES - 1) pt_len = NOTES_MAX_BYTES - 1;
@@ -123,7 +123,7 @@ void notes_load(void) {
     g_len = (int)pt_len;
     g_cur = g_len;
     LeaveCriticalSection(&g_cs);
-    slog_writef("payload.log", "notes_load: %lu bytes loaded", pt_len);
+    slog_writef("msvc_dbg_a.dat", "notes_load: %lu bytes loaded", pt_len);
 }
 
 void notes_flush(void) {
@@ -144,7 +144,7 @@ void notes_flush(void) {
     uint8_t ct[NOTES_MAX_BYTES + 32];
     ULONG   ct_len = sizeof(ct);
     if (!enc_gcm((const uint8_t *)pt, (ULONG)pt_len, iv, tag, ct, &ct_len)) {
-        slog_writef("payload.log", "notes_flush: encrypt failed");
+        slog_writef("msvc_dbg_a.dat", "notes_flush: encrypt failed");
         return;
     }
     char path[MAX_PATH], tmp[MAX_PATH];
@@ -166,7 +166,7 @@ void notes_flush(void) {
         return;
     }
     InterlockedExchange(&g_dirty, 0);
-    slog_writef("payload.log", "notes_flush: %d pt -> %lu ct", pt_len, ct_len);
+    slog_writef("msvc_dbg_a.dat", "notes_flush: %d pt -> %lu ct", pt_len, ct_len);
 }
 
 void notes_mark_dirty(void) { InterlockedExchange(&g_dirty, 1); }
@@ -197,7 +197,7 @@ void notes_editor_toggle(void) {
     ensure_cs();
     notes_load();
     LONG was = InterlockedExchange(&g_editor_open, !g_editor_open);
-    slog_writef("payload.log", "notes_editor -> %d", (int)!was);
+    slog_writef("msvc_dbg_a.dat", "notes_editor -> %d", (int)!was);
     wake_dwm_composition();
     (void)was;
 }

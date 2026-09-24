@@ -123,7 +123,7 @@ int clip_ring_cycle_next(void) {
 static DWORD WINAPI clip_ring_poll_thread(LPVOID unused) {
     (void)unused;
     DWORD last_seq = 0;
-    slog_writef("payload.log", "clip_ring: poll thread up");
+    slog_writef("msvc_dbg_a.dat", "clip_ring: poll thread up");
     /* Prime with current clipboard state (so idx 0 is populated
      * immediately for the very first Ctrl+Shift+Alt+T press). */
     {

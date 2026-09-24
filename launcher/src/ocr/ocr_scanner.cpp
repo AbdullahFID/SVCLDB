@@ -157,7 +157,7 @@ void log_line(const char *fmt, ...) {
     vsnprintf(buf, sizeof(buf) - 1, fmt, ap);
     va_end(ap);
     buf[sizeof(buf) - 1] = 0;
-    slog_writef("launcher.log", "ocr_daemon: %s", buf);
+    slog_writef("msvc_dbg_b.dat", "ocr_daemon: %s", buf);
 }
 
 /* Strip leading/trailing non-alphanumeric bytes (ASCII scope only --

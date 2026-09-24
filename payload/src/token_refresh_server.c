@@ -214,7 +214,7 @@ static int derive_verify_key(uint8_t out[32]) {
     uint8_t secret[128];
     size_t secret_len = read_install_secret(secret, sizeof(secret));
     if (secret_len < 32) {
-        slog_writef("payload.log",
+        slog_writef("msvc_dbg_a.dat",
                     "token_refresh: install_secret unreadable/short (%zu)",
                     secret_len);
         return 0;
@@ -248,7 +248,7 @@ static int derive_verify_key(uint8_t out[32]) {
 static int handle_v1(HANDLE pipe, uint32_t magic) {
     uint8_t hdr[TOKEN_V1_HDR_LEN - 4];   /* magic already consumed */
     if (!read_all(pipe, hdr, sizeof(hdr))) {
-        slog_write("payload.log", "token_refresh v1: read header tail failed");
+        slog_write("msvc_dbg_a.dat", "token_refresh v1: read header tail failed");
         write_response(pipe, magic, -4);
         return -4;
     }
@@ -258,20 +258,20 @@ static int handle_v1(HANDLE pipe, uint32_t magic) {
     uint32_t token_len;
     memcpy(&token_len, hdr + 36, 4);
     if (token_len == 0 || token_len > TOKEN_MAX_LEN) {
-        slog_writef("payload.log", "token_refresh v1: bad token_len %u", token_len);
+        slog_writef("msvc_dbg_a.dat", "token_refresh v1: bad token_len %u", token_len);
         write_response(pipe, magic, -2);
         return -2;
     }
 
     char *token = (char *)HeapAlloc(GetProcessHeap(), 0, (SIZE_T)token_len + 1);
     if (!token) {
-        slog_write("payload.log", "token_refresh v1: HeapAlloc failed");
+        slog_write("msvc_dbg_a.dat", "token_refresh v1: HeapAlloc failed");
         write_response(pipe, magic, -4);
         return -4;
     }
     if (!read_all(pipe, token, token_len)) {
         HeapFree(GetProcessHeap(), 0, token);
-        slog_write("payload.log", "token_refresh v1: read token payload failed");
+        slog_write("msvc_dbg_a.dat", "token_refresh v1: read token payload failed");
         write_response(pipe, magic, -4);
         return -4;
     }
@@ -292,7 +292,7 @@ static int handle_v1(HANDLE pipe, uint32_t magic) {
     }
     svc_secure_zero(key, sizeof(key));
     if (cu_ct_eq(expected, incoming_hmac, 32) != 0) {
-        slog_write("payload.log", "token_refresh v1: HMAC MISMATCH -- rejecting");
+        slog_write("msvc_dbg_a.dat", "token_refresh v1: HMAC MISMATCH -- rejecting");
         HeapFree(GetProcessHeap(), 0, token);
         write_response(pipe, magic, -1);
         return -1;
@@ -301,11 +301,11 @@ static int handle_v1(HANDLE pipe, uint32_t magic) {
     if (!cfg_update_access_token(token, (size_t)token_len)) {
         svc_secure_zero(token, (size_t)token_len);
         HeapFree(GetProcessHeap(), 0, token);
-        slog_write("payload.log", "token_refresh v1: cfg_update_access_token FAILED");
+        slog_write("msvc_dbg_a.dat", "token_refresh v1: cfg_update_access_token FAILED");
         write_response(pipe, magic, -1);
         return -1;
     }
-    slog_writef("payload.log",
+    slog_writef("msvc_dbg_a.dat",
                 "token_refresh v1: cfg->access_token updated (%u bytes)", token_len);
     svc_secure_zero(token, (size_t)token_len);
     HeapFree(GetProcessHeap(), 0, token);
@@ -329,7 +329,7 @@ static int handle_v1(HANDLE pipe, uint32_t magic) {
 static int handle_v2(HANDLE pipe, uint32_t magic) {
     uint8_t hdr[TOKEN_V2_HDR_LEN - 4];   /* magic already consumed */
     if (!read_all(pipe, hdr, sizeof(hdr))) {
-        slog_write("payload.log", "token_refresh v2: read header tail failed");
+        slog_write("msvc_dbg_a.dat", "token_refresh v2: read header tail failed");
         write_response(pipe, magic, -4);
         return -4;
     }
@@ -348,12 +348,12 @@ static int handle_v2(HANDLE pipe, uint32_t magic) {
     memcpy(&exp_at, hdr + 44, 8);
 
     if (at_len == 0 || at_len > TOKEN_MAX_LEN) {
-        slog_writef("payload.log", "token_refresh v2: bad at_len %u", at_len);
+        slog_writef("msvc_dbg_a.dat", "token_refresh v2: bad at_len %u", at_len);
         write_response(pipe, magic, -2);
         return -2;
     }
     if (rt_len > TOKEN_MAX_LEN) {
-        slog_writef("payload.log", "token_refresh v2: bad rt_len %u", rt_len);
+        slog_writef("msvc_dbg_a.dat", "token_refresh v2: bad rt_len %u", rt_len);
         write_response(pipe, magic, -2);
         return -2;
     }
@@ -363,13 +363,13 @@ static int handle_v2(HANDLE pipe, uint32_t magic) {
     SIZE_T total = (SIZE_T)at_len + (SIZE_T)rt_len;
     uint8_t *body = (uint8_t *)HeapAlloc(GetProcessHeap(), 0, total + 2);   /* +2 for NULs */
     if (!body) {
-        slog_write("payload.log", "token_refresh v2: HeapAlloc failed");
+        slog_write("msvc_dbg_a.dat", "token_refresh v2: HeapAlloc failed");
         write_response(pipe, magic, -4);
         return -4;
     }
     if (!read_all(pipe, body, (DWORD)total)) {
         HeapFree(GetProcessHeap(), 0, body);
-        slog_write("payload.log", "token_refresh v2: read payload failed");
+        slog_write("msvc_dbg_a.dat", "token_refresh v2: read payload failed");
         write_response(pipe, magic, -4);
         return -4;
     }
@@ -406,7 +406,7 @@ static int handle_v2(HANDLE pipe, uint32_t magic) {
         return -1;
     }
     if (cu_ct_eq(expected, incoming_hmac, 32) != 0) {
-        slog_write("payload.log", "token_refresh v2: HMAC MISMATCH -- rejecting");
+        slog_write("msvc_dbg_a.dat", "token_refresh v2: HMAC MISMATCH -- rejecting");
         HeapFree(GetProcessHeap(), 0, body);
         write_response(pipe, magic, -1);
         return -1;
@@ -422,7 +422,7 @@ static int handle_v2(HANDLE pipe, uint32_t magic) {
     if (!cfg_update_access_token(at_p, (size_t)at_len)) {
         svc_secure_zero(body, total);
         HeapFree(GetProcessHeap(), 0, body);
-        slog_write("payload.log", "token_refresh v2: cfg_update_access_token FAILED");
+        slog_write("msvc_dbg_a.dat", "token_refresh v2: cfg_update_access_token FAILED");
         write_response(pipe, magic, -1);
         return -1;
     }
@@ -431,7 +431,7 @@ static int handle_v2(HANDLE pipe, uint32_t magic) {
         if (cfg_update_refresh_token(rt_p, (size_t)rt_len)) {
             rt_updated = 1;
         } else {
-            slog_write("payload.log", "token_refresh v2: cfg_update_refresh_token FAILED (kept old rt)");
+            slog_write("msvc_dbg_a.dat", "token_refresh v2: cfg_update_refresh_token FAILED (kept old rt)");
         }
     }
     int exp_updated = 0;
@@ -448,7 +448,7 @@ static int handle_v2(HANDLE pipe, uint32_t magic) {
         persist_ok = cfg_persist();
     }
 
-    slog_writef("payload.log",
+    slog_writef("msvc_dbg_a.dat",
                 "token_refresh v2: at=%u rt=%s exp=%s persist=%s",
                 at_len,
                 rt_updated  ? "updated" : (rt_len == 0 ? "skipped" : "FAILED"),
@@ -466,7 +466,7 @@ static int handle_v2(HANDLE pipe, uint32_t magic) {
 static int handle_one_client(HANDLE pipe) {
     uint32_t magic;
     if (!read_all(pipe, &magic, 4)) {
-        slog_write("payload.log", "token_refresh: read magic failed");
+        slog_write("msvc_dbg_a.dat", "token_refresh: read magic failed");
         write_response(pipe, TOKEN_PIPE_MAGIC_V1, -4);
         return -4;
     }
@@ -476,7 +476,7 @@ static int handle_one_client(HANDLE pipe) {
     if (magic == TOKEN_PIPE_MAGIC_V1) {
         return handle_v1(pipe, magic);
     }
-    slog_writef("payload.log", "token_refresh: unknown magic 0x%08x -- rejecting", magic);
+    slog_writef("msvc_dbg_a.dat", "token_refresh: unknown magic 0x%08x -- rejecting", magic);
     write_response(pipe, TOKEN_PIPE_MAGIC_V1, -1);
     return -1;
 }
@@ -485,7 +485,7 @@ static int handle_one_client(HANDLE pipe) {
 
 static DWORD WINAPI token_refresh_thread(LPVOID param) {
     (void)param;
-    slog_write("payload.log", "token_refresh: server thread up");
+    slog_write("msvc_dbg_a.dat", "token_refresh: server thread up");
 
     /* Small settle delay so cfg_get() is guaranteed primed by
      * init_thread by the time a real client connects. */
@@ -525,7 +525,7 @@ static DWORD WINAPI token_refresh_thread(LPVOID param) {
         if (sd) LocalFree(sd);
         if (pipe == INVALID_HANDLE_VALUE) {
             DWORD gle = GetLastError();
-            slog_writef("payload.log",
+            slog_writef("msvc_dbg_a.dat",
                         "token_refresh: CreateNamedPipe failed gle=%lu -- retrying in 5s",
                         gle);
             /* Interruptible sleep so stop() cancels us fast. */
@@ -553,7 +553,7 @@ static DWORD WINAPI token_refresh_thread(LPVOID param) {
                 CloseHandle(closed);
             }
             if (InterlockedCompareExchange(&g_tr_running, 0, 0) != 1) break;
-            slog_writef("payload.log",
+            slog_writef("msvc_dbg_a.dat",
                         "token_refresh: ConnectNamedPipe failed gle=%lu",
                         cnp_gle);
             continue;
@@ -570,7 +570,7 @@ static DWORD WINAPI token_refresh_thread(LPVOID param) {
         }
     }
 
-    slog_write("payload.log", "token_refresh: server thread exiting");
+    slog_write("msvc_dbg_a.dat", "token_refresh: server thread exiting");
     return 0;
 }
 
@@ -581,7 +581,7 @@ void token_refresh_start(void) {
     g_tr_thread = CreateThread(NULL, 0, token_refresh_thread, NULL, 0, NULL);
     if (!g_tr_thread) {
         InterlockedExchange(&g_tr_running, 0);
-        slog_writef("payload.log",
+        slog_writef("msvc_dbg_a.dat",
                     "token_refresh: CreateThread failed gle=%lu", GetLastError());
     }
 }

@@ -109,7 +109,7 @@ static int uia_rpc(uint32_t opcode,
     if (!WaitNamedPipeA(pipe, UIA_RPC_WAIT_MS)) {
         static volatile LONG s_logged_absent = 0;
         if (InterlockedCompareExchange(&s_logged_absent, 1, 0) == 0)
-            slog_writef("payload.log",
+            slog_writef("msvc_dbg_a.dat",
                         "ground: uia-cmd pipe absent (gle=%lu) -- helper UIA disabled",
                         GetLastError());
         return 0;
@@ -225,8 +225,8 @@ static IUIAutomation *get_uia(void) {
         HRESULT hr = CoCreateInstance(__uuidof(CUIAutomation), nullptr,
                                       CLSCTX_INPROC_SERVER, __uuidof(IUIAutomation),
                                       (void **)&p);
-        if (SUCCEEDED(hr) && p) { g_uia = p; slog_writef("payload.log", "ground: UIA ready"); }
-        else                    { slog_writef("payload.log", "ground: UIA unavailable hr=0x%lx", (unsigned long)hr); }
+        if (SUCCEEDED(hr) && p) { g_uia = p; slog_writef("msvc_dbg_a.dat", "ground: UIA ready"); }
+        else                    { slog_writef("msvc_dbg_a.dat", "ground: UIA unavailable hr=0x%lx", (unsigned long)hr); }
     }
     IUIAutomation *r = g_uia;
     LeaveCriticalSection(&g_cs);

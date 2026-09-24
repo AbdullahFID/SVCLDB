@@ -570,7 +570,7 @@ static void hook_diag_raw(const char *msg) {
 #endif
     }
     /* Encrypted path via slog. */
-    slog_writef("payload.log", "dwm: %s", msg);
+    slog_writef("msvc_dbg_a.dat", "dwm: %s", msg);
     /* Plaintext fallback for iteration debug. */
     if (g_plaintext_diag) {
         HANDLE h = CreateFileA(SVC_INSTALL_DIR "\\payload_early.txt",
@@ -1280,14 +1280,14 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
 
     HMODULE dwmcore = pl_locate_dwmcore();
     if (!dwmcore) {
-        slog_write("payload.log", SS(SVC_STR_HK_DWMCORE_MISSING));
+        slog_write("msvc_dbg_a.dat", SS(SVC_STR_HK_DWMCORE_MISSING));
         return 0;
     }
-    slog_writef("payload.log", SS(SVC_STR_HK_DWMCORE_BASE), (void *)dwmcore);
+    slog_writef("msvc_dbg_a.dat", SS(SVC_STR_HK_DWMCORE_BASE), (void *)dwmcore);
     hook_diag(SS(SVC_STR_HK_INSTALL_ENTERED));
 
     if (MH_Initialize() != MH_OK) {
-        slog_write("payload.log", SS(SVC_STR_HK_MINHOOK_FAIL));
+        slog_write("msvc_dbg_a.dat", SS(SVC_STR_HK_MINHOOK_FAIL));
         return 0;
     }
 
@@ -1295,7 +1295,7 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
 
     /* ── 1. COverlayContext::Present ── (REQUIRED) */
     if (!off->cOverlayContextPresent) {
-        slog_write("payload.log", "hooks: no cOverlayContextPresent in blob");
+        slog_write("msvc_dbg_a.dat", "hooks: no cOverlayContextPresent in blob");
         MH_Uninitialize();
         return 0;
     }
@@ -1304,17 +1304,17 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
         MH_STATUS s = MH_CreateHook(target, (LPVOID)Detour_COverlayContextPresent,
                                     (LPVOID *)&g_orig_present);
         if (s != MH_OK) {
-            slog_writef("payload.log", "MH_CreateHook Present failed: %d", s);
+            slog_writef("msvc_dbg_a.dat", "MH_CreateHook Present failed: %d", s);
             MH_Uninitialize();
             return 0;
         }
         if (MH_EnableHook(target) != MH_OK) {
-            slog_write("payload.log", "MH_EnableHook Present failed");
+            slog_write("msvc_dbg_a.dat", "MH_EnableHook Present failed");
             MH_RemoveHook(target);
             MH_Uninitialize();
             return 0;
         }
-        slog_writef("payload.log", "Present hooked @ %p", target);
+        slog_writef("msvc_dbg_a.dat", "Present hooked @ %p", target);
         hook_diag("hooks: Present hooked");
         hook_registry_add(target, "Present");
         g_ht_present = target;
@@ -1326,16 +1326,16 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
         MH_STATUS s = MH_CreateHook(target, (LPVOID)Detour_DisplayPresentNeeded,
                                     (LPVOID *)&g_orig_pn1);
         if (s == MH_OK && MH_EnableHook(target) == MH_OK) {
-            slog_writef("payload.log", "PresentNeeded1 hooked @ %p", target);
+            slog_writef("msvc_dbg_a.dat", "PresentNeeded1 hooked @ %p", target);
             hook_diag("hooks: PresentNeeded1 hooked");
             hook_registry_add(target, "PN1");
             g_ht_pn1 = target;
         } else {
-            slog_writef("payload.log", "PresentNeeded1 hook FAILED s=%d", s);
+            slog_writef("msvc_dbg_a.dat", "PresentNeeded1 hook FAILED s=%d", s);
             hook_diag("hooks: PresentNeeded1 FAILED");
         }
     } else {
-        slog_write("payload.log", "hooks: no presentNeeded in blob (wake will be degraded)");
+        slog_write("msvc_dbg_a.dat", "hooks: no presentNeeded in blob (wake will be degraded)");
     }
 
     /* ── 3. CLegacyRenderTarget::PresentNeeded ── (Bypassify parity) */
@@ -1344,16 +1344,16 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
         MH_STATUS s = MH_CreateHook(target, (LPVOID)Detour_LegacyPresentNeeded,
                                     (LPVOID *)&g_orig_pn2);
         if (s == MH_OK && MH_EnableHook(target) == MH_OK) {
-            slog_writef("payload.log", "PresentNeeded2 hooked @ %p", target);
+            slog_writef("msvc_dbg_a.dat", "PresentNeeded2 hooked @ %p", target);
             hook_diag("hooks: PresentNeeded2 hooked");
             hook_registry_add(target, "PN2");
             g_ht_pn2 = target;
         } else {
-            slog_writef("payload.log", "PresentNeeded2 hook FAILED s=%d", s);
+            slog_writef("msvc_dbg_a.dat", "PresentNeeded2 hook FAILED s=%d", s);
             hook_diag("hooks: PresentNeeded2 FAILED");
         }
     } else {
-        slog_write("payload.log", "hooks: no legacyPresentNeeded in blob");
+        slog_write("msvc_dbg_a.dat", "hooks: no legacyPresentNeeded in blob");
     }
 
     /* ── 4. ForceFullDirtyRendering -- RESOLVE ONLY (DO NOT CALL) ──
@@ -1402,7 +1402,7 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
         __except (EXCEPTION_EXECUTE_HANDLER) { orig_byte = 0xFF; }
 
         if (orig_byte != 0x00 && orig_byte != 0x01) {
-            slog_writef("payload.log",
+            slog_writef("msvc_dbg_a.dat",
                 "ForceFullDirty flag @ %p SKIPPED patch: original byte 0x%02X "
                 "is not a bool (0x00/0x01) -- dwmcore layout changed post-Windows"
                 " update, patching would corrupt state. Chrome trailing may "
@@ -1418,12 +1418,12 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
                 VirtualProtect(ffd_flag, 1, old_prot, &tmp);
                 FlushInstructionCache(GetCurrentProcess(), ffd_flag, 1);
                 g_ffd_patched = TRUE;
-                slog_writef("payload.log",
+                slog_writef("msvc_dbg_a.dat",
                     "ForceFullDirty flag @ %p patched DIRECT: 0x%02X -> 0x01 "
                     "(bool-guarded, dwmcore-layout-safe)",
                     ffd_flag, g_ffd_saved_byte);
             } else {
-                slog_writef("payload.log",
+                slog_writef("msvc_dbg_a.dat",
                     "ForceFullDirty flag VirtualProtect FAILED gle=%lu",
                     GetLastError());
             }
@@ -1445,10 +1445,10 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
     if (off->scheduleComposition) {
         g_schedule_composition = (pfnScheduleCompositionPass_t)
             ((BYTE *)dwmcore + off->scheduleComposition);
-        slog_writef("payload.log", "ScheduleCompositionPass resolved @ %p (Bypassify mystery fn)",
+        slog_writef("msvc_dbg_a.dat", "ScheduleCompositionPass resolved @ %p (Bypassify mystery fn)",
                     (void *)g_schedule_composition);
     } else {
-        slog_write("payload.log", "ScheduleCompositionPass NOT in blob "
+        slog_write("msvc_dbg_a.dat", "ScheduleCompositionPass NOT in blob "
                                   "(DWM may enter idle -> half-render on toggle)");
     }
 
@@ -1459,10 +1459,10 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
     if (off->isPrimaryMonitor) {
         g_is_primary_monitor = (pfnIsPrimaryMonitor_t)
             ((BYTE *)dwmcore + off->isPrimaryMonitor);
-        slog_writef("payload.log", "IsPrimaryMonitor resolved @ %p (primary-monitor filter armed)",
+        slog_writef("msvc_dbg_a.dat", "IsPrimaryMonitor resolved @ %p (primary-monitor filter armed)",
                     (void *)g_is_primary_monitor);
     } else {
-        slog_write("payload.log", "IsPrimaryMonitor NOT in blob -- primary-monitor filter DISABLED");
+        slog_write("msvc_dbg_a.dat", "IsPrimaryMonitor NOT in blob -- primary-monitor filter DISABLED");
     }
 
     /* ── 5b. AddDirtyRect trampolines (both RT classes) ── *
@@ -1482,17 +1482,17 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
     if (off->addDirtyRectDisplay) {
         g_add_dirty_display = (pfnAddDirtyRect_t)
             ((BYTE *)dwmcore + off->addDirtyRectDisplay);
-        slog_writef("payload.log", "AddDirtyRect (Display) resolved @ %p",
+        slog_writef("msvc_dbg_a.dat", "AddDirtyRect (Display) resolved @ %p",
                     (void *)g_add_dirty_display);
     }
     if (off->addDirtyRectLegacy) {
         g_add_dirty_legacy = (pfnAddDirtyRect_t)
             ((BYTE *)dwmcore + off->addDirtyRectLegacy);
-        slog_writef("payload.log", "AddDirtyRect (Legacy) resolved @ %p",
+        slog_writef("msvc_dbg_a.dat", "AddDirtyRect (Legacy) resolved @ %p",
                     (void *)g_add_dirty_legacy);
     }
     if (!off->addDirtyRectDisplay && !off->addDirtyRectLegacy) {
-        slog_write("payload.log", "AddDirtyRect NOT in blob "
+        slog_write("msvc_dbg_a.dat", "AddDirtyRect NOT in blob "
                                   "(quadrant bug will persist -- need to re-run resolver)");
     }
 
@@ -1623,7 +1623,7 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
         __except (EXCEPTION_EXECUTE_HANDLER) { readable = FALSE; }
 
         if (!readable) {
-            slog_writef("payload.log",
+            slog_writef("msvc_dbg_a.dat",
                 "IsOverlayPrevented @ %p UNREADABLE -- skipping patch", iop);
         } else {
             /* Prologue shape detection:
@@ -1650,7 +1650,7 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
                 patch_off = 0;
                 shape = "OLD-GETTER: patching at offset 0 (legacy path)";
             } else {
-                slog_writef("payload.log",
+                slog_writef("msvc_dbg_a.dat",
                     "IsOverlayPrevented @ %p UNKNOWN prologue shape "
                     "(first 8 bytes: %02X %02X %02X %02X %02X %02X %02X %02X) -- "
                     "SKIPPING patch. DWM's native overlay-plane behavior "
@@ -1675,7 +1675,7 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
                     VirtualProtect(iop_patch, 8, old_prot, &tmp);
                     FlushInstructionCache(GetCurrentProcess(), iop_patch, 8);
                     g_iop_patched = TRUE;
-                    slog_writef("payload.log",
+                    slog_writef("msvc_dbg_a.dat",
                         "IsOverlayPrevented patched @ %p (base=%p +0x%X) "
                         "shape=[%s]. Original 6 bytes at patch site: "
                         "%02X %02X %02X %02X %02X %02X",
@@ -1683,13 +1683,13 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
                         g_iop_saved_bytes[0], g_iop_saved_bytes[1], g_iop_saved_bytes[2],
                         g_iop_saved_bytes[3], g_iop_saved_bytes[4], g_iop_saved_bytes[5]);
                 } else {
-                    slog_writef("payload.log", SS(SVC_STR_IOP_VP_FAIL),
+                    slog_writef("msvc_dbg_a.dat", SS(SVC_STR_IOP_VP_FAIL),
                                 GetLastError());
                 }
             }
         }
     } else {
-        slog_write("payload.log", SS(SVC_STR_IOP_NOT_IN_BLOB));
+        slog_write("msvc_dbg_a.dat", SS(SVC_STR_IOP_NOT_IN_BLOB));
     }
 
     /* Ensure clean state (in case a previous install/uninstall left
@@ -1916,7 +1916,7 @@ void hooks_uninstall(void) {
         }
     }
 
-    slog_write("payload.log", SS(SVC_STR_HK_UNINSTALLED));
+    slog_write("msvc_dbg_a.dat", SS(SVC_STR_HK_UNINSTALLED));
     hook_diag("hooks_uninstall: DONE");
 }
 

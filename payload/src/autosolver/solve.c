@@ -248,7 +248,7 @@ static DWORD WINAPI solve_thread(LPVOID unused) {
     }
     if (!png || !plen) {
         ui_dot_set_state(UI_DOT_ERROR);
-        slog_writef("payload.log", "solve: capture FAILED");
+        slog_writef("msvc_dbg_a.dat", "solve: capture FAILED");
         InterlockedExchange(&g_solving, 0);
         return 2;
     }
@@ -262,7 +262,7 @@ static DWORD WINAPI solve_thread(LPVOID unused) {
     png = NULL;
     if (!ok_img || !gpng) {
         ui_dot_set_state(UI_DOT_ERROR);
-        slog_writef("payload.log", "solve: imgproc FAILED");
+        slog_writef("msvc_dbg_a.dat", "solve: imgproc FAILED");
         InterlockedExchange(&g_solving, 0);
         return 3;
     }
@@ -317,7 +317,7 @@ static DWORD WINAPI solve_thread(LPVOID unused) {
     if (!got || !reply) {
         ui_dot_set_state(UI_DOT_ERROR);
         ui_dot_set_answer("!", err[0] ? err : "AI request failed");
-        slog_writef("payload.log", "solve: ai FAILED: %s", err);
+        slog_writef("msvc_dbg_a.dat", "solve: ai FAILED: %s", err);
         imgproc_free(gpng);
         if (anchors) ground_free(anchors);
         if (reply) ai_free_reply(reply);
@@ -404,7 +404,7 @@ static DWORD WINAPI solve_thread(LPVOID unused) {
             sv_action_t *a = &acts[i];
             const char *t = a->type;
             if ((strstr(t, "click")) && desc_is_navigation(a->desc)) {
-                slog_writef("payload.log", "solve: dropped nav action '%s'", a->desc);
+                slog_writef("msvc_dbg_a.dat", "solve: dropped nav action '%s'", a->desc);
                 continue;
             }
             if      (!strcmp(t, "click"))        { if (a->has_xy) act_click_image(&ctx, a->x, a->y, 0, 1); }
@@ -427,7 +427,7 @@ static DWORD WINAPI solve_thread(LPVOID unused) {
         ui_dot_set_state(UI_DOT_DONE);  /* display-only */
     }
 
-    slog_writef("payload.log", "solve: done status=%s acts=%d click=%d jump=(%d,%d) conf=%.2f short=\"%.60s\" (%lu ms)",
+    slog_writef("msvc_dbg_a.dat", "solve: done status=%s acts=%d click=%d jump=(%d,%d) conf=%.2f short=\"%.60s\" (%lu ms)",
                 status[0] ? status : "?", nacts, as->auto_click,
                 jump_sx, jump_sy, conf, shortans, GetTickCount() - t0);
 
@@ -438,7 +438,7 @@ static DWORD WINAPI solve_thread(LPVOID unused) {
         _snprintf(excerpt, sizeof(excerpt) - 1, "%.240s", reply ? reply : "");
         excerpt[sizeof(excerpt) - 1] = 0;
         for (char *e = excerpt; *e; e++) if (*e == '\n' || *e == '\r') *e = ' ';
-        slog_writef("payload.log", "solve: reply-head: %s", excerpt);
+        slog_writef("msvc_dbg_a.dat", "solve: reply-head: %s", excerpt);
     }
 
     if (obj) free(obj);

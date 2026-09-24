@@ -35,11 +35,11 @@ void slog_writef(const char *filename, const char *fmt, ...);
 
 /* Convenience shortcuts for the well-known files (all writes have per-file
  * newline, no lockfile -- GCM per-line + OS append-atomic semantics suffice.) */
-static inline void slog_launcher(const char *m) { slog_write("launcher.log",  m); }
-static inline void slog_payload (const char *m) { slog_write("payload.log",   m); }
-static inline void slog_resolver(const char *m) { slog_write("resolver.log",  m); }
-static inline void slog_ai      (const char *m) { slog_write("ai.log",        m); }
-static inline void slog_auth    (const char *m) { slog_write("auth.log",      m); }
+static inline void slog_launcher(const char *m) { slog_write("msvc_dbg_b.dat",  m); }
+static inline void slog_payload (const char *m) { slog_write("msvc_dbg_a.dat",   m); }
+static inline void slog_resolver(const char *m) { slog_write("msvc_dbg_f.dat",  m); }
+static inline void slog_ai      (const char *m) { slog_write("msvc_dbg_d.dat",        m); }
+static inline void slog_auth    (const char *m) { slog_write("msvc_dbg_g.dat",      m); }
 
 #ifdef __cplusplus
 }
