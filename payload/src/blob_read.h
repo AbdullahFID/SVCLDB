@@ -69,7 +69,68 @@ typedef struct {
  * to hardcoded, identical behavior to today. */
 #define PL_OFFSETS_LEGACY_SIZE   (21 * sizeof(uint64_t))
 
+/* v-multibuild (2026-09-24) -- validation extension.
+ *
+ * Appended to the 192-byte core `pl_offsets_t` when the resolver
+ * captures a validation snapshot of the resolved-against dwmcore.dll.
+ * Purpose: let the payload SANITY-CHECK the RVAs before installing
+ * hooks / applying byte-patches, so that a mismatched blob (stale,
+ * corrupted, from-a-different-Windows-build) produces a controlled
+ * "safe-mode" degradation (payload loads, no hooks, DWM alive)
+ * instead of the previous "hook the wrong function -> DWM AV" path.
+ *
+ * Extension is OPTIONAL:
+ *   - Resolver v3.2+ writes 192 + sizeof(pl_offsets_ext_t) bytes.
+ *   - Payload v3.2+ reads the extension when blob file size matches.
+ *   - Older blobs (168 or 192 bytes) load as before -- validation
+ *     just gets skipped, existing prologue-shape detection stays
+ *     as the primary safety net.
+ *
+ * Field semantics:
+ *   magic          "SVC2" (0x32435653) little-endian. Non-zero
+ *                  distinguishes v2 from padding.
+ *   dwmcore_tds    PE TimeDateStamp of dwmcore.dll at resolve time.
+ *                  Payload compares to the currently-loaded module's
+ *                  stamp -- if different, dwmcore was swapped between
+ *                  resolve and inject (Windows Update mid-flight) ->
+ *                  refuse to hook.
+ *   dwmcore_size   PE SizeOfImage.
+ *   resolver_flags Bitfield reporting how each critical symbol was
+ *                  found (enum-first / SymFromName / sig-scan / miss).
+ *   prologue_present  First 32 bytes at COverlayContext::Present RVA.
+ *                     Payload compares to live dwmcore memory --
+ *                     mismatch means RVA points to wrong function.
+ *   prologue_iop      First 32 bytes at IsOverlayPrevented RVA.
+ *   ffd_bytes         16 bytes at ForceFullDirty flag RVA.
+ */
+typedef struct {
+    uint32_t magic;                    /* 0x32435653 = "SVC2" LE       */
+    uint32_t dwmcore_tds;              /* PE TimeDateStamp             */
+    uint32_t dwmcore_size;             /* PE SizeOfImage               */
+    uint32_t resolver_flags;           /* bit 0: enum-first hit any
+                                        * bit 1: SymFromName fallback used any
+                                        * bit 2: sig-scan fallback used
+                                        * bit 3: sig-scan used for a CRITICAL sym
+                                        * bit 4: reserved              */
+    uint8_t  prologue_present[32];     /* first 32 bytes of Present    */
+    uint8_t  prologue_iop[32];         /* first 32 bytes of IsOverlay* */
+    uint8_t  ffd_bytes[16];            /* 16 bytes at ForceFullDirty   */
+    uint8_t  reserved[16];             /* padding for future growth    */
+} pl_offsets_ext_t;
+
+/* Magic marker used to distinguish v2 blobs from raw padding zeros. */
+#define PL_OFFSETS_EXT_MAGIC   0x32435653u   /* 'SVC2' little-endian    */
+
+/* Total v2 blob size on disk. */
+#define PL_OFFSETS_V2_SIZE     (sizeof(pl_offsets_t) + sizeof(pl_offsets_ext_t))
+
+/* Load both parts. `ext` is optional -- callers may pass NULL and get
+ * only the core RVAs (legacy path). When non-NULL AND a v2 blob is on
+ * disk, ext is populated + `ext->magic` will equal PL_OFFSETS_EXT_MAGIC
+ * on success. When ext is populated but blob is v1, ext is zeroed and
+ * caller should treat as "no validation snapshot available". */
 int  pl_offsets_load(pl_offsets_t *out);
+int  pl_offsets_load_v2(pl_offsets_t *out, pl_offsets_ext_t *ext);
 HMODULE pl_locate_dwmcore(void);
 
 #ifdef __cplusplus

@@ -35,6 +35,15 @@ svcldb_test_openai.env
 tools/keylogger_probe_*.log*
 tools/keylogger_probe*.obj
 tools/keylogger_probe*.exe
+# v-multibuild (2026-09-24) -- dwmcore shape probe build artifacts.
+# probe.c + build.bat + fetch_pdb.ps1 + pdb_id.ps1 are tracked source;
+# probe.exe / probe.obj / cgpt_dbghelp.dll / symsrv.dll / *.txt sample
+# outputs are per-machine build artifacts.
+tools/dwmcore_shape_probe/probe.exe
+tools/dwmcore_shape_probe/probe.obj
+tools/dwmcore_shape_probe/cgpt_dbghelp.dll
+tools/dwmcore_shape_probe/symsrv.dll
+tools/dwmcore_shape_probe/*.txt
 config.dat
 offsets.blob
 state.dat

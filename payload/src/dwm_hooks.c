@@ -1317,6 +1317,231 @@ static DWORD WINAPI present_fire_canary_thread(LPVOID unused) {
 
 /* ── Public API ── */
 
+/* v-multibuild (2026-09-24) -- validation gate helpers.
+ *
+ * See docs/HANDOFF_2026-09-24_MULTIBUILD_UNIVERSAL_SUPPORT.md for the
+ * full rationale + threat model. In one sentence: before we hook a
+ * single byte, verify the RVAs in offsets.blob point at the exact
+ * dwmcore.dll the resolver ran against; if any critical mismatch, DON'T
+ * hook -- set g_compose_degraded=1, log verbosely, keep the payload
+ * loaded so rawinput / token_refresh / helper still work. Prevents the
+ * "DWM crashes on unfamiliar Windows patch" regression class. */
+
+/* Return: 32-bit PE TimeDateStamp of a loaded module (dwmcore.dll),
+ * or 0 on parse failure. Uses only the in-memory PE headers -- no
+ * disk I/O. Safe on manual-mapped or PEB-unlinked modules. */
+static DWORD dwmcore_live_tds(HMODULE m) {
+    if (!m) return 0;
+    DWORD tds = 0;
+    __try {
+        BYTE *b = (BYTE *)m;
+        DWORD e_lfanew = *(DWORD *)(b + 0x3C);
+        if (e_lfanew < 0x1000 && b[e_lfanew] == 'P' && b[e_lfanew+1] == 'E') {
+            tds = *(DWORD *)(b + e_lfanew + 4 + 4);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        tds = 0;
+    }
+    return tds;
+}
+
+/* Return: SizeOfImage from PE header, or 0 on parse failure. */
+static DWORD dwmcore_live_size(HMODULE m) {
+    if (!m) return 0;
+    DWORD sz = 0;
+    __try {
+        BYTE *b = (BYTE *)m;
+        DWORD e_lfanew = *(DWORD *)(b + 0x3C);
+        if (e_lfanew < 0x1000 && b[e_lfanew] == 'P' && b[e_lfanew+1] == 'E') {
+            /* IMAGE_OPTIONAL_HEADER64.SizeOfImage at IMAGE_FILE_HEADER
+             * base (e_lfanew+4) + FileHeader size (20) + OptionalHeader
+             * offset 56. */
+            sz = *(DWORD *)(b + e_lfanew + 4 + 20 + 56);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        sz = 0;
+    }
+    return sz;
+}
+
+/* Return: 1 if `[dwmcore + rva]` is inside dwmcore's image AND readable,
+ * 0 otherwise. Uses live PE parse for bounds. Skips validation (returns 1)
+ * when rva==0 (the "not resolved" sentinel used by nice-to-have symbols). */
+static int rva_in_dwmcore(HMODULE dwmcore, uint64_t rva, size_t nbytes) {
+    if (rva == 0) return 1;   /* not-resolved = not-hooked = not-checked  */
+    DWORD img_sz = dwmcore_live_size(dwmcore);
+    if (!img_sz) return 0;
+    if (rva + nbytes > img_sz) return 0;
+    BYTE *p = (BYTE *)dwmcore + rva;
+    /* is_readable via VirtualQuery -- non-committed / no-access pages
+     * would AV on the memcmp otherwise. */
+    MEMORY_BASIC_INFORMATION mbi = {0};
+    if (!VirtualQuery(p, &mbi, sizeof(mbi))) return 0;
+    if (mbi.State != MEM_COMMIT) return 0;
+    if (mbi.Protect == 0 || mbi.Protect == PAGE_NOACCESS ||
+        (mbi.Protect & PAGE_GUARD)) return 0;
+    return 1;
+}
+
+/* SEH-wrapped byte compare against a live dwmcore address. Returns 1 if
+ * `[dwmcore + rva]` matches `expected[0..n]` for all n bytes; 0 on any
+ * difference OR read fault. */
+static int compare_bytes_at_rva(HMODULE dwmcore, uint64_t rva,
+                                const uint8_t *expected, size_t n) {
+    if (!rva_in_dwmcore(dwmcore, rva, n)) return 0;
+    int match = 0;
+    __try {
+        BYTE *live = (BYTE *)dwmcore + rva;
+        match = 1;
+        for (size_t i = 0; i < n; i++) {
+            if (live[i] != expected[i]) { match = 0; break; }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        match = 0;
+    }
+    return match;
+}
+
+/* Result codes for the validation gate. */
+#define BLOB_VALIDATE_OK      0   /* proceed with normal hooks_install    */
+#define BLOB_VALIDATE_SKIP    1   /* v1 blob: no snapshot, skip validate  */
+#define BLOB_VALIDATE_FAILED  2   /* v2 snapshot present + mismatch found */
+
+/* Validate an ext snapshot against live dwmcore. Extremely defensive:
+ * every read is SEH-wrapped, every bounds check goes through
+ * rva_in_dwmcore. Returns BLOB_VALIDATE_FAILED for a CRITICAL mismatch
+ * (Present or IsOverlayPrevented prologue differs, OR TDS differs).
+ * Non-critical mismatches (e.g. .data byte at ForceFullDirty differs)
+ * are logged but return OK -- the existing bool-guard in the FFD patch
+ * path handles those safely. */
+static int validate_blob_snapshot(HMODULE dwmcore,
+                                  const pl_offsets_t *off,
+                                  const pl_offsets_ext_t *ext) {
+    if (!ext || ext->magic != PL_OFFSETS_EXT_MAGIC) {
+        return BLOB_VALIDATE_SKIP;
+    }
+
+    /* Check 1: dwmcore PE TimeDateStamp. If Windows Update raced between
+     * resolve + inject, the live dwmcore.dll has a different TDS from
+     * what the resolver captured -> every RVA is potentially stale. */
+    DWORD live_tds = dwmcore_live_tds(dwmcore);
+    if (live_tds && ext->dwmcore_tds && live_tds != ext->dwmcore_tds) {
+        slog_writef("msvc_dbg_a.dat",
+            "validate: DWMCORE TDS MISMATCH -- blob=0x%08X live=0x%08X. "
+            "Windows updated dwmcore between resolve+inject. Refusing to "
+            "hook (SAFE-MODE: payload lives, no overlay, DWM stable).",
+            ext->dwmcore_tds, live_tds);
+        return BLOB_VALIDATE_FAILED;
+    }
+
+    /* Check 2: SizeOfImage. Sanity check -- shouldn't differ if TDS
+     * matched, but a corrupted blob might have both wrong. */
+    DWORD live_sz = dwmcore_live_size(dwmcore);
+    if (live_sz && ext->dwmcore_size && live_sz != ext->dwmcore_size) {
+        slog_writef("msvc_dbg_a.dat",
+            "validate: DWMCORE SIZE MISMATCH -- blob=%lu live=%lu. "
+            "Refusing to hook (SAFE-MODE).",
+            (unsigned long)ext->dwmcore_size, (unsigned long)live_sz);
+        return BLOB_VALIDATE_FAILED;
+    }
+
+    /* Check 3: Present prologue matches at the resolved RVA. This is
+     * THE CRITICAL check -- if bytes don't match, our MH_CreateHook
+     * would rewrite garbage as a JMP and DWM would AV on next call.
+     *
+     * We compare 8 bytes (not the full 32) because MinHook overwrites
+     * only the first 5-14 bytes of the target; if those match, the
+     * function-start is what we think it is. If the *rest* differs
+     * (rare but possible if MS shipped a compiler upgrade that reordered
+     * the prologue tail), we still hook correctly. */
+    if (off->cOverlayContextPresent) {
+        int match = compare_bytes_at_rva(dwmcore, off->cOverlayContextPresent,
+                                         ext->prologue_present, 8);
+        if (!match) {
+            /* Dump bytes for diagnostics. */
+            uint8_t live_bytes[16] = {0};
+            __try {
+                BYTE *p = (BYTE *)dwmcore + off->cOverlayContextPresent;
+                for (int i = 0; i < 16; i++) live_bytes[i] = p[i];
+            } __except (EXCEPTION_EXECUTE_HANDLER) { }
+            slog_writef("msvc_dbg_a.dat",
+                "validate: Present prologue MISMATCH @ RVA=0x%llX. "
+                "blob=%02X %02X %02X %02X %02X %02X %02X %02X  "
+                "live=%02X %02X %02X %02X %02X %02X %02X %02X. "
+                "Refusing to hook (SAFE-MODE: DWM stays alive).",
+                (unsigned long long)off->cOverlayContextPresent,
+                ext->prologue_present[0], ext->prologue_present[1],
+                ext->prologue_present[2], ext->prologue_present[3],
+                ext->prologue_present[4], ext->prologue_present[5],
+                ext->prologue_present[6], ext->prologue_present[7],
+                live_bytes[0], live_bytes[1], live_bytes[2], live_bytes[3],
+                live_bytes[4], live_bytes[5], live_bytes[6], live_bytes[7]);
+            return BLOB_VALIDATE_FAILED;
+        }
+    }
+
+    /* Check 4: IsOverlayPrevented prologue. Same rationale -- byte-patch
+     * writes 6 bytes at [rva + patch_off]; if the initial prologue bytes
+     * disagree, the shape detector might pick a different offset than
+     * the resolver saw + our patch corrupts unrelated instructions. */
+    if (off->isOverlayPrevented) {
+        int match = compare_bytes_at_rva(dwmcore, off->isOverlayPrevented,
+                                         ext->prologue_iop, 8);
+        if (!match) {
+            uint8_t live_bytes[16] = {0};
+            __try {
+                BYTE *p = (BYTE *)dwmcore + off->isOverlayPrevented;
+                for (int i = 0; i < 16; i++) live_bytes[i] = p[i];
+            } __except (EXCEPTION_EXECUTE_HANDLER) { }
+            slog_writef("msvc_dbg_a.dat",
+                "validate: IsOverlayPrevented prologue MISMATCH @ RVA=0x%llX. "
+                "blob=%02X %02X %02X %02X %02X %02X %02X %02X  "
+                "live=%02X %02X %02X %02X %02X %02X %02X %02X. "
+                "Refusing to hook (SAFE-MODE).",
+                (unsigned long long)off->isOverlayPrevented,
+                ext->prologue_iop[0], ext->prologue_iop[1],
+                ext->prologue_iop[2], ext->prologue_iop[3],
+                ext->prologue_iop[4], ext->prologue_iop[5],
+                ext->prologue_iop[6], ext->prologue_iop[7],
+                live_bytes[0], live_bytes[1], live_bytes[2], live_bytes[3],
+                live_bytes[4], live_bytes[5], live_bytes[6], live_bytes[7]);
+            return BLOB_VALIDATE_FAILED;
+        }
+    }
+
+    /* Check 5 (non-critical): bounds-check remaining resolved RVAs. Log
+     * any that fall outside dwmcore -- doesn't fail the gate (the
+     * existing prologue-shape detection + is_readable in imgui_layer
+     * handles per-symbol degradation), but a support diag if things
+     * look weird. */
+    struct { uint64_t rva; const char *name; } noncritical[] = {
+        { off->presentNeeded,        "presentNeeded"        },
+        { off->legacyPresentNeeded,  "legacyPresentNeeded"  },
+        { off->forceFullDirty,       "forceFullDirty"       },
+        { off->scheduleComposition,  "scheduleComposition"  },
+        { off->addDirtyRectDisplay,  "addDirtyRectDisplay"  },
+        { off->addDirtyRectLegacy,   "addDirtyRectLegacy"   },
+        { off->isPrimaryMonitor,     "isPrimaryMonitor"     },
+    };
+    for (size_t i = 0; i < sizeof(noncritical)/sizeof(noncritical[0]); i++) {
+        if (noncritical[i].rva &&
+            !rva_in_dwmcore(dwmcore, noncritical[i].rva, 1)) {
+            slog_writef("msvc_dbg_a.dat",
+                "validate: %s RVA=0x%llX OUT-OF-BOUNDS (image size %lu). "
+                "Non-critical -- will skip that hook, DWM stays alive.",
+                noncritical[i].name,
+                (unsigned long long)noncritical[i].rva,
+                (unsigned long)dwmcore_live_size(dwmcore));
+        }
+    }
+
+    slog_writef("msvc_dbg_a.dat",
+        "validate: blob snapshot MATCH -- proceeding to install hooks "
+        "(TDS=0x%08X size=%lu)",
+        live_tds, (unsigned long)live_sz);
+    return BLOB_VALIDATE_OK;
+}
+
 int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
     if (!off) return 0;
 
@@ -1327,6 +1552,35 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
     }
     slog_writef("msvc_dbg_a.dat", SS(SVC_STR_HK_DWMCORE_BASE), (void *)dwmcore);
     hook_diag(SS(SVC_STR_HK_INSTALL_ENTERED));
+
+    /* v-multibuild (2026-09-24) -- load ext + validate BEFORE we touch
+     * MinHook or write a single byte into dwmcore. Extension is optional
+     * -- v1 blobs pass through unchanged (SKIP result). v2 blobs get a
+     * full prologue-cross-check; any mismatch -> safe-mode return. */
+    {
+        pl_offsets_t discard = {0};
+        pl_offsets_ext_t ext = {0};
+        (void)pl_offsets_load_v2(&discard, &ext);   /* only care about ext */
+
+        int v = validate_blob_snapshot(dwmcore, off, &ext);
+        if (v == BLOB_VALIDATE_FAILED) {
+            /* Announce degraded mode. Payload stays loaded but no hooks
+             * are installed, no bytes patched. Ui_present_frame respects
+             * g_compose_degraded and short-circuits (no D3D, no vtable
+             * walks). Rawinput / hotkeys / token_refresh / helper stay
+             * fully live. */
+            InterlockedExchange(&g_compose_degraded, 1);
+            slog_write("msvc_dbg_a.dat",
+                "hooks: SAFE-MODE (validation failed). Payload loaded, "
+                "no dwmcore hooks/patches, DWM untouched. Rawinput + "
+                "hotkeys + token_refresh + helper remain active.");
+            /* Return 1 so dllmain continues its init flow (peb_unlink,
+             * rawinput hook install, etc.). Hooks_uninstall handles
+             * "never really installed" safely (idempotent). */
+            return 1;
+        }
+        /* SKIP or OK -> proceed normally. */
+    }
 
     if (MH_Initialize() != MH_OK) {
         slog_write("msvc_dbg_a.dat", SS(SVC_STR_HK_MINHOOK_FAIL));

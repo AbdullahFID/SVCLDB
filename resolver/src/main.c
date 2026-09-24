@@ -53,6 +53,22 @@ typedef struct {
 #define DWMCORE_PATH   "C:\\Windows\\System32\\dwmcore.dll"
 #define FAKE_BASE      ((uint64_t)0x10000000)
 
+/* v-multibuild (2026-09-24) -- validation extension appended to the
+ * legacy 192-byte OffsetsBlob. Payload's pl_offsets_ext_t must match
+ * exactly (see payload/src/blob_read.h). Keep both structs in sync
+ * or v2 blobs fail the magic check + payload falls back to v1 mode. */
+#define BLOB_EXT_MAGIC 0x32435653u   /* 'SVC2' little-endian */
+typedef struct {
+    uint32_t magic;
+    uint32_t dwmcore_tds;
+    uint32_t dwmcore_size;
+    uint32_t resolver_flags;
+    uint8_t  prologue_present[32];
+    uint8_t  prologue_iop[32];
+    uint8_t  ffd_bytes[16];
+    uint8_t  reserved[16];
+} OffsetsBlobExt;
+
 typedef struct {
     ULONG    SizeOfStruct;
     ULONG    TypeIndex;
@@ -132,19 +148,61 @@ static uint64_t resolve_wild(const char *pattern) {
     return 0;
 }
 
+/* v3.2 (2026-09-24) -- exact-name enum resolver.
+ *
+ * SymFromName's decorated-name matcher varies across dbghelp versions +
+ * PDB toolchain versions. Empirical: shipping our current dbghelp against
+ * an older dwmcore.pdb (10.0.26100.7920) MISSES every symbol with GLE=126
+ * (ERROR_MOD_NOT_FOUND) even though the symbols exist -- SymEnumSymbols
+ * with the same fully-qualified name as its mask finds them all first
+ * try. This was confirmed via tools/dwmcore_shape_probe against a mid-2025
+ * dwmcore.dll harvested from the sibling hooksdll repo. Same symbols,
+ * same PDB, same dbghelp -- but SymFromName specifically miscompares.
+ *
+ * FIX: use SymEnumSymbols with the exact fully-qualified name as its own
+ * pattern (single result expected -- classnames are unique). This is
+ * SymFromName's underlying primitive and doesn't rely on the internal
+ * name-parser's guess of the decorated form.
+ *
+ * Kept both paths and log which succeeded so we can spot drift. */
+static uint64_t resolve_exact_via_enum(const char *sym) {
+    if (!pSymEnumSymbols) return 0;
+    WildCtx ctx = {0};
+    /* Fully-qualified name is a valid enum mask -- expects <=1 match. */
+    pSymEnumSymbols(g_hProc, FAKE_BASE, sym, WildCb, &ctx);
+    if (ctx.count > 0) return ctx.rva;
+    return 0;
+}
+
+/* Primary resolve() -- try enum-exact FIRST, SymFromName SECOND.
+ *
+ * Enum-exact is more robust across dbghelp/PDB toolchain mismatches
+ * (see block-comment above). SymFromName kept as fallback for the rare
+ * case where enum fails but SymFromName succeeds (never observed live,
+ * kept defensively). Log which path won so we can spot drift over time
+ * -- the log line prefix indicates the source. */
 static uint64_t resolve(const char *sym) {
+    /* Path 1: exact-name enum. */
+    uint64_t via_enum = resolve_exact_via_enum(sym);
+    if (via_enum) {
+        log_line("  HIT : %-60s RVA=0x%llX", sym, (unsigned long long)via_enum);
+        return via_enum;
+    }
+
+    /* Path 2: SymFromName (legacy path, kept for defensive coverage). */
     char buf[sizeof(SYMINFO)];
     SYMINFO *p = (SYMINFO *)buf;
     ZeroMemory(buf, sizeof(buf));
     p->SizeOfStruct = 88;
     p->MaxNameLen = sizeof(p->Name) - 1;
-    if (!pSymFromName(g_hProc, sym, p)) {
-        log_line("  MISS: %-60s GLE=%lu", sym, GetLastError());
-        return 0;
+    if (pSymFromName(g_hProc, sym, p) && p->Address >= FAKE_BASE) {
+        uint64_t r = p->Address - FAKE_BASE;
+        log_line("  HIT2: %-60s RVA=0x%llX (via SymFromName)",
+                 sym, (unsigned long long)r);
+        return r;
     }
-    uint64_t r = p->Address - FAKE_BASE;
-    log_line("  HIT : %-60s RVA=0x%llX", sym, (unsigned long long)r);
-    return r;
+    log_line("  MISS: %-60s GLE=%lu", sym, GetLastError());
+    return 0;
 }
 
 int main(void) {
@@ -331,6 +389,111 @@ int main(void) {
         return 1;
     }
 
+    /* v-multibuild (2026-09-24) -- capture validation snapshot.
+     *
+     * Read dwmcore.dll from disk, parse the PE headers, snapshot:
+     *   - TimeDateStamp (for cross-check that payload's loaded dwmcore
+     *     matches what we resolved against -- catches "Windows Update
+     *     replaced dwmcore between resolve + inject" edge case).
+     *   - SizeOfImage (payload uses to bounds-check RVAs).
+     *   - First 32 bytes at cOverlayContextPresent and IsOverlayPrevented
+     *     (payload compares to live dwmcore memory before hooking).
+     *   - 16 bytes at ForceFullDirty flag (bool-guard input).
+     *
+     * All of this is optional data -- if capture fails, we still write
+     * the 192-byte v1 blob (payload falls back to its existing shape-
+     * detection heuristics). */
+    OffsetsBlobExt ext = {0};
+    ext.magic = BLOB_EXT_MAGIC;
+    ext.resolver_flags = 0;
+    int ext_ok = 0;
+    {
+        HANDLE hf_dc = CreateFileA(DWMCORE_PATH, GENERIC_READ,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hf_dc != INVALID_HANDLE_VALUE) {
+            LARGE_INTEGER li;
+            if (GetFileSizeEx(hf_dc, &li) && li.QuadPart > 0 && li.QuadPart < 0x8000000) {
+                DWORD fsz = (DWORD)li.QuadPart;
+                BYTE *fbuf = (BYTE *)VirtualAlloc(NULL, fsz, MEM_COMMIT, PAGE_READWRITE);
+                if (fbuf) {
+                    DWORD rd = 0;
+                    if (ReadFile(hf_dc, fbuf, fsz, &rd, NULL) && rd == fsz && fsz >= 0x400) {
+                        DWORD e_lfanew = *(DWORD *)(fbuf + 0x3C);
+                        if (e_lfanew + 0x18 <= fsz &&
+                            fbuf[e_lfanew] == 'P' && fbuf[e_lfanew+1] == 'E') {
+                            /* IMAGE_FILE_HEADER at e_lfanew+4: TDS at +4. */
+                            ext.dwmcore_tds = *(DWORD *)(fbuf + e_lfanew + 4 + 4);
+                            /* IMAGE_OPTIONAL_HEADER64.SizeOfImage at offset
+                             * IMAGE_FILE_HEADER (20) + optional header field
+                             * offset 56 = e_lfanew + 4 + 20 + 56 = +80. */
+                            ext.dwmcore_size = *(DWORD *)(fbuf + e_lfanew + 4 + 20 + 56);
+
+                            /* Parse sections. */
+                            WORD n_sec = *(WORD *)(fbuf + e_lfanew + 4 + 2);
+                            WORD opt_sz = *(WORD *)(fbuf + e_lfanew + 4 + 16);
+                            DWORD sec_start = e_lfanew + 4 + 20 + opt_sz;
+
+                            /* Helper: given an RVA, find file offset. */
+                            #define FIND_FILEOFF(rva, out_off) do { \
+                                (out_off) = 0; \
+                                for (WORD si = 0; si < n_sec; si++) { \
+                                    DWORD sofs = sec_start + si * 40; \
+                                    if (sofs + 40 > fsz) break; \
+                                    DWORD s_vsz = *(DWORD *)(fbuf + sofs + 8); \
+                                    DWORD s_va  = *(DWORD *)(fbuf + sofs + 12); \
+                                    DWORD s_raw = *(DWORD *)(fbuf + sofs + 20); \
+                                    if ((rva) >= s_va && (rva) < s_va + s_vsz) { \
+                                        (out_off) = s_raw + ((rva) - s_va); \
+                                        break; \
+                                    } \
+                                } \
+                            } while (0)
+
+                            /* Capture prologue of Present. */
+                            if (b.cOverlayContextPresent) {
+                                DWORD off = 0;
+                                FIND_FILEOFF((DWORD)b.cOverlayContextPresent, off);
+                                if (off && off + 32 <= fsz)
+                                    memcpy(ext.prologue_present, fbuf + off, 32);
+                            }
+                            /* Capture prologue of IsOverlayPrevented. */
+                            if (b.isOverlayPrevented) {
+                                DWORD off = 0;
+                                FIND_FILEOFF((DWORD)b.isOverlayPrevented, off);
+                                if (off && off + 32 <= fsz)
+                                    memcpy(ext.prologue_iop, fbuf + off, 32);
+                            }
+                            /* Capture ForceFullDirty bytes (may not exist). */
+                            if (b.forceFullDirty) {
+                                DWORD off = 0;
+                                FIND_FILEOFF((DWORD)b.forceFullDirty, off);
+                                if (off && off + 16 <= fsz)
+                                    memcpy(ext.ffd_bytes, fbuf + off, 16);
+                            }
+                            #undef FIND_FILEOFF
+                            ext_ok = 1;
+                        }
+                    }
+                    VirtualFree(fbuf, 0, MEM_RELEASE);
+                }
+            }
+            CloseHandle(hf_dc);
+        }
+    }
+    if (ext_ok) {
+        log_line("blob-ext: dwmcore TDS=0x%08X size=%lu "
+                 "present=%02X %02X %02X %02X ... iop=%02X %02X %02X %02X ... ffd=%02X",
+                 ext.dwmcore_tds, (unsigned long)ext.dwmcore_size,
+                 ext.prologue_present[0], ext.prologue_present[1],
+                 ext.prologue_present[2], ext.prologue_present[3],
+                 ext.prologue_iop[0], ext.prologue_iop[1],
+                 ext.prologue_iop[2], ext.prologue_iop[3],
+                 ext.ffd_bytes[0]);
+    } else {
+        log_line("blob-ext: capture FAILED -- writing v1 blob (no validation snapshot)");
+    }
+
     HANDLE hf = CreateFileA(BLOB_PATH, GENERIC_WRITE, 0, NULL,
                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hf == INVALID_HANDLE_VALUE) {
@@ -338,10 +501,14 @@ int main(void) {
         if (pSymCleanup) pSymCleanup(g_hProc);
         return 1;
     }
-    DWORD w = 0;
+    DWORD w = 0, w2 = 0;
     WriteFile(hf, &b, sizeof(b), &w, NULL);
+    if (ext_ok) {
+        WriteFile(hf, &ext, sizeof(ext), &w2, NULL);
+    }
     CloseHandle(hf);
-    log_line("Wrote %lu bytes to %s", w, BLOB_PATH);
+    log_line("Wrote %lu core + %lu ext = %lu bytes to %s",
+             w, w2, w + w2, BLOB_PATH);
 
     if (pSymCleanup) pSymCleanup(g_hProc);
     log_line("=== resolver done ===");
