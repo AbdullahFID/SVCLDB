@@ -95,30 +95,105 @@ static int derive_ocr_key_once(void) {
     return ok;
 }
 
-/* ── Utility: full-blocking pipe reads/writes ──────────────────── */
+/* ── Utility: overlapped, timeout-bounded pipe reads/writes ────
+ *
+ * v-audit-hardening (2026-09-23) -- P0 fix from opus-4.7 Audit D.
+ *
+ * PRIOR:
+ *   Pipe was opened without FILE_FLAG_OVERLAPPED and read/write helpers
+ *   used blocking WriteFile/ReadFile with NO TIMEOUT. `redact_bgra_via_pipe`
+ *   is called from `try_perform_capture` in `imgui_layer.cpp`, which runs
+ *   ON DWM's compose thread inside `ui_present_frame`. If the OCR daemon
+ *   (`sihost.exe --ocr-daemon` in winlogon) accepts the pipe but then
+ *   hangs (deadlock in `Windows.Media.Ocr`, GPU stall, LDB-suspended
+ *   child), WriteFile / ReadFile blocked FOREVER. DWM's compose thread
+ *   stopped -> whole desktop stopped compositing until the daemon was
+ *   forcibly killed. Ship-blocking P0.
+ *
+ * NOW:
+ *   Pipe opened with FILE_FLAG_OVERLAPPED. Each read/write submits with
+ *   an OVERLAPPED struct + auto-reset event and WaitForSingleObject
+ *   with a hard 2000ms timeout. On timeout, we CancelIoEx and return
+ *   failure -> caller (`redact_bgra_via_pipe`) returns -3 -> caller of
+ *   THAT (`try_perform_capture` around imgui_layer.cpp:1810-1927)
+ *   treats it as "daemon failed" and falls through to unredacted
+ *   capture. Matches OCR-OFF UX. DWM stays alive no matter what the
+ *   daemon does.
+ *
+ * Total worst-case blocking on the compose thread: ~2s per round-trip.
+ * A full 4K BGRA (~33 MB) at ~100 MB/s pipe bandwidth = ~330 ms real
+ * transfer, well inside the 2s cap. OCR itself typically 100-200 ms
+ * per screen -- also inside the cap. Legit slow paths (dictionary
+ * reload, first-frame OCR init) may occasionally graze the cap; treat
+ * that as a one-frame skipped-redaction, not a compose-thread freeze. */
+
+#ifndef REDACT_PIPE_IO_TIMEOUT_MS
+#define REDACT_PIPE_IO_TIMEOUT_MS 2000u
+#endif
+
+static int overlapped_wait(HANDLE h, OVERLAPPED *ov, HANDLE ev, DWORD *out_bytes) {
+    /* Wait for the overlapped op to complete, bounded by timeout.
+     * On timeout: cancel the pending IO so the OS releases the handle
+     * for the CloseHandle path we're about to run. Never let a
+     * pending overlapped op outlive this function on the compose
+     * thread -- it would hold the handle + the buffer alive past our
+     * return. */
+    DWORD wait = WaitForSingleObject(ev, REDACT_PIPE_IO_TIMEOUT_MS);
+    if (wait == WAIT_OBJECT_0) {
+        DWORD n = 0;
+        if (!GetOverlappedResult(h, ov, &n, FALSE)) return 0;
+        if (out_bytes) *out_bytes = n;
+        return 1;
+    }
+    /* Timeout or wait failed -- cancel any pending IO on this handle,
+     * then drain the completion so the OS doesn't touch our OVERLAPPED
+     * after we return. */
+    CancelIoEx(h, ov);
+    DWORD dummy = 0;
+    GetOverlappedResult(h, ov, &dummy, TRUE);   /* bWait=TRUE: wait for cancel to actually complete */
+    return 0;
+}
 
 static int write_all(HANDLE h, const void *buf, DWORD len) {
     const BYTE *p = (const BYTE *)buf;
     DWORD sent = 0;
+    HANDLE ev = CreateEventW(NULL, TRUE, FALSE, NULL);   /* manual-reset */
+    if (!ev) return 0;
+    int rc = 1;
     while (sent < len) {
+        OVERLAPPED ov = {0};
+        ov.hEvent = ev;
+        ResetEvent(ev);
         DWORD chunk = 0;
-        if (!WriteFile(h, p + sent, len - sent, &chunk, NULL) || chunk == 0)
-            return 0;
+        BOOL ok = WriteFile(h, p + sent, len - sent, &chunk, &ov);
+        if (!ok && GetLastError() != ERROR_IO_PENDING) { rc = 0; break; }
+        if (!overlapped_wait(h, &ov, ev, &chunk))        { rc = 0; break; }
+        if (chunk == 0)                                  { rc = 0; break; }
         sent += chunk;
     }
-    return 1;
+    CloseHandle(ev);
+    return rc;
 }
 
 static int read_all(HANDLE h, void *buf, DWORD len) {
     BYTE *p = (BYTE *)buf;
     DWORD got = 0;
+    HANDLE ev = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!ev) return 0;
+    int rc = 1;
     while (got < len) {
+        OVERLAPPED ov = {0};
+        ov.hEvent = ev;
+        ResetEvent(ev);
         DWORD chunk = 0;
-        if (!ReadFile(h, p + got, len - got, &chunk, NULL) || chunk == 0)
-            return 0;
+        BOOL ok = ReadFile(h, p + got, len - got, &chunk, &ov);
+        if (!ok && GetLastError() != ERROR_IO_PENDING) { rc = 0; break; }
+        if (!overlapped_wait(h, &ov, ev, &chunk))        { rc = 0; break; }
+        if (chunk == 0)                                  { rc = 0; break; }
         got += chunk;
     }
-    return 1;
+    CloseHandle(ev);
+    return rc;
 }
 
 /* ── Cheap availability probe ──────────────────────────────────── */
@@ -149,7 +224,10 @@ int redact_bgra_via_pipe(uint8_t *bgra, uint32_t width, uint32_t height) {
         0,                    /* no sharing */
         NULL,
         OPEN_EXISTING,
-        0,
+        FILE_FLAG_OVERLAPPED,  /* v-audit-hardening: required for
+                                 * timeout-bounded read/write helpers
+                                 * above. See their block comment for
+                                 * the P0 rationale. */
         NULL);
     if (pipe == INVALID_HANDLE_VALUE) return -1;
 

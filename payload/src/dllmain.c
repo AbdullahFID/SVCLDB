@@ -714,11 +714,33 @@ static void ai_stream_done_handler(int ok, const char *full_reply, size_t reply_
              * streamed is preserved because ui_chat_stream_append kept
              * appending as tokens arrived. We just tack on a suffix +
              * finalize (clears the typing indicator). If NOTHING had
-             * streamed yet, the suffix stands alone as a clean message. */
+             * streamed yet, the suffix stands alone as a clean message.
+             *
+             * v-audit-hardening (2026-09-23) -- P1-2 from opus-4.7 Audit D.
+             *
+             * BATCHED MODE FIX: `ai_stream_chunk_handler` early-returns for
+             * `ctx->batched`, so `ui_chat_stream_append` was NEVER called
+             * during streaming for batched-mode users. The partial reply
+             * only existed in `ai_try_streaming_once`'s local buffer, which
+             * used to be freed on !http_ok -> user's abort produced a
+             * message containing ONLY the suffix. `ai_try_streaming_once`
+             * now hands us the partial buffer via `full_reply`; push it to
+             * the UI BEFORE appending the suffix so batched-mode users see
+             * what the model produced before they aborted.
+             *
+             * LIVE MODE unchanged: chunks were streamed live; `full_reply`
+             * carries the same bytes as a redundant safety copy but we
+             * don't need to re-push them (would double-render). Skip the
+             * push in live mode. */
+            if (ctx->batched && full_reply && reply_len > 0) {
+                ui_chat_set_reply_of_pending(ctx->msg_id, full_reply);
+            }
             static const char SUFFIX[] = "\n\n_(stopped by user via Ctrl+Alt+S)_";
             ui_chat_stream_append(ctx->msg_id, SUFFIX, sizeof(SUFFIX) - 1);
             ui_chat_finalize_pending(ctx->msg_id);
-            slog_write("msvc_dbg_d.dat", "stream stopped by user hotkey");
+            slog_writef("msvc_dbg_d.dat",
+                        "stream stopped by user hotkey (batched=%d partial_len=%zu)",
+                        (int)ctx->batched, reply_len);
             free(ctx);   /* v2.0 (2026-09-10): don't leak ctx on abort */
             return;
         }
@@ -1821,6 +1843,19 @@ static DWORD WINAPI shutdown_watcher(LPVOID param) {
         token_refresh_stop,          /* v14 ordering: still MUST complete before hooks_uninstall + */
         token_refresh_client_stop,   /* cfg_cleanup below -- WaitForMultipleObjects joins ALL parallel */
                                      /* workers before we fall through, so the invariant holds. */
+        /* v-audit-hardening (2026-09-23) -- P1 (opus-4.7 Audit E).
+         * Cancel-and-join the two worker threads whose handles the
+         * prior code discarded via CloseHandle immediately after
+         * CreateThread. Each shutdown fn sets its own cancel flag +
+         * WaitForSingleObject with a bounded 1000-1500ms budget. Both
+         * are idempotent and safe when the subsystem wasn't started.
+         *
+         * Without these, autotype-mid-flight-unload OR poll-mid-Sleep-
+         * unload could execute in freed pages (manual-map: launcher
+         * VirtualFrees our pages externally after this function
+         * returns) -> DWM AV. */
+        human_type_shutdown,
+        clip_ring_shutdown,
     };
     const int nindep = (int)(sizeof(indep_stops)/sizeof(indep_stops[0]));
     HANDLE thrs[16] = {0};

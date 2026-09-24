@@ -1333,6 +1333,18 @@ static inline ImVec4 with_alpha_mul(ImVec4 c) {
 static UINT g_target_w = 0;   /* Largest layer dimensions we've seen. */
 static UINT g_target_h = 0;
 static ID3D11Texture2D *g_target_tex = nullptr;  /* Last texture matching target. */
+/* v-audit-hardening (2026-09-23) -- P1-4 (opus-4.7 Audit A). Counter of
+ * consecutive frames where every layer was rejected by the 95%-of-largest
+ * gate.  Grow-only g_target_w/h was leaving overlay dead after a
+ * resolution DECREASE (unplug external 4K monitor -> laptop 1080p ->
+ * every layer < 95% of 3840 forever).  When this streak crosses 30 (~500
+ * ms at 60 Hz), get_or_create_rtv zeroes g_target_w/h so the next
+ * fullscreen layer re-anchors the gate.  Reset to 0 on any accepted
+ * layer.  Read+written from the compose thread only (via
+ * get_or_create_rtv) so no atomicity requirement, but Interlocked ops
+ * are used defensively in case a future call site introduces cross-
+ * thread access. */
+static volatile LONG g_rtv_shrink_streak = 0;
 
 /* Frame dedup -- Present is called PER LAYER by DWM. Even after size gate
  * multiple ~fullscreen layers can pass through in the same compose cycle
@@ -4875,8 +4887,39 @@ static ID3D11RenderTargetView *get_or_create_rtv(ID3D11Device *dev,
     UINT thresh_w = (g_target_w * 95) / 100;
     UINT thresh_h = (g_target_h * 95) / 100;
     if (desc.Width < thresh_w || desc.Height < thresh_h) {
+        /* v-audit-hardening (2026-09-23) -- P1-4 from opus-4.7 Audit A.
+         *
+         * PRIOR: g_target_w/h only grew. If the user plugged in an
+         * external 4K monitor (target grows to 3840x2160) then unplugged
+         * it (desktop drops to laptop's 1080p), EVERY subsequent layer
+         * would be 1920x1080 < 95% of 3840 -> rejected forever ->
+         * overlay silently invisible until DWM restart or sihost --reinject.
+         * ui_reinit only zeroes these on Progman HWND change, which does
+         * NOT happen on a pure display-setting change.
+         *
+         * NOW: count consecutive frames where every layer was rejected
+         * by this gate. After ~30 frames (~500ms at 60Hz), assume the
+         * display config genuinely shrunk and re-anchor by zeroing
+         * g_target_w/h. Next fullscreen layer establishes fresh
+         * baseline. Cost: one InterlockedIncrement per rejected frame,
+         * zero when overlay is composing normally. */
+        LONG n = InterlockedIncrement(&g_rtv_shrink_streak);
+        if (n >= 30) {
+            UINT ow = g_target_w, oh = g_target_h;
+            g_target_w = 0;
+            g_target_h = 0;
+            InterlockedExchange(&g_rtv_shrink_streak, 0);
+            diag("[AUDIT-P1-4] RTV size gate re-anchor: %ld consecutive frames "
+                 "smaller than %ux%u (95%% gate=%ux%u). Zeroing target so next "
+                 "fullscreen layer establishes fresh baseline. Prior gate "
+                 "would have kept overlay invisible after resolution decrease.",
+                 (long)n, ow, oh, thresh_w, thresh_h);
+        }
         return nullptr;
     }
+    /* Accepted a layer -- reset shrink-streak so a transient sub-
+     * fullscreen layer doesn't compound with a subsequent real shrink. */
+    InterlockedExchange(&g_rtv_shrink_streak, 0);
 
     /* Choose RTV format. For HDR (R16G16B16A16_FLOAT), same format works --
      * ImGui outputs float4(r,g,b,a) values in [0,1] which is exactly scRGB
@@ -9566,7 +9609,22 @@ extern "C" void ui_request_hide_now(void) {
 }
 
 extern "C" void ui_shutdown() {
-    /* v1.7.8: FIRST -- force underlying apps to repaint at the last
+    /* v-audit-hardening (2026-09-23) -- P1 (opus-4.7 Audit E).
+     *
+     * Flush the notes editor to disk BEFORE we tear down ImGui / DX11 /
+     * critical section. `notes_mark_dirty` is called on every edit,
+     * but `notes_flush` only ran on explicit save/close via the editor
+     * UI. If the user was mid-edit when the payload unloaded (uninject
+     * / Ctrl+Shift+Alt+Q / --unload), the unsaved changes were dropped.
+     * `notes_flush()` is idempotent + short (~1ms) + safe to call when
+     * no notes exist. */
+    extern void notes_flush(void);
+    __try { notes_flush(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        diag("[AUDIT-P1] notes_flush faulted during shutdown -- caught");
+    }
+
+    /* v1.7.8: force underlying apps to repaint at the last
      * overlay rect so DWM re-composes over our stale pixels. Fixes
      * "overlay silhouette lingers for seconds after uninject" bug
      * (LO 2026-07-24). Fires BEFORE Win32/DX11 backend teardown so

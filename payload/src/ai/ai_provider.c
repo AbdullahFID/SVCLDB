@@ -2344,7 +2344,31 @@ static int ai_try_streaming_once(const svc_config_t *cfg_active,
     jb_free(&jb);
 
     if (!http_ok) {
-        if (s.full_reply) { free(s.full_reply); }
+        /* v-audit-hardening (2026-09-23) -- P1-2 from opus-4.7 Audit D.
+         *
+         * PRIOR: `if (s.full_reply) { free(s.full_reply); }` unconditionally,
+         * dropping whatever tokens we'd buffered so far. On a USER-REQUESTED
+         * abort mid-stream (Ctrl+Alt+S) with batched-mode display (default per
+         * `stream_ctx_t` docstring), `on_chunk` never fired for those tokens,
+         * so the buffer was the ONLY copy. Result: user aborted a 30-line
+         * reply, got an empty chat bubble with only the "_(stopped by user)_"
+         * suffix.
+         *
+         * NOW: On abort, TRANSFER OWNERSHIP of the partial buffer to the
+         * caller so it can surface it via `on_done`. On genuine transport
+         * error we still free (nothing to salvage). Detected via
+         * `ai_abort_requested()` -- same sentinel `stream_chunk_recv`
+         * uses to break the read loop. */
+        if (s.full_reply) {
+            if (ai_abort_requested()) {
+                result->full_reply = s.full_reply;
+                result->full_len   = s.full_len;
+                s.full_reply       = NULL;
+                s.full_len         = 0;
+            } else {
+                free(s.full_reply);
+            }
+        }
         if (raw_headers) LocalFree(raw_headers);
         /* result->status stays 0 -> caller sees transport error */
         return 0;
@@ -2470,13 +2494,26 @@ int ai_ask_streaming(const svc_config_t *cfg,
                 }
                 /* v4.5: user hit Ctrl+Alt+S mid-flight? Don't retry / don't
                  * fall back -- surface whatever partial reply we buffered
-                 * with a friendly note. */
+                 * with a friendly note.
+                 *
+                 * v-audit-hardening (2026-09-23) -- P1-2: `ai_try_streaming_once`
+                 * now transfers ownership of `r.full_reply` on abort (see the
+                 * `if (!http_ok)` block above). Hand that partial to `on_done`
+                 * so batched-mode users see what the model produced before
+                 * they aborted. Non-batched users have already received these
+                 * bytes via `on_chunk` during streaming; the extra `on_done`
+                 * carry is redundant-but-harmless there (done handler
+                 * finalizes on `full_reply` if provided, else uses the
+                 * live-appended text). */
                 if (ai_abort_requested()) {
                     if (image_b64) free(image_b64);
-                    slog_writef("msvc_dbg_d.dat", "ai_ask_streaming ABORTED by user provider=%s",
-                                ai_provider_name(prov));
+                    slog_writef("msvc_dbg_d.dat",
+                                "ai_ask_streaming ABORTED by user provider=%s partial_len=%zu",
+                                ai_provider_name(prov), r.full_len);
                     if (on_done) {
-                        on_done(0, NULL, 0, "stopped by user", userdata);
+                        on_done(0, r.full_reply, r.full_len, "stopped by user", userdata);
+                    } else if (r.full_reply) {
+                        free(r.full_reply);
                     }
                     ai_clear_abort();
                     return 1;

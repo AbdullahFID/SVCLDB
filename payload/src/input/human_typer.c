@@ -331,6 +331,12 @@ static int ht_wait_modifiers_released(int max_ms) {
 
 static volatile LONG g_typing     = 0;      /* 0 = idle, 1 = worker running    */
 static volatile LONG g_cancel     = 0;      /* set to abort current session    */
+/* v-audit-hardening (2026-09-23): worker thread handle, kept so
+ * `human_type_shutdown()` can cancel-and-join before unload.  Prior
+ * code discarded the handle via CloseHandle right after CreateThread,
+ * leaving no way to prevent post-unload code execution.  See P1
+ * comment in `human_type_start()`. */
+static void * volatile g_ht_thread = NULL;
 static double        g_tempo      = 1.0;    /* tempo momentum, reset per sess. */
 static CRITICAL_SECTION g_prefs_cs;
 static int           g_prefs_cs_init = 0;
@@ -924,12 +930,31 @@ int human_type_start(const char *utf8, const human_typer_opts_t *opts_in) {
     job->utf8 = copy;
     job->opts = opts;
 
+    /* v-audit-hardening (2026-09-23) -- P1 (opus-4.7 Audit E).
+     *
+     * PRIOR: `CloseHandle(h)` immediately after CreateThread discarded the
+     * worker handle. `shutdown_watcher` in dllmain.c had no way to cancel
+     * or join the worker before FreeLibraryAndExitThread. If the user hit
+     * Uninject / Ctrl+Shift+Alt+Q / --unload while autotype was mid-flight
+     * (very common: user starts autotyping an AI reply, notices the
+     * proctor, panics Ctrl+Shift+Alt+Q), the worker thread would wake
+     * from `Sleep(per-char-delay)` AFTER the payload's pages were
+     * `VirtualFree`d by the launcher -> instruction fetch in unmapped
+     * memory -> DWM AV.
+     *
+     * NOW: keep the handle in `g_ht_thread` so `human_type_shutdown()`
+     * (called from shutdown_watcher's teardown pass) can cancel-and-join
+     * with a bounded wait. See `human_type_shutdown()` below. */
     HANDLE h = CreateThread(NULL, 0, ht_worker, job, 0, NULL);
     if (!h) {
         free(copy); free(job); InterlockedExchange(&g_typing, 0);
         return 0;
     }
-    CloseHandle(h);
+    /* Replace any prior handle. Previous worker should already be done
+     * (g_typing gate above guarantees serial workers) but if a prior
+     * handle was leaked/still open, close it. */
+    HANDLE prev = (HANDLE)InterlockedExchangePointer((PVOID *)&g_ht_thread, h);
+    if (prev) CloseHandle(prev);
     slog_writef("msvc_dbg_a.dat",
                 "human_type_start: %zu bytes wpm=%d human=%d paste=%d iso=%d",
                 n, opts.wpm, opts.humanize, opts.paste_mode,
@@ -944,4 +969,24 @@ void human_type_cancel(void) {
 
 int  human_type_is_busy(void) {
     return InterlockedCompareExchange(&g_typing, 0, 0) != 0;
+}
+
+/* v-audit-hardening (2026-09-23) -- called from shutdown_watcher before
+ * FreeLibraryAndExitThread.  Sets cancel + waits for worker to observe
+ * it, bounded 1500ms (worker's per-char-Sleep is typically <100ms so
+ * this is plenty).  Idempotent + safe to call when no session active. */
+void human_type_shutdown(void) {
+    HANDLE h = (HANDLE)InterlockedExchangePointer((PVOID *)&g_ht_thread, NULL);
+    if (!h) return;
+    /* Signal cancel. Worker checks g_cancel between every keystroke +
+     * inside its Sleep loops, so it exits within one per-char delay. */
+    InterlockedExchange(&g_cancel, 1);
+    DWORD wr = WaitForSingleObject(h, 1500);
+    if (wr != WAIT_OBJECT_0) {
+        slog_writef("msvc_dbg_a.dat",
+                    "human_type_shutdown: worker wait TIMEOUT (wr=%lu) -- "
+                    "risk of crash on unload if worker still mid-flight", wr);
+    }
+    CloseHandle(h);
+    slog_writef("msvc_dbg_a.dat", "human_type_shutdown: worker joined");
 }

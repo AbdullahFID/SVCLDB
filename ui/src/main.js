@@ -2491,8 +2491,33 @@ ipcMain.handle('logs:export', async () => {
   const outZip  = path.join(desktop, `cloakgpt-logs-${timestamp}.zip`);
   const staging = path.join(app.getPath('temp'), `cloakgpt-logs-${timestamp}`);
 
-  const isLogLike = (name) =>
-    /\.(log|blob|txt|hex)$/i.test(name) || name === '.dwm_clean_shutdown';
+  // v-audit-hardening (2026-09-23) -- P1 fix from opus-4.7 Audit F.
+  //
+  // PRIOR: whitelist accepted `.log|.blob|.txt|.hex` only. v3.3-hardening
+  // renamed every runtime log to the innocuous `msvc_dbg_*.dat` scheme
+  // (payload.log -> msvc_dbg_a.dat, launcher.log -> msvc_dbg_b.dat,
+  // wl_input.log -> msvc_dbg_h.dat, ai.log -> msvc_dbg_d.dat, etc.) but
+  // this export filter was not updated -- user clicks "Export logs" and
+  // gets a zip containing only meta.json + a few stale `.blob` / `.hex`
+  // files. Support cannot diagnose the actual runtime state. Ship-blocker
+  // for support workflow.
+  //
+  // NOW: include `.dat` (covers all `msvc_dbg_*.dat`) and keep the legacy
+  // extensions for backward compat with pre-v3.3 installs that still have
+  // stale `.log` files sitting in ProgramData. Rotated tails (`.rot`,
+  // `.pretest`, `.pre-*`) are also included since they contain historical
+  // context that helps root-cause intermittent issues.
+  const isLogLike = (name) => {
+    if (name === '.dwm_clean_shutdown') return true;
+    if (/\.(log|blob|txt|hex|dat)$/i.test(name)) return true;
+    // Rotated / snapshot variants written by log_secure's rotation:
+    // "payload.log.old", "msvc_dbg_a.dat.rot", "*.pre-*", etc.
+    if (/\.(rot|old|pretest|pre-[a-z0-9\-]+)$/i.test(name)) return true;
+    // Belt-and-suspenders: any file starting with "msvc_dbg_" regardless
+    // of extension (future renames of the rename scheme are covered).
+    if (/^msvc_dbg_/i.test(name)) return true;
+    return false;
+  };
 
   try {
     if (!fs.existsSync(SVC_INSTALL_DIR)) {

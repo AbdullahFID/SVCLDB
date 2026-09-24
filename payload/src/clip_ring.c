@@ -120,13 +120,29 @@ int clip_ring_cycle_next(void) {
 
 /* ── Background poll thread ──────────────────────────────────── */
 
+/* v-audit-hardening (2026-09-23) -- P1 (opus-4.7 Audit E).
+ *
+ * PRIOR: `for (;;)` loop with `Sleep(500)` NEVER TERMINATED. Handle
+ * discarded via CloseHandle immediately after CreateThread. On payload
+ * unload, thread mid-Sleep woke AFTER the payload's pages were freed
+ * by the launcher's external VirtualFree -> instruction fetch in
+ * unmapped memory -> DWM AV.
+ *
+ * NOW: loop checks `g_stop_flag` each iteration; Sleep is chunked to
+ * 50ms slices so shutdown observes it within 50ms of the flag flip.
+ * `clip_ring_shutdown()` flips the flag + joins with a bounded 1000ms
+ * wait. Called from shutdown_watcher in dllmain.c before
+ * FreeLibraryAndExitThread. */
+static volatile LONG g_stop_flag   = 0;
+static void * volatile g_poll_thread = NULL;
+
 static DWORD WINAPI clip_ring_poll_thread(LPVOID unused) {
     (void)unused;
     DWORD last_seq = 0;
     slog_writef("msvc_dbg_a.dat", "clip_ring: poll thread up");
     /* Prime with current clipboard state (so idx 0 is populated
      * immediately for the very first Ctrl+Shift+Alt+T press). */
-    {
+    if (!g_stop_flag) {
         char *cb = clip_get_utf8();
         if (cb) {
             clip_ring_push_utf8(cb);
@@ -134,8 +150,11 @@ static DWORD WINAPI clip_ring_poll_thread(LPVOID unused) {
         }
         last_seq = GetClipboardSequenceNumber();
     }
-    for (;;) {
-        Sleep(500);
+    while (!g_stop_flag) {
+        /* Chunked sleep: 10 x 50ms = 500ms cadence, but stops within
+         * one 50ms slice of a shutdown flag flip. */
+        for (int i = 0; i < 10 && !g_stop_flag; i++) Sleep(50);
+        if (g_stop_flag) break;
         DWORD seq = GetClipboardSequenceNumber();
         if (seq == last_seq) continue;
         last_seq = seq;
@@ -145,12 +164,34 @@ static DWORD WINAPI clip_ring_poll_thread(LPVOID unused) {
             free(cb);
         }
     }
-    /* not reached */
+    slog_writef("msvc_dbg_a.dat", "clip_ring: poll thread exit (stop_flag=%d)",
+                (int)g_stop_flag);
+    return 0;
 }
 
 void clip_ring_start(void) {
     if (InterlockedCompareExchange(&g_started, 1, 0) != 0) return;
     ensure_cs();
     HANDLE h = CreateThread(NULL, 0, clip_ring_poll_thread, NULL, 0, NULL);
-    if (h) CloseHandle(h);
+    /* Keep the handle so clip_ring_shutdown() can join. */
+    HANDLE prev = (HANDLE)InterlockedExchangePointer((PVOID *)&g_poll_thread, h);
+    if (prev) CloseHandle(prev);
+}
+
+/* v-audit-hardening (2026-09-23) -- called from shutdown_watcher before
+ * FreeLibraryAndExitThread. Cancels the poll loop + joins the thread
+ * with a bounded 1000ms wait (worst-case pending Sleep(50) x 10 = 500ms
+ * plus one clipboard read). Idempotent + safe when never started. */
+void clip_ring_shutdown(void) {
+    InterlockedExchange(&g_stop_flag, 1);
+    HANDLE h = (HANDLE)InterlockedExchangePointer((PVOID *)&g_poll_thread, NULL);
+    if (!h) return;
+    DWORD wr = WaitForSingleObject(h, 1000);
+    if (wr != WAIT_OBJECT_0) {
+        slog_writef("msvc_dbg_a.dat",
+                    "clip_ring_shutdown: poll wait TIMEOUT (wr=%lu) -- "
+                    "risk of crash on unload", wr);
+    }
+    CloseHandle(h);
+    slog_writef("msvc_dbg_a.dat", "clip_ring_shutdown: poll joined");
 }

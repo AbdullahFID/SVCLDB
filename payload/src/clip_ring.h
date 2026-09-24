@@ -30,6 +30,13 @@ extern "C" {
  * init_thread after hooks are up. */
 void clip_ring_start(void);
 
+/* v-audit-hardening (2026-09-23) -- shutdown-safe join.
+ * Called from shutdown_watcher in dllmain.c before FreeLibraryAndExitThread
+ * so the poll thread cannot outlive the payload's mapped pages.  Flips
+ * a stop flag and joins with a bounded 1000ms wait.  Idempotent + safe
+ * when never started (no-ops). */
+void clip_ring_shutdown(void);
+
 /* Push a UTF-8 string into the ring. Newest = index 0. Dedupes
  * consecutive duplicates so pasting the same text twice doesn't
  * waste a slot. Safe from any thread. Silently truncates entries

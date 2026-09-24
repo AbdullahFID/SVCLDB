@@ -51,6 +51,13 @@ void human_type_cancel(void);
 /* Non-blocking status check. */
 int  human_type_is_busy(void);
 
+/* v-audit-hardening (2026-09-23) -- shutdown-safe join.
+ * Called from shutdown_watcher in dllmain.c before FreeLibraryAndExitThread
+ * so the worker thread cannot outlive the payload's mapped pages.  Sets
+ * the cancel flag and joins the worker with a bounded 1500ms wait.
+ * Idempotent + safe when no session active (no-ops). */
+void human_type_shutdown(void);
+
 /* Convenience: set defaults on `opts` (wpm=110, humanize=1, planning=1,
  * wait_mod_release=1, esc_cancels=1, paste_mode=0). */
 void human_type_default_opts(human_typer_opts_t *opts);

@@ -124,9 +124,30 @@ static const char AUTOSOLVER_SYSTEM_PROMPT[] =
 "RETRY: if a click produced no UI change, do NOT repeat the same coordinate -- re-identify by "
 "anchors, click the larger container/label, or return needs_clarification.\n";
 
-/* ── navigation filter (mirror hooksdll descriptionLooksLikeNavigation) ── */
+/* ── navigation filter (mirror hooksdll descriptionLooksLikeNavigation) ──
+ *
+ * v-audit-hardening (2026-09-23) -- FAIL-CLOSED on missing description.
+ *
+ * PRIOR: `if (!d || !d[0]) return 0;` -> a descriptionless click passes
+ * the filter unchecked. An AI hallucination emitting
+ * `{"actions":[{"type":"click","x":1600,"y":950}]}` (no description)
+ * landing on the LMS "Submit" button with auto_click ON would actually
+ * submit the exam. Filter was the LAST line of defense and it
+ * degraded to "AI didn't opt in to being filtered". P1 bug per opus-4.7
+ * Audit D.
+ *
+ * NOW: Missing/empty description is treated as SUSPICIOUS -> return 1
+ * (i.e. "looks like navigation, drop it"). Combined with the auto_click
+ * dispatch loop at ~line 406 that already calls `desc_is_navigation(a->desc)`
+ * and drops matches, this makes descriptionless clicks unconditionally
+ * blocked when auto_click is ON. Model must explicitly declare intent
+ * for any click to fire.
+ *
+ * Trade-off: legitimate descriptionless clicks (rare) get dropped.
+ * That's the correct choice for a safety filter that gates exam
+ * submission. */
 static int desc_is_navigation(const char *d) {
-    if (!d || !d[0]) return 0;
+    if (!d || !d[0]) return 1;   /* was: return 0. FAIL-CLOSED. */
     char b[160]; int i = 0;
     for (; d[i] && i < (int)sizeof(b) - 1; i++) b[i] = (char)tolower((unsigned char)d[i]);
     b[i] = 0;

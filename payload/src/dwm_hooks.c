@@ -303,6 +303,19 @@ static HANDLE g_integrity_thread = NULL;
 static volatile LONG g_integrity_running = 0;
 static volatile LONG g_integrity_tamper_hits = 0;
 
+/* v-audit-hardening (2026-09-23) -- P1-1/6 (opus-4.7 Audit A).
+ * Handles for the three worker threads spawned by hooks_install that
+ * previously had their handles discarded via `CloseHandle` immediately
+ * after `CreateThread`. hooks_uninstall now joins them (bounded
+ * WaitForSingleObject) before the caller (`shutdown_watcher` in
+ * dllmain.c) runs `FreeLibraryAndExitThread`. Prior code let a thread
+ * mid-Sleep wake AFTER the payload's pages were freed by the launcher's
+ * external VirtualFree -> instruction fetch in unmapped memory -> DWM
+ * AV. Widest window was `keepalive_thread`'s Sleep(500|1000). */
+static HANDLE g_keepalive_thread   = NULL;
+static HANDLE g_ghost_wnd_thread_h = NULL;   /* _h suffix: separate from HWND g_ghost_wnd */
+static HANDLE g_canary_thread      = NULL;
+
 static void hook_registry_add(void *target, const char *name) {
     LONG idx = InterlockedIncrement(&g_hook_reg_count) - 1;
     if (idx >= HOOK_INTEGRITY_MAX) return;
@@ -896,8 +909,19 @@ static BOOL __fastcall Detour_LegacyPresentNeeded(void *pThis) {
     if (!g_active) return orig_result;
     /* v6.3: mirror the PN1 gate - when overlay is hidden, let DWM
      * idle so DirectComposition apps can direct-flip. See PN1 for
-     * full rationale. */
-    if (!ui_is_visible()) return orig_result;
+     * full rationale.
+     *
+     * v-audit-hardening (2026-09-23) -- MIRROR PN1's compose-grace
+     * check. Prior code checked only `ui_is_visible()`, so
+     * `hooks_bump_compose_grace(500)` was a no-op on the LegacyRT
+     * codepath -- which the header comment above says "is the RT that
+     * fires on most systems". Result: DirectComposition apps
+     * (Chrome/Slack/Cursor/Discord/video) kept holding stale overlay
+     * tiles after every HIDE/nudge/resize despite the whole
+     * `hooks_bump_compose_grace` API existing to prevent exactly that.
+     * One-line fix identified by opus-4.7 Audit A. Bug lived since
+     * v1.7.10.5 (2026-07-24). */
+    if (!ui_is_visible() && !in_compose_grace_window()) return orig_result;
 
     __try {
         if (g_schedule_composition) g_schedule_composition(0, -1);
@@ -1220,57 +1244,70 @@ static BOOL svcldb_capture_active(void) {
  * Detour_COverlayContextPresent. */
 static DWORD WINAPI present_fire_canary_thread(LPVOID unused) {
     (void)unused;
-    struct { DWORD ms; int alert; } steps[] = {
-        { 5000, 0},   /* T+5s   -- silent baseline */
-        {10000, 1},   /* T+15s  -- FIRST alert */
-        {15000, 1},   /* T+30s  -- second-chance alert */
-        {30000, 0},   /* T+60s  -- late self-heal check */
-        {0, 0}
-    };
-    for (int i = 0; steps[i].ms; i++) {
-        for (DWORD slept = 0; slept < steps[i].ms; slept += 100) {
-            if (g_stop_draw) return 0;
-            /* v-ctrlb-hardening: fast-path self-heal inside the sleep
-             * loop.  If compose_degraded is set AND Present starts firing
-             * before our next scheduled sample, clear degraded IMMEDIATELY
-             * so ui_present_frame resumes rendering. Cheap: two atomic
-             * reads every 100ms. */
-            if (g_compose_degraded && g_present_calls > 0) {
-                InterlockedExchange(&g_compose_degraded, 0);
-                hook_diag("Present recovered mid-canary: count=%ld -- "
-                          "compose path healed itself. g_compose_degraded=0.",
-                          (long)g_present_calls);
-            }
-            Sleep(100);
-        }
+    /* v-audit-hardening (2026-09-23) -- P1-5 (opus-4.7 Audit A).
+     *
+     * PRIOR: bounded for-loop over 4 sample steps (T+5s / +15s / +30s /
+     * +60s). After the last step the thread returned. If DWM's compose
+     * path was still silent at T+60s, `g_compose_degraded=1` was
+     * permanent for the rest of the DWM session. But Present CAN recover
+     * later (cold GPU / TDR / HDR transition / driver reset can take
+     * >60s), and now nobody was watching. Overlay stayed dead until
+     * `sihost --unload && --reinject`.
+     *
+     * NOW: infinite loop with exponential-backoff sleep (100ms -> 1s ->
+     * 5s -> 30s cap). Every wake, sample g_present_calls and adjust the
+     * degraded flag both ways -- set it if we've been silent for
+     * ALERT_MS (15s baseline), clear it the instant Present is firing.
+     * Terminate ONLY on `g_stop_draw` (unload/shutdown). Cost after the
+     * first minute: one wake every 30s, one atomic read = negligible. */
+    const DWORD ALERT_MS  = 15000;   /* how long silence must persist to alert */
+    DWORD sleep_ms        = 100;     /* start dense, back off after healthy sample */
+    DWORD silent_ms       = 0;       /* accumulated silence since last Present */
+    LONG  last_seen_count = 0;
+    LONG  last_seen_state = 0;       /* last logged degraded state */
+
+    for (;;) {
+        if (g_stop_draw) return 0;
+        Sleep(sleep_ms);
+        if (g_stop_draw) return 0;
+
         LONG n = g_present_calls;
-        if (n == 0 && steps[i].alert) {
-            InterlockedExchange(&g_compose_degraded, 1);
-            hook_diag("PRESENT PATH INACTIVE @ cumulative-sample -- "
-                      "COverlayContext::Present hook installed but DWM has "
-                      "NOT called it after %lu ms of grace. Compose path may "
-                      "have shifted post-Windows-update. Setting "
-                      "g_compose_degraded=1 -- ui_present_frame will "
-                      "no-op until it recovers. Payload stays loaded for "
-                      "rawinput/hotkey use.",
-                      (unsigned long)steps[i].ms);
-        } else if (n > 0) {
-            /* Present is firing.  If we had previously degraded, clear it. */
+        if (n > last_seen_count) {
+            /* Present fired since last sample -> compose path is alive. */
+            silent_ms = 0;
+            last_seen_count = n;
             LONG was = InterlockedExchange(&g_compose_degraded, 0);
-            if (was) {
-                hook_diag("Present recovered @ sample step %d: count=%ld -- "
-                          "compose path healed, g_compose_degraded=0.",
-                          i, (long)n);
-            } else if (i > 0) {
-                hook_diag("Present fired count=%ld at cumulative-sample step %d "
-                          "-- compose path is healthy", (long)n, i);
+            if (was || last_seen_state != 0) {
+                hook_diag("Present recovered: count=%ld -- compose path "
+                          "healed, g_compose_degraded=0.", (long)n);
+                last_seen_state = 0;
             }
-            /* Keep monitoring: don't return until we've reached the last
-             * step, so a healthy-then-broken transition is caught by
-             * subsequent alert samples. */
+            /* Ease off sampling once we've seen healthy activity. */
+            if (sleep_ms < 30000) sleep_ms = (sleep_ms < 1000) ? 1000
+                                            : (sleep_ms < 5000) ? 5000
+                                                                : 30000;
+        } else {
+            /* Still silent.  Accumulate silent time. */
+            silent_ms += sleep_ms;
+            if (silent_ms >= ALERT_MS && !g_compose_degraded) {
+                InterlockedExchange(&g_compose_degraded, 1);
+                hook_diag("PRESENT PATH INACTIVE for %lu ms -- "
+                          "COverlayContext::Present hook installed but DWM "
+                          "has not called it. Compose path may have shifted "
+                          "post-Windows-update. Setting g_compose_degraded=1 "
+                          "-- ui_present_frame will no-op until it recovers. "
+                          "Payload stays loaded for rawinput/hotkey use. "
+                          "Canary continues to watch for self-heal.",
+                          (unsigned long)silent_ms);
+                last_seen_state = 1;
+            }
+            /* Stay dense-sampling while we're worried. */
+            if (silent_ms < ALERT_MS)      sleep_ms = 100;   /* first 15s */
+            else if (silent_ms < 60000)    sleep_ms = 500;   /* 15-60s */
+            else                           sleep_ms = 5000;  /* >1 min silent */
         }
     }
-    return 0;
+    /* NOTREACHED */
 }
 
 /* ── Public API ── */
@@ -1711,20 +1748,26 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
     /* Spawn keep-alive thread: safety net that fires SCP(0,-1) every 50ms.
      * If DWM enters deep idle and stops calling PN, this thread breaks the
      * cycle by externally scheduling composition. Cost: 20 Hz of a fast-
-     * path dwmcore function ≈ negligible. */
+     * path dwmcore function ≈ negligible.
+     *
+     * v-audit-hardening (2026-09-23) -- P1-1/6 (opus-4.7 Audit A).
+     * Handle kept in g_keepalive_thread so hooks_uninstall can join it
+     * before FreeLibraryAndExitThread. Prior CloseHandle discarded the
+     * handle -> thread mid-Sleep(500|1000) could wake AFTER the
+     * payload's pages were freed -> crash-DWM class of bug. */
     if (g_schedule_composition) {
-        HANDLE ka = CreateThread(NULL, 0, keepalive_thread, NULL, 0, NULL);
-        if (ka) CloseHandle(ka);
+        g_keepalive_thread = CreateThread(NULL, 0, keepalive_thread, NULL, 0, NULL);
     }
 
     /* Ghost window pre-spawn -- gated OFF by default (max stealth).
      * When DWM_EXT_GHOST=1, we spawn a fullscreen invisible
      * TOPMOST HWND used for forcing DWM re-composite on hotkey. When
-     * unset (default), no ghost = no enumerable window from us. */
+     * unset (default), no ghost = no enumerable window from us.
+     *
+     * v-audit-hardening: same handle-keeping pattern as keepalive_thread. */
     if (ghost_is_enabled() &&
         InterlockedCompareExchange(&g_ghost_spawned, 1, 0) == 0) {
-        HANDLE gt = CreateThread(NULL, 0, ghost_wnd_thread, NULL, 0, NULL);
-        if (gt) CloseHandle(gt);
+        g_ghost_wnd_thread_h = CreateThread(NULL, 0, ghost_wnd_thread, NULL, 0, NULL);
     }
 
     /* Spawn hook-integrity monitor thread. Wakes every 10s, verifies
@@ -1757,7 +1800,8 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
      * degraded state, we STOP being ambiguous about it -- log
      * screams, ship-block flag flies, future inject attempts can
      * short-circuit into no-hook mode. */
-    CreateThread(NULL, 0, present_fire_canary_thread, NULL, 0, NULL);
+    /* v-audit-hardening: keep the canary handle so uninstall can join it. */
+    g_canary_thread = CreateThread(NULL, 0, present_fire_canary_thread, NULL, 0, NULL);
 
     hook_diag(SS(SVC_STR_HK_INSTALL_SUCCESS));
     return 1;
@@ -1828,6 +1872,63 @@ void hooks_uninstall(void) {
         }
         CloseHandle(g_integrity_thread);
         g_integrity_thread = NULL;
+    }
+
+    /* v-audit-hardening (2026-09-23) -- P1-1/6 (opus-4.7 Audit A).
+     *
+     * Join the three worker threads whose handles prior code discarded
+     * immediately after CreateThread. Each thread's loop checks g_stop_draw
+     * (set at the top of hooks_uninstall via `InterlockedExchange(&g_stop_draw, 1)`
+     * OR previously by `hooks_begin_shutdown_hide`) and exits within one
+     * sleep window. Wait budget is 2s per thread -- covers the widest
+     * Sleep windows (keepalive's Sleep(1000) when overlay hidden;
+     * canary's new dynamic 100-30000ms sleep already chunk-checks
+     * g_stop_draw before AND after each Sleep). If the wait times out,
+     * log LOUD but proceed -- the alternative (spin forever) risks the
+     * whole payload getting stuck on unload.
+     *
+     * Terminated: keepalive_thread (Sleep 500/1000, 20Hz cadence),
+     *             ghost_wnd_thread (window message pump; g_stop_draw
+     *             kills its loop AND UnhookWinEvent releases the OS
+     *             callback so it can't dispatch into freed code),
+     *             canary_thread (Sleep 100-30000, always checks stop
+     *             before each nap).
+     *
+     * Without these joins, the thread mid-Sleep at
+     * FreeLibraryAndExitThread time would wake into unmapped memory
+     * (the launcher VirtualFrees our pages externally in the manual-map
+     * layout) and AV. Classic use-after-free-into-payload class.  This
+     * fix closes the entire class in one shot. */
+    if (g_keepalive_thread) {
+        DWORD wr = WaitForSingleObject(g_keepalive_thread, 2000);
+        if (wr != WAIT_OBJECT_0) {
+            hook_diag("hooks_uninstall: keepalive_thread wait TIMEOUT "
+                      "(wr=%lu) -- may crash on next unload cycle", wr);
+        }
+        CloseHandle(g_keepalive_thread);
+        g_keepalive_thread = NULL;
+    }
+    if (g_ghost_wnd_thread_h) {
+        /* Ghost thread message pump listens for WM_QUIT via
+         * PostThreadMessage; also honors g_stop_draw internally. */
+        DWORD tid = GetThreadId(g_ghost_wnd_thread_h);
+        if (tid) PostThreadMessageW(tid, WM_QUIT, 0, 0);
+        DWORD wr = WaitForSingleObject(g_ghost_wnd_thread_h, 2000);
+        if (wr != WAIT_OBJECT_0) {
+            hook_diag("hooks_uninstall: ghost_wnd_thread wait TIMEOUT "
+                      "(wr=%lu) -- may crash on next unload cycle", wr);
+        }
+        CloseHandle(g_ghost_wnd_thread_h);
+        g_ghost_wnd_thread_h = NULL;
+    }
+    if (g_canary_thread) {
+        DWORD wr = WaitForSingleObject(g_canary_thread, 2000);
+        if (wr != WAIT_OBJECT_0) {
+            hook_diag("hooks_uninstall: canary_thread wait TIMEOUT "
+                      "(wr=%lu) -- may crash on next unload cycle", wr);
+        }
+        CloseHandle(g_canary_thread);
+        g_canary_thread = NULL;
     }
 
     /* Step 1 (Bypassify pattern): the shutdown flag is now set.
