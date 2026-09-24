@@ -82,12 +82,24 @@
 #define NT_SUCCESS(s) (((NTSTATUS)(s)) >= 0)
 #endif
 
-/* Wire struct (24 bytes) -- MUST match seb_evt in payload/rawinput_hook.c. */
+/* Wire struct (24 bytes) -- MUST match seb_evt in payload/rawinput_hook.c.
+ *
+ * v-audit-hardening (2026-09-23) -- P1-1 (opus-4.7 Audit B): the former
+ * `pad` byte is now `injected`.  Set to 1 by the LL mouse hook when
+ * MSLLHOOKSTRUCT.flags carries LLMHF_INJECTED / LLMHF_LOWER_IL_INJECTED,
+ * OR by the RIDEV_INPUTSINK mouse handler when there is NO matching
+ * physical-LL-tick within EMERG_INJ_MATCH_MS.  Payload's
+ * dispatch_external_mouse rejects any wire_evt with injected=1 to close
+ * the "iso-desktop attacker triggers autosolver via SendInput mouse-
+ * hold" DoS.  Struct size preserved (24 bytes); wire ABI unchanged for
+ * rolling-upgrade compat -- old payloads treat the byte as pad, ignore
+ * the flag, get pre-fix behavior. */
 #pragma pack(push, 1)
 typedef struct {
     unsigned char  type;        /* 0 = key, 1 = mouse */
     unsigned char  down;        /* key: 1=down 0=up */
-    unsigned char  ctrl, shift, alt, pad;
+    unsigned char  ctrl, shift, alt;
+    unsigned char  injected;    /* v-audit-hardening: was `pad` */
     unsigned short vk;          /* key virtual-key */
     unsigned int   wp;          /* mouse: WM_* message code */
     int            x, y;        /* mouse: absolute screen pos */
@@ -1004,6 +1016,64 @@ typedef struct {
 #define WL_LLKHF_INJECTED           0x00000010U
 #define WL_LLKHF_LOWER_IL_INJECTED  0x00000002U
 
+/* v-audit-hardening (2026-09-23) -- P1-1 (opus-4.7 Audit B).
+ *
+ * Local mirror of MSLLHOOKSTRUCT so we can install WH_MOUSE_LL alongside
+ * WH_KEYBOARD_LL without pulling extra winuser types into the manual-map
+ * unit. `flags` carries LLMHF_INJECTED / LLMHF_LOWER_IL_INJECTED bits
+ * (identical numeric values to their kbd counterparts). */
+typedef struct {
+    POINT     pt;
+    DWORD     mouseData;
+    DWORD     flags;
+    DWORD     time;
+    ULONG_PTR dwExtraInfo;
+} SVC_MSLL;
+#define WL_LLMHF_INJECTED           0x00000001U
+#define WL_LLMHF_LOWER_IL_INJECTED  0x00000002U
+
+/* RIDEV_INPUTSINK receives mouse events with NO injection flag -- the raw
+ * input stack captures physical AND synthesized indiscriminately. To
+ * distinguish, we ALSO install WH_MOUSE_LL (which DOES carry the
+ * injection bits in MSLLHOOKSTRUCT.flags) and record the tick of the
+ * MOST RECENT PHYSICAL (non-injected) event of each interesting type.
+ * The RIDEV mouse handler then checks: is there a matching physical
+ * tick within EMERG_INJ_MATCH_MS? If YES -> real user, forward with
+ * injected=0. If NO -> synthesized by SendInput / keybd_event /
+ * mouse_event, forward with injected=1 so payload drops it.
+ *
+ * We track by WM_* message code (0x201/0x202/... = LMB DN/UP etc.).
+ * A single 32-slot table keyed by the low byte of the wp code is
+ * plenty for the messages we forward. Volatile because the LL callback
+ * (window-thread callback) races the RIDEV WM_INPUT handler (same
+ * thread in run_reader, but define semantics anyway for defense in
+ * depth against a future off-thread reader). */
+#define WL_MOUSE_PHYS_TABLE_SZ 32
+static volatile ULONGLONG g_ll_mouse_phys_tick[WL_MOUSE_PHYS_TABLE_SZ] = {0};
+#define EMERG_INJ_MATCH_MS 50   /* real user LL + RIDEV arrive <5ms apart */
+
+/* Was the last mouse event of this type from a physical source
+ * (LL hook saw it non-injected recently)? */
+static int wl_mouse_was_physical(unsigned int wp) {
+    unsigned idx = (wp & 0x1F);   /* low 5 bits -> table slot */
+    ULONGLONG t = g_ll_mouse_phys_tick[idx];
+    if (t == 0) return 0;
+    ULONGLONG now = GetTickCount64();
+    return (now - t) < EMERG_INJ_MATCH_MS;
+}
+
+static LRESULT CALLBACK wl_ll_mouse(int code, WPARAM wp, LPARAM lp) {
+    if (code != 0) return CallNextHookEx(NULL, code, wp, lp);
+    SVC_MSLL *m = (SVC_MSLL *)lp;
+    /* Only stamp on NON-injected events. wp is the WM_* code. */
+    if (m && !(m->flags & (WL_LLMHF_INJECTED | WL_LLMHF_LOWER_IL_INJECTED))) {
+        unsigned idx = ((unsigned)wp & 0x1F);
+        g_ll_mouse_phys_tick[idx] = GetTickCount64();
+    }
+    /* Pass through -- we don't consume mouse events, only observe. */
+    return CallNextHookEx(NULL, code, wp, lp);
+}
+
 static LRESULT CALLBACK wl_ll_kbd(int code, WPARAM wp, LPARAM lp) {
     if (code != 0 /*HC_ACTION*/) return CallNextHookEx(NULL, code, wp, lp);
     SVC_KBDLL *k = (SVC_KBDLL *)lp;
@@ -1248,6 +1318,21 @@ static void run_reader(const char *deskname) {
     lg("reader: WH_KEYBOARD_LL install %s (v3.3 active consume ARMED)",
        hkbd ? "OK" : "FAILED");
 
+    /* v-audit-hardening (2026-09-23) -- P1-1 (opus-4.7 Audit B).
+     *
+     * WH_MOUSE_LL alongside the keyboard hook. Purpose is NOT to consume
+     * mouse events -- run_reader's RIDEV_INPUTSINK path stays authoritative
+     * for cursor coords + button state (LL hook can't deliver RIDEV's
+     * absolute pos as cleanly). The LL hook exists ONLY to stamp
+     * g_ll_mouse_phys_tick[] on non-injected events so the RIDEV handler
+     * below can distinguish physical vs. SendInput-synthesized events and
+     * set wire_evt.injected accordingly. Payload's dispatch_external_mouse
+     * drops injected=1 events, closing the "iso attacker triggers
+     * autosolver via SendInput LMB-hold" DoS. */
+    HHOOK hmouse = SetWindowsHookExW(14 /*WH_MOUSE_LL*/, wl_ll_mouse, NULL, 0);
+    lg("reader: WH_MOUSE_LL install %s (v-audit-hardening injection filter ARMED)",
+       hmouse ? "OK" : "FAILED");
+
     /* Wire the LL hook to the reader-owned pipe. Both live on the same
      * thread (LL callbacks dispatch on the SetWindowsHookEx caller's
      * message queue), so a plain assignment is race-free. */
@@ -1311,27 +1396,49 @@ static void run_reader(const char *deskname) {
                     wire_evt e;
                     for (int i = 0; i < (int)sizeof(e); i++) ((char*)&e)[i] = 0;
                     e.type = 1; e.x = pt.x; e.y = pt.y;
-                    if (bf & RI_MOUSE_LEFT_BUTTON_DOWN)   { e.wp = 0x0201; e.mouseData = 0;         wire_send(&g_reader_pipe, &e); }
-                    if (bf & RI_MOUSE_LEFT_BUTTON_UP)     { e.wp = 0x0202; e.mouseData = 0;         wire_send(&g_reader_pipe, &e); }
-                    if (bf & RI_MOUSE_RIGHT_BUTTON_DOWN)  { e.wp = 0x0204; e.mouseData = 0;         wire_send(&g_reader_pipe, &e); }
-                    if (bf & RI_MOUSE_RIGHT_BUTTON_UP)    { e.wp = 0x0205; e.mouseData = 0;         wire_send(&g_reader_pipe, &e); }
-                    if (bf & RI_MOUSE_MIDDLE_BUTTON_DOWN) { e.wp = 0x0207; e.mouseData = 0;         wire_send(&g_reader_pipe, &e); }
-                    if (bf & RI_MOUSE_MIDDLE_BUTTON_UP)   { e.wp = 0x0208; e.mouseData = 0;         wire_send(&g_reader_pipe, &e); }
-                    if (bf & RI_MOUSE_BUTTON_4_DOWN)      { e.wp = 0x020B; e.mouseData = (1u<<16); wire_send(&g_reader_pipe, &e); }
-                    if (bf & RI_MOUSE_BUTTON_4_UP)        { e.wp = 0x020C; e.mouseData = (1u<<16); wire_send(&g_reader_pipe, &e); }
-                    if (bf & RI_MOUSE_BUTTON_5_DOWN)      { e.wp = 0x020B; e.mouseData = (2u<<16); wire_send(&g_reader_pipe, &e); }
-                    if (bf & RI_MOUSE_BUTTON_5_UP)        { e.wp = 0x020C; e.mouseData = (2u<<16); wire_send(&g_reader_pipe, &e); }
+                    /* v-audit-hardening (2026-09-23) -- P1-1: helper for
+                     * each mouse-message-type below: forwards the wire_evt
+                     * with injected flag set to 0 if LL mouse hook saw a
+                     * matching physical event within EMERG_INJ_MATCH_MS,
+                     * else 1 (means the RIDEV event has no non-injected
+                     * corroboration -> synthesized). Payload drops
+                     * injected=1 events. */
+                    #define WL_SEND_MOUSE(_wp, _md) do { \
+                        e.wp = (_wp); e.mouseData = (_md); \
+                        e.injected = wl_mouse_was_physical(_wp) ? 0 : 1; \
+                        wire_send(&g_reader_pipe, &e); \
+                    } while (0)
+                    if (bf & RI_MOUSE_LEFT_BUTTON_DOWN)   { WL_SEND_MOUSE(0x0201, 0);         }
+                    if (bf & RI_MOUSE_LEFT_BUTTON_UP)     { WL_SEND_MOUSE(0x0202, 0);         }
+                    if (bf & RI_MOUSE_RIGHT_BUTTON_DOWN)  { WL_SEND_MOUSE(0x0204, 0);         }
+                    if (bf & RI_MOUSE_RIGHT_BUTTON_UP)    { WL_SEND_MOUSE(0x0205, 0);         }
+                    if (bf & RI_MOUSE_MIDDLE_BUTTON_DOWN) { WL_SEND_MOUSE(0x0207, 0);         }
+                    if (bf & RI_MOUSE_MIDDLE_BUTTON_UP)   { WL_SEND_MOUSE(0x0208, 0);         }
+                    if (bf & RI_MOUSE_BUTTON_4_DOWN)      { WL_SEND_MOUSE(0x020B, (1u<<16));  }
+                    if (bf & RI_MOUSE_BUTTON_4_UP)        { WL_SEND_MOUSE(0x020C, (1u<<16));  }
+                    if (bf & RI_MOUSE_BUTTON_5_DOWN)      { WL_SEND_MOUSE(0x020B, (2u<<16));  }
+                    if (bf & RI_MOUSE_BUTTON_5_UP)        { WL_SEND_MOUSE(0x020C, (2u<<16));  }
                     if (bf & RI_MOUSE_WHEEL) {
-                        e.wp = 0x020A;
-                        e.mouseData = ((DWORD)(unsigned short)rm->usButtonData) << 16;
-                        wire_send(&g_reader_pipe, &e);
+                        WL_SEND_MOUSE(0x020A,
+                                      ((DWORD)(unsigned short)rm->usButtonData) << 16);
                     }
                     static POINT lastpt = { -100000, -100000 };
                     if (pt.x != lastpt.x || pt.y != lastpt.y) {
                         lastpt = pt;
-                        e.wp = 0x0200; e.mouseData = 0;
+                        /* Cursor MOVE: forward unconditionally with
+                         * injected=0.  Mouse movement is not exploited by
+                         * the autosolver-trigger attack (which needs
+                         * BUTTON events), and requiring LL corroboration
+                         * on MOVE would break the RIDEV cursor tracking
+                         * (RIDEV MOVE fires at higher rate than LL for
+                         * high-DPI mice on 240Hz+ polling). Accept the
+                         * small residual attack surface (forced cursor
+                         * position without click) as a defense-in-depth
+                         * trade-off. */
+                        e.wp = 0x0200; e.mouseData = 0; e.injected = 0;
                         wire_send(&g_reader_pipe, &e);
                     }
+                    #undef WL_SEND_MOUSE
                 }
             }
         } else if (m.message == WM_TIMER) {

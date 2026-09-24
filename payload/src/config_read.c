@@ -340,21 +340,76 @@ int cfg_persist(void) {
      * the real GLE (5 = ACCESS_DENIED) revealed the DACL bug this function
      * is now designed to survive. Loud logging protects against future
      * regressions. */
+    /* v-audit-hardening (2026-09-23) -- P1-3 (opus-4.7 Audit C).
+     *
+     * PRIOR: `MoveFileExA(REPLACE_EXISTING)` INHERITS the source's security
+     * descriptor onto the destination. Our source (.tmp) is created with
+     * default DACL under DWM-N's process token, so config.dat's SD after
+     * every persist ends up scoped to "current DWM-N + inherited". If DWM
+     * later crashes and respawns as a DIFFERENT DWM-M virtual account
+     * (Window Manager\DWM-M, distinct SID from DWM-N), the fresh payload
+     * loads config.dat via SYSTEM inheritance for READ -- BUT: the v14.2
+     * comment above claims "SYSTEM inheritance + admin inheritance both
+     * survive", and empirically that's TRUE for read... EXCEPT the write
+     * path fails silently, and any user who reboots BEFORE the next
+     * svchelper arm loses whatever refresh_token rotation happened after
+     * the last arm's DACL heal. Overlay "silently doesn't come up after
+     * reboot" for the specific sequence: install -> arm -> autonomous
+     * refresh persists -> DWM crashes -> boot without arming.
+     *
+     * NOW: `ReplaceFileA` preserves the DESTINATION's SD by design (that
+     * is its documented semantic; see MSDN "Attribute Preservation"). The
+     * launcher-set widened DACL on config.dat (SYSTEM + Admins + WMG-Full,
+     * PROTECTED) survives every persist call. The .tmp still starts with
+     * default DACL (avoiding the SA-in-payload crash the v14.2 comment
+     * documents), but its SD is DISCARDED by ReplaceFile in favor of the
+     * pre-existing config.dat's SD. Fixes the DWM-respawn silent-lockout
+     * class of bug WITHOUT re-introducing the SA-crash we deferred in
+     * v14.2.
+     *
+     * FIRST-CALL EDGE CASE: If config.dat DOESN'T EXIST yet (fresh install
+     * where launcher hasn't run yet, or launcher's write path was skipped
+     * for some reason), ReplaceFile fails with ERROR_FILE_NOT_FOUND. In
+     * that case fall through to MoveFileEx REPLACE_EXISTING which will
+     * do a rename since there's nothing to replace. Launcher's next arm
+     * will heal the DACL anyway. */
     DWORD last_gle = 0;
     for (int attempt = 0; attempt < 3; attempt++) {
-        if (MoveFileExA(tmp_path, CONFIG_PATH,
-                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-            slog_writef("msvc_dbg_a.dat", "cfg_persist: wrote %zu bytes to %s (attempt %d)",
+        /* ReplaceFile preserves destination ACL; used when config.dat exists. */
+        if (ReplaceFileA(CONFIG_PATH, tmp_path, NULL,
+                         REPLACEFILE_WRITE_THROUGH,
+                         NULL, NULL)) {
+            slog_writef("msvc_dbg_a.dat",
+                        "cfg_persist: wrote %zu bytes to %s via ReplaceFile "
+                        "(dst-ACL preserved; attempt %d)",
                         clen, CONFIG_PATH, attempt + 1);
             return 1;
         }
         last_gle = GetLastError();
+
+        /* Fallback: destination doesn't exist yet (fresh install or after
+         * a hand-wipe). Rename via MoveFileEx; launcher's next arm will
+         * heal the DACL. Same behavior as pre-v-audit-hardening code. */
+        if (last_gle == ERROR_FILE_NOT_FOUND) {
+            if (MoveFileExA(tmp_path, CONFIG_PATH,
+                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                slog_writef("msvc_dbg_a.dat",
+                            "cfg_persist: wrote %zu bytes to %s via MoveFileEx "
+                            "(fresh install path; DACL heal required at next arm; attempt %d)",
+                            clen, CONFIG_PATH, attempt + 1);
+                return 1;
+            }
+            last_gle = GetLastError();
+        }
+
         if (last_gle != ERROR_SHARING_VIOLATION && last_gle != ERROR_ACCESS_DENIED) {
-            slog_writef("msvc_dbg_a.dat", "cfg_persist: MoveFileEx failed gle=%lu (fatal)",
+            slog_writef("msvc_dbg_a.dat",
+                        "cfg_persist: ReplaceFile+MoveFileEx failed gle=%lu (fatal)",
                         (unsigned long)last_gle);
             break;
         }
-        slog_writef("msvc_dbg_a.dat", "cfg_persist: MoveFileEx gle=%lu (attempt %d/3, retrying)",
+        slog_writef("msvc_dbg_a.dat",
+                    "cfg_persist: ReplaceFile gle=%lu (attempt %d/3, retrying)",
                     (unsigned long)last_gle, attempt + 1);
         Sleep(50);
     }

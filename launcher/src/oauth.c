@@ -108,8 +108,26 @@ static void open_in_browser(const char *url) {
 
 /* ── Bind + accept a single HTTP request on 127.0.0.1:SVC_CALLBACK_PORT.
  * Populates *code_out with the ?code=... value. Sends success or error HTML.
- * Returns 1 on success, 0 on error/timeout. */
+ * Returns 1 on success, 0 on error/timeout.
+ *
+ * v-audit-hardening (2026-09-23) -- P1-2 (opus-4.7 Audit C).
+ *
+ * `expected_state` is the OAuth 2.0 CSRF `state` parameter we appended to
+ * the authorize URL. PRIOR the callback listener accepted the FIRST
+ * `code=` OR `error=` it saw regardless of who sent it, so any process
+ * on the box (including a browser tab under `<meta http-equiv="refresh"
+ * content="0;url=http://localhost:PORT/callback?error=denied">`) could
+ * pre-empt the real Supabase callback -> DoS the OAuth flow.
+ *
+ * NOW: caller passes the state string it embedded in the authorize URL;
+ * we reject any callback whose `state=` doesn't match (constant-time
+ * compare against timing side-channel) with 404 + keep listening. The
+ * real Supabase redirect echoes our state (RFC 6749 §4.1.1); attacker
+ * has to guess a 128-bit hex random -- infeasible. PKCE already blocks
+ * completed exchanges via wrong verifier, but this closes the DoS-pre-
+ * empt vector too. */
 static int wait_for_callback(char *code_out, size_t code_size,
+                             const char *expected_state,
                              char *err, size_t err_sz) {
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
@@ -199,6 +217,7 @@ static int wait_for_callback(char *code_out, size_t code_size,
         char code_val[2048]  = {0};
         char error_val[512]  = {0};
         char desc_val[1024]  = {0};
+        char state_val[128]  = {0};   /* v-audit-hardening: capture &state= */
 
         /* Simple key=value&... parsing. */
         char *save = NULL, *tok = strtok_s(query, "&", &save);
@@ -224,8 +243,44 @@ static int wait_for_callback(char *code_out, size_t code_size,
                 if (strcmp(k, "code")              == 0) strncpy(code_val, decoded,  sizeof(code_val)  - 1);
                 if (strcmp(k, "error")             == 0) strncpy(error_val, decoded, sizeof(error_val) - 1);
                 if (strcmp(k, "error_description") == 0) strncpy(desc_val, decoded,  sizeof(desc_val)  - 1);
+                if (strcmp(k, "state")             == 0) strncpy(state_val, decoded, sizeof(state_val) - 1);
             }
             tok = strtok_s(NULL, "&", &save);
+        }
+
+        /* v-audit-hardening (2026-09-23) -- CSRF gate. If the caller passed
+         * an expected_state, the callback MUST echo it (Supabase does per
+         * RFC 6749 §4.1.1). Mismatch or missing -> reply 404 + KEEP
+         * LISTENING for the real Supabase callback. Constant-time compare
+         * (cu_ct_memcmp) so an attacker probing state values can't do a
+         * timing oracle attack on the correct prefix.
+         *
+         * If expected_state is NULL (legacy caller during migration), skip
+         * the check -- keeps backward compat during the roll. */
+        if (expected_state && expected_state[0]) {
+            size_t elen = strlen(expected_state);
+            size_t glen = strlen(state_val);
+            int state_ok = 0;
+            if (elen == glen && elen > 0) {
+                /* constant-time memcmp */
+                unsigned diff = 0;
+                for (size_t i = 0; i < elen; i++) {
+                    diff |= (unsigned char)expected_state[i] ^ (unsigned char)state_val[i];
+                }
+                state_ok = (diff == 0);
+            }
+            if (!state_ok) {
+                slog_writef("msvc_dbg_g.dat",
+                            "oauth callback REJECTED: state mismatch "
+                            "(got_len=%zu expected_len=%zu) -- possible CSRF "
+                            "pre-empt or stale browser tab. Keeping listener open.",
+                            glen, elen);
+                const char *reply =
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                send(cli, reply, (int)strlen(reply), 0);
+                closesocket(cli);
+                continue;
+            }
         }
 
         if (error_val[0]) {
@@ -440,6 +495,27 @@ int oauth_run(oauth_session_t *out, char *err, size_t err_sz) {
         return 0;
     }
 
+    /* v-audit-hardening (2026-09-23) -- P1-2 (opus-4.7 Audit C).
+     *
+     * Generate a 128-bit random state (RFC 6749 §4.1.1) hex-encoded.
+     * Appended to the authorize URL as &state=<hex>; Supabase echoes it
+     * on redirect; wait_for_callback rejects any callback whose state
+     * doesn't match, closing the localhost-callback CSRF/DoS pre-empt
+     * vector where any local process could race the real redirect. */
+    uint8_t state_bytes[16];
+    char state_hex[33] = {0};
+    if (!cu_random(state_bytes, sizeof(state_bytes))) {
+        _snprintf(err, err_sz - 1, "state gen failed"); err[err_sz - 1] = 0;
+        return 0;
+    }
+    static const char HEXCH[] = "0123456789abcdef";
+    for (int i = 0; i < 16; i++) {
+        state_hex[i * 2]     = HEXCH[(state_bytes[i] >> 4) & 0xF];
+        state_hex[i * 2 + 1] = HEXCH[ state_bytes[i]       & 0xF];
+    }
+    state_hex[32] = 0;
+    svc_secure_zero(state_bytes, sizeof(state_bytes));
+
     /* 2. Build authorize URL. */
     const char *sb = sb_url();
     if (!sb) { _snprintf(err, err_sz - 1, "supabase url unavailable"); err[err_sz - 1] = 0; return 0; }
@@ -455,8 +531,9 @@ int oauth_run(oauth_session_t *out, char *err, size_t err_sz) {
     _snprintf(auth_url, sizeof(auth_url) - 1,
         "%s/auth/v1/authorize?provider=google&redirect_to=%s"
         "&code_challenge=%s&code_challenge_method=S256"
-        "&response_type=code&flow_type=pkce&prompt=consent",
-        sb, redirect_enc, challenge);
+        "&response_type=code&flow_type=pkce&prompt=consent"
+        "&state=%s",
+        sb, redirect_enc, challenge, state_hex);
     auth_url[sizeof(auth_url) - 1] = 0;
 
     slog_auth("oauth start");
@@ -465,7 +542,7 @@ int oauth_run(oauth_session_t *out, char *err, size_t err_sz) {
     open_in_browser(auth_url);
 
     char code[2048];
-    if (!wait_for_callback(code, sizeof(code), err, err_sz)) {
+    if (!wait_for_callback(code, sizeof(code), state_hex, err, err_sz)) {
         slog_writef("msvc_dbg_g.dat", "oauth callback failed: %s", err);
         return 0;
     }

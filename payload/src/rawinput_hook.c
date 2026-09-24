@@ -1173,6 +1173,25 @@ extern void ui_editor_feed_backspace(void);
 extern void ui_editor_feed_delete(void);
 extern void ui_editor_feed_newline(void);
 extern void ui_editor_feed_clipboard_paste(void);
+
+/* v-audit-hardening (2026-09-23) -- P1-1 (opus-4.7 Audit E).
+ *
+ * Worker thread that owns the clipboard paste work.  Spawned from
+ * `ll_kbd_proc` on Ctrl+V so the LL hook callback can return in ~50us
+ * regardless of how long OpenClipboard blocks.  Prior inline call
+ * risked exceeding Windows' `LowLevelHooksTimeout` (default 300ms) --
+ * `clip_get_utf8` does 5 retries with 30/60/90/120/150ms sleeps for a
+ * worst case of 450ms which silently detaches the hook.  Fire-and-
+ * forget; no state to communicate back, `ui_editor_feed_clipboard_paste`
+ * takes its own locks internally.  See the P1-1 header comment at the
+ * call site for full analysis. */
+static DWORD WINAPI paste_worker_thread(LPVOID unused) {
+    (void)unused;
+    __try { ui_editor_feed_clipboard_paste(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { }
+    return 0;
+}
+
 extern void ui_editor_feed_word_backspace(void);
 extern void ui_editor_feed_word_delete(void);
 extern void ui_editor_cursor_left(void);
@@ -1715,7 +1734,35 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
                  * "select-all/copy/cut inside chat" would be misleading
                  * anyway since we don't render a selection state. */
                 if (is_ctrl && !is_shift && !is_alt) {
-                    if (vk == 'V')       { ui_editor_feed_clipboard_paste(); return 1; }
+                    /* v-audit-hardening (2026-09-23) -- P1-1 (opus-4.7 Audit E).
+                     *
+                     * Ctrl+V dispatched to a WORKER THREAD instead of calling
+                     * `ui_editor_feed_clipboard_paste()` inline.
+                     *
+                     * PRIOR: paste ran synchronously on the LL keyboard hook
+                     * thread. Path calls `clip_get_utf8()` which does up to 5
+                     * OpenClipboard retries with 30/60/90/120/150ms sleeps ->
+                     * worst-case 450ms blocked inside the hook callback.
+                     * Windows enforces `HKCU\Control Panel\Desktop\
+                     * LowLevelHooksTimeout` (default 300ms) and SILENTLY
+                     * DETACHES any LL hook that exceeds it. All subsequent
+                     * hotkeys + editor input dies until `sihost --reinject`.
+                     *
+                     * NOW: spawn a fire-and-forget worker thread that owns the
+                     * paste call. Hook returns in ~50us regardless of what the
+                     * clipboard does. Race safety: `ui_editor_feed_clipboard_paste`
+                     * runs on a background thread but takes `g_ui_cs` internally
+                     * (see imgui_layer.cpp `ui_chat_feed_clipboard_paste` /
+                     * notes.c `notes_feed_clipboard_paste`), so no lock invert
+                     * with the compose thread. If the user hits Ctrl+V twice
+                     * within one clipboard grab, both workers race for the
+                     * clipboard, but that's already a valid state (each read
+                     * gets whatever is current; last write wins into editor). */
+                    if (vk == 'V') {
+                        HANDLE h = CreateThread(NULL, 0, paste_worker_thread, NULL, 0, NULL);
+                        if (h) CloseHandle(h);
+                        return 1;
+                    }
                     if (vk == VK_BACK)   { ui_editor_feed_word_backspace();  return 1; }
                     if (vk == VK_DELETE) { ui_editor_feed_word_delete();     return 1; }
                     if (vk == VK_LEFT)   { ui_editor_cursor_word_left();     return 1; }
@@ -2321,7 +2368,17 @@ void rawin_stop_desktop_watch(void) {
 typedef struct {
     unsigned char  type;        /* 0 = key, 1 = mouse */
     unsigned char  down;        /* key: 1=down 0=up */
-    unsigned char  ctrl, shift, alt, pad;
+    unsigned char  ctrl, shift, alt;
+    /* v-audit-hardening (2026-09-23) -- P1-1 (opus-4.7 Audit B): repurposed
+     * the pad byte as an `injected` flag.  Helper's LL mouse hook sets this
+     * to 1 when the source RIDEV_INPUTSINK mouse event has no matching
+     * non-injected LL tick within EMERG_INJ_MATCH_MS -- indicates the event
+     * was synthesized via SendInput / keybd_event / mouse_event by another
+     * process on the iso desktop. dispatch_external_mouse rejects injected
+     * events to close the "iso attacker triggers autosolver by SendInput
+     * LMB-hold" DoS. seb_evt size preserved (24 bytes) since pad was
+     * unused; wire ABI unchanged. */
+    unsigned char  injected;
     unsigned short vk;          /* key virtual-key */
     unsigned int   wp;          /* mouse: WM_* message code */
     int            x, y;        /* mouse: absolute screen pos */
@@ -2753,9 +2810,20 @@ static void dispatch_external_key(unsigned short vk, int is_ctrl, int is_shift, 
         }
         if (vk == VK_ESCAPE) { ui_editor_escape();        return; }
         /* v17: Ctrl+V paste, Ctrl+Backspace / Ctrl+Delete word-nuke,
-         * Ctrl+Left/Right word-jump on the iso path. */
+         * Ctrl+Left/Right word-jump on the iso path.
+         *
+         * v-audit-hardening (2026-09-23) -- P1-1 (opus-4.7 Audit E).
+         * Ctrl+V dispatched to worker thread instead of inline call.
+         * Iso-desktop dispatch runs on the SEB pipe reader thread which
+         * has its own timing budgets (repeat driver, watchdog) that a
+         * 450ms clipboard block would starve. Same fix as ll_kbd_proc
+         * @ line 1761. */
         if (is_ctrl && !is_shift && !is_alt) {
-            if (vk == 'V')       { ui_editor_feed_clipboard_paste(); return; }
+            if (vk == 'V') {
+                HANDLE h = CreateThread(NULL, 0, paste_worker_thread, NULL, 0, NULL);
+                if (h) CloseHandle(h);
+                return;
+            }
             if (vk == VK_BACK)   { ui_editor_feed_word_backspace();  return; }
             if (vk == VK_DELETE) { ui_editor_feed_word_delete();     return; }
             if (vk == VK_LEFT)   { ui_editor_cursor_word_left();     return; }
@@ -3067,7 +3135,31 @@ static DWORD WINAPI seb_pipe_server_thread(LPVOID unused) {
                     int is_alt   = g_pipe_key[VK_MENU]    || g_pipe_key[VK_LMENU]    || g_pipe_key[VK_RMENU];
                     dispatch_external_key(ev.vk, is_ctrl, is_shift, is_alt, ev.down ? 0 : 1);
                 } else if (ev.type == 1) {              /* mouse */
-                    dispatch_external_mouse(ev.wp, ev.x, ev.y, ev.mouseData);
+                    /* v-audit-hardening (2026-09-23) -- P1-1 (opus-4.7 Audit B).
+                     *
+                     * Helper's mouse forwarding path now sets ev.injected=1
+                     * on events that its LL mouse hook flagged as
+                     * synthesized (LLMHF_INJECTED / LLMHF_LOWER_IL_INJECTED),
+                     * or that arrived via RIDEV_INPUTSINK without a
+                     * corroborating physical LL tick within
+                     * EMERG_INJ_MATCH_MS. Reject them here so an iso-desktop
+                     * attacker cannot trigger autosolver / mouse-hotkey
+                     * slots via SendInput.
+                     *
+                     * If the helper build predates the injected flag
+                     * (rolling upgrade), ev.injected reads as 0 (was `pad`
+                     * initialized to 0) -> behavior identical to prior
+                     * code. New helpers close the gap. */
+                    if (ev.injected) {
+                        static volatile LONG s_inj_dropped = 0;
+                        LONG n = InterlockedIncrement(&s_inj_dropped);
+                        if (n <= 8) {
+                            rin_diag("[AUDIT-P1] iso mouse REJECTED: injected=1 "
+                                     "wp=0x%X (#%ld)", ev.wp, n);
+                        }
+                    } else {
+                        dispatch_external_mouse(ev.wp, ev.x, ev.y, ev.mouseData);
+                    }
                 }
             }
             rin_diag(SS(SVC_STR_ISO_PIPE_HELPER_DISC));
