@@ -44,6 +44,12 @@ tools/dwmcore_shape_probe/probe.obj
 tools/dwmcore_shape_probe/cgpt_dbghelp.dll
 tools/dwmcore_shape_probe/symsrv.dll
 tools/dwmcore_shape_probe/*.txt
+# Multi-build harness: downloaded DLLs + per-sample probe outputs are
+# per-machine artifacts (multi-MB each). The tool source + the final
+# compat_matrix.md/.json are tracked.
+tools/dwmcore_multi/_dwmcore_samples/
+tools/dwmcore_multi/_probe_out/
+tools/dwmcore_multi/samples.json
 config.dat
 offsets.blob
 state.dat

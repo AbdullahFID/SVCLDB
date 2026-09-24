@@ -189,21 +189,56 @@ static void read_file_version(const char *path, char *out, size_t out_sz) {
     free(info);
 }
 
-static const char *g_symbols[] = {
-    "dwmcore!COverlayContext::Present",
-    "dwmcore!CGlobalCompositionSurfaceInfo::IsOverlayPrevented",
-    "dwmcore!CCommonRegistryData::ForceFullDirtyRendering",
-    "dwmcore!CDDisplayRenderTarget::PresentNeeded",
-    "dwmcore!CLegacyRenderTarget::PresentNeeded",
-    "dwmcore!ScheduleCompositionPass",
-    "dwmcore!CVisual::RenderContent",
-    "dwmcore!CWindowNode::RenderContent",
-    "dwmcore!CDDisplaySwapChain::GetPhysicalBackBuffer",
-    "dwmcore!COverlaySwapChain::GetPhysicalBackBuffer",
-    "dwmcore!CDDisplaySwapChainBuffer::GetD3D11Resource",
-    "dwmcore!COverlaySwapChain::GetD3D11Resource",
-    "dwmcore!CDeviceTextureTarget::GetTexture2D",
-    NULL
+/* Symbol table -- ordered by priority. Each entry is a NULL-terminated
+ * list of candidate patterns; probe emits ONE result line per entry
+ * (first pattern that resolves wins). This mirrors the resolver's
+ * fallback chain in resolver/src/main.c so the compat matrix truly
+ * reflects what our shipping resolver would find. Wildcards use '*'. */
+typedef struct {
+    const char *label;
+    const char *candidates[8];   /* NULL-terminated */
+} SymEntry;
+
+static const SymEntry g_syms[] = {
+    { "COverlayContext::Present",
+      { "dwmcore!COverlayContext::Present", NULL } },
+    { "CGlobalCompositionSurfaceInfo::IsOverlayPrevented",
+      { "dwmcore!CGlobalCompositionSurfaceInfo::IsOverlayPrevented", NULL } },
+    { "CCommonRegistryData::ForceFullDirtyRendering",
+      { "dwmcore!CCommonRegistryData::ForceFullDirtyRendering", NULL } },
+    { "CDDisplayRenderTarget::PresentNeeded",
+      { "dwmcore!CDDisplayRenderTarget::PresentNeeded",
+        "dwmcore!*RenderTarget::PresentNeeded",
+        "dwmcore!*::PresentNeeded", NULL } },
+    { "CLegacyRenderTarget::PresentNeeded",
+      { "dwmcore!CLegacyRenderTarget::PresentNeeded",
+        "dwmcore!*Legacy*::PresentNeeded", NULL } },
+    { "ScheduleCompositionPass",
+      { "dwmcore!ScheduleCompositionPass", NULL } },
+    { "CVisual::RenderContent",
+      { "dwmcore!CVisual::RenderContent", NULL } },
+    { "CWindowNode::RenderContent",
+      { "dwmcore!CWindowNode::RenderContent", NULL } },
+    /* backbuffer chain -- multiple class variants across builds */
+    { "GetPhysicalBackBuffer",
+      { "dwmcore!CDDisplaySwapChain::GetPhysicalBackBuffer",
+        "dwmcore!COverlaySwapChain::GetPhysicalBackBuffer",
+        "dwmcore!*SwapChain::GetPhysicalBackBuffer",
+        "dwmcore!*::GetPhysicalBackBuffer",
+        "dwmcore!*PhysicalBackBuffer*", NULL } },
+    { "GetD3D11Resource",
+      { "dwmcore!CDDisplaySwapChainBuffer::GetD3D11Resource",
+        "dwmcore!CDDisplaySwapChain::GetD3D11Resource",
+        "dwmcore!COverlaySwapChain::GetD3D11Resource",
+        "dwmcore!*::GetD3D11Resource",
+        "dwmcore!*GetD3D11Resource*", NULL } },
+    { "Accessor (GetTexture2D)",
+      { "dwmcore!CDeviceTextureTarget::GetTexture2D",
+        "dwmcore!*Target::GetTexture2D",
+        "dwmcore!*::GetTexture2D",
+        "dwmcore!*::AsTexture2D",
+        "dwmcore!*::GetResource", NULL } },
+    { NULL, { NULL } }   /* terminator */
 };
 
 int main(int argc, char **argv) {
@@ -323,65 +358,49 @@ int main(int argc, char **argv) {
                (unsigned long)secs[i].raw, (unsigned long)secs[i].rsz);
     }
 
-    /* Resolve via 3 fallback paths in order (matches the resolver's new
-     * enum-first flow after v3.2 refactor):
-     *   1. SymEnumSymbols with fully-qualified name (dwmcore!Class::Method)
-     *   2. SymEnumSymbols with name only (Class::Method), no module qual
-     *   3. SymFromName (legacy) with fully-qualified name
-     *
-     * The name-only form catches PDBs where SymEnumSymbols internally
-     * doesn't like the module-scoped prefix. */
-    for (int i = 0; g_symbols[i]; i++) {
-        char buf[sizeof(SYMINFO)];
-        SYMINFO *p = (SYMINFO*)buf;
-        ZeroMemory(buf, sizeof(buf));
-        p->SizeOfStruct = 88;
-        p->MaxNameLen = sizeof(p->Name) - 1;
+    /* For each symbol entry, try candidates in order (exact first,
+     * wildcards last). Mirrors resolver's fallback chain so the
+     * compat matrix reflects what the shipping resolver would find.
+     * Records which candidate index won (1..N or 99=SymFromName). */
+    for (int i = 0; g_syms[i].label; i++) {
         DWORD rva = 0;
-        int hit_via = 0; /* 1=Enum-Full, 2=Enum-NoPrefix, 3=SymFromName */
+        int hit_via = 0;
+        const char *matched_pat = NULL;
 
-        /* Path 1: SymEnumSymbols with the full qualified name. */
-        if (pSymEnum) {
+        int c;
+        for (c = 0; g_syms[i].candidates[c] && !rva; c++) {
+            const char *pat = g_syms[i].candidates[c];
+            if (!pSymEnum) break;
             FILE *fnul = fopen("NUL", "w");
             EnumCtx2 ec2;
             ec2.max = 1; ec2.count = 0;
             ec2.fp = fnul ? fnul : stdout;
             ec2.rva = 0;
-            pSymEnum(hProc, mb, g_symbols[i], single_hit_cb, &ec2);
+            pSymEnum(hProc, mb, pat, single_hit_cb, &ec2);
             if (ec2.count > 0 && ec2.rva >= FAKE_BASE) {
                 rva = (DWORD)(ec2.rva - FAKE_BASE);
-                hit_via = 1;
+                hit_via = c + 1;
+                matched_pat = pat;
             }
             if (fnul) fclose(fnul);
         }
-        /* Path 2: SymEnumSymbols with just Class::Method (strip module prefix). */
-        if (!rva && pSymEnum) {
-            const char *bang;
-            const char *no_pref;
-            FILE *fnul;
-            EnumCtx2 ec2b;
-            bang = strchr(g_symbols[i], '!');
-            no_pref = bang ? bang + 1 : g_symbols[i];
-            fnul = fopen("NUL", "w");
-            ec2b.max = 1; ec2b.count = 0;
-            ec2b.fp = fnul ? fnul : stdout;
-            ec2b.rva = 0;
-            pSymEnum(hProc, mb, no_pref, single_hit_cb, &ec2b);
-            if (ec2b.count > 0 && ec2b.rva >= FAKE_BASE) {
-                rva = (DWORD)(ec2b.rva - FAKE_BASE);
-                hit_via = 2;
+        /* Last resort: SymFromName with the primary (index 0) candidate. */
+        if (!rva) {
+            char buf[sizeof(SYMINFO)];
+            SYMINFO *p = (SYMINFO*)buf;
+            ZeroMemory(buf, sizeof(buf));
+            p->SizeOfStruct = 88;
+            p->MaxNameLen = sizeof(p->Name) - 1;
+            if (pSymFrom(hProc, g_syms[i].candidates[0], p) && p->Address >= FAKE_BASE) {
+                rva = (DWORD)(p->Address - FAKE_BASE);
+                hit_via = 99;
+                matched_pat = g_syms[i].candidates[0];
             }
-            if (fnul) fclose(fnul);
-        }
-        /* Path 3: SymFromName (legacy). */
-        if (!rva && pSymFrom(hProc, g_symbols[i], p) && p->Address >= FAKE_BASE) {
-            rva = (DWORD)(p->Address - FAKE_BASE);
-            hit_via = 3;
         }
 
         if (!rva) {
-            printf("build=%s tds=0x%08lX sym=%s rva=MISS gle=%lu\n",
-                   fv, (unsigned long)tds, g_symbols[i], GetLastError());
+            printf("build=%s tds=0x%08lX sym=dwmcore!%s rva=MISS gle=%lu\n",
+                   fv, (unsigned long)tds, g_syms[i].label, GetLastError());
             continue;
         }
         const SectionInfo *si = find_section_for_rva(secs, n_secs, rva);
@@ -392,7 +411,8 @@ int main(int argc, char **argv) {
         char *bp = bytes;
         int max_bytes = 32;
         if (file_off && file_off + max_bytes <= file_sz) {
-            for (int b = 0; b < max_bytes; b++) {
+            int b;
+            for (b = 0; b < max_bytes; b++) {
                 bp += sprintf(bp, "%02X ", file[file_off + b]);
             }
             if (bp > bytes) bp[-1] = 0;
@@ -400,13 +420,14 @@ int main(int argc, char **argv) {
             strcpy(bytes, "<unmapped>");
         }
         {
-            const char *via_lbl = (hit_via == 1) ? "Enum-Full" :
-                                  (hit_via == 2) ? "Enum-NoPrefix" :
-                                  (hit_via == 3) ? "SymFromName" : "?";
-            printf("build=%s tds=0x%08lX sym=%s rva=0x%lX via=%s "
-                   "section=%-8.8s file_off=0x%lX b32=%s\n",
-                   fv, (unsigned long)tds, g_symbols[i],
+            char via_lbl[32];
+            if (hit_via == 99) strcpy(via_lbl, "SymFromName");
+            else               sprintf(via_lbl, "cand%d", hit_via);
+            printf("build=%s tds=0x%08lX sym=dwmcore!%s rva=0x%lX via=%s "
+                   "matched=%s section=%-8.8s file_off=0x%lX b32=%s\n",
+                   fv, (unsigned long)tds, g_syms[i].label,
                    (unsigned long)rva, via_lbl,
+                   matched_pat ? matched_pat : "?",
                    si ? si->section : "<none>",
                    (unsigned long)file_off,
                    bytes);
