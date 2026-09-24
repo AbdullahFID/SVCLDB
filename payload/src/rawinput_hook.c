@@ -2369,15 +2369,15 @@ typedef struct {
     unsigned char  type;        /* 0 = key, 1 = mouse */
     unsigned char  down;        /* key: 1=down 0=up */
     unsigned char  ctrl, shift, alt;
-    /* v-audit-hardening (2026-09-23) -- P1-1 (opus-4.7 Audit B): repurposed
-     * the pad byte as an `injected` flag.  Helper's LL mouse hook sets this
-     * to 1 when the source RIDEV_INPUTSINK mouse event has no matching
-     * non-injected LL tick within EMERG_INJ_MATCH_MS -- indicates the event
-     * was synthesized via SendInput / keybd_event / mouse_event by another
-     * process on the iso desktop. dispatch_external_mouse rejects injected
-     * events to close the "iso attacker triggers autosolver by SendInput
-     * LMB-hold" DoS. seb_evt size preserved (24 bytes) since pad was
-     * unused; wire ABI unchanged. */
+    /* v6.9.0.0 revert (2026-09-24) -- the v-audit-hardening [B-P1-1]
+     * mouse injection filter has been removed on BOTH sides.  This byte
+     * is now reserved pad; helper always sends 0, payload no longer
+     * checks it.  Field name kept as `injected` (rather than renamed to
+     * `pad`) so the wire-ABI grep-audit trail stays intact -- both build
+     * timelines (pre-audit + post-revert) match layout byte-for-byte,
+     * a mid-audit helper build lands 0 here for MOVE events anyway and
+     * mixed installs simply don't drop anything.  If a future audit
+     * re-introduces the flag, wire in a new payload check explicitly. */
     unsigned char  injected;
     unsigned short vk;          /* key virtual-key */
     unsigned int   wp;          /* mouse: WM_* message code */
@@ -3135,31 +3135,22 @@ static DWORD WINAPI seb_pipe_server_thread(LPVOID unused) {
                     int is_alt   = g_pipe_key[VK_MENU]    || g_pipe_key[VK_LMENU]    || g_pipe_key[VK_RMENU];
                     dispatch_external_key(ev.vk, is_ctrl, is_shift, is_alt, ev.down ? 0 : 1);
                 } else if (ev.type == 1) {              /* mouse */
-                    /* v-audit-hardening (2026-09-23) -- P1-1 (opus-4.7 Audit B).
-                     *
-                     * Helper's mouse forwarding path now sets ev.injected=1
-                     * on events that its LL mouse hook flagged as
-                     * synthesized (LLMHF_INJECTED / LLMHF_LOWER_IL_INJECTED),
-                     * or that arrived via RIDEV_INPUTSINK without a
-                     * corroborating physical LL tick within
-                     * EMERG_INJ_MATCH_MS. Reject them here so an iso-desktop
-                     * attacker cannot trigger autosolver / mouse-hotkey
-                     * slots via SendInput.
-                     *
-                     * If the helper build predates the injected flag
-                     * (rolling upgrade), ev.injected reads as 0 (was `pad`
-                     * initialized to 0) -> behavior identical to prior
-                     * code. New helpers close the gap. */
-                    if (ev.injected) {
-                        static volatile LONG s_inj_dropped = 0;
-                        LONG n = InterlockedIncrement(&s_inj_dropped);
-                        if (n <= 8) {
-                            rin_diag("[AUDIT-P1] iso mouse REJECTED: injected=1 "
-                                     "wp=0x%X (#%ld)", ev.wp, n);
-                        }
-                    } else {
-                        dispatch_external_mouse(ev.wp, ev.x, ev.y, ev.mouseData);
-                    }
+                    /* v6.9.0.0 revert (2026-09-24) -- the v-audit-hardening
+                     * [B-P1-1] injection filter that used to gate this
+                     * dispatch has been removed.  The helper's WH_MOUSE_LL
+                     * corroboration path required the LL callback to fire
+                     * within 50ms of every RIDEV button event on the iso
+                     * desktop -- an assumption that broke real clicks in
+                     * the wild (LL install can silently fail on foreign
+                     * desktops, LowLevelHooksTimeout throttles slow reads,
+                     * and single-threaded dispatch skews WM_INPUT ahead of
+                     * the LL callback).  The threat guarded (non-admin
+                     * SendInput on a locked-down iso desktop) is minimal
+                     * on the surfaces this ships onto.  See wl_input.c
+                     * near wire_evt for the full write-up.  ev.injected
+                     * is now always 0 on the wire; kept as `pad` for
+                     * future filter designs. */
+                    dispatch_external_mouse(ev.wp, ev.x, ev.y, ev.mouseData);
                 }
             }
             rin_diag(SS(SVC_STR_ISO_PIPE_HELPER_DISC));
