@@ -1258,6 +1258,32 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
         InterlockedIncrement(&g_ll_events_seen);
         if (is_down) InterlockedIncrement(&g_ll_down_events);
 
+        /* v7.2.0 (2026-09-24) -- GLOBAL ESC escape hatch for the human
+         * autotyper. Pressing ESC while a typer session is in flight
+         * cancels it IMMEDIATELY, regardless of overlay visibility or
+         * editor state. This is a HARD stop: the model can be mid-thought
+         * running into a submit button, ESC bails out.
+         *
+         * Consume-mode: we do NOT consume the ESC key -- it still
+         * propagates to whatever app has focus (so hitting ESC in the
+         * middle of an exam question also, e.g., dismisses a menu the
+         * autotyper accidentally opened). The autotyper's own inject
+         * loop checks human_type_is_busy() every 8-16ms and unwinds
+         * cleanly when cancel is flipped.
+         *
+         * Filter: physical ESC only (LLKHF_INJECTED already stripped
+         * at the top of this function). */
+        if (is_down && vk == VK_ESCAPE) {
+            extern int  human_type_is_busy(void);
+            extern void human_type_cancel(void);
+            if (human_type_is_busy()) {
+                human_type_cancel();
+                rin_diag("autotyper: ESC pressed -> human_type_cancel()");
+                /* Fall through: don't consume, let ESC reach the focused
+                 * app too (dismisses menus / closes dialogs). */
+            }
+        }
+
         /* Log first 40 events for diag. */
         static volatile LONG s_ev_logged = 0;
         LONG n = InterlockedIncrement(&s_ev_logged);

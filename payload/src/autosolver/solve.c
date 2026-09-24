@@ -398,17 +398,37 @@ static DWORD WINAPI solve_thread(LPVOID unused) {
     sv_action_t acts[SV_MAX_ACTIONS];
     int nacts = obj ? parse_actions(obj, acts, SV_MAX_ACTIONS) : 0;
 
-    /* find the primary click coord for the dot-jump */
+    /* find the primary click coord for the dot-jump.
+     *
+     * v7.2.0 (2026-09-24) -- REMOVED desc_is_navigation gate here.
+     *
+     * v-audit-hardening (2026-09-23, commit 90822f7) P1-4 made
+     * desc_is_navigation FAIL-CLOSED on empty descriptions ("" -> 1)
+     * as a safety fix for auto_click. That gate was then applied
+     * to BOTH the auto_click dispatch (correct -- safety-critical:
+     * we don't want to submit the exam) AND this dot-jump loop
+     * (WRONG -- pure visual, no side effects on the underlying
+     * page). Every AI action without an explicit description got
+     * filtered out here too, so the dot silently didn't move to
+     * the answer even when the AI returned valid coordinates.
+     *
+     * NOW: dot-jump loop takes the first action with click/type +
+     * has_xy, without regard to description. The auto_click gate
+     * below (line ~427) still honors desc_is_navigation for the
+     * actual click dispatch, which is the safety surface that
+     * matters. */
     int jump_sx = -1, jump_sy = -1;
     if (!no_q && as->dot_jump) {
         for (int i = 0; i < nacts; i++) {
             const char *t = acts[i].type;
-            if ((strstr(t, "click") || strstr(t, "type")) && acts[i].has_xy &&
-                !desc_is_navigation(acts[i].desc)) {
+            if ((strstr(t, "click") || strstr(t, "type")) && acts[i].has_xy) {
                 int sx, sy;
                 coords_image_to_screen(&mon, render_scale, acts[i].x, acts[i].y, &sx, &sy);
                 jump_sx = sx; jump_sy = sy;
                 ui_dot_jump_to(sx, sy);
+                slog_writef("msvc_dbg_a.dat",
+                    "solve: dot_jump -> (%d,%d) type=%s desc='%.40s'",
+                    sx, sy, t, acts[i].desc[0] ? acts[i].desc : "(empty)");
                 break;
             }
         }
