@@ -24,9 +24,14 @@ echo === Building %OUT_NAME% ===
 
 set CFLAGS=/nologo /W3 /O2 /Oi /GS /Gy /MT /GL /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /DWIN32_LEAN_AND_MEAN
 
+REM  v-audit-hardening (2026-09-23) -- log_secure.c now calls
+REM  svc_build_log_file_sa (from sec_attr.c) so newly-created log files
+REM  start with a WMG-writable DACL. Must be added to the resolver's
+REM  link line, else 'unresolved external symbol' at link time.
 set SOURCES=^
  "%SHARED%\log_secure.c" "%SHARED%\log_key.c" ^
  "%SHARED%\str_enc.c" ^
+ "%SHARED%\sec_attr.c" ^
  "%SRC%\main.c"
 
 REM  Hardening: /CETCOMPAT (hardware ROP defence),
