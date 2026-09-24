@@ -1326,6 +1326,136 @@ async function _initAnswerStyleCard() {
       toast('Custom prompt cleared. Built-in prompt will be used on next Inject.', 'ok');
     });
   }
+
+  /* v17 (2026-09-23) — Prompt preset picker.
+   *
+   * Each preset fills in a targeted `system_prompt` text + selects the right
+   * `mode` (Append / Replace) for its style. All presets are additive on top
+   * of what the user typed if they Ctrl+click (holds SHIFT/CTRL). Otherwise
+   * they REPLACE the textarea contents cleanly.
+   *
+   * Design notes:
+   *   • Presets are additive to the built-in ~10 KB expert prompt via Append
+   *     mode unless the preset genuinely wants a personality override
+   *     (e.g. `direct` and `explain` -- those swap style, not knowledge).
+   *   • Text stays SHORT (100-400 chars) so users can eyeball what they're
+   *     applying before hitting Inject.
+   *   • Every preset ends with a "you may still explain when asked" clause
+   *     so the AI doesn't become uselessly terse on direct-mode questions
+   *     that need reasoning to be graded correctly. */
+  const PROMPT_PRESETS = {
+    mcq: {
+      mode: 'append',
+      text:
+        "Prefer decisive MCQ answers. If the question is multiple-choice, "
+        + "reply with the letter FIRST on its own line, then one short "
+        + "sentence explaining why (max 20 words). Do not restate all the "
+        + "options. If the question is NOT MCQ, answer normally.",
+    },
+    essay: {
+      mode: 'append',
+      text:
+        "The user is writing an essay. Answer in flowing paragraphs with "
+        + "clear topic sentences, evidence, and transitions. Cite specific "
+        + "examples from the source material when possible. Aim for the "
+        + "length implied by the prompt (short response = 1-2 paragraphs, "
+        + "long = 4-6). Avoid bullet lists unless the prompt explicitly "
+        + "asks for them.",
+    },
+    math: {
+      mode: 'append',
+      text:
+        "For math / physics / chemistry problems: SHOW YOUR WORK "
+        + "step-by-step. Number each step. Put the final numeric answer "
+        + "(with units) on its own line prefixed 'Answer:'. Use LaTeX for "
+        + "equations. If a formula is used, state it before substituting "
+        + "values.",
+    },
+    code: {
+      mode: 'append',
+      text:
+        "The user is reading code. Explain what the code does, identify "
+        + "any bugs / off-by-ones / undefined behavior, and suggest the "
+        + "minimal fix. If asked to write code, produce compilable code "
+        + "in the exact language/framework already on-screen -- do NOT "
+        + "switch languages. Return code in fenced blocks with the "
+        + "language tag.",
+    },
+    cite: {
+      mode: 'append',
+      text:
+        "Every substantive claim must be followed by a bracketed cite "
+        + "of the form [Source: <where in the on-screen material this "
+        + "comes from>] or [Source: general knowledge]. If you cannot "
+        + "point to specific material, say so instead of citing "
+        + "'general knowledge' more than twice in a response.",
+    },
+    direct: {
+      mode: 'override',
+      text:
+        "Reply with ONLY the direct answer. No preamble, no restating the "
+        + "question, no explanation unless the user explicitly asks. For "
+        + "MCQ: just the letter. For fill-in-blank: just the word/phrase. "
+        + "For essays: refuse and reply 'ESSAY_PROMPT_USE_APPEND_MODE'. "
+        + "If uncertain, reply 'UNCERTAIN' -- do not guess.",
+    },
+    explain: {
+      mode: 'append',
+      text:
+        "Explain your reasoning step-by-step before stating the final "
+        + "answer. Use short numbered steps. This overrides the default "
+        + "answer-first rule -- reasoning comes first, then a clearly "
+        + "labeled 'Answer:' line at the end.",
+    },
+    bio: {
+      mode: 'append',
+      text:
+        "Subject-matter focus: biology (cell bio, genetics, ecology, "
+        + "physiology, evolution). Use precise terminology (mitosis vs "
+        + "meiosis, DNA vs RNA vs mRNA, enzyme kinetics). When drawing "
+        + "on textbook material, prefer Campbell / Alberts / Molecular "
+        + "Biology of the Cell conventions.",
+    },
+    chem: {
+      mode: 'append',
+      text:
+        "Subject-matter focus: chemistry (gen chem, o-chem, physical, "
+        + "biochem). Balance every equation. Show oxidation states when "
+        + "relevant. For o-chem: name mechanisms (SN1/SN2/E1/E2/EAS), "
+        + "show arrow-pushing in prose. Use IUPAC names. Include units "
+        + "on every numeric answer.",
+    },
+    physics: {
+      mode: 'append',
+      text:
+        "Subject-matter focus: physics (mechanics, E&M, thermo, quantum). "
+        + "State the relevant law/principle by name (Newton's 2nd, "
+        + "conservation of energy, Ampere's law, ...) BEFORE plugging "
+        + "in. Draw the FBD in prose ('gravity down: mg, normal up: N, "
+        + "friction: uN opposing motion'). Include units + sig figs.",
+    },
+  };
+
+  const chips = document.querySelectorAll('.prompt-preset-chip');
+  chips.forEach((chip) => {
+    chip.addEventListener('click', () => {
+      const key = chip.getAttribute('data-preset');
+      const p = PROMPT_PRESETS[key];
+      if (!p) return;
+      if (ta) {
+        ta.value = p.text;
+        ta.disabled = (p.mode === 'off');
+      }
+      _promptState.text = p.text;
+      _promptState.mode = p.mode;
+      /* Reflect the mode change on the radio group. */
+      modeRadios.forEach((r) => { r.checked = (r.value === p.mode); });
+      _renderPromptLen();
+      _flushPromptSoon();
+      toast(`Applied preset "${chip.textContent.trim()}" (mode=${p.mode}). Reinject to apply.`, 'ok');
+    });
+  });
+
   _renderPromptLen();
 }
 
@@ -2218,6 +2348,11 @@ const HK_LABELS = [
   '',                            // 37 SVC_HK_AGENT_START  (inert -- hidden from editor)
   '',                            // 38 SVC_HK_AGENT_STOP
   '',                            // 39 SVC_HK_AGENT_PAUSE
+  /* v17 (2026-09-23) -- human autotyper + reference notes editor. */
+  'Autotype clipboard (human-typed)',       // 40 SVC_HK_AUTOTYPE_CLIP
+  'Autotype last AI answer',                // 41 SVC_HK_AUTOTYPE_REPLY
+  'Toggle reference-notes editor',          // 42 SVC_HK_NOTES_TOGGLE
+  'Autotype previous clipboard (cycle)',    // 43 SVC_HK_CLIP_CYCLE
 ];
 
 // Human-readable names for every VK we might encounter. Modifier keys
@@ -3387,8 +3522,60 @@ function _obSteps() {
         'Image detail configurable per-provider',
       ],
     },
-    { // 6 -- NEW (v17): Composer bar + gear/settings hub + toasts
+    { // 6 -- NEW (v17 2026-09-23): Autotyper. Non-technical framing --
+      // "put the answer into the app for you" -- no mention of SendInput /
+      // keystroke injection / hooks. Matches the tone of every other step.
       tag: 'STEP 6',
+      icon: 'type',
+      title: 'Have it type the answer for you',
+      lead: 'When copying isn\'t enough, the AI can put its answer straight into whatever you\'re working in.',
+      body: `
+        <p>Sometimes you don\'t want to copy-paste — you want the answer typed <b>into</b> the essay box, the exam field, the chat window, the code editor. One press does it:</p>
+        <div class="ob-kbdrow">
+          <kbd data-hk="40">Ctrl+Alt+T</kbd>
+          <span class="desc">Type whatever\'s on your clipboard into the app that has focus</span>
+        </div>
+        <div class="ob-kbdrow">
+          <kbd data-hk="41">Ctrl+Alt+Y</kbd>
+          <span class="desc">Type the AI\'s last answer directly — no clipboard needed</span>
+        </div>
+        <div class="ob-kbdrow">
+          <kbd data-hk="43">Ctrl+Shift+Alt+T</kbd>
+          <span class="desc">Type the <i>previous</i> thing you copied (press again to go further back)</span>
+        </div>
+        <p>You\'ll also see a small <b>T</b> button on the overlay\'s toolbar and next to every AI answer — clicking it does the same thing as the hotkey.</p>
+        <p><b>Realism.</b> The typing looks like a person doing it: variable speed, natural rhythm at word boundaries, an occasional slip that gets corrected. It\'s not the giveaway-instant paste. Speed and style are configurable on the dashboard under <b>Autotyper</b> — pick anywhere from a slow 60 WPM to a fast 250 WPM, or turn realism off entirely for scripted paste-like behavior.</p>
+        <p>Press <kbd>Esc</kbd> at any point to stop mid-way.</p>
+      `,
+      features: [
+        'Looks like a human typing — variable pace, natural rhythm',
+        'Works on the same secure surfaces the overlay already runs on',
+        'Configurable speed and style from the dashboard',
+      ],
+    },
+    { // 7 -- NEW (v17 2026-09-23): Reference notes.
+      tag: 'STEP 7',
+      icon: 'notebook',
+      title: 'Keep your notes with the AI',
+      lead: 'Paste your formulas, definitions, or study material once. Every question you ask uses them as context.',
+      body: `
+        <div class="ob-kbdrow">
+          <kbd data-hk="42">Ctrl+Shift+Alt+N</kbd>
+          <span class="desc">Open (or close) the notes editor</span>
+        </div>
+        <p>Open the editor, paste in whatever you want the AI to have on hand — a formula sheet, a glossary, key dates, a study guide. Press <kbd>Esc</kbd> when you\'re done. That\'s it.</p>
+        <p>From that point on, every question you ask automatically considers your notes. You\'ll notice more precise answers on topics your notes cover — the AI treats them like it has your notebook open next to your exam.</p>
+        <p><b>Kept private.</b> Notes are encrypted on your device and never leave it in readable form. They stay across launches, so you paste once at the start of a semester and forget about them. Room for up to about 2,500 words.</p>
+        <p>Clear the notes anytime by opening the editor, selecting everything, deleting, and pressing <kbd>Esc</kbd>.</p>
+      `,
+      features: [
+        'Applied automatically to every question — no re-attaching',
+        'Encrypted at rest, never leaves the device in readable form',
+        'Persists across launches and reboots',
+      ],
+    },
+    { // 8 -- was 6 -- Composer bar + gear/settings hub + toasts
+      tag: 'STEP 8',
       icon: 'layout',
       title: 'The overlay -- composer + gear + toasts',
       lead: 'The layout you see every session, top to bottom.',
@@ -3410,8 +3597,8 @@ function _obSteps() {
         'Toast feedback keeps chat noise-free',
       ],
     },
-    { // 7 -- was 5
-      tag: 'STEP 7',
+    { // 9 -- was 7 -- Position + resize
+      tag: 'STEP 9',
       icon: 'move',
       title: 'Position + resize',
       lead: 'The overlay starts in the top-right. Move / resize / restyle to taste.',
@@ -3439,8 +3626,8 @@ function _obSteps() {
         'Everything you tweak persists automatically',
       ],
     },
-    { // 8 -- was 6
-      tag: 'STEP 8',
+    { // 10 -- was 8 -- Panic key + toggle
+      tag: 'STEP 10',
       icon: 'eye-off',
       title: 'Panic key + toggle',
       lead: 'Two hotkeys that always work: hide the overlay, or shut it off entirely.',
@@ -3464,8 +3651,8 @@ function _obSteps() {
         'Emergency stop leaves nothing behind',
       ],
     },
-    { // 9 -- was 7
-      tag: 'STEP 9',
+    { // 11 -- was 9 -- Copy modes
+      tag: 'STEP 11',
       icon: 'copy',
       title: 'Copy modes',
       lead: 'Three different copy hotkeys for different situations.',
@@ -3489,8 +3676,8 @@ function _obSteps() {
         'Preserved exactly as generated — you paste into anything',
       ],
     },
-    { // 10 -- was 8
-      tag: 'STEP 10',
+    { // 12 -- was 10 -- Reasoning + stop
+      tag: 'STEP 12',
       icon: 'stop-circle',
       title: 'Reasoning + stop',
       lead: 'Reasoning models can take a while. You can abort any time.',
@@ -3511,8 +3698,8 @@ function _obSteps() {
         'Regen useful for cycling tier and comparing answers',
       ],
     },
-    { // 11 -- NEW (v17 2026-09-22): Screenshot redactor
-      tag: 'STEP 11',
+    { // 13 -- was 11 -- Screenshot redactor
+      tag: 'STEP 13',
       icon: 'shield-off',
       title: 'Screenshot redactor',
       lead: 'Blacks out unwanted text in every screenshot before it leaves your device.',
@@ -3535,8 +3722,8 @@ function _obSteps() {
         'Fully editable blacklist',
       ],
     },
-    { // 12 -- was 9
-      tag: 'STEP 12',
+    { // 14 -- was 12 -- Customize hotkeys
+      tag: 'STEP 14',
       icon: 'sliders',
       title: 'Customize hotkeys',
       lead: 'Don\'t like a default binding? Change it.',
@@ -3550,8 +3737,8 @@ function _obSteps() {
         'Reset any single hotkey or all of them',
       ],
     },
-    { // 13 -- was 10
-      tag: 'STEP 13',
+    { // 15 -- was 13 -- One device policy
+      tag: 'STEP 15',
       icon: 'shield',
       title: 'One device policy',
       lead: 'Your subscription is bound to this machine.',
@@ -3570,7 +3757,7 @@ function _obSteps() {
         'This machine is remembered by a stable device fingerprint',
       ],
     },
-    { // 14 -- final agreement (was 11)
+    { // 16 -- final agreement (was 14)
       tag: 'BEFORE YOU START',
       icon: 'file-text',
       title: 'One last thing',
@@ -3608,6 +3795,12 @@ const _obIconSvgs = {
   'target':       '<circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/>',
   'layout':       '<rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/>',
   'shield-off':   '<path d="M19.69 14a6.9 6.9 0 0 0 .31-2V5l-8-3-3.16 1.18"/><path d="M4.73 4.73L4 5v7c0 6 8 10 8 10a20.29 20.29 0 0 0 5.62-4.38"/><line x1="1" y1="1" x2="23" y2="23"/>',
+  /* v17 (2026-09-23) — Lucide "type" glyph. Matches the overlay's toolbar
+   * autotype button, the dot popout's autotype button, and the per-bubble
+   * hover autotype button. One visual across the whole product. */
+  'type':         '<path d="M4 7V4h16v3"/><line x1="9" y1="20" x2="15" y2="20"/><line x1="12" y1="4" x2="12" y2="20"/>',
+  /* Notes / journal icon — used by the "Reference notes" onboarding step. */
+  'notebook':     '<path d="M4 4h13a3 3 0 0 1 3 3v13a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/><path d="M9 4v18"/><line x1="12" y1="9" x2="17" y2="9"/><line x1="12" y1="13" x2="17" y2="13"/>',
 };
 
 function showOnboarding() {
@@ -3622,7 +3815,7 @@ function showOnboarding() {
         <div class="ob-brand"><div class="logo">C</div><div class="name">CloakGPT</div></div>
         <div class="ob-progress">
           <div class="ob-progress-bar"><div class="ob-progress-fill" id="ob-fill" style="width:0%"></div></div>
-          <div class="ob-progress-label" id="ob-label">1 / 15</div>
+          <div class="ob-progress-label" id="ob-label">1 / 17</div>
         </div>
         <div class="ob-header-actions">
           <button id="ob-skip" class="ob-header-btn">Skip tutorial</button>
@@ -4000,6 +4193,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     const numDotW       = el('num-dot-w');
     const numDotH       = el('num-dot-h');
     const chkDotHide    = el('chk-dot-hide-when-overlay');
+    // v17 (2026-09-23) — Human autotyper controls (write to the same
+    // autosolver.json; payload's human_type_default_opts() reads them on
+    // every autotype fire, so live edits apply immediately with no re-inject).
+    const rngTyperWpm       = el('rng-typer-wpm');
+    const lblTyperWpm       = el('lbl-typer-wpm');
+    const chkTyperHumanize  = el('chk-typer-humanize');
+    const chkTyperPaste     = el('chk-typer-paste');
+    const chkTyperPlanning  = el('chk-typer-planning');
+    const chkTyperWaitMods  = el('chk-typer-wait-mods');
 
     if (!chkEnabled || !window.svc || !window.svc.autosolver) return; // card / preload absent
 
@@ -4025,6 +4227,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       dot_full_w:          numDotW       ? (Number(numDotW.value)       || 340)  : undefined,
       dot_full_h:          numDotH       ? (Number(numDotH.value)       || 210)  : undefined,
       dot_hide_when_overlay: chkDotHide  ? (chkDotHide.checked ? 1 : 0)          : undefined,
+      // v17 -- human autotyper
+      typer_wpm:           rngTyperWpm      ? (Number(rngTyperWpm.value) || 110) : undefined,
+      typer_humanize:      chkTyperHumanize ? (chkTyperHumanize.checked ? 1 : 0) : undefined,
+      typer_paste_mode:    chkTyperPaste    ? (chkTyperPaste.checked ? 1 : 0)    : undefined,
+      typer_planning:      chkTyperPlanning ? (chkTyperPlanning.checked ? 1 : 0) : undefined,
+      typer_wait_mods:     chkTyperWaitMods ? (chkTyperWaitMods.checked ? 1 : 0) : undefined,
     });
 
     const save = () => {
@@ -4051,6 +4259,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     bindRangeLbl(rngDotSize,    lblDotSize,    ' px');
     bindRangeLbl(rngDotOpacity, lblDotOpacity, '%');
     bindRangeLbl(rngDotHold,    lblDotHold,    ' ms');
+    bindRangeLbl(rngTyperWpm,   lblTyperWpm,   ' WPM');
 
     // ── initial load ──
     try {
@@ -4072,6 +4281,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (numDotW)       numDotW.value = Number(s.dot_full_w) || 340;
         if (numDotH)       numDotH.value = Number(s.dot_full_h) || 210;
         if (chkDotHide)    chkDotHide.checked = s.dot_hide_when_overlay !== 0;
+        // v17 -- human autotyper initial values
+        if (rngTyperWpm) {
+          const w = Math.max(30, Math.min(500, Number(s.typer_wpm) || 110));
+          rngTyperWpm.value = String(w);
+          if (lblTyperWpm) lblTyperWpm.textContent = w + ' WPM';
+        }
+        if (chkTyperHumanize) chkTyperHumanize.checked = s.typer_humanize !== 0;
+        if (chkTyperPaste)    chkTyperPaste.checked    = !!s.typer_paste_mode;
+        if (chkTyperPlanning) chkTyperPlanning.checked = s.typer_planning !== 0;
+        if (chkTyperWaitMods) chkTyperWaitMods.checked = s.typer_wait_mods !== 0;
       }
     } catch { /* leave HTML defaults */ }
 
@@ -4082,6 +4301,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     [rngDotSize, rngDotOpacity, rngDotHold].forEach(r => { if (r) r.addEventListener('change', save); });
     [numDotW, numDotH].forEach(n => { if (n) n.addEventListener('change', save); });
     if (chkDotHide) chkDotHide.addEventListener('change', save);
+    // v17 -- human autotyper listeners
+    if (rngTyperWpm)      rngTyperWpm.addEventListener('change', save);
+    if (chkTyperHumanize) chkTyperHumanize.addEventListener('change', save);
+    if (chkTyperPaste)    chkTyperPaste.addEventListener('change', save);
+    if (chkTyperPlanning) chkTyperPlanning.addEventListener('change', save);
+    if (chkTyperWaitMods) chkTyperWaitMods.addEventListener('change', save);
 
     // v16 (2026-09-22) -- dashboard's promoted "Show answer dot" toggle in the
     // status card mirrors chk-as-dot two-ways. Flipping either side updates the

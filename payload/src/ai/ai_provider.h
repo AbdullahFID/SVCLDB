@@ -25,8 +25,9 @@ extern "C" {
 /* ── Tier tables ──
  *
  * OpenAI, Anthropic, Google each expose 3 tiers we curate. OpenRouter
- * is user-picked -- either "openrouter/free" (default, zero-cost auto-
- * routing) or any specific slug like "meta-llama/llama-4-maverick:free".
+ * is user-picked -- either "openrouter/auto" (default; auto-router picks
+ * the best available model) or any specific slug like
+ * "meta-llama/llama-4-maverick:free" or "anthropic/claude-opus-5".
  */
 typedef struct {
     const char *model_id;       /* API slug */
@@ -39,7 +40,7 @@ typedef struct {
 
 /* Lookup model info for a (provider, tier) pair.
  * For OpenRouter, tier is ignored -- always returns the entry pointing
- * at "openrouter/free". Non-OpenRouter with tier=CUSTOM returns NULL
+ * at "openrouter/auto". Non-OpenRouter with tier=CUSTOM returns NULL
  * (caller must use cfg->model verbatim).
  * Returns NULL if the (provider, tier) combo isn't supported. */
 const svc_model_tier_t *ai_get_tier(int provider, int tier);

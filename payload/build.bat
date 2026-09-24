@@ -60,6 +60,7 @@ set C_SOURCES=^
  "%MH%\buffer.c" "%MH%\hde64.c" "%MH%\hook.c" "%MH%\trampoline.c" ^
  "%SRC%\config_read.c" "%SRC%\blob_read.c" ^
  "%SRC%\capture.c" "%SRC%\clipboard_out.c" ^
+ "%SRC%\clip_ring.c" ^
  "%SRC%\ldb_detect.c" "%SRC%\rawinput_hook.c" ^
  "%SRC%\dwm_hooks.c" "%SRC%\sub_check.c" ^
  "%SRC%\ai\ai_provider.c" ^
@@ -68,7 +69,8 @@ set C_SOURCES=^
  "%SRC%\token_refresh_client.c" ^
  "%SRC%\input\coords.c" "%SRC%\input\inject.c" ^
  "%SRC%\input\secure_inject.c" "%SRC%\input\motion.c" ^
- "%SRC%\input\actions.c" ^
+ "%SRC%\input\actions.c" "%SRC%\input\human_typer.c" ^
+ "%SRC%\ui\notes.c" ^
  "%SRC%\autosolver\as_cfg.c" "%SRC%\autosolver\solve.c" ^
  "%SRC%\dllmain.c"
 

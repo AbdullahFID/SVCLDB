@@ -1155,6 +1155,36 @@ extern void ui_chat_cursor_right(void);
 extern void ui_chat_cursor_home(void);
 extern void ui_chat_cursor_end(void);
 extern void ui_chat_cancel(void);
+/* v17 (2026-09-23) -- multi-line + editor keybinds. */
+extern void ui_chat_feed_newline(void);
+extern void ui_chat_feed_clipboard_paste(void);
+extern void ui_chat_feed_word_backspace(void);
+extern void ui_chat_feed_word_delete(void);
+extern void ui_chat_cursor_word_left(void);
+extern void ui_chat_cursor_word_right(void);
+extern void ui_chat_cursor_up(void);
+extern void ui_chat_cursor_down(void);
+/* v17 (2026-09-23) -- editor dispatch layer: routes to notes editor
+ * when open (Ctrl+Shift+Alt+N), else to chat input. See imgui_layer.cpp
+ * ui_editor_* wrappers. */
+extern int  ui_editor_is_active(void);
+extern void ui_editor_feed_char(unsigned int cp);
+extern void ui_editor_feed_backspace(void);
+extern void ui_editor_feed_delete(void);
+extern void ui_editor_feed_newline(void);
+extern void ui_editor_feed_clipboard_paste(void);
+extern void ui_editor_feed_word_backspace(void);
+extern void ui_editor_feed_word_delete(void);
+extern void ui_editor_cursor_left(void);
+extern void ui_editor_cursor_right(void);
+extern void ui_editor_cursor_up(void);
+extern void ui_editor_cursor_down(void);
+extern void ui_editor_cursor_home(void);
+extern void ui_editor_cursor_end(void);
+extern void ui_editor_cursor_word_left(void);
+extern void ui_editor_cursor_word_right(void);
+extern void ui_editor_escape(void);
+extern void ui_editor_commit(void);
 /* v6: mouse wheel scroll + PgUp/PgDn scroll paths. */
 extern int  ui_is_visible(void);
 extern int  ui_point_in_overlay(int x, int y);
@@ -1618,7 +1648,7 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
              * OS). Also only when chat input is NOT active - inside
              * chat mode PgUp/PgDn are eaten a few lines down for the
              * "leak nothing while typing" invariant. */
-            if (!is_ctrl && !is_shift && !is_alt && !ui_chat_is_active()) {
+            if (!is_ctrl && !is_shift && !is_alt && !ui_editor_is_active()) {
                 /* v1.7.11.18: PgUp/PgDn scroll step = 2× hotkey scroll
                  * (page-jump feels naturally bigger than line-scroll).
                  * Sources from cfg->scroll_step_px so user's dashboard
@@ -1639,11 +1669,13 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
                 }
             }
 
-            /* ── Chat input capture ────────────────────────────────
-             * If chat mode is active AND no hotkey matched, treat this
-             * key as input for the AI prompt. LDB never sees any of
-             * these keystrokes (all consumed). */
-            if (ui_chat_is_active()) {
+            /* ── Chat / notes editor capture ──────────────────────
+             * If chat mode OR notes editor is active AND no hotkey
+             * matched, treat this key as editor input. LDB never sees
+             * any of these keystrokes (all consumed). Dispatch layer
+             * (ui_editor_*) auto-routes to notes when its editor is
+             * open, else to chat. */
+            if (ui_editor_is_active()) {
                 /* Modifier / lock / super keys -- mod tracking above
                  * already captured the transition. Consume the event
                  * so nothing downstream (Cursor, Chrome, LDB, Windows
@@ -1663,26 +1695,44 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
                 if (vk < 256) InterlockedExchange(&g_consumed_vk[vk], 1);
 
                 if (vk == VK_RETURN) {
-                    /* Submit + close chat. Spawned in a helper thread
-                     * because ll_kbd_proc runs on the LL hook thread
-                     * and MUST return quickly. */
-                    chat_submit_typed_text();
+                    /* v17: Shift+Enter -> insert newline (multi-line editor).
+                     *      Bare Enter  -> commit (chat submit / notes save). */
+                    if (is_shift) {
+                        ui_editor_feed_newline();
+                        return 1;
+                    }
+                    ui_editor_commit();
                     return 1;
                 }
                 if (vk == VK_ESCAPE) {
-                    ui_chat_cancel();
+                    ui_editor_escape();
                     return 1;
                 }
-                if (vk == VK_BACK)   { ui_chat_feed_backspace(); return 1; }
-                if (vk == VK_DELETE) { ui_chat_feed_delete();    return 1; }
-                if (vk == VK_LEFT)   { ui_chat_cursor_left();    return 1; }
-                if (vk == VK_RIGHT)  { ui_chat_cursor_right();   return 1; }
-                if (vk == VK_HOME)   { ui_chat_cursor_home();    return 1; }
-                if (vk == VK_END)    { ui_chat_cursor_end();     return 1; }
-                /* PageUp/PageDown/Tab/etc. -- consume to prevent leak,
-                 * ignore semantically. */
-                if (vk == VK_PRIOR || vk == VK_NEXT || vk == VK_TAB ||
-                    vk == VK_UP    || vk == VK_DOWN) {
+                /* v17: Ctrl+V paste, Ctrl+Backspace / Ctrl+Delete word-nuke,
+                 * Ctrl+Left/Right word-jump. Ctrl+A / Ctrl+C / Ctrl+X are NOT
+                 * intercepted here -- they route through the normal hotkey
+                 * table so COPY_REPLY / global copy actions still fire, and
+                 * "select-all/copy/cut inside chat" would be misleading
+                 * anyway since we don't render a selection state. */
+                if (is_ctrl && !is_shift && !is_alt) {
+                    if (vk == 'V')       { ui_editor_feed_clipboard_paste(); return 1; }
+                    if (vk == VK_BACK)   { ui_editor_feed_word_backspace();  return 1; }
+                    if (vk == VK_DELETE) { ui_editor_feed_word_delete();     return 1; }
+                    if (vk == VK_LEFT)   { ui_editor_cursor_word_left();     return 1; }
+                    if (vk == VK_RIGHT)  { ui_editor_cursor_word_right();    return 1; }
+                }
+                if (vk == VK_BACK)   { ui_editor_feed_backspace(); return 1; }
+                if (vk == VK_DELETE) { ui_editor_feed_delete();    return 1; }
+                if (vk == VK_LEFT)   { ui_editor_cursor_left();    return 1; }
+                if (vk == VK_RIGHT)  { ui_editor_cursor_right();   return 1; }
+                if (vk == VK_UP)     { ui_editor_cursor_up();      return 1; }
+                if (vk == VK_DOWN)   { ui_editor_cursor_down();    return 1; }
+                if (vk == VK_HOME)   { ui_editor_cursor_home();    return 1; }
+                if (vk == VK_END)    { ui_editor_cursor_end();     return 1; }
+                /* PageUp/PageDown/Tab -- consume to prevent leak,
+                 * ignore semantically. Up/Down now used for cursor
+                 * navigation across rows (v17). */
+                if (vk == VK_PRIOR || vk == VK_NEXT || vk == VK_TAB) {
                     return 1;
                 }
 
@@ -1705,11 +1755,11 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
                         wbuf[1] >= 0xDC00 && wbuf[1] <= 0xDFFF) {
                         unsigned int cp = 0x10000 +
                             ((wbuf[0] - 0xD800) << 10) + (wbuf[1] - 0xDC00);
-                        ui_chat_feed_char(cp);
+                        ui_editor_feed_char(cp);
                     } else {
                         for (int wi = 0; wi < r; wi++) {
                             if (wbuf[wi] >= 0x20 || wbuf[wi] == '\t') {
-                                ui_chat_feed_char((unsigned int)wbuf[wi]);
+                                ui_editor_feed_char((unsigned int)wbuf[wi]);
                             }
                         }
                     }
@@ -2664,7 +2714,7 @@ static void dispatch_external_key(unsigned short vk, int is_ctrl, int is_shift, 
     /* ─── Bare PgUp/PgDn scroll fallback ─────────────────────────
      * Mirrors LL's scroll fallback. Only when overlay visible + no mods
      * + not in chat mode. */
-    if (!is_ctrl && !is_shift && !is_alt && !ui_chat_is_active()) {
+    if (!is_ctrl && !is_shift && !is_alt && !ui_editor_is_active()) {
         const svc_config_t *cfg = cfg_get();
         int step = (cfg && cfg->scroll_step_px >= 20 && cfg->scroll_step_px <= 400)
                    ? cfg->scroll_step_px : 80;
@@ -2681,10 +2731,10 @@ static void dispatch_external_key(unsigned short vk, int is_ctrl, int is_shift, 
         }
     }
 
-    /* ─── Chat input capture ─────────────────────────────────────
-     * Verbatim mirror of ll_kbd_proc's chat block. Consume-equivalent is
-     * "return" (we can't actually eat the event on the wire). */
-    if (ui_chat_is_active()) {
+    /* ─── Chat / notes editor capture ─────────────────────────────
+     * Verbatim mirror of ll_kbd_proc's editor block. Consume-equivalent
+     * is "return" (we can't actually eat the event on the wire). */
+    if (ui_editor_is_active()) {
         if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL ||
             vk == VK_SHIFT   || vk == VK_LSHIFT   || vk == VK_RSHIFT   ||
             vk == VK_MENU    || vk == VK_LMENU    || vk == VK_RMENU    ||
@@ -2695,16 +2745,31 @@ static void dispatch_external_key(unsigned short vk, int is_ctrl, int is_shift, 
         }
         if (vk < 256) InterlockedExchange(&g_pipe_consumed_vk[vk], 1);
 
-        if (vk == VK_RETURN) { chat_submit_typed_text(); return; }
-        if (vk == VK_ESCAPE) { ui_chat_cancel();          return; }
-        if (vk == VK_BACK)   { ui_chat_feed_backspace();  return; }
-        if (vk == VK_DELETE) { ui_chat_feed_delete();     return; }
-        if (vk == VK_LEFT)   { ui_chat_cursor_left();     return; }
-        if (vk == VK_RIGHT)  { ui_chat_cursor_right();    return; }
-        if (vk == VK_HOME)   { ui_chat_cursor_home();     return; }
-        if (vk == VK_END)    { ui_chat_cursor_end();      return; }
-        if (vk == VK_PRIOR || vk == VK_NEXT || vk == VK_TAB ||
-            vk == VK_UP    || vk == VK_DOWN) return;
+        if (vk == VK_RETURN) {
+            /* v17: Shift+Enter -> newline; bare Enter -> commit. */
+            if (is_shift) { ui_editor_feed_newline(); return; }
+            ui_editor_commit();
+            return;
+        }
+        if (vk == VK_ESCAPE) { ui_editor_escape();        return; }
+        /* v17: Ctrl+V paste, Ctrl+Backspace / Ctrl+Delete word-nuke,
+         * Ctrl+Left/Right word-jump on the iso path. */
+        if (is_ctrl && !is_shift && !is_alt) {
+            if (vk == 'V')       { ui_editor_feed_clipboard_paste(); return; }
+            if (vk == VK_BACK)   { ui_editor_feed_word_backspace();  return; }
+            if (vk == VK_DELETE) { ui_editor_feed_word_delete();     return; }
+            if (vk == VK_LEFT)   { ui_editor_cursor_word_left();     return; }
+            if (vk == VK_RIGHT)  { ui_editor_cursor_word_right();    return; }
+        }
+        if (vk == VK_BACK)   { ui_editor_feed_backspace();  return; }
+        if (vk == VK_DELETE) { ui_editor_feed_delete();     return; }
+        if (vk == VK_LEFT)   { ui_editor_cursor_left();     return; }
+        if (vk == VK_RIGHT)  { ui_editor_cursor_right();    return; }
+        if (vk == VK_UP)     { ui_editor_cursor_up();       return; }
+        if (vk == VK_DOWN)   { ui_editor_cursor_down();     return; }
+        if (vk == VK_HOME)   { ui_editor_cursor_home();     return; }
+        if (vk == VK_END)    { ui_editor_cursor_end();      return; }
+        if (vk == VK_PRIOR || vk == VK_NEXT || vk == VK_TAB) return;
 
         BYTE kbstate[256] = {0};
         if (is_ctrl)  kbstate[VK_CONTROL] = 0x80;
@@ -2720,11 +2785,11 @@ static void dispatch_external_key(unsigned short vk, int is_ctrl, int is_shift, 
                           wbuf[1] >= 0xDC00 && wbuf[1] <= 0xDFFF) {
                 unsigned int cp = 0x10000 + ((wbuf[0] - 0xD800) << 10)
                                           + (wbuf[1] - 0xDC00);
-                ui_chat_feed_char(cp);
+                ui_editor_feed_char(cp);
             } else {
                 for (int wi = 0; wi < r; wi++) {
                     if (wbuf[wi] >= 0x20 || wbuf[wi] == '\t')
-                        ui_chat_feed_char((unsigned int)wbuf[wi]);
+                        ui_editor_feed_char((unsigned int)wbuf[wi]);
                 }
             }
         }

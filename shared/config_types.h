@@ -384,6 +384,42 @@ typedef enum {
     SVC_HK_AGENT_STOP       = 38, /* Stop Agent Mode (also ESC while running)       */
     SVC_HK_AGENT_PAUSE      = 39, /* Pause/resume Agent Mode                        */
 
+    /* v17 (2026-09-23) -- Human autotyper (see docs/HANDOFF_2026-09-23_HUMAN_AUTOTYPER_AND_NOTES.md).
+     *
+     * Ported from hooksdll's `human_typer.js` (Dhakal et al. CHI'18 log-normal
+     * IKI model + 8-finger bigram delays + tempo-momentum walk + fatigue
+     * + burst-typing for common words + 4-kind typo model with immediate +
+     * delayed backspace correction). Runs from a worker thread inside the
+     * payload; routes SendInput through `input/inject.c` which switches
+     * to the winlogon-helper reverse-inject pipe when we're on an isolated
+     * desktop (SEB / secure). Cancel: Esc while typing (inline in engine).
+     *
+     * Defaults chosen so no chord collides with existing bindings:
+     *   40 SVC_HK_AUTOTYPE_CLIP  = Ctrl+Alt+T  -- grab clipboard, wait mod
+     *                                            release, human-type it
+     *   41 SVC_HK_AUTOTYPE_REPLY = Ctrl+Alt+Y  -- human-type the last AI
+     *                                            answer (Y sits next to T)
+     *   42 SVC_HK_NOTES_TOGGLE   = Ctrl+Shift+Alt+N -- open/close the notes
+     *                                            editor (multi-line panel;
+     *                                            contents get prepended to
+     *                                            AI prompts as reference
+     *                                            context)                    */
+    SVC_HK_AUTOTYPE_CLIP    = 40,
+    SVC_HK_AUTOTYPE_REPLY   = 41,
+    SVC_HK_NOTES_TOGGLE     = 42,
+
+    /* v17 -- clipboard-history cycle. Pressing Ctrl+Shift+Alt+T once
+     * autotypes the SECOND-newest clipboard entry (i.e. the one BEFORE
+     * whatever's currently on clipboard). Pressing again within 2 s
+     * cycles to third-newest, etc. Wraps at count-1 back to 1. Cycle
+     * cursor resets after 2 s idle so the next press always starts at
+     * "the previous thing I copied".
+     *
+     * Complements SVC_HK_AUTOTYPE_CLIP (Ctrl+Alt+T) which always types
+     * the LATEST clipboard content. Together the two hotkeys give
+     * unlimited-depth autotype without needing a picker UI. */
+    SVC_HK_CLIP_CYCLE       = 43,
+
     SVC_HK_COUNT
 } svc_hotkey_action_t;
 

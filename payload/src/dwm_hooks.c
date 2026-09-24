@@ -130,7 +130,24 @@ extern int ui_is_visible(void);
  * hooks_bump_compose_grace(). */
 static volatile LONG64 g_compose_grace_until_tick = 0;
 
+/* v-ctrlb-hardening (2026-09-23) -- forward decls of teardown flags so
+ * hooks_bump_compose_grace + hooks_uninstall_in_progress can gate on
+ * them.  Real definitions are further down the file (near
+ * Detour_COverlayContextPresent) alongside the phase-state comment;
+ * these declarations just make them visible up here. */
+extern volatile LONG g_active;
+extern volatile LONG g_stop_draw;
+
 void hooks_bump_compose_grace(unsigned ms) {
+    /* v-ctrlb-hardening (2026-09-23) -- teardown gate. Bumping compose
+     * grace after g_stop_draw is set just delays the graceful exit
+     * (PN detours would keep forcing PN=TRUE during the drain phase we
+     * WANT to end promptly). Also useless: hooks_begin_shutdown_hide
+     * has already set its own 500ms grace window that covers instant-
+     * hide semantics -- extra bumps from downstream toggle/nudge/resize
+     * calls arriving mid-teardown would just push the shutdown drain
+     * further out. Skip. */
+    if (g_stop_draw || !g_active) return;
     LONG64 target = (LONG64)GetTickCount64() + (LONG64)ms;
     /* Only extend, never shorten. */
     LONG64 cur;
@@ -139,6 +156,18 @@ void hooks_bump_compose_grace(unsigned ms) {
         if (target <= cur) return;
     } while (InterlockedCompareExchange64(&g_compose_grace_until_tick,
                                           target, cur) != cur);
+}
+
+/* v-ctrlb-hardening (2026-09-23) -- public accessor for teardown state.
+ * Callers use this to skip work that would just make teardown slower or
+ * cross a MinHook-disable race. Cheap: two volatile reads. */
+int hooks_uninstall_in_progress(void) {
+    /* Either flip is a "we're going away" signal:
+     *  - g_stop_draw : hooks_begin_shutdown_hide OR hooks_uninstall set.
+     *  - !g_active   : hooks_uninstall completed OR never installed. */
+    if (g_stop_draw) return 1;
+    if (!g_active)   return 1;
+    return 0;
 }
 
 static int in_compose_grace_window(void) {
@@ -441,8 +470,8 @@ static volatile void *g_legacy_rt  = NULL;
  *   Present: SKIPS drawing (g_stop_draw still 1)
  *   PN:      returns orig  (let DWM's normal lazy-compose take over)
  *   Then MH_DisableHook removes the detours entirely. */
-static volatile LONG g_active     = 0;   /* 1 while payload is alive (RUNNING + DRAINING) */
-static volatile LONG g_stop_draw  = 0;   /* 1 = Present skips our draw callback */
+volatile LONG g_active     = 0;   /* 1 while payload is alive (RUNNING + DRAINING) -- non-static so hooks_bump_compose_grace / hooks_uninstall_in_progress (earlier in TU) can read via extern decl */
+volatile LONG g_stop_draw  = 0;   /* 1 = Present skips our draw callback -- non-static (same reason) */
 /* v-next (2026-09-23) -- separate hooks_uninstall idempotency guard from
  * g_stop_draw so a caller can flip g_stop_draw for INSTANT overlay hide
  * (hooks_begin_shutdown_hide) without wedging a subsequent hooks_uninstall
@@ -1157,11 +1186,34 @@ static BOOL svcldb_capture_active(void) {
 
 /* v3.1 (2026-09-21) -- Present-fire canary thread.
  *
- * Sleeps + samples g_present_calls at 2s, 5s, 10s, 30s post-install.
  * Verifies DWM is actually invoking our COverlayContext::Present detour.
- * If it never does within 2s of hooks_install, log LOUD warning +
+ * If it never does within a reasonable window, log LOUD warning +
  * set g_compose_degraded so ui_present_frame short-circuits.
  * Zero corrective action -- observability + safe quiesce only.
+ *
+ * v-ctrlb-hardening (2026-09-23) -- RAISED the initial alert threshold
+ * from 2s -> 15s. Empirical: on my Win11 25H2 box, DWM sometimes takes
+ * 5-15s to first call our Present detour after hooks_install (idle
+ * desktop with no window movement, HDR content playing on a secondary
+ * monitor, DWM in low-power compose mode). The 2s canary tripped
+ * false-positive there, latching g_compose_degraded=1 for the next
+ * 28 seconds -> overlay invisible -> user hits Ctrl+B trying to make
+ * it appear -> toggle path still kicks DWM (invalidate + compose-grace
+ * bump) which on a truly-shifted compose path could cause the "screen
+ * goes black" P0 symptom.
+ *
+ * New timing:
+ *   T+5s   : SILENT sample (no alert; just observability if we want to
+ *            grep for very-fast healthy starts).
+ *   T+15s  : ALERT if still zero -- this is a REAL degraded state.
+ *   T+30s  : ALERT if still zero -- second chance for cold GPU / TDR
+ *            recovery / dwm-restart timing edges.
+ *
+ * Also added: if we EVER sample n > 0 after a prior alert set degraded,
+ * clear degraded immediately -- self-heal the moment DWM starts calling
+ * our detour. This closes the "canary fires at T+15s but Present starts
+ * firing at T+16s" edge case where we would previously stay degraded
+ * for another 15s waiting for the next sample.
  *
  * Placement: HERE (not near forward decls) because it references
  * g_present_calls / g_stop_draw which are defined above near
@@ -1169,29 +1221,53 @@ static BOOL svcldb_capture_active(void) {
 static DWORD WINAPI present_fire_canary_thread(LPVOID unused) {
     (void)unused;
     struct { DWORD ms; int alert; } steps[] = {
-        {2000, 1}, {3000, 0}, {5000, 0}, {20000, 1}, {0, 0}
+        { 5000, 0},   /* T+5s   -- silent baseline */
+        {10000, 1},   /* T+15s  -- FIRST alert */
+        {15000, 1},   /* T+30s  -- second-chance alert */
+        {30000, 0},   /* T+60s  -- late self-heal check */
+        {0, 0}
     };
     for (int i = 0; steps[i].ms; i++) {
         for (DWORD slept = 0; slept < steps[i].ms; slept += 100) {
             if (g_stop_draw) return 0;
+            /* v-ctrlb-hardening: fast-path self-heal inside the sleep
+             * loop.  If compose_degraded is set AND Present starts firing
+             * before our next scheduled sample, clear degraded IMMEDIATELY
+             * so ui_present_frame resumes rendering. Cheap: two atomic
+             * reads every 100ms. */
+            if (g_compose_degraded && g_present_calls > 0) {
+                InterlockedExchange(&g_compose_degraded, 0);
+                hook_diag("Present recovered mid-canary: count=%ld -- "
+                          "compose path healed itself. g_compose_degraded=0.",
+                          (long)g_present_calls);
+            }
             Sleep(100);
         }
         LONG n = g_present_calls;
         if (n == 0 && steps[i].alert) {
             InterlockedExchange(&g_compose_degraded, 1);
-            hook_diag("PRESENT PATH INACTIVE @ T+%lu ms -- "
-                      "COverlayContext::Present hook installed but DWM is "
-                      "NOT calling it. Compose path may have shifted post-"
-                      "Windows-update. Setting g_compose_degraded=1 -- overlay "
-                      "will NOT render this session. Payload stays loaded "
-                      "for rawinput/hotkey use so keep-alive is minimal.",
+            hook_diag("PRESENT PATH INACTIVE @ cumulative-sample -- "
+                      "COverlayContext::Present hook installed but DWM has "
+                      "NOT called it after %lu ms of grace. Compose path may "
+                      "have shifted post-Windows-update. Setting "
+                      "g_compose_degraded=1 -- ui_present_frame will "
+                      "no-op until it recovers. Payload stays loaded for "
+                      "rawinput/hotkey use.",
                       (unsigned long)steps[i].ms);
-        } else if (n > 0 && i > 0) {
-            InterlockedExchange(&g_compose_degraded, 0);
-            hook_diag("Present fired count=%ld at T+%lu ms -- compose "
-                      "path is healthy",
-                      (long)n, (unsigned long)steps[i].ms);
-            return 0;
+        } else if (n > 0) {
+            /* Present is firing.  If we had previously degraded, clear it. */
+            LONG was = InterlockedExchange(&g_compose_degraded, 0);
+            if (was) {
+                hook_diag("Present recovered @ sample step %d: count=%ld -- "
+                          "compose path healed, g_compose_degraded=0.",
+                          i, (long)n);
+            } else if (i > 0) {
+                hook_diag("Present fired count=%ld at cumulative-sample step %d "
+                          "-- compose path is healthy", (long)n, i);
+            }
+            /* Keep monitoring: don't return until we've reached the last
+             * step, so a healthy-then-broken transition is caught by
+             * subsequent alert samples. */
         }
     }
     return 0;

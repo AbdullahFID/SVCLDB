@@ -607,10 +607,11 @@ static const char SVCLDB_DEFAULT_SYSTEM_PROMPT[] =
  * -> gemini-3.1-flash-lite (cheapest). Verified against
  * https://ai.google.dev/gemini-api/docs/pricing
  *
- * OpenRouter: user picks the model. Default is `openrouter/free`
- * (auto-routes to a free model). Also accepts any specific slug like
- * `meta-llama/llama-4-maverick:free` or `anthropic/claude-opus-5`.
- * Reference: https://openrouter.ai/docs/guides/routing/routers/free-router
+ * OpenRouter: user picks the model. Default is `openrouter/auto`
+ * (auto-router picks the best available model for the request). Also
+ * accepts any specific slug like `anthropic/claude-opus-5` or
+ * `meta-llama/llama-4-maverick:free` (zero-cost, subject to availability).
+ * Reference: https://openrouter.ai/docs/api-reference/overview
  */
 
 /* OpenAI tiers.
@@ -686,12 +687,20 @@ static const svc_model_tier_t GOOGLE_TIERS[SVC_TIER_COUNT] = {
 };
 
 /* OpenRouter is special: user picks the model. The "tier" concept
- * doesn't apply -- we always use cfg->model (default `openrouter/free`
- * for zero-cost auto-routing). All entries point at the same fallback
- * for API stability. */
+ * doesn't apply -- we always use cfg->model (default `openrouter/auto`
+ * for OpenRouter's auto-router, which selects the best available model
+ * for the request).
+ *
+ * 2026-09-23 correction: the default used to be `openrouter/free`, which
+ * was never a real slug on OpenRouter's catalog. Blank-model requests
+ * against the API were returning 404 "model not found" -- dormant bug
+ * because the UI always populates cfg->model with an explicit slug in
+ * practice. `openrouter/auto` is the documented auto-router. Users who
+ * want free-tier only can still pick `<vendor>/<model>:free`-suffixed
+ * slugs (documented per OpenRouter's model catalog). */
 static const svc_model_tier_t OPENROUTER_TIER = {
-    "openrouter/free", "OpenRouter (user-picked)",
-    "Zero-cost auto-router; user can override with any :free-suffixed slug",
+    "openrouter/auto", "OpenRouter (user-picked)",
+    "Auto-router picks best-available; user can override with any specific slug (e.g. anthropic/claude-opus-5, or a :free-suffixed one for zero cost)",
     1, 1, 8192
 };
 
@@ -762,8 +771,10 @@ static const char *effort_str(int e) {
  *  3. Fallback -> cfg->model (may be empty; caller must reject) */
 static const char *resolve_effective_model(const svc_config_t *cfg) {
     if (cfg->provider == SVC_PROVIDER_OPENROUTER) {
-        /* Always user-picked; default is openrouter/free. */
-        return (cfg->model[0]) ? cfg->model : "openrouter/free";
+        /* Always user-picked; default is openrouter/auto (auto-router).
+         * See OPENROUTER_TIER comment above for the 2026-09-23 slug fix.
+         * openrouter/free was fictional and would 404 upstream. */
+        return (cfg->model[0]) ? cfg->model : "openrouter/auto";
     }
     if (cfg->tier == SVC_TIER_CUSTOM) {
         return cfg->model;
@@ -1029,80 +1040,163 @@ static int build_anthropic_body(const svc_config_t *cfg, const char *user_prompt
     return !jb->err;
 }
 
+/* Is this model on Google's new /v1beta/interactions endpoint?
+ *
+ * 2026-09-23: Google migrated the primary Gemini surface from
+ * /v1beta/models/{model}:generateContent to /v1beta/interactions.
+ * Body shape changed too: snake_case, flat `input[]` (no contents/parts
+ * wrapper), `system_instruction` as a plain string, `generation_config`
+ * with `thinking_level` at root (no thinkingConfig nesting).
+ *
+ * Gemini 3.x + newer go through the new endpoint. Gemini 2.5.x still
+ * lives on the legacy generateContent path (Google keeps it up for
+ * back-compat; we route 2.5.x there so the ai_google_stable_fallback
+ * "3.x overloaded -> 2.5-flash" path keeps working). When 2.5.x is
+ * finally sunset, this whole branch and its legacy body-builder drop
+ * out with no other code changes. */
+static int is_gemini_new_endpoint(const char *model_id) {
+    if (!model_id) return 0;
+    /* Gemini 3.x, 4.x, or any future gemini-N.x where N >= 3.
+     * gemini-2.5* stays on legacy. */
+    if (strstr(model_id, "gemini-3")) return 1;
+    if (strstr(model_id, "gemini-4")) return 1;
+    /* Explicit 2.5.x check -> legacy. Cheap safety net if Google ever
+     * releases a "gemini-3" that pins itself to the old endpoint (they
+     * won't, but a NULL-return-on-unknown default is safer than
+     * assuming). */
+    if (strstr(model_id, "gemini-2.5")) return 0;
+    /* Unknown gemini flavour: default to new endpoint (that's where
+     * Google's docs point everyone now). */
+    return 1;
+}
+
+/* Map cfg->reasoning_effort (1..5) to Gemini's `thinking_level` enum.
+ * 1=minimal, 2=low, 3=medium, 4=high, 5=high (docs cap at high). */
+static const char *gemini_thinking_level(int effort) {
+    switch (effort) {
+        case 1:  return "minimal";
+        case 2:  return "low";
+        case 3:  return "medium";
+        case 4:
+        case 5:  return "high";
+        default: return "high";
+    }
+}
+
 /* ── Google Gemini body builder ───────────────────────────────────
  *
- * Gemini 3.x uses thinkingLevel (MINIMAL/LOW/MEDIUM/HIGH); Gemini 2.5.x
- * uses thinkingBudget (-1 for dynamic). MUTUALLY EXCLUSIVE -- sending
- * both returns 400. TEXT before IMAGE (best practice). */
+ * Two body shapes, chosen by is_gemini_new_endpoint(model_id):
+ *
+ *   NEW (Gemini 3.x+, /v1beta/interactions):
+ *     { "model": "...", "system_instruction": "...", "stream": bool,
+ *       "input": [ {type:"text",text:"..."}, {type:"image",data:"...",mime_type:"image/png"} ],
+ *       "generation_config": { "max_output_tokens", "temperature",
+ *                              "thinking_level": "low|medium|high|minimal" } }
+ *
+ *   LEGACY (Gemini 2.5.x, /v1beta/models/{model}:generateContent):
+ *     { "systemInstruction": {parts:[{text}]},
+ *       "contents": [{role:"user", parts:[{text},{inline_data:{mime_type,data}}]}],
+ *       "generationConfig": { "maxOutputTokens", "temperature",
+ *                             "thinkingConfig": { "thinkingBudget": -1 } } }
+ *
+ * TEXT before IMAGE in both shapes (documented best practice). */
 static int build_google_body(const svc_config_t *cfg, const char *user_prompt,
                              const char *image_b64, const char *model_id,
-                             json_builder_t *jb) {
+                             int enable_streaming, json_builder_t *jb) {
     if (!jb_init(jb, 8192 + (image_b64 ? strlen(image_b64) : 0))) return 0;
 
-    int is_gemini3 = (strstr(model_id, "gemini-3") != NULL) ||
-                     (strstr(model_id, "gemini-4") != NULL);   /* future-proof */
+    int new_endpoint = is_gemini_new_endpoint(model_id);
 
     jb_obj_begin(jb);
-      if (cfg->system_prompt[0]) {
-        jb_key(jb, "systemInstruction");
-        jb_obj_begin(jb);
-          jb_key(jb, "parts");
-          jb_arr_begin(jb);
+
+    if (new_endpoint) {
+        /* New /v1beta/interactions shape. Model goes in the BODY (not
+         * the URL path like the legacy generateContent endpoint). */
+        jb_key(jb, "model"); jb_str(jb, model_id);
+
+        if (cfg->system_prompt[0]) {
+            jb_key(jb, "system_instruction"); jb_str(jb, cfg->system_prompt);
+        }
+
+        /* Input is a flat array of typed content blocks -- no role
+         * wrapper, no parts nesting. Text first, image second. */
+        jb_key(jb, "input");
+        jb_arr_begin(jb);
             jb_obj_begin(jb);
-              jb_key(jb, "text"); jb_str(jb, cfg->system_prompt);
-            jb_obj_end(jb);
-          jb_arr_end(jb);
-        jb_obj_end(jb);
-      }
-      /* Contents: role user + parts [ text FIRST, image SECOND ]. */
-      jb_key(jb, "contents");
-      jb_arr_begin(jb);
-        jb_obj_begin(jb);
-          jb_key(jb, "role"); jb_str(jb, "user");
-          jb_key(jb, "parts");
-          jb_arr_begin(jb);
-            jb_obj_begin(jb);
-              jb_key(jb, "text"); jb_str(jb, user_prompt);
+                jb_key(jb, "type"); jb_str(jb, "text");
+                jb_key(jb, "text"); jb_str(jb, user_prompt);
             jb_obj_end(jb);
             if (image_b64) {
-              jb_obj_begin(jb);
-                jb_key(jb, "inline_data");
                 jb_obj_begin(jb);
-                  jb_key(jb, "mime_type"); jb_str(jb, "image/png");
-                  jb_key(jb, "data");      jb_str(jb, image_b64);
+                    jb_key(jb, "type");      jb_str(jb, "image");
+                    /* Inline bytes: `data` (base64) + `mime_type`. The
+                     * alternative is `uri: "..."` from the Files API,
+                     * which we don't use -- we always inline. */
+                    jb_key(jb, "data");      jb_str(jb, image_b64);
+                    jb_key(jb, "mime_type"); jb_str(jb, "image/png");
                 jb_obj_end(jb);
-              jb_obj_end(jb);
             }
-          jb_arr_end(jb);
-        jb_obj_end(jb);
-      jb_arr_end(jb);
+        jb_arr_end(jb);
 
-      /* generationConfig -- sizes output + reasoning depth. */
-      jb_key(jb, "generationConfig");
-      jb_obj_begin(jb);
-        jb_key(jb, "maxOutputTokens"); jb_num_i(jb, resolve_max_output_tokens(cfg));
-        jb_key(jb, "temperature");     jb_num_d(jb, 0.7);
-        jb_key(jb, "thinkingConfig");
+        if (enable_streaming) {
+            jb_key(jb, "stream"); jb_bool(jb, 1);
+        }
+
+        jb_key(jb, "generation_config");
         jb_obj_begin(jb);
-          if (is_gemini3) {
-            /* Gemini 3.x thinkingLevel. Map our effort scale to their
-             * 4-level enum: 1=minimal, 2=low, 3=medium, 4=high, 5=high. */
-            const char *lvl = "high";
-            switch (cfg->reasoning_effort) {
-                case 1: lvl = "minimal"; break;
-                case 2: lvl = "low";     break;
-                case 3: lvl = "medium";  break;
-                case 4:
-                case 5: lvl = "high";    break;
-                default: lvl = "high";   break;
-            }
-            jb_key(jb, "thinkingLevel"); jb_str(jb, lvl);
-          } else {
-            /* Legacy Gemini 2.5.x thinkingBudget. -1 = dynamic. */
-            jb_key(jb, "thinkingBudget"); jb_num_i(jb, -1);
-          }
+            jb_key(jb, "max_output_tokens"); jb_num_i(jb, resolve_max_output_tokens(cfg));
+            jb_key(jb, "temperature");       jb_num_d(jb, 0.7);
+            jb_key(jb, "thinking_level");    jb_str(jb, gemini_thinking_level(cfg->reasoning_effort));
         jb_obj_end(jb);
-      jb_obj_end(jb);
+    } else {
+        /* LEGACY /v1beta/models/{model}:generateContent shape (Gemini
+         * 2.5.x). Kept working for the ai_google_stable_fallback path
+         * ("3.x overloaded -> retry on 2.5-flash"). */
+        if (cfg->system_prompt[0]) {
+            jb_key(jb, "systemInstruction");
+            jb_obj_begin(jb);
+                jb_key(jb, "parts");
+                jb_arr_begin(jb);
+                    jb_obj_begin(jb);
+                        jb_key(jb, "text"); jb_str(jb, cfg->system_prompt);
+                    jb_obj_end(jb);
+                jb_arr_end(jb);
+            jb_obj_end(jb);
+        }
+        jb_key(jb, "contents");
+        jb_arr_begin(jb);
+            jb_obj_begin(jb);
+                jb_key(jb, "role"); jb_str(jb, "user");
+                jb_key(jb, "parts");
+                jb_arr_begin(jb);
+                    jb_obj_begin(jb);
+                        jb_key(jb, "text"); jb_str(jb, user_prompt);
+                    jb_obj_end(jb);
+                    if (image_b64) {
+                        jb_obj_begin(jb);
+                            jb_key(jb, "inline_data");
+                            jb_obj_begin(jb);
+                                jb_key(jb, "mime_type"); jb_str(jb, "image/png");
+                                jb_key(jb, "data");      jb_str(jb, image_b64);
+                            jb_obj_end(jb);
+                        jb_obj_end(jb);
+                    }
+                jb_arr_end(jb);
+            jb_obj_end(jb);
+        jb_arr_end(jb);
+
+        jb_key(jb, "generationConfig");
+        jb_obj_begin(jb);
+            jb_key(jb, "maxOutputTokens"); jb_num_i(jb, resolve_max_output_tokens(cfg));
+            jb_key(jb, "temperature");     jb_num_d(jb, 0.7);
+            jb_key(jb, "thinkingConfig");
+            jb_obj_begin(jb);
+                /* Legacy 2.5.x uses thinkingBudget (-1 = dynamic). */
+                jb_key(jb, "thinkingBudget"); jb_num_i(jb, -1);
+            jb_obj_end(jb);
+        jb_obj_end(jb);
+    }
+
     jb_obj_end(jb);
     return !jb->err;
 }
@@ -1228,8 +1322,101 @@ static int extract_anthropic_reply(const char *body, char **out_reply) {
     return 0;
 }
 
-/* Google: {"candidates":[{"content":{"parts":[{"text":"..."}]}}]} */
+/* Google response extractor.
+ *
+ * Handles BOTH endpoint response shapes:
+ *
+ *   NEW /v1beta/interactions:
+ *     { "id": "...", "output_text": "...", "steps": [
+ *         { "content": [{ "type":"text", "text":"..." }, ...] }, ...
+ *       ] }
+ *     `output_text` is a top-level convenience field the SDKs expose; it
+ *     joins the tail-consecutive text blocks. We prefer it; if absent
+ *     (interleaved multimodal or `output_text` was omitted server-side),
+ *     we walk `steps[]` and pull the last text block. Correct per docs:
+ *     "interaction.steps[-1].content[0].text" is the canonical location.
+ *
+ *   LEGACY /v1beta/models/{model}:generateContent:
+ *     { "candidates": [ { "content": { "parts": [ {"text":"..."} ] } } ] }
+ *
+ * 2-pass sizing so multi-hundred-KB replies on STRONG-tier don't clip
+ * (same rationale as extract_openai_reply / extract_anthropic_reply). */
 static int extract_google_reply(const char *body, char **out_reply) {
+    if (!body || !body[0]) return 0;
+
+    /* ── Try NEW endpoint first ── */
+
+    /* Fast path: top-level `output_text` convenience field. */
+    if (strstr(body, "\"output_text\"")) {
+        size_t need = json_get_str_len(body, "output_text");
+        if (need > 0) {
+            size_t cap = need + 16;
+            if (cap > 8u * 1024u * 1024u) cap = 8u * 1024u * 1024u;
+            char *reply = (char *)malloc(cap);
+            if (reply) {
+                if (json_get_str(body, "output_text", reply, cap) && reply[0]) {
+                    *out_reply = reply;
+                    return 1;
+                }
+                free(reply);
+            }
+        }
+        /* output_text present but empty -> fall through to steps walk. */
+    }
+
+    /* Walk `steps[]` for the LAST text-typed content block. Same string-
+     * aware brace-scanning helper as the legacy path so LaTeX + code
+     * blocks with unbalanced-looking braces inside string values don't
+     * truncate mid-object. */
+    if (strstr(body, "\"steps\"")) {
+        const char *last_text_obj_start = NULL;
+        const char *last_text_obj_end   = NULL;
+        const char *scan = body;
+        for (;;) {
+            const char *t = strstr(scan, "\"type\":\"text\"");
+            if (!t) {
+                /* Also accept "type": "text" with spaces (some serializers). */
+                t = strstr(scan, "\"type\": \"text\"");
+            }
+            if (!t) break;
+            /* Walk back to the enclosing '{' -- t is anchored on a real
+             * JSON key so the previous '{' is a structural brace. */
+            const char *ob = t;
+            while (ob > body && *ob != '{') ob--;
+            const char *oe = find_object_end(ob);
+            if (oe) {
+                last_text_obj_start = ob;
+                last_text_obj_end   = oe;
+                scan = oe;
+            } else {
+                scan = t + 8;
+            }
+        }
+        if (last_text_obj_start && last_text_obj_end) {
+            size_t sz = (size_t)(last_text_obj_end - last_text_obj_start);
+            char *obuf = (char *)malloc(sz + 1);
+            if (obuf) {
+                memcpy(obuf, last_text_obj_start, sz); obuf[sz] = 0;
+                size_t need = json_get_str_len(obuf, "text");
+                if (need > 0) {
+                    size_t cap = need + 16;
+                    if (cap > 8u * 1024u * 1024u) cap = 8u * 1024u * 1024u;
+                    char *reply = (char *)malloc(cap);
+                    if (reply) {
+                        if (json_get_str(obuf, "text", reply, cap) && reply[0]) {
+                            *out_reply = reply;
+                            free(obuf);
+                            return 1;
+                        }
+                        free(reply);
+                    }
+                }
+                free(obuf);
+            }
+        }
+    }
+
+    /* ── Fall back to LEGACY candidates[] shape (Gemini 2.5.x) ── */
     const char *cand = strstr(body, "\"candidates\"");
     if (!cand) return 0;
     const char *text_key = strstr(cand, "\"text\"");
@@ -1242,9 +1429,6 @@ static int extract_google_reply(const char *body, char **out_reply) {
     char *obuf = (char *)malloc(sz + 1);
     if (!obuf) return 0;
     memcpy(obuf, ob, sz); obuf[sz] = 0;
-    /* v2.0.1 (2026-09-10): 2-pass sizing. Google Gemini returns the
-     * entire candidate text block in one field, so this is the extractor
-     * most likely to hit multi-hundred-KB replies on STRONG tier. */
     size_t need = json_get_str_len(obuf, "text");
     int ok = 0;
     if (need > 0) {
@@ -1452,15 +1636,30 @@ static int build_request(const svc_config_t *cfg, const char *user_prompt,
             hdrs[3] = NULL;
             break;
         case SVC_PROVIDER_GOOGLE:
-            if (!build_google_body(cfg, user_prompt, image_b64, model_id, jb)) {
+            if (!build_google_body(cfg, user_prompt, image_b64, model_id,
+                                    enable_streaming, jb)) {
                 _snprintf(err, err_sz - 1, "google json build failed");
                 return 0;
             }
-            _snprintf(url, url_sz - 1,
-                      "%s/%s:%s",
-                      SS(SVC_STR_GOOGLE_GEN_URL),
-                      model_id,
-                      enable_streaming ? "streamGenerateContent?alt=sse" : "generateContent");
+            /* SVC_STR_GOOGLE_GEN_URL is the /v1beta base -- endpoint
+             * suffix depends on the model:
+             *   Gemini 3.x+  -> /interactions               (model in body)
+             *   Gemini 2.5.x -> /models/{id}:generateContent | :streamGenerateContent?alt=sse
+             * On the new endpoint, streaming is toggled by ?alt=sse in
+             * the URL AND `stream: true` in the body (both required per
+             * Google's Interactions docs). */
+            if (is_gemini_new_endpoint(model_id)) {
+                _snprintf(url, url_sz - 1,
+                          "%s/interactions%s",
+                          SS(SVC_STR_GOOGLE_GEN_URL),
+                          enable_streaming ? "?alt=sse" : "");
+            } else {
+                _snprintf(url, url_sz - 1,
+                          "%s/models/%s:%s",
+                          SS(SVC_STR_GOOGLE_GEN_URL),
+                          model_id,
+                          enable_streaming ? "streamGenerateContent?alt=sse" : "generateContent");
+            }
             _snprintf(auth_hdr, auth_sz - 1, "x-goog-api-key: %s", cfg->api_key);
             hdrs[0] = "Content-Type: application/json";
             hdrs[1] = auth_hdr;
@@ -1902,17 +2101,71 @@ static char *extract_sse_delta(int provider, const char *json) {
         return content;
     }
 
-    /* Google format (SSE): data: {"candidates":[{"content":{"parts":[{"text":"..."}]}}]}
-     * Same shape as non-streaming, but chunked. */
+    /* Google SSE. Two shapes:
+     *
+     *   NEW /v1beta/interactions (Gemini 3.x+):
+     *     data: {"event_type":"step.delta","delta":{"type":"text","text":"..."}}
+     *   Other event_types we currently ignore ("step.start", "step.end",
+     *   "interaction.done", thinking deltas, tool calls, etc.). If a
+     *   thinking delta comes through with delta.type=="thought" we skip
+     *   it -- users see the reply text, not the internal chain.
+     *
+     *   LEGACY /v1beta/models/{model}:streamGenerateContent?alt=sse:
+     *     data: {"candidates":[{"content":{"parts":[{"text":"..."}]}}]}
+     *   Same shape as non-streaming, chunked. extract_google_reply's
+     *   legacy branch already handles it.
+     *
+     * v2.0 (2026-09-10) note: Google sends the ENTIRE text block per
+     * SSE event, not per-token like OpenAI/Anthropic, so single events
+     * can be multi-KB. extract_google_reply mallocs the reply out; we
+     * pass ownership up to stream_chunk_recv which frees it after
+     * appending. */
     if (provider == SVC_PROVIDER_GOOGLE) {
-        /* v2.0 (2026-09-10): Google sends the ENTIRE candidate text block
-         * per SSE event, not individual tokens like OpenAI/Anthropic. A
-         * single event containing a full code answer / long paragraph
-         * routinely exceeds 8 KB and was silently strncpy-truncated into
-         * an 8192-byte scratch buffer. extract_google_reply already mallocs
-         * out for us -- just return that directly and let the caller free.
-         * (The caller `stream_chunk_recv` calls full_append(delta, strlen(delta))
-         * then free(delta); no upstream needs a fixed-size buffer.) */
+        /* NEW-shape fast path: event_type == "step.delta" carrying a
+         * text delta. Parse the "delta" object's text field. */
+        if (strstr(json, "\"event_type\":\"step.delta\"") ||
+            strstr(json, "\"event_type\": \"step.delta\"")) {
+            const char *dl = strstr(json, "\"delta\"");
+            if (dl) {
+                const char *ob = strchr(dl, '{');
+                if (ob) {
+                    const char *oe = find_object_end(ob);
+                    if (oe) {
+                        size_t sz = (size_t)(oe - ob);
+                        char *dbuf = (char *)malloc(sz + 1);
+                        if (dbuf) {
+                            memcpy(dbuf, ob, sz); dbuf[sz] = 0;
+                            /* Only surface deltas whose type is "text";
+                             * skip "thought" / other event flavours. */
+                            char dtype[32] = {0};
+                            (void)json_get_str(dbuf, "type", dtype, sizeof(dtype));
+                            if (dtype[0] == 0 || strcmp(dtype, "text") == 0) {
+                                size_t need = json_get_str_len(dbuf, "text");
+                                if (need > 0) {
+                                    size_t cap = need + 16;
+                                    if (cap > 8u * 1024u * 1024u) cap = 8u * 1024u * 1024u;
+                                    char *reply = (char *)malloc(cap);
+                                    if (reply) {
+                                        if (json_get_str(dbuf, "text", reply, cap) && reply[0]) {
+                                            free(dbuf);
+                                            return reply;
+                                        }
+                                        free(reply);
+                                    }
+                                }
+                            }
+                            free(dbuf);
+                        }
+                    }
+                }
+            }
+            /* Unknown step.delta shape -- silent skip rather than
+             * corrupting the stream with garbage. */
+            return NULL;
+        }
+
+        /* LEGACY-shape fallback: reuse extract_google_reply's candidates
+         * branch on the raw SSE data line. */
         char *out = NULL;
         if (extract_google_reply(json, &out) && out && out[0]) {
             return out;

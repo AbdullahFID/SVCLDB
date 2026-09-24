@@ -50,6 +50,12 @@ static as_settings_t g_as = {
     /* agent_max_steps    */ 40,
     /* agent_max_wallclock_ms */ 30 * 60 * 1000,
     /* agent_pace         */ 1,
+    /* v17 (2026-09-23) -- Human autotyper defaults. */
+    /* typer_wpm          */ 110,
+    /* typer_humanize     */ 1,
+    /* typer_paste_mode   */ 0,
+    /* typer_planning     */ 1,
+    /* typer_wait_mods    */ 1,
 };
 
 static void ensure_cs(void) {
@@ -122,6 +128,12 @@ void as_cfg_load(void) {
         if (json_get_num (j, "agent_max_steps", &d))    g_as.agent_max_steps = clampi((int)d, 1, 400);
         if (json_get_num (j, "agent_max_wallclock_ms", &d)) g_as.agent_max_wallclock_ms = clampi((int)d, 60000, 12*60*60*1000);
         if (json_get_num (j, "agent_pace", &d))         g_as.agent_pace = clampi((int)d, 0, 2);
+        /* v17 (2026-09-23) -- Human autotyper fields. */
+        if (json_get_num (j, "typer_wpm", &d))          g_as.typer_wpm = clampi((int)d, 30, 500);
+        if (json_get_bool(j, "typer_humanize", &b))     g_as.typer_humanize = b;
+        if (json_get_bool(j, "typer_paste_mode", &b))   g_as.typer_paste_mode = b;
+        if (json_get_bool(j, "typer_planning", &b))     g_as.typer_planning = b;
+        if (json_get_bool(j, "typer_wait_mods", &b))    g_as.typer_wait_mods = b;
         free(j);
         slog_writef("payload.log", "as_cfg loaded (autosolver=%d auto_click=%d humanize=%d uia=%d dot=%d)",
                     g_as.autosolver_enabled, g_as.auto_click, g_as.humanize,
@@ -168,6 +180,12 @@ void as_cfg_save(void) {
           jb_key(&jb, "agent_max_steps");       jb_num_i(&jb, g_as.agent_max_steps);
           jb_key(&jb, "agent_max_wallclock_ms");jb_num_i(&jb, g_as.agent_max_wallclock_ms);
           jb_key(&jb, "agent_pace");            jb_num_i(&jb, g_as.agent_pace);
+          /* v17 (2026-09-23) -- Human autotyper. */
+          jb_key(&jb, "typer_wpm");             jb_num_i(&jb, g_as.typer_wpm);
+          jb_key(&jb, "typer_humanize");        jb_bool(&jb, g_as.typer_humanize);
+          jb_key(&jb, "typer_paste_mode");      jb_bool(&jb, g_as.typer_paste_mode);
+          jb_key(&jb, "typer_planning");        jb_bool(&jb, g_as.typer_planning);
+          jb_key(&jb, "typer_wait_mods");       jb_bool(&jb, g_as.typer_wait_mods);
         jb_obj_end(&jb);
         if (!jb.err && jb.buf) {
             HANDLE h = CreateFileA(AS_CFG_PATH, GENERIC_WRITE, 0, NULL,

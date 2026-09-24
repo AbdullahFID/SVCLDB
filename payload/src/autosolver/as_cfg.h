@@ -45,6 +45,16 @@ typedef struct {
     int    agent_max_steps;
     int    agent_max_wallclock_ms;
     int    agent_pace;          /* 0 fast, 1 balanced, 2 careful */
+    /* ── Human autotyper (v17, 2026-09-23) ── *
+     * svchelper (Electron dashboard) is the master control for these;
+     * payload reads via as_cfg() on every human_type_default_opts()
+     * call so live-edits from the dashboard take effect on the next
+     * autotype run without needing a --reinject. */
+    int    typer_wpm;           /* 30..500, default 110 */
+    int    typer_humanize;      /* 1 = full Dhakal engine, 0 = constant timing */
+    int    typer_paste_mode;    /* 1 = Ctrl+V paste (fast), 0 = per-keystroke */
+    int    typer_planning;      /* 1 = initial 0.2..0.85 s pre-type pause */
+    int    typer_wait_mods;     /* 1 = poll VK_CONTROL/SHIFT/MENU until up before typing */
 } as_settings_t;
 
 /* Current settings (loads defaults + autosolver.json on first call). */

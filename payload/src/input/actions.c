@@ -144,15 +144,53 @@ static int is_modifier(const char *n, int *vk) {
     return 0;
 }
 
-/* ── typing (humanized) ─────────────────────────────────────────── */
+/* ── typing (humanized) ─────────────────────────────────────────── *
+ *
+ * v17 (2026-09-23) -- Route through the shared human_typer engine so the
+ * AutoSolver's `type` action gets the same Dhakal-CHI'18 log-normal +
+ * bigram + 4-kind typo model as the standalone autotyper hotkeys.
+ * Falls back to the LEGACY inline lognormal path if human_type_start
+ * refuses (e.g. a typing session is already in flight from a hotkey).
+ *
+ * WPM conversion: caller passes `cpm` (chars per minute) in ctx->wpm.
+ * WPM ~= cpm / 5 for English prose. human_type engine accepts 30..500
+ * so we clamp accordingly. */
+#include "human_typer.h"
+
 void act_type(act_ctx_t *ctx, const char *utf8) {
     if (!utf8 || mot_cancelled()) return;
-    /* base inter-key interval from wpm: chars/min -> ms/char */
+
     int cpm = (ctx && ctx->wpm > 0) ? ctx->wpm : 220;
+    int humanize = ctx ? ctx->humanize : 1;
+    /* Convert cpm -> wpm. English avg word ~= 5 chars incl. space. */
+    int wpm = cpm / 5;
+    if (wpm < 30)  wpm = 30;
+    if (wpm > 500) wpm = 500;
+
+    human_typer_opts_t opts;
+    human_type_default_opts(&opts);
+    opts.wpm             = wpm;
+    opts.humanize        = humanize ? 1 : 0;
+    opts.planning_pause  = 1;
+    opts.wait_mod_release = 0;    /* AutoSolver already knows no mods are held */
+    opts.esc_cancels     = 0;     /* mot_cancelled() is the AutoSolver's abort */
+    opts.paste_mode      = 0;
+
+    /* Note: human_type_start spawns its own worker thread and returns
+     * immediately. We must WAIT here so AutoSolver's sequential action
+     * loop doesn't fire the next click before this type finishes. */
+    if (human_type_start(utf8, &opts)) {
+        while (human_type_is_busy()) {
+            if (mot_cancelled()) { human_type_cancel(); }
+            Sleep(25);
+        }
+        return;
+    }
+
+    /* Fallback -- inline lognormal loop (legacy). */
     double base_ms = 60000.0 / (double)cpm;
     if (base_ms < 20)  base_ms = 20;
     if (base_ms > 400) base_ms = 400;
-    int humanize = ctx ? ctx->humanize : 1;
 
     const char *p = utf8;
     unsigned int cp;
@@ -168,7 +206,6 @@ void act_type(act_ctx_t *ctx, const char *utf8) {
         }
         if (humanize) {
             mot_precise_sleep(mot_lognormal_ms(base_ms, 0.35, base_ms * 0.4, base_ms * 3.0));
-            /* occasional planning pause */
             if (++since_pause > 6 && rand_pct() < 12) {
                 mot_precise_sleep(mot_lognormal_ms(base_ms * 4, 0.3, base_ms, base_ms * 9));
                 since_pause = 0;

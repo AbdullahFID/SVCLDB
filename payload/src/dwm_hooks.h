@@ -208,6 +208,15 @@ int hooks_add_dirty_full(void);
  * covers the whole burst). */
 void hooks_bump_compose_grace(unsigned ms);
 
+/* v-ctrlb-hardening (2026-09-23) -- returns non-zero if the payload is
+ * in teardown (hooks_begin_shutdown_hide has flipped g_stop_draw OR
+ * hooks_uninstall has run OR g_active is zero).  Used by defensive
+ * callers (invalidate_last_overlay_region, wake helpers, etc.) to
+ * short-circuit work that would just make teardown slower / could race
+ * with the ordered MinHook disable pass. Cheap: one atomic-aligned
+ * volatile read, no lock. */
+int hooks_uninstall_in_progress(void);
+
 #ifdef __cplusplus
 }
 #endif

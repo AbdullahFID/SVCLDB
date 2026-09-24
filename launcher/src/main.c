@@ -695,6 +695,13 @@ static void load_env_config(svc_config_t *cfg, const oauth_session_t *sess) {
      * gesture, so this hijacks nothing. Rebind via the hotkey editor. */
     cfg->hotkeys[SVC_HK_QUICK_ASK]     = SVC_HK_PACK_MOUSE_MULTI(3, 400, 4);
     cfg->hotkeys[SVC_HK_LEAN_TOGGLE]   = SVC_HK_PACK(MOD_CSA, 'M');       /* 34 Ctrl+Shift+Alt+M  Lean mode  */
+    /* 35-39 AutoSolver/Agent slots -- left unbound; payload installs
+     * fallback defaults at arm time (see dllmain install_hk_defaults). */
+    /* v17 (2026-09-23) -- human autotyper + reference notes + clip history. */
+    cfg->hotkeys[SVC_HK_AUTOTYPE_CLIP]  = SVC_HK_PACK(MOD_CA,  'T');      /* 40 Ctrl+Alt+T  Autotype clipboard */
+    cfg->hotkeys[SVC_HK_AUTOTYPE_REPLY] = SVC_HK_PACK(MOD_CA,  'Y');      /* 41 Ctrl+Alt+Y  Autotype last AI answer */
+    cfg->hotkeys[SVC_HK_NOTES_TOGGLE]   = SVC_HK_PACK(MOD_CSA, 'N');      /* 42 Ctrl+Shift+Alt+N  Toggle notes editor */
+    cfg->hotkeys[SVC_HK_CLIP_CYCLE]     = SVC_HK_PACK(MOD_CSA, 'T');      /* 43 Ctrl+Shift+Alt+T  Autotype previous clipboard entry */
 
     cfg->overlay_x = 40; cfg->overlay_y = 40;
     cfg->overlay_w = 560; cfg->overlay_h = 420;

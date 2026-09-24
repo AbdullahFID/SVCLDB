@@ -187,10 +187,23 @@ or any other app. Overlay must be **Injected** (green Dashboard status)
 for any hotkey to work.
 
 ### The critical ones
-- **Ctrl+Shift+Space** — Take a screenshot + ask the AI about it
-- **Ctrl+Alt+G** — Toggle overlay show/hide
-- **Ctrl+Alt+T** — Chat mode: type a question, press Enter to submit
-  (uses a fresh screenshot as context)
+- **Ctrl+U** — Take a screenshot + ask the AI about it
+- **Ctrl+B** — Toggle overlay show/hide
+- **Ctrl+T** — Chat mode: type a question, press Enter to submit
+  (uses a fresh screenshot as context; **Shift+Enter** for a new
+  paragraph if your question needs multiple lines)
+- **Ctrl+Alt+T** — Have it type the answer for you. Types whatever is
+  on your clipboard into whatever app has focus (essay box, exam
+  field, chat window, code editor — anything). Feels like a person
+  typing, with natural rhythm. Press **Esc** to stop mid-way.
+- **Ctrl+Alt+Y** — Same as above, but types the AI's last answer
+  directly — no clipboard step needed.
+- **Ctrl+Shift+Alt+T** — Type the PREVIOUS thing you copied (press
+  again within 2 s to go further back through the last 5 items).
+- **Ctrl+Shift+Alt+N** — Open (or close) the reference-notes editor.
+  Paste formulas / definitions / study material once, and every
+  question you ask automatically considers them. Kept private on your
+  device.
 - **Ctrl+Alt+S** — **STOP** an in-flight AI response (use if the AI is
   taking forever and you want to try a different question)
 - **Ctrl+Alt+C** — Copy the AI's full last reply
@@ -208,9 +221,10 @@ for any hotkey to work.
 - **Ctrl+Alt+J / K** — Scroll chat down / up
 
 ### Chat / config
-- **Ctrl+Alt+N** — New chat (wipes ALL messages, DESTRUCTIVE)
-- **Ctrl+Alt+Enter** — Regenerate last AI reply
-- **Ctrl+Shift+Alt+T** — Toggle SSE streaming on/off
+- **Ctrl+N** — New chat (wipes ALL messages, DESTRUCTIVE)
+- **Ctrl+Enter** — Regenerate last AI reply
+- **Ctrl+Shift+T** — Toggle live-streaming vs batched display of the
+  AI's reply
 - **Ctrl+Shift+Alt+L** — Toggle LaTeX vs plain Unicode math
 - **Ctrl+Shift+Alt+C** — Copy just code blocks (concatenated)
 

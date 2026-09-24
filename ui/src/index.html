@@ -20,7 +20,7 @@
     <div class="brand">
       <div class="logo">C</div>
       <span class="name">CloakGPT</span>
-      <span class="ver" id="titlebar-ver">v6.7.0.0</span>
+      <span class="ver" id="titlebar-ver">v6.9.0.0</span>
     </div>
     <div class="actions">
       <button id="tb-min" title="Minimize" aria-label="Minimize">
@@ -74,7 +74,7 @@
             Browser didn't open? <a id="copy-auth-url">Copy sign-in URL</a>
           </div>
           <div class="device-id" id="login-device"></div>
-          <div class="app-version" id="login-app-ver">CloakGPT v6.7.0.0</div>
+          <div class="app-version" id="login-app-ver">CloakGPT v6.9.0.0</div>
         </div>
       </div>
     </section>
@@ -377,6 +377,25 @@
                       rows="5"
                       spellcheck="false"
                       maxlength="15000"></textarea>
+            <!-- v17 (2026-09-23) — Prompt preset picker. Presets fill in
+                 subject-optimized instructions the user can further edit. All
+                 presets pair naturally with `Append` mode (which stacks on the
+                 built-in expert prompt); a couple with `Replace` mode for
+                 users who want to fully swap the persona. Data lives inline
+                 in renderer.js PROMPT_PRESETS. -->
+            <div class="prompt-presets-row" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;align-items:center">
+              <span style="font-size:11px;color:var(--fg3);text-transform:uppercase;letter-spacing:0.05em;margin-right:4px">Presets:</span>
+              <button type="button" class="prompt-preset-chip btn btn-secondary" data-preset="mcq"     style="padding:5px 10px;font-size:11px;border-radius:14px">MCQ concise</button>
+              <button type="button" class="prompt-preset-chip btn btn-secondary" data-preset="essay"   style="padding:5px 10px;font-size:11px;border-radius:14px">Essay flow</button>
+              <button type="button" class="prompt-preset-chip btn btn-secondary" data-preset="math"    style="padding:5px 10px;font-size:11px;border-radius:14px">Math (show work)</button>
+              <button type="button" class="prompt-preset-chip btn btn-secondary" data-preset="code"    style="padding:5px 10px;font-size:11px;border-radius:14px">Code review</button>
+              <button type="button" class="prompt-preset-chip btn btn-secondary" data-preset="cite"    style="padding:5px 10px;font-size:11px;border-radius:14px">Cite sources</button>
+              <button type="button" class="prompt-preset-chip btn btn-secondary" data-preset="direct"  style="padding:5px 10px;font-size:11px;border-radius:14px">Direct only</button>
+              <button type="button" class="prompt-preset-chip btn btn-secondary" data-preset="explain" style="padding:5px 10px;font-size:11px;border-radius:14px">Explain step-by-step</button>
+              <button type="button" class="prompt-preset-chip btn btn-secondary" data-preset="bio"     style="padding:5px 10px;font-size:11px;border-radius:14px">Biology</button>
+              <button type="button" class="prompt-preset-chip btn btn-secondary" data-preset="chem"    style="padding:5px 10px;font-size:11px;border-radius:14px">Chemistry</button>
+              <button type="button" class="prompt-preset-chip btn btn-secondary" data-preset="physics" style="padding:5px 10px;font-size:11px;border-radius:14px">Physics</button>
+            </div>
             <div class="prompt-editor-actions">
               <span class="prompt-editor-hint">Applies on next <b>Inject Now</b>. Encrypted at rest.</span>
               <button id="btn-prompt-clear" class="btn btn-secondary" style="padding:6px 12px;font-size:11px">Clear</button>
@@ -554,6 +573,90 @@
               <div class="ans-toggle-title">Auto-hide dot when overlay is open</div>
               <div class="ans-toggle-sub">
                 When the main chat overlay is showing (<kbd>Ctrl+B</kbd> to toggle), hide the dot so you're not looking at both surfaces at once. Turn off to always show the dot.
+              </div>
+            </div>
+          </div>
+
+          <!-- v17 (2026-09-23) — Human autotyper controls. Settings write to
+               the same autosolver.json the payload mtime-watches, so live
+               edits apply within ~2s with no re-inject. Fired from:
+                 • toolbar autotype button in the overlay
+                 • per-bubble hover autotype button on AI messages
+                 • Ctrl+Alt+T hotkey (clipboard → type)
+                 • Ctrl+Alt+Y hotkey (last AI answer → type)
+                 • AutoSolver's own `type` action                       -->
+          <!-- Divider carries a small inline "T" glyph identical to the
+               Lucide "type" icon rendered on every overlay autotype button
+               (toolbar, dot popout, per-message hover). One glyph across the
+               whole product = users learn one visual for "have it type this". -->
+          <div class="as-divider">
+            <span>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px;vertical-align:-2px;margin-right:6px;display:inline-block">
+                <path d="M4 7V4h16v3"/>
+                <line x1="9" y1="20" x2="15" y2="20"/>
+                <line x1="12" y1="4" x2="12" y2="20"/>
+              </svg>
+              Have it type it for you
+            </span>
+          </div>
+
+          <div class="as-field-row">
+            <div class="as-field-label">
+              Typing speed
+              <div class="as-field-sub">Words per minute. 60-90 = slow &amp; safe (long essays), 110-160 = comfortable average, 200+ = fast typist. Default 110.</div>
+            </div>
+            <input type="range" id="rng-typer-wpm" min="30" max="500" step="5" value="110" class="as-range">
+            <span id="lbl-typer-wpm" class="as-range-val">110 WPM</span>
+          </div>
+
+          <div class="ans-toggle-row">
+            <label class="ans-toggle">
+              <input type="checkbox" id="chk-typer-humanize" checked>
+              <span class="ans-toggle-slider"></span>
+            </label>
+            <div class="ans-toggle-text">
+              <div class="ans-toggle-title">Humanize (typos, hand model, tempo)</div>
+              <div class="ans-toggle-sub">
+                Full Dhakal CHI'18 engine: log-normal timing, 8-finger bigram model, tempo momentum, occasional typos with backspace-and-retype, sentence-end pauses. Turn OFF for constant-rate typing with no typos (useful for scripted paste-like automation).
+              </div>
+            </div>
+          </div>
+
+          <div class="ans-toggle-row">
+            <label class="ans-toggle">
+              <input type="checkbox" id="chk-typer-paste">
+              <span class="ans-toggle-slider"></span>
+            </label>
+            <div class="ans-toggle-text">
+              <div class="ans-toggle-title">Paste mode (fast, no humanization)</div>
+              <div class="ans-toggle-sub">
+                Instead of typing character-by-character, copy the text to the clipboard and fire <kbd>Ctrl+V</kbd>. Instantaneous, but hostile targets that behavioral-analyze input (typing rhythm) will see a clipboard event instead of typing. Off by default.
+              </div>
+            </div>
+          </div>
+
+          <div class="ans-toggle-row">
+            <label class="ans-toggle">
+              <input type="checkbox" id="chk-typer-planning" checked>
+              <span class="ans-toggle-slider"></span>
+            </label>
+            <div class="ans-toggle-text">
+              <div class="ans-toggle-title">Planning pause before typing starts</div>
+              <div class="ans-toggle-sub">
+                A short 200-850 ms delay before the first keystroke (writers stage a sentence in their head before typing). Turn off for instant typing.
+              </div>
+            </div>
+          </div>
+
+          <div class="ans-toggle-row">
+            <label class="ans-toggle">
+              <input type="checkbox" id="chk-typer-wait-mods" checked>
+              <span class="ans-toggle-slider"></span>
+            </label>
+            <div class="ans-toggle-text">
+              <div class="ans-toggle-title">Wait for modifier keys to release</div>
+              <div class="ans-toggle-sub">
+                Before typing, poll <kbd>Ctrl</kbd>/<kbd>Shift</kbd>/<kbd>Alt</kbd> until they're physically up. Prevents your first character from combining with a still-held hotkey modifier (e.g. Ctrl+Alt+T's Ctrl leaking into the first typed key). Recommended ON.
               </div>
             </div>
           </div>

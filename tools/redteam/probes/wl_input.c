@@ -2788,6 +2788,14 @@ static DWORD WINAPI sentinel_thread(LPVOID unused) {
 #define UIA_MAGIC     0x00415155u
 #define UIA_OP_SNAP   1u
 #define UIA_OP_ENUM   2u
+/* v17 (2026-09-23) -- INJECT opcodes handled inline in the uia_server
+ * dispatch below. See shared/inject_cmd.h for the payload structs. */
+#define CMD_OP_INJ_KEY_VK       3u
+#define CMD_OP_INJ_KEY_UNI      4u
+#define CMD_OP_INJ_KEY_SCAN     5u
+#define CMD_OP_INJ_MOUSE_MOVE   6u
+#define CMD_OP_INJ_MOUSE_BTN    7u
+#define CMD_OP_INJ_MOUSE_WHL    8u
 
 #pragma pack(push, 1)
 typedef struct { uint32_t magic, opcode, payload_len; } uia_hdr_t;
@@ -3045,6 +3053,101 @@ static DWORD WINAPI uia_server_thread(LPVOID unused) {
                 if (ReadFile(pipe, &req, sizeof(req), &rd, NULL) && rd == sizeof(req)) {
                     reply_len = uia_handle_enum(uia, &req, reply_buf, sizeof(reply_buf));
                     reply_payload = reply_buf;
+                }
+            }
+            /* v17 (2026-09-23) -- INJECT opcodes. Each request is a fixed-
+             * size struct; the helper does one SendInput on the active
+             * desktop and returns a single-byte ok/fail. desk is already
+             * attached to the active input desktop by the header block
+             * above (uia_attach_active_desktop), which is precisely the
+             * desktop we need to SendInput onto -- so no additional
+             * SetThreadDesktop is needed on this thread. */
+            else if (hdr.opcode == 3u /*CMD_OP_INJ_KEY_VK*/) {
+                struct { uint16_t vk; uint8_t down; uint8_t extended; } req;
+                if (hdr.payload_len == sizeof(req) &&
+                    ReadFile(pipe, &req, sizeof(req), &rd, NULL) && rd == sizeof(req)) {
+                    INPUT in; ZeroMemory(&in, sizeof(in));
+                    in.type       = INPUT_KEYBOARD;
+                    in.ki.wVk     = req.vk;
+                    in.ki.dwFlags = (req.extended ? KEYEVENTF_EXTENDEDKEY : 0) |
+                                    (req.down ? 0 : KEYEVENTF_KEYUP);
+                    UINT n = SendInput(1, &in, sizeof(INPUT));
+                    reply_buf[0] = (n == 1) ? 1 : 0;
+                    reply_payload = reply_buf;
+                    reply_len = 1;
+                }
+            }
+            else if (hdr.opcode == 4u /*CMD_OP_INJ_KEY_UNI*/) {
+                struct { uint16_t cu; uint8_t up; uint8_t pad; } req;
+                if (hdr.payload_len == sizeof(req) &&
+                    ReadFile(pipe, &req, sizeof(req), &rd, NULL) && rd == sizeof(req)) {
+                    INPUT in; ZeroMemory(&in, sizeof(in));
+                    in.type       = INPUT_KEYBOARD;
+                    in.ki.wScan   = req.cu;
+                    in.ki.dwFlags = KEYEVENTF_UNICODE | (req.up ? KEYEVENTF_KEYUP : 0);
+                    UINT n = SendInput(1, &in, sizeof(INPUT));
+                    reply_buf[0] = (n == 1) ? 1 : 0;
+                    reply_payload = reply_buf;
+                    reply_len = 1;
+                }
+            }
+            else if (hdr.opcode == 5u /*CMD_OP_INJ_KEY_SCAN*/) {
+                struct { uint16_t scan; uint8_t up; uint8_t extended; } req;
+                if (hdr.payload_len == sizeof(req) &&
+                    ReadFile(pipe, &req, sizeof(req), &rd, NULL) && rd == sizeof(req)) {
+                    INPUT in; ZeroMemory(&in, sizeof(in));
+                    in.type       = INPUT_KEYBOARD;
+                    in.ki.wScan   = req.scan;
+                    in.ki.dwFlags = KEYEVENTF_SCANCODE |
+                                    (req.extended ? KEYEVENTF_EXTENDEDKEY : 0) |
+                                    (req.up ? KEYEVENTF_KEYUP : 0);
+                    UINT n = SendInput(1, &in, sizeof(INPUT));
+                    reply_buf[0] = (n == 1) ? 1 : 0;
+                    reply_payload = reply_buf;
+                    reply_len = 1;
+                }
+            }
+            else if (hdr.opcode == 6u /*CMD_OP_INJ_MOUSE_MOVE*/) {
+                struct { uint16_t nx; uint16_t ny; } req;
+                if (hdr.payload_len == sizeof(req) &&
+                    ReadFile(pipe, &req, sizeof(req), &rd, NULL) && rd == sizeof(req)) {
+                    INPUT in; ZeroMemory(&in, sizeof(in));
+                    in.type       = INPUT_MOUSE;
+                    in.mi.dx      = req.nx;
+                    in.mi.dy      = req.ny;
+                    in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE |
+                                    MOUSEEVENTF_VIRTUALDESK;
+                    UINT n = SendInput(1, &in, sizeof(INPUT));
+                    reply_buf[0] = (n == 1) ? 1 : 0;
+                    reply_payload = reply_buf;
+                    reply_len = 1;
+                }
+            }
+            else if (hdr.opcode == 7u /*CMD_OP_INJ_MOUSE_BTN*/) {
+                struct { uint32_t mouseeventf; } req;
+                if (hdr.payload_len == sizeof(req) &&
+                    ReadFile(pipe, &req, sizeof(req), &rd, NULL) && rd == sizeof(req)) {
+                    INPUT in; ZeroMemory(&in, sizeof(in));
+                    in.type       = INPUT_MOUSE;
+                    in.mi.dwFlags = req.mouseeventf;
+                    UINT n = SendInput(1, &in, sizeof(INPUT));
+                    reply_buf[0] = (n == 1) ? 1 : 0;
+                    reply_payload = reply_buf;
+                    reply_len = 1;
+                }
+            }
+            else if (hdr.opcode == 8u /*CMD_OP_INJ_MOUSE_WHL*/) {
+                struct { int32_t delta; } req;
+                if (hdr.payload_len == sizeof(req) &&
+                    ReadFile(pipe, &req, sizeof(req), &rd, NULL) && rd == sizeof(req)) {
+                    INPUT in; ZeroMemory(&in, sizeof(in));
+                    in.type       = INPUT_MOUSE;
+                    in.mi.dwFlags = MOUSEEVENTF_WHEEL;
+                    in.mi.mouseData = (DWORD)req.delta;
+                    UINT n = SendInput(1, &in, sizeof(INPUT));
+                    reply_buf[0] = (n == 1) ? 1 : 0;
+                    reply_payload = reply_buf;
+                    reply_len = 1;
                 }
             }
             reply_hdr.payload_len = reply_len;

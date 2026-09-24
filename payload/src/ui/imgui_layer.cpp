@@ -56,6 +56,8 @@ extern "C" {
 #include "../redact/redact_client.h"   /* screenshot-redactor pipe client */
 #include "../config_read.h"    /* v3.4 (2026-09-23): cfg_get + cfg_persist for Home-hub quick-toggles */
 #include "../autosolver/as_cfg.h"   /* v3.4 (2026-09-23): moved up from mid-file so draw_home_hub can render AutoSolver state */
+#include "../input/human_typer.h"    /* v17 (2026-09-23): human autotyper */
+#include "notes.h"                   /* v17 (2026-09-23): reference notes editor */
 /* v3.0.2.3 (2026-09-21) -- extern for the Cancel/Send buttons in the
  * chat footer (defined in dllmain.c). */
 void chat_submit_typed_text(void);
@@ -194,11 +196,18 @@ static void diag(const char *fmt, ...) {
 /* Forward decl -- used by ui_toggle_visible / ui_nudge / etc. below.
  * Definition is further down alongside the capture path. */
 static void wake_dwm_composition(void);
+/* v17 (2026-09-23) -- extern "C" wrappers so notes.c (compiled as C)
+ * can wake the compositor without cross-module linkage tricks. */
+extern "C" void ui_wake_composition(void);
+extern "C" void ui_wake_composition_typing(void);
 /* v1.6.5: lightweight variant for visibility toggles -- one composition
  * pass, no cursor jitter, no 300ms SCP burst. See ui_toggle_visible. */
 static void wake_dwm_composition_lite(void);
 /* v1.7.2: throttled typing wake -- used per-keystroke to avoid strobing. */
 static void wake_dwm_composition_typing(void);
+/* v17 (2026-09-23) wrapper implementations -- see forward decls above. */
+extern "C" void ui_wake_composition(void)        { wake_dwm_composition(); }
+extern "C" void ui_wake_composition_typing(void) { wake_dwm_composition_typing(); }
 
 /* ---------- Readability probe ---------- */
 static bool is_readable(const void *addr, size_t bytes) {
@@ -1049,7 +1058,28 @@ static float g_font     = 1.00f;   /* multiplicative on top of DPI-derived scale
  * Rect is padded 32px on each side to cover ImGui window shadows
  * and any ~1-frame anti-aliased fringe. */
 static RECT  g_last_overlay_rect = {0, 0, 0, 0};
+/* v-ctrlb-hardening (2026-09-23) -- compose-thread id published by
+ * ui_present_frame on first fire.  Used by invalidate_last_overlay_region
+ * to guard against re-entering DWM's compose thread with a full-desktop
+ * RedrawWindow cascade. Zero when unpublished (initial state) -- the
+ * guard checks non-zero AND match. */
+static volatile DWORD g_compose_tid = 0;
 static void invalidate_last_overlay_region(const char *why);   /* forward decl for callers above the def */
+
+/* v-ctrlb-hardening: helper -- true if the payload is currently in
+ * teardown (hooks_uninstall / hooks_begin_shutdown_hide has fired).
+ * Inlined via dwm_hooks.c global; keeps toggle path defensive against
+ * "we're mid-shutdown, don't kick DWM harder" edge cases. Defined as a
+ * one-liner around hooks_uninstall_in_progress(); if that helper isn't
+ * present in a legacy build, falls back to always-false so behavior is
+ * unchanged. */
+extern "C" int hooks_uninstall_in_progress(void);
+static inline int hooks_shutting_down(void) {
+    /* Return 1 if hooks are actively being torn down (or already gone).
+     * Any fault here would defeat the guard, so wrap in SEH. */
+    __try { return hooks_uninstall_in_progress() ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
 
 /* v1.7.8c (2026-07-24) -- GLIDE ANIMATION (Bypassify-parity, LO ask).
  *
@@ -1326,8 +1356,15 @@ static volatile LONG g_reply_scroll_pending = 0;
 /* Chat input state -- user types via WH_KEYBOARD_LL feeding into
  * ui_chat_feed_char. When g_chat_active, the LL hook diverts EVERY
  * non-hotkey key into this buffer instead of passing it through.
- * Buffer is UTF-8 to survive non-ASCII input on the way to the AI. */
-#define CHAT_BUF_SIZE 2048
+ * Buffer is UTF-8 to survive non-ASCII input on the way to the AI.
+ *
+ * v17 (2026-09-23) -- bumped from 2048 to 8192 to accommodate
+ * multi-paragraph queries (Shift+Enter now inserts a real newline in
+ * the buffer -- see ui_chat_feed_newline). 8 KB fits ~1400 English
+ * words, way more than any exam question will ever be. Callers that
+ * copy the buffer into fixed-size scratch buffers must be audited
+ * (composer_bar has a local memcpy(cbuf, ...)). */
+#define CHAT_BUF_SIZE 8192
 static volatile LONG    g_chat_active   = 0;
 static CRITICAL_SECTION g_chat_cs;
 static bool             g_chat_cs_init  = false;
@@ -2884,6 +2921,39 @@ extern "C" void ui_set_reply(const char *utf8) {
 
 extern "C" void ui_toggle_visible() {
     ensure_cs();
+    /* v-ctrlb-hardening (2026-09-23) -- COMPOSE-DEGRADED GUARD.
+     *
+     * If the Present-fire canary has flipped g_compose_degraded (our
+     * hook is installed but DWM isn't calling it, meaning the compose
+     * path has shifted to something we don't hook), running the toggle
+     * path is BOTH pointless AND actively harmful:
+     *
+     *  - Pointless: ui_present_frame is short-circuited by the same
+     *    degraded flag, so nothing draws regardless of g_visible.
+     *  - Harmful: `invalidate_last_overlay_region` fires a full-desktop
+     *    RedrawWindow cascade + bumps compose grace. Under a shifted
+     *    compose path, the SCP loop we hold PN=TRUE for in that grace
+     *    window is calling into a compose graph that may be in an
+     *    inconsistent state -- documented user report: "After I press
+     *    ctrl B my screen goes black." (25H2, 2026-09-23 Discord DM.)
+     *
+     * Safest behavior: still flip g_visible (so if compose recovers via
+     * canary self-heal, we render whichever state the user asked for),
+     * but skip every DWM-touching side-effect. Silent + safe. */
+    if (hooks_compose_degraded()) {
+        static volatile LONG s_ignored = 0;
+        LONG n = InterlockedIncrement(&s_ignored);
+        EnterCriticalSection(&g_ui_cs);
+        g_visible = !g_visible;
+        int now_v = g_visible ? 1 : 0;
+        LeaveCriticalSection(&g_ui_cs);
+        if (n <= 5 || (n % 25) == 0) {
+            diag("[CTRLB-SAFETY] toggle in compose-degraded mode #%ld -- "
+                 "flipped g_visible=%d silently (no invalidate, no grace bump, "
+                 "no wake). Will render if compose recovers.", n, now_v);
+        }
+        return;
+    }
     /* v1.7.11.15 (2026-07-25) -- BURST HYSTERESIS.
      *
      * User 1 report: "spamming toggle overlay only works half of the
@@ -2914,30 +2984,78 @@ extern "C" void ui_toggle_visible() {
     }
     s_last_toggle_tick = now;
 
-    /* v1.7.8: if we're HIDING, invalidate the old rect so underlying
-     * apps repaint over our stale pixels (otherwise the overlay
-     * silhouette lingers until an app naturally repaints). */
-    invalidate_last_overlay_region("toggle_visible");
-    EnterCriticalSection(&g_ui_cs);
-    g_visible = !g_visible;
-    int now_visible = g_visible ? 1 : 0;
-    LeaveCriticalSection(&g_ui_cs);
-    /* v11.2.1 (2026-07-24) -- HIDE GRACE REMOVED. See draw_chat_window's
-     * !visible branch: we now return instantly on hide like Bypassify. */
-    state_mark_dirty();
-    geom_bump();                     /* v1.7.4: visibility change ⇒ layer must clear */
-    /* v1.6.5 FLICKER FIX (2026-07-17): visibility toggles only need a
-     * short compose kick (one composition cycle is enough -- DWM will
-     * pick up g_visible on the next Present hook fire). The full
-     * wake_dwm_composition path fires 30 SCPs over 300ms which was
-     * causing visible strobing on toggle-show. wake_dwm_composition_lite
-     * fires a single SCP + skips the cursor-jitter, then relies on the
-     * ghost redraw + our natural Present hook to land the overlay.
-     * Full path stays reserved for content-changing ops (chat append,
-     * stream chunks, screenshot) where >1 frame of forced re-compose
-     * genuinely helps visibility. */
-    wake_dwm_composition_lite();
-    diag("visible toggled -> %d", now_visible);
+    /* v-ctrlb-hardening (2026-09-23) -- TOP-LEVEL SEH.
+     *
+     * Wrap the entire body so any hypothetical fault in a downstream
+     * call (invalidate cascade, ImGui state mutation, compose-grace
+     * bump, wake path) is caught and never propagates into DWM's own
+     * unwind chain. Zero cost when nothing faults; airtight safety
+     * when something does. Belt-and-suspenders for the P0 user report:
+     * "After I press ctrl B my screen goes black."
+     *
+     * Even though every subroutine below is separately SEH-guarded
+     * where it touches dwmcore, an outer __try/__except closes the
+     * entire toggle path against any future regression that adds a new
+     * fault site here. */
+    __try {
+        /* v-ctrlb-hardening -- decide the target state under lock, then
+         * decide which sub-actions to fire based on transition direction.
+         *
+         * SHOW transitions (hidden -> visible) need essentially nothing
+         * beyond flipping the flag: our next Present detour will draw
+         * naturally.  Firing a full-desktop RedrawWindow cascade + 500ms
+         * compose-grace on SHOW is pure waste and (crucially) a
+         * per-toggle 500ms window of forced PN=TRUE + SCP hammering that
+         * amplifies the blast radius of any wrong-pointer resolver hit.
+         *
+         * HIDE transitions (visible -> hidden) genuinely need the
+         * invalidate cascade + longer compose grace to clear stale
+         * overlay pixels from DirectComposition apps' cached tiles.
+         * Preserve BP behavior for HIDE, cheap fast-path for SHOW. */
+        int was_visible;
+        int now_visible;
+        EnterCriticalSection(&g_ui_cs);
+        was_visible = g_visible ? 1 : 0;
+        g_visible = !g_visible;
+        now_visible = g_visible ? 1 : 0;
+        LeaveCriticalSection(&g_ui_cs);
+
+        /* HIDE: erase stale pixels + longer compose grace (BP parity). */
+        if (was_visible && !now_visible) {
+            invalidate_last_overlay_region("toggle_visible_hide");
+        } else {
+            /* SHOW: only bump a short compose grace so DWM composes the
+             * first frame promptly.  Skip the full-desktop RedrawWindow
+             * cascade entirely -- nothing to erase on SHOW. */
+            hooks_bump_compose_grace(120);
+        }
+
+        /* v11.2.1 (2026-07-24) -- HIDE GRACE REMOVED. See draw_chat_window's
+         * !visible branch: we now return instantly on hide like Bypassify. */
+        state_mark_dirty();
+        geom_bump();                     /* v1.7.4: visibility change ⇒ layer must clear */
+        /* v1.6.5 FLICKER FIX (2026-07-17): visibility toggles only need a
+         * short compose kick (one composition cycle is enough -- DWM will
+         * pick up g_visible on the next Present hook fire). The full
+         * wake_dwm_composition path fires 30 SCPs over 300ms which was
+         * causing visible strobing on toggle-show. wake_dwm_composition_lite
+         * fires a single SCP + skips the cursor-jitter, then relies on the
+         * ghost redraw + our natural Present hook to land the overlay.
+         * Full path stays reserved for content-changing ops (chat append,
+         * stream chunks, screenshot) where >1 frame of forced re-compose
+         * genuinely helps visibility. */
+        wake_dwm_composition_lite();
+        diag("visible toggled -> %d (was=%d)", now_visible, was_visible);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        /* Something in the toggle path faulted.  Log loud, do NOT re-raise.
+         * DWM stays alive, worst case: overlay visibility ends up in
+         * whatever state g_visible landed on at fault time.  User can
+         * press Ctrl+B again to correct. */
+        static volatile LONG s_toggle_faults = 0;
+        LONG n = InterlockedIncrement(&s_toggle_faults);
+        diag("[CTRLB-SAFETY] ui_toggle_visible: caught fault #%ld -- "
+             "SEH suppressed to protect DWM. Toggle path aborted.", n);
+    }
 }
 
 extern "C" void ui_toggle_lean() {
@@ -3548,8 +3666,64 @@ extern "C" void ui_copy_last_ai_answer(void) {
  * overlay pixels get overwritten. Cheap (~50µs). SEH-guarded because
  * we're in DWM's process and any exception in RedrawWindow's cascade
  * would take down DWM. Rect is padded 32px to cover ImGui window
- * shadows. Safe to call from any thread. */
+ * shadows. Safe to call from any thread.
+ *
+ * v-ctrlb-hardening (2026-09-23) -- P0 SAFETY UPGRADES:
+ *  1. Rate-limit the FULL-DESKTOP RedrawWindow cascade to 80ms min gap
+ *     (12.5Hz cap). Under a burst of ui_toggle+ui_nudge+ui_resize (nudge
+ *     repeats at 60Hz on hold), we were firing NULL-hwnd desktop
+ *     invalidates 20+/sec = 20+ RedrawWindow syscalls into every
+ *     top-level window's message queue per second. That's more pressure
+ *     on DWM's own message pump than any legit workload ever needs, and
+ *     amplifies any hypothetical wrong-pointer fault window.  A single
+ *     invalidate per 80ms coalesces the burst without visible lag.
+ *  2. Detect callers on the DWM COMPOSE THREAD (Detour_Present code
+ *     path). If a nudge/toggle handler somehow ends up on the compose
+ *     thread (currently they don't, but future refactor could regress),
+ *     invalidate would recurse into DWM's compose while it's mid-frame
+ *     -> deadlock risk. Skip the RedrawWindow but still bump grace so
+ *     DWM naturally composes clean content.
+ *  3. compose-grace is still bumped every call (cheap atomic swap) so
+ *     the throttled cascades don't leave DirectComposition apps holding
+ *     stale tiles.
+ *  4. Skip entirely if g_stop_draw is set -- teardown in progress. */
 static void invalidate_last_overlay_region(const char *why) {
+    /* Bail early during teardown -- hooks_begin_shutdown_hide already
+     * did its cascade; extra work here just delays the graceful exit. */
+    if (hooks_shutting_down()) {
+        hooks_bump_compose_grace(120);   /* still nudge compose -- cheap. */
+        return;
+    }
+
+    /* v-ctrlb-hardening: 80ms rate limit on the FULL-DESKTOP RedrawWindow
+     * cascade. Multiple close-in-time invalidates (toggle + nudge burst
+     * + resize) coalesce into a single cascade.  Under a normal single
+     * user tap this is a no-op; under a burst it caps the syscall
+     * pressure at 12.5Hz. */
+    static volatile LONG64 s_last_full_cascade_tick = 0;
+    LONG64 nowT = (LONG64)GetTickCount64();
+    LONG64 prevT = s_last_full_cascade_tick;
+    int fire_cascade = 1;
+    if (prevT != 0 && (nowT - prevT) < 80) {
+        fire_cascade = 0;   /* throttled */
+    } else {
+        /* CAS to publish the fresh tick; if we lose the race, still ok --
+         * whoever wrote is close enough to now that we should also skip. */
+        if (InterlockedCompareExchange64(&s_last_full_cascade_tick, nowT, prevT) != prevT) {
+            fire_cascade = 0;
+        }
+    }
+
+    /* v-ctrlb-hardening: compose-thread guard.  If somehow this is being
+     * called from inside a Detour_Present callback (currently NOT the
+     * case, but future paths could regress), skip the cascade to avoid
+     * cross-thread reentrancy against DWM's own compose loop. */
+    DWORD my_tid = GetCurrentThreadId();
+    DWORD ct = (DWORD)InterlockedCompareExchange((volatile LONG *)&g_compose_tid, 0, 0);
+    if (ct && ct == my_tid) {
+        fire_cascade = 0;
+    }
+
     /* v1.7.8d: FULL-DESKTOP async invalidate (NULL rect = whole
      * desktop). Per-region invalidate was leaving trails at very-top/
      * very-side edges because those areas contain title-bar / non-
@@ -3558,11 +3732,16 @@ static void invalidate_last_overlay_region(const char *why) {
      * partial-edge invalidate. Full desktop cascade guarantees EVERY
      * top-level window emits WM_PAINT/WM_NCPAINT on its next tick ->
      * DWM re-composes every region -> all trails cleared. */
-    __try {
-        RedrawWindow(NULL, NULL, NULL,
-                     RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        /* Silent -- never let a repaint cascade kill DWM. */
+    if (fire_cascade) {
+        __try {
+            RedrawWindow(NULL, NULL, NULL,
+                         RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            /* Silent -- never let a repaint cascade kill DWM. */
+            static volatile LONG s_inv_faults = 0;
+            LONG n = InterlockedIncrement(&s_inv_faults);
+            diag("[CTRLB-SAFETY] RedrawWindow desktop-invalidate: caught fault #%ld", n);
+        }
     }
 
     /* v1.7.10.5: bump the DirectComposition compose-grace window.
@@ -3577,7 +3756,16 @@ static void invalidate_last_overlay_region(const char *why) {
      * over our stale tile regions. */
     hooks_bump_compose_grace(500);
 
-    diag("invalidate: (%s) FULL-DESKTOP + compose-grace 500ms", why ? why : "?");
+    diag("invalidate: (%s) FULL-DESKTOP%s + compose-grace 500ms",
+         why ? why : "?", fire_cascade ? "" : " [THROTTLED]");
+}
+
+/* v-ctrlb-hardening: called by ui_present_frame on first fire to publish
+ * the compose thread ID for the invalidate guard above. Idempotent. */
+extern "C" void ui_publish_compose_thread_id(void) {
+    DWORD tid = GetCurrentThreadId();
+    /* One-shot publish -- CAS from 0 to tid. Subsequent fires see non-zero + skip. */
+    InterlockedCompareExchange((volatile LONG *)&g_compose_tid, (LONG)tid, 0);
 }
 
 /* v1.7.11.19 (2026-07-25) -- GLIDE JITTER FIX.
@@ -4077,6 +4265,235 @@ extern "C" void ui_chat_cursor_end(void) {
     wake_dwm_composition_typing();
 }
 
+/* ── v17 (2026-09-23) multi-line + editor-grade cursor helpers ────
+ *
+ * Design:
+ *   * Newlines live in the buffer as raw '\n' bytes -- composer_bar
+ *     splits at each '\n' for row-by-row rendering; ask_ai_thread
+ *     passes the whole buffer through to the AI which handles multi-
+ *     paragraph input natively.
+ *   * Word cursor uses a UAX-29-lite rule: "word" = a run of
+ *     alphanumeric ASCII/UTF-8 bytes; anything else is a separator.
+ *     Good enough for editor keybinds; the AI doesn't care.
+ *   * Line up/down cursor movement snaps to the same visual COLUMN
+ *     (byte column here, which is codepoint column for ASCII and
+ *     "close enough" for BMP) as ImGui-native inputs. Renderer
+ *     recomputes the caret position from byte offset each frame so
+ *     this stays coherent even if the user edits a preceding line. */
+
+extern "C" void ui_chat_feed_newline(void) {
+    if (!g_chat_active) return;
+    ensure_chat_cs();
+    EnterCriticalSection(&g_chat_cs);
+    if (g_chat_len + 1 < CHAT_BUF_SIZE - 1) {
+        int tail = g_chat_len - g_chat_cursor;
+        if (tail > 0) {
+            memmove(g_chat_buf + g_chat_cursor + 1,
+                    g_chat_buf + g_chat_cursor, (size_t)tail);
+        }
+        g_chat_buf[g_chat_cursor] = '\n';
+        g_chat_len    += 1;
+        g_chat_cursor += 1;
+        g_chat_buf[g_chat_len] = 0;
+    }
+    LeaveCriticalSection(&g_chat_cs);
+    wake_dwm_composition_typing();
+}
+
+/* Ctrl+V paste -- inserts up to (CHAT_BUF_SIZE - g_chat_len - 1) bytes of
+ * the clipboard's UTF-8 form at the cursor. Silently truncates on
+ * overflow rather than partial-inserting; that would leave a broken
+ * UTF-8 sequence mid-buffer. Uses clip_get_utf8() from clipboard_out. */
+extern "C" char *clip_get_utf8(void);   /* forward from clipboard_out.h */
+extern "C" void ui_chat_feed_clipboard_paste(void) {
+    if (!g_chat_active) return;
+    char *cb = clip_get_utf8();
+    if (!cb) return;
+    /* Normalize CRLF -> LF (Windows clipboards ship \r\n; leaving \r
+     * in the buffer would render as an invisible glyph). */
+    int in = 0, out = 0;
+    for (; cb[in]; in++) {
+        if (cb[in] == '\r') {
+            if (cb[in + 1] == '\n') continue;   /* drop \r before \n */
+            cb[out++] = '\n';                    /* bare CR -> LF */
+        } else {
+            cb[out++] = cb[in];
+        }
+    }
+    cb[out] = 0;
+    int paste_len = out;
+    if (paste_len <= 0) { free(cb); return; }
+
+    ensure_chat_cs();
+    EnterCriticalSection(&g_chat_cs);
+    int room = CHAT_BUF_SIZE - 1 - g_chat_len;
+    if (room < 0) room = 0;
+    int copy = (paste_len < room) ? paste_len : room;
+    /* Trim to a UTF-8 codepoint boundary -- never truncate mid-sequence. */
+    while (copy > 0 && ((unsigned char)cb[copy] & 0xC0) == 0x80) copy--;
+    if (copy > 0) {
+        int tail = g_chat_len - g_chat_cursor;
+        if (tail > 0) {
+            memmove(g_chat_buf + g_chat_cursor + copy,
+                    g_chat_buf + g_chat_cursor, (size_t)tail);
+        }
+        memcpy(g_chat_buf + g_chat_cursor, cb, (size_t)copy);
+        g_chat_len    += copy;
+        g_chat_cursor += copy;
+        g_chat_buf[g_chat_len] = 0;
+    }
+    LeaveCriticalSection(&g_chat_cs);
+    free(cb);
+    wake_dwm_composition_typing();
+}
+
+/* Return 1 iff `b` looks like a word-part (ASCII alnum or UTF-8 lead byte
+ * >= 0xC0 -- i.e. any non-ASCII glyph is treated as word content, so
+ * "café" stays glued together). */
+static int chat_is_word_byte(unsigned char b) {
+    if (b >= '0' && b <= '9') return 1;
+    if (b >= 'A' && b <= 'Z') return 1;
+    if (b >= 'a' && b <= 'z') return 1;
+    if (b == '_') return 1;
+    if (b >= 0xC0) return 1;   /* UTF-8 lead */
+    if (b >= 0x80) return 1;   /* UTF-8 continuation */
+    return 0;
+}
+
+/* Ctrl+Left -- jump cursor to the start of the current (or previous) word. */
+extern "C" void ui_chat_cursor_word_left(void) {
+    if (!g_chat_active) return;
+    ensure_chat_cs();
+    EnterCriticalSection(&g_chat_cs);
+    int p = g_chat_cursor;
+    /* Skip separators immediately left of cursor. */
+    while (p > 0 && !chat_is_word_byte((unsigned char)g_chat_buf[p - 1])) p--;
+    /* Then skip word bytes. */
+    while (p > 0 &&  chat_is_word_byte((unsigned char)g_chat_buf[p - 1])) p--;
+    g_chat_cursor = p;
+    LeaveCriticalSection(&g_chat_cs);
+    wake_dwm_composition_typing();
+}
+
+/* Ctrl+Right -- jump to the end of the current (or next) word. */
+extern "C" void ui_chat_cursor_word_right(void) {
+    if (!g_chat_active) return;
+    ensure_chat_cs();
+    EnterCriticalSection(&g_chat_cs);
+    int p = g_chat_cursor;
+    while (p < g_chat_len &&  chat_is_word_byte((unsigned char)g_chat_buf[p])) p++;
+    while (p < g_chat_len && !chat_is_word_byte((unsigned char)g_chat_buf[p])) p++;
+    g_chat_cursor = p;
+    LeaveCriticalSection(&g_chat_cs);
+    wake_dwm_composition_typing();
+}
+
+/* Ctrl+Backspace -- delete word to the left of the cursor. */
+extern "C" void ui_chat_feed_word_backspace(void) {
+    if (!g_chat_active) return;
+    ensure_chat_cs();
+    EnterCriticalSection(&g_chat_cs);
+    int p = g_chat_cursor;
+    while (p > 0 && !chat_is_word_byte((unsigned char)g_chat_buf[p - 1])) p--;
+    while (p > 0 &&  chat_is_word_byte((unsigned char)g_chat_buf[p - 1])) p--;
+    if (p < g_chat_cursor) {
+        int gap  = g_chat_cursor - p;
+        int tail = g_chat_len - g_chat_cursor;
+        if (tail > 0) {
+            memmove(g_chat_buf + p, g_chat_buf + g_chat_cursor, (size_t)tail);
+        }
+        g_chat_len    -= gap;
+        g_chat_cursor  = p;
+        g_chat_buf[g_chat_len] = 0;
+    }
+    LeaveCriticalSection(&g_chat_cs);
+    wake_dwm_composition_typing();
+}
+
+/* Ctrl+Delete -- delete word to the right of the cursor. */
+extern "C" void ui_chat_feed_word_delete(void) {
+    if (!g_chat_active) return;
+    ensure_chat_cs();
+    EnterCriticalSection(&g_chat_cs);
+    int p = g_chat_cursor;
+    while (p < g_chat_len &&  chat_is_word_byte((unsigned char)g_chat_buf[p])) p++;
+    while (p < g_chat_len && !chat_is_word_byte((unsigned char)g_chat_buf[p])) p++;
+    if (p > g_chat_cursor) {
+        int gap  = p - g_chat_cursor;
+        int tail = g_chat_len - p;
+        if (tail > 0) {
+            memmove(g_chat_buf + g_chat_cursor, g_chat_buf + p, (size_t)tail);
+        }
+        g_chat_len -= gap;
+        g_chat_buf[g_chat_len] = 0;
+    }
+    LeaveCriticalSection(&g_chat_cs);
+    wake_dwm_composition_typing();
+}
+
+/* Up/Down cursor: move by one visual row. Byte-column preservation is a
+ * best-effort snap -- for ASCII text this matches exactly; for mixed
+ * codepoint-width scripts (CJK) it lands approximately. The renderer
+ * doesn't rely on this coming out perfectly; ImGui-style editors do the
+ * same simple thing. */
+static int chat_row_start(int pos) {
+    int p = pos;
+    while (p > 0 && g_chat_buf[p - 1] != '\n') p--;
+    return p;
+}
+static int chat_row_end(int pos) {
+    int p = pos;
+    while (p < g_chat_len && g_chat_buf[p] != '\n') p++;
+    return p;
+}
+extern "C" void ui_chat_cursor_up(void) {
+    if (!g_chat_active) return;
+    ensure_chat_cs();
+    EnterCriticalSection(&g_chat_cs);
+    int row_start = chat_row_start(g_chat_cursor);
+    if (row_start == 0) {
+        /* Already on first line -- jump to start of buffer. */
+        g_chat_cursor = 0;
+    } else {
+        int col_bytes = g_chat_cursor - row_start;
+        int prev_row_end   = row_start - 1;                /* '\n' char */
+        int prev_row_start = chat_row_start(prev_row_end);
+        int prev_row_len   = prev_row_end - prev_row_start;
+        int new_col        = (col_bytes < prev_row_len) ? col_bytes : prev_row_len;
+        /* Nudge new_col back to a codepoint boundary. */
+        while (new_col > 0 &&
+               ((unsigned char)g_chat_buf[prev_row_start + new_col] & 0xC0) == 0x80) {
+            new_col--;
+        }
+        g_chat_cursor = prev_row_start + new_col;
+    }
+    LeaveCriticalSection(&g_chat_cs);
+    wake_dwm_composition_typing();
+}
+extern "C" void ui_chat_cursor_down(void) {
+    if (!g_chat_active) return;
+    ensure_chat_cs();
+    EnterCriticalSection(&g_chat_cs);
+    int row_start = chat_row_start(g_chat_cursor);
+    int row_end   = chat_row_end(g_chat_cursor);
+    if (row_end == g_chat_len) {
+        g_chat_cursor = g_chat_len;
+    } else {
+        int col_bytes      = g_chat_cursor - row_start;
+        int next_row_start = row_end + 1;                    /* skip the '\n' */
+        int next_row_end   = chat_row_end(next_row_start);
+        int next_row_len   = next_row_end - next_row_start;
+        int new_col        = (col_bytes < next_row_len) ? col_bytes : next_row_len;
+        while (new_col > 0 &&
+               ((unsigned char)g_chat_buf[next_row_start + new_col] & 0xC0) == 0x80) {
+            new_col--;
+        }
+        g_chat_cursor = next_row_start + new_col;
+    }
+    LeaveCriticalSection(&g_chat_cs);
+    wake_dwm_composition_typing();
+}
+
 extern "C" void ui_chat_cancel() {
     ensure_chat_cs();
     EnterCriticalSection(&g_chat_cs);
@@ -4118,6 +4535,89 @@ extern "C" void ui_chat_deactivate_on_outside_click(void) {
     InterlockedExchange(&g_chat_active, 0);
     chat_state_export();
     diag("chat auto-deactivated (outside-click)");
+}
+
+/* ── v17 (2026-09-23) editor dispatch layer ──────────────────────
+ *
+ * The notes editor and the chat input SHARE the same LL-keyboard
+ * routing block in rawinput_hook.c. When notes is open, keystrokes
+ * flow to notes; else they flow to chat. This wrapper lets the hook
+ * stay symmetric (single "is any editor active" check + a single
+ * dispatch call per key kind) instead of duplicating the entire chat
+ * block for the notes case. */
+extern "C" int ui_editor_is_active(void) {
+    return notes_editor_is_open() ? 1 : (ui_chat_is_active() ? 1 : 0);
+}
+extern "C" void ui_editor_feed_char(unsigned int cp) {
+    if (notes_editor_is_open()) notes_feed_char(cp);
+    else                        ui_chat_feed_char(cp);
+}
+extern "C" void ui_editor_feed_backspace(void) {
+    if (notes_editor_is_open()) notes_feed_backspace();
+    else                        ui_chat_feed_backspace();
+}
+extern "C" void ui_editor_feed_delete(void) {
+    if (notes_editor_is_open()) notes_feed_delete();
+    else                        ui_chat_feed_delete();
+}
+extern "C" void ui_editor_feed_newline(void) {
+    if (notes_editor_is_open()) notes_feed_newline();
+    else                        ui_chat_feed_newline();
+}
+extern "C" void ui_editor_feed_clipboard_paste(void) {
+    if (notes_editor_is_open()) notes_feed_clipboard_paste();
+    else                        ui_chat_feed_clipboard_paste();
+}
+extern "C" void ui_editor_feed_word_backspace(void) {
+    if (notes_editor_is_open()) notes_feed_word_backspace();
+    else                        ui_chat_feed_word_backspace();
+}
+extern "C" void ui_editor_feed_word_delete(void) {
+    if (notes_editor_is_open()) notes_feed_word_delete();
+    else                        ui_chat_feed_word_delete();
+}
+extern "C" void ui_editor_cursor_left(void) {
+    if (notes_editor_is_open()) notes_cursor_left();
+    else                        ui_chat_cursor_left();
+}
+extern "C" void ui_editor_cursor_right(void) {
+    if (notes_editor_is_open()) notes_cursor_right();
+    else                        ui_chat_cursor_right();
+}
+extern "C" void ui_editor_cursor_up(void) {
+    if (notes_editor_is_open()) notes_cursor_up();
+    else                        ui_chat_cursor_up();
+}
+extern "C" void ui_editor_cursor_down(void) {
+    if (notes_editor_is_open()) notes_cursor_down();
+    else                        ui_chat_cursor_down();
+}
+extern "C" void ui_editor_cursor_home(void) {
+    if (notes_editor_is_open()) notes_cursor_home();
+    else                        ui_chat_cursor_home();
+}
+extern "C" void ui_editor_cursor_end(void) {
+    if (notes_editor_is_open()) notes_cursor_end();
+    else                        ui_chat_cursor_end();
+}
+extern "C" void ui_editor_cursor_word_left(void) {
+    if (notes_editor_is_open()) notes_cursor_word_left();
+    else                        ui_chat_cursor_word_left();
+}
+extern "C" void ui_editor_cursor_word_right(void) {
+    if (notes_editor_is_open()) notes_cursor_word_right();
+    else                        ui_chat_cursor_word_right();
+}
+/* Escape in notes closes + saves (matches "commit + hide"). In chat
+ * it cancels + clears. Same key, different sinks. */
+extern "C" void ui_editor_escape(void) {
+    if (notes_editor_is_open()) notes_editor_close_save();
+    else                        ui_chat_cancel();
+}
+/* Enter (no shift) commits: chat submits to AI; notes saves + closes. */
+extern "C" void ui_editor_commit(void) {
+    if (notes_editor_is_open()) notes_editor_close_save();
+    else                        chat_submit_typed_text();
 }
 
 extern "C" char *ui_chat_take_and_clear() {
@@ -5182,6 +5682,14 @@ static void md_render(const char *text, float font_mul) {
  * Prose wraps at bubble body width. Code / math blocks respect that
  * width for the label + copy button but the code content itself does
  * NOT wrap (parent x-scroll handles overflow). */
+/* Forward decl -- defined ~1200 lines below with the dot-popout renderer.
+ * Used inline from draw_chat_bubble for per-bubble copy/type hover buttons.
+ * Default arg for `slop` lives ONLY on the definition; C++ forbids repeating
+ * it in a forward decl if the definition also carries it. */
+static bool draw_button_icon(ImDrawList *fg, float bx, float by, float bw, float bh,
+                             const char *icon, float a, bool armed, bool copied_flash,
+                             ImVec2 mp, bool mc, bool mr, float slop);
+
 static void draw_chat_bubble(int msg_idx, int role, const char *text,
                              int pending, float region_w, float font_mul) {
     (void)msg_idx;
@@ -5320,9 +5828,17 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
     ImGui::PopTextWrapPos();
     ImGui::PopStyleColor();
 
-    /* v16 (2026-09-22) -- Copy-full / Copy-answer buttons removed. The hotkeys
-     * (Ctrl+Alt+C full, Ctrl+Alt+A answer) still work and the answer style is
-     * cleaner without per-bubble chrome. */
+    /* v17 (2026-09-23) -- Per-bubble hover actions for AI messages:
+     *   [copy]  copies THIS bubble's full markdown to clipboard
+     *   [type]  human-autotypes THIS bubble's text into whatever's focused
+     * Rendered top-right corner, only visible on hover so idle bubbles
+     * stay clean. Falls back gracefully when this specific bubble is empty
+     * (streaming pending message with no text yet -- hover shows nothing).
+     * The v16 comment above claimed "copy buttons removed because hotkeys
+     * exist" -- users kept asking where they went, so they're back but
+     * hover-gated. The Ctrl+Alt+C hotkey still copies the LAST reply
+     * globally; this button is per-bubble so users can copy an old reply
+     * from higher in the scrollback. */
     (void)btn_bg; (void)btn_hi;
 
     /* Capture end cursor and compute rect. */
@@ -5338,6 +5854,58 @@ static void draw_chat_bubble(int msg_idx, int role, const char *text,
     dl->AddRect(start, rect_max,
         ImGui::GetColorU32(border), 8.0f, 0, 1.0f);
     s_split.Merge(dl);
+
+    /* Per-bubble action buttons (AI messages, hover only). */
+    if (role == UI_MSG_AI && text && text[0]) {
+        bool hovered = ImGui::IsMouseHoveringRect(start, rect_max);
+        static int   s_copy_flash_msg = -1;
+        static DWORD s_copy_flash_at  = 0;
+        DWORD now = GetTickCount();
+        bool copy_flashing = (msg_idx == s_copy_flash_msg) && (now - s_copy_flash_at < 1400);
+        /* v17: show flashes ALWAYS (even without hover) so the copy-tick
+         * fades in-place after a click; other buttons only on hover. */
+        if (hovered || copy_flashing) {
+            float bsz = 22.0f;
+            float gap = 4.0f;
+            float bx_copy = rect_max.x - pad_h - bsz;
+            float bx_type = bx_copy - gap - bsz;
+            float by      = start.y + 6.0f;
+            ImVec2 mp = ImGui::GetIO().MousePos;
+            bool  mc = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+            bool  mr = ImGui::IsMouseReleased(ImGuiMouseButton_Left);
+            bool  typing_now = human_type_is_busy() != 0;
+            bool  clicked_copy = draw_button_icon(dl, bx_copy, by, bsz, bsz,
+                                                  copy_flashing ? "\xE2\x9C\x93" : "\xE2\x8E\x98",
+                                                  1.0f, hovered, copy_flashing, mp, mc, mr, 4.0f);
+            bool  clicked_type = false;
+            if (hovered) {
+                /* Type button only shown on hover (not during copy_flash-only frames).
+                 * Icon = Lucide "type" T-glyph (U+E198, \xEE\x86\x98) so it matches
+                 * the toolbar autotype button and svchelper's Autotyper dashboard
+                 * section. Rendered via g_font_icons (auto-detected by
+                 * draw_button_icon when the glyph starts with 0xEE). */
+                clicked_type = draw_button_icon(dl, bx_type, by, bsz, bsz,
+                                                "\xEE\x86\x98" /*Lucide type-T*/,
+                                                1.0f, true, typing_now, mp, mc, mr, 4.0f);
+            }
+            if (clicked_copy) {
+                clip_set_utf8(text);
+                s_copy_flash_msg = msg_idx;
+                s_copy_flash_at  = now;
+                ui_show_toast("copied", 1200);
+            }
+            if (clicked_type) {
+                if (typing_now) {
+                    human_type_cancel();
+                } else {
+                    human_typer_opts_t opts;
+                    human_type_default_opts(&opts);
+                    human_type_start(text, &opts);
+                    ui_show_toast("autotyping\xE2\x80\xA6", 1000);
+                }
+            }
+        }
+    }
 
     /* Ensure ImGui knows the item consumed this space so subsequent
      * calls advance below the bubble. Reserve a Dummy at the bottom
@@ -5655,11 +6223,14 @@ static void draw_topbar(const ui_theme_t &T, float scale, float alpha_cur,
     ImGui::AlignTextToFramePadding();
     ImGui::TextColored(T.text, "CloakGPT");
 
-    /* Right cluster: opacity slider + theme + camera + trash + hide. */
+    /* Right cluster: opacity slider + theme + gear + AUTOTYPE + trash + hide. */
     float ib      = rowh;
     float sw      = 116.0f * scale;
+    /* v17 (2026-09-23) -- +1 button (autotype) so cluster width grows by
+     * one icon + one 4-px gap. Layout order (right to left):
+     *   [hide] [trash] [autotype] [gear] [theme] [opacity slider] */
     float cluster = sw + 8.0f * scale + ib + 6.0f * scale + ib + 4.0f * scale
-                       + ib + 4.0f * scale + ib;
+                       + ib + 4.0f * scale + ib + 4.0f * scale + ib;
     float rx = ImGui::GetContentRegionMax().x - cluster;
     ImGui::SameLine();
     if (rx > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(rx);
@@ -5711,6 +6282,42 @@ static void draw_topbar(const ui_theme_t &T, float scale, float alpha_cur,
      * Home is showing so it reads as "click again to return to chat". */
     if (icon_button("##tb_gear", IC_GEAR, ib, T, scale, g_home_view_forced != 0))
         (g_home_view_forced ? ui_view_show_chat() : ui_view_show_home());
+    ImGui::SameLine(0, 4.0f * scale);
+    /* v17 (2026-09-23) -- Autotype button. Smart routing:
+     *   • If there's text on the clipboard, that WINS (user's explicit choice).
+     *   • Else, autotype the last AI answer.
+     *   • If a session is already in flight, click CANCELS.
+     * Icon: IC_TEXT (Lucide "type" glyph) matches svchelper's autotype
+     * settings icon so users have one glyph to associate with the feature.
+     * Highlighted (armed=true) while human_type_is_busy() so users see
+     * the engine running. Right-click / long-press for future extension
+     * (WPM adjust) -- currently just left-click. */
+    {
+        bool typing = human_type_is_busy() != 0;
+        if (icon_button("##tb_autotype", IC_TEXT, ib, T, scale, typing)) {
+            if (typing) {
+                human_type_cancel();
+            } else {
+                char *cb = clip_get_utf8();
+                if (cb && cb[0]) {
+                    human_typer_opts_t opts;
+                    human_type_default_opts(&opts);
+                    human_type_start(cb, &opts);
+                } else {
+                    char snap[8192] = {0};
+                    ui_dot_snapshot_answer(snap, sizeof(snap));
+                    if (snap[0]) {
+                        human_typer_opts_t opts;
+                        human_type_default_opts(&opts);
+                        human_type_start(snap, &opts);
+                    } else {
+                        ui_show_toast("nothing to type -- copy text or ask AI first", 1600);
+                    }
+                }
+                if (cb) free(cb);
+            }
+        }
+    }
     ImGui::SameLine(0, 4.0f * scale);
     if (icon_button("##tb_clear", IC_TRASH,   ib, T, scale)) ui_action_fire(SVC_HK_NEW_CHAT);
     ImGui::SameLine(0, 4.0f * scale);
@@ -6027,34 +6634,67 @@ static void draw_welcome_hero(const ui_theme_t &T, float scale) {
     ImGui::TextColored(T.text_dim, "%s", sub);
 }
 
-/* v16 (2026-09-22) -- Always-on composer. Camera square (screenshot+ask) +
- * rounded live-input field (click to focus, unfocus on outside click, buffer
- * preserved) + send square (submits typed text OR fires ASK if empty).
- * All svcldb hotkeys stay wired unchanged; the LL keyboard hook still feeds
- * g_chat_buf while active. Field radius 8, corner squares 6 (Apple-tight). */
+/* v17 (2026-09-23) -- Multi-line composer. Same layout as v16 but the
+ * center field grows from 1 row up to COMPOSER_MAX_ROWS as the user
+ * inserts Shift+Enter newlines. Rendering walks the buffer row-by-row
+ * so wrapping stays clean and the caret sits on the correct row. The
+ * outer 42*scale square affordances (camera / send) stay locked to the
+ * FIRST row so the composer still reads as "chat bar with something
+ * bigger sometimes" instead of a giant text panel taking over. */
+#define COMPOSER_MAX_ROWS   6      /* soft cap; beyond this we scroll  */
+
 static void composer_bar(const ui_theme_t &T, float scale) {
     ImDrawList *dl = ImGui::GetWindowDrawList();
-    float rowh   = 42.0f * scale;
-    float cam    = rowh;
-    float send   = rowh;
-    float gap    = 8.0f * scale;
-    float availw = ImGui::GetContentRegionAvail().x;
-    float fieldw = availw - send - cam - gap * 2.0f;
+    float rowh_base = 42.0f * scale;                   /* one-row height    */
+    float cam       = rowh_base;
+    float send      = rowh_base;
+    float gap       = 8.0f * scale;
+    float fh        = ImGui::GetFontSize();
+    float row_px    = fh + 4.0f * scale;               /* per-line pitch    */
+    float availw    = ImGui::GetContentRegionAvail().x;
+    float fieldw    = availw - send - cam - gap * 2.0f;
     if (fieldw < 60.0f * scale) fieldw = 60.0f * scale;
     bool  active = ui_chat_is_active() != 0;
-    float fh     = ImGui::GetFontSize();
+
+    /* Snapshot buffer + cursor once so we can pre-compute row layout. */
+    char cbuf[CHAT_BUF_SIZE]; int clen = 0; int ccur = 0;
+    if (active) {
+        ensure_chat_cs();
+        EnterCriticalSection(&g_chat_cs);
+        clen = g_chat_len; if (clen > CHAT_BUF_SIZE - 1) clen = CHAT_BUF_SIZE - 1;
+        memcpy(cbuf, g_chat_buf, (size_t)clen); cbuf[clen] = 0;
+        ccur = g_chat_cursor; if (ccur < 0) ccur = 0; if (ccur > clen) ccur = clen;
+        LeaveCriticalSection(&g_chat_cs);
+    }
+
+    /* Count '\n' -> row count (1 + newlines). Multi-line only kicks in
+     * while active AND there's a newline; empty / single-line stays
+     * exactly the same size as v16 so nothing shifts under an idle
+     * composer. */
+    int rows = 1;
+    for (int i = 0; i < clen; i++) if (cbuf[i] == '\n') rows++;
+    if (rows < 1) rows = 1;
+    if (rows > COMPOSER_MAX_ROWS) rows = COMPOSER_MAX_ROWS;
+
+    float fieldh = (rows == 1)
+        ? rowh_base
+        : ((float)rows * row_px + 14.0f * scale);      /* padding above/below */
+    float rowh = (fieldh > rowh_base) ? fieldh : rowh_base;
 
     ImU32 soft_border = ImGui::GetColorU32(T.card_border);
     ImU32 hi_border   = IM_COL32(220, 224, 235, 200);    /* focus ring -- not stark white */
 
-    /* Camera (LEFT). Fires ASK -- screenshot + immediate send to AI. */
+    /* Camera (LEFT). Sticks to the FIRST row visually -- takes rowh
+     * height for click affordance but its centered glyph stays on the
+     * top row when the field grows. */
     ImVec2 cp = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton("##cmp_cam", ImVec2(cam, rowh));
     bool cam_hov = ImGui::IsItemHovered(), cam_clk = ImGui::IsItemClicked();
-    dl->AddRectFilled(cp, ImVec2(cp.x + cam, cp.y + rowh),
+    dl->AddRectFilled(ImVec2(cp.x, cp.y), ImVec2(cp.x + cam, cp.y + rowh_base),
                       ImGui::GetColorU32(cam_hov ? T.frame_hi : T.card_bg), 6.0f * scale);
-    dl->AddRect(cp, ImVec2(cp.x + cam, cp.y + rowh), soft_border, 6.0f * scale, 0, 1.0f);
-    draw_icon(dl, IC_CAMERA, ImVec2(cp.x + cam * 0.5f, cp.y + rowh * 0.5f),
+    dl->AddRect(ImVec2(cp.x, cp.y), ImVec2(cp.x + cam, cp.y + rowh_base),
+                soft_border, 6.0f * scale, 0, 1.0f);
+    draw_icon(dl, IC_CAMERA, ImVec2(cp.x + cam * 0.5f, cp.y + rowh_base * 0.5f),
               cam * 0.24f, ImGui::GetColorU32(T.text),
               ImGui::GetColorU32(T.card_bg), 1.8f * scale);
     if (cam_clk) ui_action_fire(SVC_HK_ASK);
@@ -6070,42 +6710,89 @@ static void composer_bar(const ui_theme_t &T, float scale) {
                 active ? hi_border : soft_border, 8.0f * scale, 0,
                 active ? 1.4f * scale : 1.0f);
 
-    char cbuf[CHAT_BUF_SIZE]; int clen = 0; int ccur = 0;
-    if (active) {
-        ensure_chat_cs();
-        EnterCriticalSection(&g_chat_cs);
-        clen = g_chat_len; if (clen > CHAT_BUF_SIZE - 1) clen = CHAT_BUF_SIZE - 1;
-        memcpy(cbuf, g_chat_buf, (size_t)clen); cbuf[clen] = 0;
-        ccur = g_chat_cursor; if (ccur < 0) ccur = 0; if (ccur > clen) ccur = clen;
-        LeaveCriticalSection(&g_chat_cs);
-    }
     /* Clip so long typing doesn't spill into the send square. */
-    dl->PushClipRect(ImVec2(fp.x + 8.0f * scale, fp.y),
-                     ImVec2(fp.x + fieldw - 8.0f * scale, fp.y + rowh), true);
-    ImVec2 tp(fp.x + 14.0f * scale, fp.y + (rowh - fh) * 0.5f);
+    float clip_l = fp.x + 8.0f * scale;
+    float clip_r = fp.x + fieldw - 8.0f * scale;
+    dl->PushClipRect(ImVec2(clip_l, fp.y),
+                     ImVec2(clip_r, fp.y + rowh), true);
+    float text_l = fp.x + 14.0f * scale;                   /* left inset  */
     bool blink = ((GetTickCount() / 500) & 1) == 0;
+
     if (active) {
-        if (clen > 0) {
-            /* Split at cursor so the blink block sits at ccur. */
-            char before[CHAT_BUF_SIZE], after[CHAT_BUF_SIZE];
-            memcpy(before, cbuf, (size_t)ccur); before[ccur] = 0;
-            int tail = clen - ccur;
-            memcpy(after, cbuf + ccur, (size_t)tail); after[tail] = 0;
-            float bx = tp.x;
-            if (ccur > 0) {
-                dl->AddText(ImVec2(bx, tp.y), ImGui::GetColorU32(T.text), before);
-                bx += ImGui::CalcTextSize(before).x;
-            }
-            if (blink) dl->AddText(ImVec2(bx, tp.y), ImGui::GetColorU32(T.text), "\xE2\x96\x8A");
-            if (tail > 0) {
-                float ax = bx + (blink ? ImGui::CalcTextSize("\xE2\x96\x8A").x : 0.0f);
-                dl->AddText(ImVec2(ax, tp.y), ImGui::GetColorU32(T.text), after);
-            }
-        } else {
+        if (clen == 0) {
+            /* Empty buffer -- render just the caret at row 0. */
+            ImVec2 tp(text_l, fp.y + (rowh_base - fh) * 0.5f);
             dl->AddText(tp, ImGui::GetColorU32(T.text), blink ? "\xE2\x96\x8A" : " ");
+        } else {
+            /* Row-by-row rendering. Find scroll offset so the caret row
+             * stays in view when we exceed COMPOSER_MAX_ROWS. */
+            int total_rows = 1;
+            int caret_row  = 0;
+            int caret_col  = 0;   /* bytes from row start */
+            {
+                int col = 0;
+                for (int i = 0; i < clen; i++) {
+                    if (i == ccur) { caret_row = total_rows - 1; caret_col = col; }
+                    if (cbuf[i] == '\n') { total_rows++; col = 0; }
+                    else col++;
+                }
+                if (ccur == clen) { caret_row = total_rows - 1; caret_col = col; }
+            }
+            int visible_rows = (total_rows > COMPOSER_MAX_ROWS) ? COMPOSER_MAX_ROWS : total_rows;
+            int scroll_row   = 0;
+            if (caret_row >= visible_rows) scroll_row = caret_row - visible_rows + 1;
+
+            /* Top offset -- for a 1-row field we center vertically; for
+             * multi-row we top-pad by a fixed inset so all rows sit at
+             * predictable y positions. */
+            float y_top = (rows == 1)
+                ? fp.y + (rowh_base - fh) * 0.5f
+                : fp.y + 7.0f * scale;
+
+            /* Walk rows, drawing each. We track byte offsets so we can
+             * place the caret using CalcTextSize for the row prefix. */
+            int cur_row_start = 0;
+            int cur_row       = 0;
+            for (int i = 0; i <= clen; i++) {
+                bool eol = (i == clen) || (cbuf[i] == '\n');
+                if (!eol) continue;
+                int row_len = i - cur_row_start;
+                if (cur_row >= scroll_row && cur_row < scroll_row + visible_rows) {
+                    /* Render this row's text (may be zero-length). */
+                    float rowY = y_top + (float)(cur_row - scroll_row) * row_px;
+                    if (row_len > 0) {
+                        /* AddText requires a NUL-terminated string; render the
+                         * slice by temporarily overwriting cbuf[i]. */
+                        char save = cbuf[i]; cbuf[i] = 0;
+                        dl->AddText(ImVec2(text_l, rowY),
+                                    ImGui::GetColorU32(T.text),
+                                    cbuf + cur_row_start);
+                        cbuf[i] = save;
+                    }
+                    /* Caret on this row? */
+                    if (blink && cur_row == caret_row) {
+                        float caret_x = text_l;
+                        if (caret_col > 0) {
+                            char save = cbuf[cur_row_start + caret_col];
+                            cbuf[cur_row_start + caret_col] = 0;
+                            caret_x += ImGui::CalcTextSize(cbuf + cur_row_start).x;
+                            cbuf[cur_row_start + caret_col] = save;
+                        }
+                        dl->AddText(ImVec2(caret_x, rowY),
+                                    ImGui::GetColorU32(T.text), "\xE2\x96\x8A");
+                    }
+                }
+                cur_row++;
+                cur_row_start = i + 1;   /* skip the '\n' */
+                if (i == clen) break;
+            }
         }
     } else {
-        dl->AddText(tp, ImGui::GetColorU32(T.text_dim), "Ask anything\xE2\x80\xA6");
+        /* Placeholder. v17 hints at Shift+Enter for newline so users
+         * discover the feature without a tooltip. */
+        ImVec2 tp(text_l, fp.y + (rowh_base - fh) * 0.5f);
+        dl->AddText(tp, ImGui::GetColorU32(T.text_dim),
+                    "Ask anything\xE2\x80\xA6 (Shift+Enter for newline)");
     }
     dl->PopClipRect();
 
@@ -6127,7 +6814,8 @@ static void composer_bar(const ui_theme_t &T, float scale) {
     /* Send square (RIGHT). Only enabled when there's typed text -- the camera
      * (LEFT) handles screenshot-only asks. When empty: renders dim + no-op so
      * users understand it's the "commit what I've typed" affordance. Uses the
-     * IC_SEND paper-plane glyph so it reads as "send", not "up arrow". */
+     * IC_SEND paper-plane glyph so it reads as "send", not "up arrow". Stays
+     * anchored to the first row visually (matches camera). */
     bool has_text = false;
     if (active) {
         ensure_chat_cs();
@@ -6142,28 +6830,175 @@ static void composer_bar(const ui_theme_t &T, float scale) {
     ImU32 snd_bg = has_text
         ? ImGui::GetColorU32(snd_hov ? T.accent_hi : T.accent)
         : ImGui::GetColorU32(T.frame_bg);
-    dl->AddRectFilled(sp, ImVec2(sp.x + send, sp.y + rowh), snd_bg, 6.0f * scale);
+    dl->AddRectFilled(sp, ImVec2(sp.x + send, sp.y + rowh_base), snd_bg, 6.0f * scale);
     if (!has_text)
-        dl->AddRect(sp, ImVec2(sp.x + send, sp.y + rowh),
+        dl->AddRect(sp, ImVec2(sp.x + send, sp.y + rowh_base),
                     soft_border, 6.0f * scale, 0, 1.0f);
     ImU32 snd_fg = has_text
         ? ImGui::GetColorU32(T.accent_text)
         : ImGui::GetColorU32(T.text_dim);
-    draw_icon(dl, IC_SEND, ImVec2(sp.x + send * 0.5f, sp.y + rowh * 0.5f),
+    draw_icon(dl, IC_SEND, ImVec2(sp.x + send * 0.5f, sp.y + rowh_base * 0.5f),
               send * 0.24f, snd_fg, snd_bg, 2.0f * scale);
     if (snd_clk && has_text) chat_submit_typed_text();
 
-    /* Outside-click unfocus. Preserves buffer -- only stops LL key routing. */
+    /* Outside-click unfocus. Preserves buffer -- only stops LL key routing.
+     * Field hit-rect uses full rowh (may exceed rowh_base when multi-line).
+     * Camera + send use rowh_base to match their visible rectangles -- a
+     * click on the "empty area" below the send square when the field is
+     * expanded should NOT count as inside-send (correctly falls through to
+     * the outside-click deactivator below). */
     if (active && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         ImVec2 m = ImGui::GetIO().MousePos;
         bool in_field = m.x >= fp.x && m.x <= fp.x + fieldw && m.y >= fp.y && m.y <= fp.y + rowh;
-        bool in_send  = m.x >= sp.x && m.x <= sp.x + send   && m.y >= sp.y && m.y <= sp.y + rowh;
-        bool in_cam   = m.x >= cp.x && m.x <= cp.x + cam    && m.y >= cp.y && m.y <= cp.y + rowh;
+        bool in_send  = m.x >= sp.x && m.x <= sp.x + send   && m.y >= sp.y && m.y <= sp.y + rowh_base;
+        bool in_cam   = m.x >= cp.x && m.x <= cp.x + cam    && m.y >= cp.y && m.y <= cp.y + rowh_base;
         if (!in_field && !in_send && !in_cam) {
             InterlockedExchange(&g_chat_active, 0);
             wake_dwm_composition();
         }
     }
+}
+
+/* ── v17 (2026-09-23) reference-notes editor overlay ────────────
+ *
+ * When Ctrl+Shift+Alt+N is pressed, the notes editor opens as a MODAL
+ * card centered near the top of the screen. All non-hotkey keystrokes
+ * are diverted into the notes buffer (through the ui_editor_* dispatch
+ * layer in this file). Esc closes + saves (encrypted at rest via
+ * notes.c). On close the buffer's contents are prepended to every
+ * subsequent AI prompt as reference context (see dllmain::ask_ai_thread).
+ *
+ * The editor uses the SAME multi-row rendering pattern as the composer
+ * bar's multi-line text -- just with a larger row cap (16 rows visible,
+ * scrolling handled by shifting scroll_row so the caret stays in view).
+ *
+ * Capture-stealth: drawn AFTER g_hide_frames_for_capture check in
+ * draw_chat_window, so screenshots taken for AI don't include the
+ * editor's UI chrome. */
+extern "C" void ui_draw_notes_editor(UINT sw, UINT sh) {
+    if (!notes_editor_is_open()) return;
+    ImDrawList *fg = ImGui::GetForegroundDrawList();
+    if (!fg) return;
+    float scale = ImGui::GetIO().FontGlobalScale;
+    float fh    = ImGui::GetFontSize();
+    if (scale < 0.5f) scale = 0.5f;
+
+    /* Card sizing: 70% of screen width, height = min(60% screen, 20 rows).*/
+    float card_w = (float)sw * 0.70f;
+    if (card_w < 400.0f) card_w = 400.0f;
+    if (card_w > 900.0f) card_w = 900.0f;
+    float row_px = fh + 4.0f * scale;
+    int   max_rows = 16;
+    float body_pad_y = 14.0f * scale;
+    float title_h = 32.0f * scale;
+    float footer_h = 26.0f * scale;
+    float body_h  = (float)max_rows * row_px + body_pad_y * 2;
+    float card_h  = title_h + body_h + footer_h;
+    if (card_h > (float)sh * 0.75f) card_h = (float)sh * 0.75f;
+
+    float ox = ((float)sw - card_w) * 0.5f;
+    float oy = (float)sh * 0.12f;
+
+    /* Backdrop dim -- semi-opaque black to focus attention. */
+    fg->AddRectFilled(ImVec2(0, 0), ImVec2((float)sw, (float)sh),
+                      IM_COL32(0, 0, 0, 110));
+
+    /* Card. */
+    float radius = 8.0f * scale;
+    fg->AddRectFilled(ImVec2(ox + 2, oy + 4), ImVec2(ox + card_w + 2, oy + card_h + 4),
+                      IM_COL32(0, 0, 0, 120), radius);
+    fg->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + card_w, oy + card_h),
+                      IM_COL32(20, 20, 22, 245), radius);
+    fg->AddRect(ImVec2(ox, oy), ImVec2(ox + card_w, oy + card_h),
+                IM_COL32(255, 255, 255, 65), radius, 0, 1.2f);
+
+    /* Title row. */
+    float title_y = oy + (title_h - fh) * 0.5f;
+    fg->AddText(ImVec2(ox + 16.0f * scale, title_y),
+                IM_COL32(230, 230, 235, 255),
+                "Reference Notes  (prepended to every AI prompt)");
+
+    /* Body: multi-row render of notes buffer + caret. */
+    float body_top = oy + title_h + body_pad_y;
+    float body_bot = oy + title_h + body_h - body_pad_y;
+    float text_l = ox + 16.0f * scale;
+    float text_r = ox + card_w - 16.0f * scale;
+    fg->AddRectFilled(ImVec2(ox + 12.0f * scale, oy + title_h + 4.0f * scale),
+                      ImVec2(ox + card_w - 12.0f * scale, oy + title_h + body_h - 4.0f * scale),
+                      IM_COL32(12, 12, 14, 220), 6.0f * scale);
+
+    char buf[NOTES_MAX_BYTES];
+    int  cur = 0;
+    int  n = notes_render_snapshot(buf, sizeof(buf), &cur);
+
+    bool blink = ((GetTickCount() / 500) & 1) == 0;
+    fg->PushClipRect(ImVec2(text_l, body_top), ImVec2(text_r, body_bot), true);
+
+    /* Row scan to place caret + walk visible rows. */
+    int total_rows = 1;
+    int caret_row  = 0;
+    int caret_col  = 0;
+    {
+        int col = 0;
+        for (int i = 0; i < n; i++) {
+            if (i == cur) { caret_row = total_rows - 1; caret_col = col; }
+            if (buf[i] == '\n') { total_rows++; col = 0; }
+            else col++;
+        }
+        if (cur == n) { caret_row = total_rows - 1; caret_col = col; }
+    }
+    int visible_rows = (int)((body_bot - body_top) / row_px);
+    if (visible_rows < 1) visible_rows = 1;
+    int scroll_row = 0;
+    if (caret_row >= visible_rows) scroll_row = caret_row - visible_rows + 1;
+
+    int cur_row_start = 0, cur_row = 0;
+    for (int i = 0; i <= n; i++) {
+        bool eol = (i == n) || (buf[i] == '\n');
+        if (!eol) continue;
+        int row_len = i - cur_row_start;
+        if (cur_row >= scroll_row && cur_row < scroll_row + visible_rows) {
+            float rowY = body_top + (float)(cur_row - scroll_row) * row_px;
+            if (row_len > 0) {
+                char save = buf[i]; buf[i] = 0;
+                fg->AddText(ImVec2(text_l, rowY),
+                            IM_COL32(228, 228, 234, 255),
+                            buf + cur_row_start);
+                buf[i] = save;
+            }
+            if (blink && cur_row == caret_row) {
+                float cx = text_l;
+                if (caret_col > 0) {
+                    char save = buf[cur_row_start + caret_col];
+                    buf[cur_row_start + caret_col] = 0;
+                    cx += ImGui::CalcTextSize(buf + cur_row_start).x;
+                    buf[cur_row_start + caret_col] = save;
+                }
+                fg->AddText(ImVec2(cx, rowY),
+                            IM_COL32(228, 228, 234, 255), "\xE2\x96\x8A");
+            }
+        }
+        if (n == 0) break;
+        cur_row++;
+        cur_row_start = i + 1;
+        if (i == n) break;
+    }
+    if (n == 0 && blink) {
+        fg->AddText(ImVec2(text_l, body_top),
+                    IM_COL32(140, 140, 150, 255),
+                    "Paste study notes here (Ctrl+V). Shift+Enter for newline.");
+    }
+    fg->PopClipRect();
+
+    /* Footer: status + hotkey hints + char count. */
+    char status[128];
+    _snprintf(status, sizeof(status) - 1,
+              "%d / %d chars   \xE2\x80\xA2   Esc to save & close   \xE2\x80\xA2   Ctrl+Shift+Alt+N to toggle",
+              n, NOTES_MAX_BYTES - 1);
+    fg->AddText(ImVec2(ox + 16.0f * scale, oy + title_h + body_h + (footer_h - fh) * 0.5f),
+                IM_COL32(150, 150, 160, 255), status);
+
+    (void)ImGuiWindowFlags_NoMove;   /* silence unused-value warnings, if any */
 }
 
 /* Visible resize grips -- corner brackets on ALL FOUR corners so it's
@@ -6296,6 +7131,31 @@ extern "C" void ui_dot_set_answer(const char *s, const char *f) {
     _snprintf(g_dot_full,  sizeof(g_dot_full)  - 1, "%s", f ? f : ""); g_dot_full[sizeof(g_dot_full)  - 1] = 0;
     LeaveCriticalSection(&g_dot_cs);
 }
+/* v17 (2026-09-23) -- Snapshot the current answer for the autotyper's
+ * Ctrl+Alt+Y hotkey. Prefers the full answer; falls back to the short
+ * (dot glyph) answer if there's no body. Returns the number of bytes
+ * written (excluding NUL). Zero-length = nothing to type. */
+extern "C" int ui_dot_snapshot_answer(char *out, int cap) {
+    if (!out || cap <= 0) return 0;
+    dot_ensure_cs();
+    EnterCriticalSection(&g_dot_cs);
+    const char *src = g_dot_full[0] ? g_dot_full : g_dot_short;
+    int n = (int)strlen(src);
+    if (n > cap - 1) n = cap - 1;
+    if (n > 0) memcpy(out, src, (size_t)n);
+    out[n] = 0;
+    LeaveCriticalSection(&g_dot_cs);
+    return n;
+}
+/* v17 (2026-09-23) -- Called by dllmain when opening the notes editor.
+ * Forces the overlay ON (idempotent) so the notes panel is on screen. */
+extern "C" void ui_force_visible(void) {
+    EnterCriticalSection(&g_ui_cs);
+    g_visible = true;
+    LeaveCriticalSection(&g_ui_cs);
+    state_mark_dirty();
+    wake_dwm_composition();
+}
 extern "C" void ui_dot_set_meta(const char *question, double confidence) {
     dot_ensure_cs();
     EnterCriticalSection(&g_dot_cs);
@@ -6410,10 +7270,23 @@ static bool draw_button_icon(ImDrawList *fg, float bx, float by, float bw, float
     ImU32 col   = copied_flash ? IM_COL32(80, 220, 130, Aval)
                                : IM_COL32(230, 230, 235, Aval);
     fg->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh), bg, 4.0f);
+    /* v17 (2026-09-23) -- Detect Lucide Private-Use codepoints (0xE000-0xF8FF
+     * encoded UTF-8 as 0xEE 0x8?/0x9? ...). Those aren't in the UI font atlas;
+     * they only render correctly via g_font_icons. This keeps the T icon
+     * consistent across the toolbar (which routes through icon_button/
+     * draw_icon and already uses g_font_icons) and the dot popout / chat
+     * bubbles (which call this function directly). */
     ImFont *font = ImGui::GetFont();
-    float fs = ImGui::GetFontSize();
-    ImVec2 tsz = ImGui::CalcTextSize(icon);
-    fg->AddText(font, fs * 0.95f,
+    float   fs   = ImGui::GetFontSize();
+    bool    lucide = (icon && (unsigned char)icon[0] == 0xEE);
+    if (lucide && g_font_icons) {
+        font = g_font_icons;
+        fs   = bw * 0.7f;    /* size the glyph to the button, like draw_icon */
+    }
+    ImVec2 tsz = (lucide && g_font_icons)
+                 ? g_font_icons->CalcTextSizeA(fs, 10000.0f, 0.0f, icon)
+                 : ImGui::CalcTextSize(icon);
+    fg->AddText(font, lucide ? fs : fs * 0.95f,
                 ImVec2(bx + (bw - tsz.x) * 0.5f, by + (bh - tsz.y) * 0.5f),
                 col, icon);
     /* Click detection uses the EXPANDED (hit-slop) rect. */
@@ -6432,15 +7305,17 @@ static void draw_toolbar_pill(ImDrawList *fg, float ox, float oy, float *out_w, 
                               int st, float a,
                               const char *shortbuf, char mcqL,
                               ImVec2 mp, bool mc, bool mr,
-                              bool *hit_dot, bool *hit_copy, bool *hit_ham,
-                              bool copy_flashing) {
+                              bool *hit_dot, bool *hit_copy, bool *hit_type, bool *hit_ham,
+                              bool copy_flashing, bool typing_in_flight) {
     (void)shortbuf;
     ImFont *font = ImGui::GetFont();
     float fs = ImGui::GetFontSize();
     float pad = 8.0f, gap = 6.0f;
     float dr = 7.0f;
     float btn = 26.0f;
-    float w = TOOLBAR_PILL_W;   /* fixed -- see comment above */
+    /* v17 (2026-09-23) -- widen pill by 30px to fit the new type button
+     * without collapsing hit-slop between neighbours. */
+    float w = TOOLBAR_PILL_W + 30.0f;
     if (out_w) *out_w = w;
 
     int   bgA = (int)(200 * a); if (bgA < 60) bgA = 60;
@@ -6467,13 +7342,19 @@ static void draw_toolbar_pill(ImDrawList *fg, float ox, float oy, float *out_w, 
                     IM_COL32(0, 0, 0, 255), lb);
     }
 
-    /* Buttons: [ham] [copy] * dot ── left of the dot. */
-    float bxC = cx - dr - 8 - btn;                 /* copy button LEFT */
-    float bxH = bxC - 4 - btn;                     /* hamburger LEFT */
+    /* Buttons (v17): [ham] [type] [copy] * dot ── left of the dot. */
+    float bxC = cx - dr - 8 - btn;                 /* copy      */
+    float bxT = bxC - 4 - btn;                     /* type      */
+    float bxH = bxT - 4 - btn;                     /* hamburger */
     float by  = oy + (h - btn) * 0.5f;
     if (hit_copy) *hit_copy = draw_button_icon(fg, bxC, by, btn, btn,
                                                copy_flashing ? "\xE2\x9C\x93" : "\xE2\x8E\x98",
                                                a, true, copy_flashing, mp, mc, mr);
+    /* v17 -- toolbar pill's type button uses Lucide "type" T-glyph
+     * (U+E198) to match toolbar + chat-bubble buttons + svchelper. */
+    if (hit_type) *hit_type = draw_button_icon(fg, bxT, by, btn, btn,
+                                               "\xEE\x86\x98" /*Lucide type-T*/,
+                                               a, true, typing_in_flight, mp, mc, mr);
     if (hit_ham)  *hit_ham  = draw_button_icon(fg, bxH, by, btn, btn, "\xE2\x98\xB0",
                                                a, true, false, mp, mc, mr);
 
@@ -6502,8 +7383,10 @@ static void draw_full_card(ImDrawList *fg, float ox, float oy, float w, float h,
                            const char *shortbuf, const char *fullbuf,
                            const char *qbuf, float conf, char mcqL,
                            ImVec2 mp, bool mc, bool mr,
-                           bool *hit_copy, bool *hit_chevron, bool *hit_ham, bool *hit_dot,
-                           bool copy_flashing, bool show_slider) {
+                           bool *hit_copy, bool *hit_type, bool *hit_chevron,
+                           bool *hit_ham, bool *hit_dot,
+                           bool copy_flashing, bool typing_in_flight,
+                           bool show_slider) {
     /* v16 (2026-09-22) -- Apple-tight radius (6px, not 8) matches the overlay
      * chrome. Bg = NL.card #111 area (~ IM_COL32(17,17,17)) for cohesion. */
     float radius = 6.0f;
@@ -6545,13 +7428,27 @@ static void draw_full_card(ImDrawList *fg, float ox, float oy, float w, float h,
         fg->AddText(font, lfs, ImVec2(cx - ltw * 0.5f,        cy - lth * 0.55f),
                     IM_COL32(0, 0, 0, 255), lb);
     }
-    float bxC = cx - dr - 8 - btn;                 /* copy */
-    float bxV = bxC - 4 - btn;                     /* chevron */
+    /* v17 (2026-09-23) -- new "type" button between copy + chevron.
+     * Layout right-to-left: [dot] [copy] [type] [chevron] [hamburger].
+     * Icon = U+2328 KEYBOARD (⌨) so it visually reads "type these
+     * keystrokes into whatever's focused". Flashes GREEN while the
+     * human_typer engine is mid-session (`typing_in_flight`) so the
+     * user can tell it's active. Click launches the autotyper on
+     * fullbuf; ESC cancels mid-flight (handled by the engine's own
+     * VK_ESCAPE poll). */
+    float bxC = cx - dr - 8 - btn;                 /* copy      */
+    float bxT = bxC - 4 - btn;                     /* type      */
+    float bxV = bxT - 4 - btn;                     /* chevron   */
     float bxH = bxV - 4 - btn;                     /* hamburger */
     float by  = row_y + (row_h - btn) * 0.5f;
     if (hit_copy)    *hit_copy    = draw_button_icon(fg, bxC, by, btn, btn,
                                                      copy_flashing ? "\xE2\x9C\x93" : "\xE2\x8E\x98",
                                                      a, true, copy_flashing, mp, mc, mr);
+    /* v17 -- FULL card's type button uses Lucide "type" T-glyph (U+E198)
+     * to match toolbar + toolbar pill + chat bubbles + svchelper. */
+    if (hit_type)    *hit_type    = draw_button_icon(fg, bxT, by, btn, btn,
+                                                     "\xEE\x86\x98" /*Lucide type-T*/,
+                                                     a, true, typing_in_flight, mp, mc, mr);
     if (hit_chevron) *hit_chevron = draw_button_icon(fg, bxV, by, btn, btn,
                                                      show_slider ? "\xE2\x96\xB2" /*▲*/ : "\xE2\x96\xBC" /*▼*/,
                                                      a, true, false, mp, mc, mr);
@@ -7003,18 +7900,21 @@ static void draw_answer_dot(UINT sw, UINT sh) {
 
     /* Render the surface AFTER interaction so buttons can consume the
      * up-click this frame. */
-    bool hit_copy = false, hit_ham = false, hit_chevron = false, hit_dot_toolbar = false, hit_dot_full = false;
+    bool hit_copy = false, hit_type = false, hit_ham = false, hit_chevron = false;
+    bool hit_dot_toolbar = false, hit_dot_full = false;
+    bool typing_in_flight = human_type_is_busy() != 0;
     if (ui == 2) {
         draw_full_card(fg, ox, oy, cw, ch, st, a,
                        shortbuf, fullbuf, qbuf, conf, mcqL,
-                       mp, mc, mr, &hit_copy, &hit_chevron, &hit_ham, &hit_dot_full,
-                       copy_flashing, show_slider);
+                       mp, mc, mr, &hit_copy, &hit_type, &hit_chevron, &hit_ham,
+                       &hit_dot_full, copy_flashing, typing_in_flight,
+                       show_slider);
     } else if (ui == 1) {
         float tw = cw;
         draw_toolbar_pill(fg, ox, oy, &tw, ch, st, a,
                           shortbuf, mcqL, mp, mc, mr,
-                          &hit_dot_toolbar, &hit_copy, &hit_ham,
-                          copy_flashing);
+                          &hit_dot_toolbar, &hit_copy, &hit_type, &hit_ham,
+                          copy_flashing, typing_in_flight);
         /* toolbar width is FIXED (TOOLBAR_PILL_W); no republish needed. */
     } else {
         draw_dot_glyph(fg, cx, cy, r, st, a, dot_state_is_solving(st));
@@ -7058,6 +7958,22 @@ static void draw_answer_dot(UINT sw, UINT sh) {
                 if (fullbuf[0]) clip_set_utf8(fullbuf);
                 else if (shortbuf[0]) clip_set_utf8(shortbuf);
                 g_dot_copied_at = GetTickCount();
+            } else if (hit_type) {
+                /* v17: launch human autotyper on the current answer.
+                 * If a session is already running, this second click
+                 * CANCELS it (matches user muscle memory: "click again
+                 * to stop"). Otherwise pull the fullbuf (or shortbuf as
+                 * fallback) and fire. */
+                if (human_type_is_busy()) {
+                    human_type_cancel();
+                } else {
+                    const char *txt = fullbuf[0] ? fullbuf : shortbuf;
+                    if (txt && txt[0]) {
+                        human_typer_opts_t opts;
+                        human_type_default_opts(&opts);
+                        human_type_start(txt, &opts);
+                    }
+                }
             } else if (hit_chevron && ui == 2) {
                 int ns = show_slider ? 0 : 1;
                 InterlockedExchange(&g_dot_show_slider, ns);
@@ -7083,6 +7999,57 @@ static void draw_answer_dot(UINT sw, UINT sh) {
             /* Note: tap on FULL body outside a button / dot area = no-op. */
         }
     }
+}
+
+/* v17 (2026-09-23) -- Human autotyper status indicator.
+ *
+ * Small dark pill near the top-center of the screen (right below the
+ * agent-status area, above any dot popout at top-right) with a live
+ * "typing…" label + character count when the engine is running.
+ * Renders on the foreground draw list so it's visible independent of
+ * the main overlay's visibility. Capture-stealth: gated by the same
+ * g_hide_frames_for_capture check as the whole draw_chat_window path.
+ *
+ * Purpose: gives AutoSolver + Ctrl+Alt+T + Ctrl+Alt+Y + per-bubble
+ * type-button an OBVIOUS "yes, it's happening" affordance so users
+ * don't spam-click the button thinking nothing fired. Matches
+ * hooksdll's Electron overlay's typing indicator (a small status
+ * badge that appears while human_typer is active). */
+static void draw_typer_status(UINT sw, UINT sh) {
+    if (!human_type_is_busy()) return;
+    ImDrawList *fg = ImGui::GetForegroundDrawList();
+    if (!fg) return;
+    float scale = (float)sh / 1080.0f;
+    if (scale < 0.75f) scale = 0.75f;
+    if (scale > 2.5f)  scale = 2.5f;
+    float fs = ImGui::GetFontSize();
+
+    /* Simple ellipsis animation so it feels alive. */
+    static const char *phases[3] = {
+        "\xE2\x8C\xA8  autotyping\xE2\x80\xA6",
+        "\xE2\x8C\xA8  autotyping",
+        "\xE2\x8C\xA8  autotyping\xE2\x80\xA6\xE2\x80\xA6",
+    };
+    const char *label = phases[(GetTickCount() / 400) % 3];
+
+    ImVec2 sz = ImGui::CalcTextSize(label);
+    float pad_x = 12.0f * scale;
+    float pad_y = 6.0f * scale;
+    float w = sz.x + pad_x * 2;
+    float h = sz.y + pad_y * 2;
+    /* Position: top-center. If agent-status is showing (~30px at same
+     * spot) shift down by that; else top edge. */
+    float x0 = ((float)sw - w) * 0.5f;
+    float y0 = 10.0f * scale;
+    if (InterlockedCompareExchange(&g_agent_active, 0, 0)) y0 += 46.0f * scale;
+    fg->AddRectFilled(ImVec2(x0 + 1, y0 + 2), ImVec2(x0 + w + 1, y0 + h + 2),
+                      IM_COL32(0, 0, 0, 90), 6.0f * scale);
+    fg->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + w, y0 + h),
+                      IM_COL32(28, 32, 24, 235), 6.0f * scale);
+    fg->AddRect      (ImVec2(x0, y0), ImVec2(x0 + w, y0 + h),
+                      IM_COL32(140, 240, 170, 220), 6.0f * scale, 0, 1.4f);
+    fg->AddText(ImGui::GetFont(), fs, ImVec2(x0 + pad_x, y0 + pad_y),
+                IM_COL32(200, 250, 210, 255), label);
 }
 
 static void draw_agent_status(UINT sw, UINT sh) {
@@ -7118,6 +8085,14 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
      * gate above), independent of the chat overlay's visibility. */
     draw_answer_dot(screen_w, screen_h);
     draw_agent_status(screen_w, screen_h);
+    /* v17 (2026-09-23) -- Autotyper status pill (visible whenever the human
+     * autotyper is running, regardless of which entry point fired it). */
+    draw_typer_status(screen_w, screen_h);
+    /* v17 (2026-09-23) -- Notes editor modal (Ctrl+Shift+Alt+N). Drawn on
+     * the foreground draw list AFTER the dot so it stacks above other UI.
+     * See draw_notes_editor definition below composer_bar. */
+    extern void ui_draw_notes_editor(UINT sw, UINT sh);
+    ui_draw_notes_editor(screen_w, screen_h);
 
     /* v1.7.11.8 REVERTED (2026-07-25) -- fullscreen dirty-touch quad
      * showed as visible "dim dance" per LO test AND did not fix Chrome
@@ -7813,6 +8788,12 @@ static DWORD WINAPI input_reattach_worker(LPVOID) {
 extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
     (void)pCtx;
     if (!pLayer) return;
+
+    /* v-ctrlb-hardening (2026-09-23) -- publish compose thread id ONCE
+     * on first fire so invalidate_last_overlay_region's compose-thread
+     * guard can skip full-desktop RedrawWindow cascades that would
+     * re-enter DWM's own compose loop.  Idempotent (CAS-guarded). */
+    ui_publish_compose_thread_id();
 
     /* v3.1 (2026-09-21) -- POST-Windows-update compose-degraded guard.
      * If the canary tripped (Present detour was installed but DWM

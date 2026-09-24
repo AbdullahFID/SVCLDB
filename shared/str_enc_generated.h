@@ -109,7 +109,7 @@ typedef enum {
 
 /* const: ciphertext at rest for the whole process lifetime. svc_str()
  * decrypts on demand into a transient scratch ring (see str_enc.c). */
-extern const char g_svc_enc_blob[3948];
+extern const char g_svc_enc_blob[3941];
 
 typedef struct { size_t offset; size_t length; } svc_str_entry_t;
 extern const svc_str_entry_t g_svc_enc_table[SVC_STR_COUNT];

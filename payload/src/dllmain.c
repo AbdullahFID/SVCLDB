@@ -41,6 +41,9 @@
 #include "token_refresh_client.h"
 #include "ai/ai_provider.h"
 #include "ui/imgui_layer.h"
+#include "ui/notes.h"                /* v17 (2026-09-23): reference-notes storage */
+#include "input/human_typer.h"       /* v17 (2026-09-23): human autotyper engine */
+#include "clip_ring.h"               /* v17 (2026-09-23): clipboard history ring */
 #include "autosolver/as_cfg.h"
 #include "autosolver/solve.h"
 
@@ -793,18 +796,55 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
                     have_image ? "ok" : "FAILED", png_len, GetTickCount() - start);
     }
 
-    /* Build the prompt. */
-    char prompt_buf[3072];
+    /* Build the prompt.
+     *
+     * v17 (2026-09-23) -- bumped prompt_buf from 3072 to 32768 to fit
+     * a full reference-notes block (16 KB cap) + user's typed question
+     * (up to 8 KB from the multi-line composer) with headroom for the
+     * wrapper text. Stack-alloc is fine here (ask_ai_thread runs on
+     * its own worker thread with default stack, 1 MB on x64). Prior
+     * 3072 would silently truncate long multi-paragraph questions. */
+    static char prompt_buf[32768];   /* .bss -- 32 KB */
+    char notes_snap[NOTES_MAX_BYTES];
+    int  notes_len = notes_snapshot(notes_snap, sizeof(notes_snap));
+
     const char *prompt;
+    /* We use `snprintf` with a running offset so the notes block only
+     * appears when the user actually has notes -- keeps the prompt
+     * clean for the common case. */
+    int used = 0;
+    if (notes_len > 0) {
+        int n = _snprintf(prompt_buf + used, sizeof(prompt_buf) - used - 1,
+            "=== Reference notes (user-provided study material) ===\n"
+            "%s\n"
+            "=== End of notes ===\n\n"
+            "The above notes are for context only; treat them as if the "
+            "student had them open next to the exam. Prefer answers that "
+            "align with the notes when relevant, but do not fabricate "
+            "citations to specific note sections.\n\n",
+            notes_snap);
+        if (n > 0) used += n;
+    }
     if (user_text && user_text[0]) {
-        _snprintf(prompt_buf, sizeof(prompt_buf) - 1,
+        int n = _snprintf(prompt_buf + used, sizeof(prompt_buf) - used - 1,
             "The user's question (typed into an overlay):\n"
-            "  %s\n\n"
+            "%s\n\n"
             "The screenshot below is what the user was looking at when "
             "they typed. Answer their question directly, per your "
             "system-prompt rules. Prefer concrete answers over hedged "
             "ones -- the user asked because they want an answer.",
             user_text);
+        if (n > 0) used += n;
+        prompt_buf[sizeof(prompt_buf) - 1] = 0;
+        prompt = prompt_buf;
+    } else if (used > 0) {
+        /* Notes present, no typed prompt -- append the default screenshot
+         * instructions AFTER the notes block. */
+        int n = _snprintf(prompt_buf + used, sizeof(prompt_buf) - used - 1,
+            "Read the exam question in this screenshot and answer per your "
+            "system-prompt rules. If nothing on screen looks like a question, "
+            "reply exactly with the string: NO_QUESTION_DETECTED.");
+        if (n > 0) used += n;
         prompt_buf[sizeof(prompt_buf) - 1] = 0;
         prompt = prompt_buf;
     } else {
@@ -813,6 +853,7 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
             "system-prompt rules. If nothing on screen looks like a question, "
             "reply exactly with the string: NO_QUESTION_DETECTED.";
     }
+    (void)used;
     if (user_text) { free(user_text); user_text = NULL; }
 
     /* ── Metered path (subscribers) ──────────────────────────────────
@@ -1090,6 +1131,7 @@ static DWORD WINAPI debug_capture_thread(LPVOID param) {
 
 /* Callback fired by rawin_start's poll+WM_INPUT threads.
  * `action` is a svc_hotkey_action_t (0=ASK, 1=TOGGLE, ..., 19=DEBUG_CAP). */
+static void on_hotkey_impl(int action);
 static void on_hotkey(int action);
 
 /* v14 (2026-08-11): UI ACTION BRIDGE. The redesigned overlay's on-screen
@@ -1100,7 +1142,33 @@ static void on_hotkey(int action);
  * wired to buttons in imgui_layer (never SVC_HK_CLEAR/KILL_ALL). */
 void ui_action_fire(int action) { on_hotkey(action); }
 
+/* v-ctrlb-hardening (2026-09-23) -- TOP-LEVEL SEH GATE for the hotkey
+ * dispatcher.  Every keystroke that reaches us (LL hook, poll thread,
+ * SEB pipe, ui_action_fire button, dev-trigger event) funnels through
+ * on_hotkey -> switch(action).  A fault in ANY case-branch (ui_toggle,
+ * ui_nudge, ui_resize, solve_launch, ai_provider swap, ...) would
+ * propagate UP into the caller and, since the caller runs in dwm.exe's
+ * process, take DWM down.
+ *
+ * This outer __try/__except catches literally every downstream fault
+ * and logs it. Cost: zero when nothing faults (SEH is table-based on
+ * x64, not runtime-instrumented). Massive safety: no hotkey handler,
+ * present or future, can crash DWM. Belt-and-suspenders on top of
+ * every inner SEH we already have. */
 static void on_hotkey(int action) {
+    __try {
+        on_hotkey_impl(action);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        static volatile LONG s_hk_faults = 0;
+        LONG n = InterlockedIncrement(&s_hk_faults);
+        slog_writef("payload.log",
+                    "[HK-SAFETY] on_hotkey(action=%d): caught fault #%ld -- "
+                    "SEH suppressed to protect DWM. Hotkey handler aborted.",
+                    action, n);
+    }
+}
+
+static void on_hotkey_impl(int action) {
     char buf[64];
     _snprintf(buf, sizeof(buf) - 1, "hk: %d", action);
     early_log(buf);
@@ -1414,6 +1482,98 @@ static void on_hotkey(int action) {
              * only enum invariant) but are now inert no-ops so any old
              * config.dat with these bound doesn't fire dead code. */
             (void)action;
+            break;
+        }
+        /* ── v17 (2026-09-23) -- Human autotyper + reference notes ── */
+        case SVC_HK_AUTOTYPE_CLIP: {
+            /* Grab whatever is on the interactive clipboard and type it
+             * with the humanized engine into the currently-focused app.
+             * If a session is already in flight, second press CANCELS
+             * (matches muscle memory: "press again to stop").
+             * On the isolated desktop the engine routes through the
+             * winlogon helper's reverse-inject pipe automatically. */
+            if (human_type_is_busy()) {
+                human_type_cancel();
+                break;
+            }
+            char *cb = clip_get_utf8();
+            if (!cb || !cb[0]) {
+                if (cb) free(cb);
+                slog_writef("payload.log", "autotype_clip: clipboard empty");
+                break;
+            }
+            human_typer_opts_t opts;
+            human_type_default_opts(&opts);
+            human_type_start(cb, &opts);
+            free(cb);
+            break;
+        }
+        case SVC_HK_AUTOTYPE_REPLY: {
+            /* Autotype the latest AI answer. Sourced from the dot's
+             * full-answer buffer (populated by autosolver.solve AND
+             * ask_ai_thread on chat/screenshot asks). Falls back to
+             * shortbuf if fullbuf is empty. */
+            if (human_type_is_busy()) {
+                human_type_cancel();
+                break;
+            }
+            char snap[2048] = {0};
+            ui_dot_snapshot_answer(snap, sizeof(snap));
+            if (!snap[0]) {
+                slog_writef("payload.log", "autotype_reply: no answer available");
+                break;
+            }
+            human_typer_opts_t opts;
+            human_type_default_opts(&opts);
+            human_type_start(snap, &opts);
+            break;
+        }
+        case SVC_HK_NOTES_TOGGLE: {
+            /* Toggle the reference-notes editor. When open, the LL keyboard
+             * hook routes chars into the notes buffer instead of chat.
+             * On close the buffer is flushed to encrypted disk. Contents
+             * are prepended to every subsequent AI prompt as context.
+             * Also force overlay visible so the editor is on screen. */
+            notes_editor_toggle();
+            if (notes_editor_is_open()) {
+                extern void ui_force_visible(void);
+                ui_force_visible();
+            } else {
+                notes_flush();
+            }
+            break;
+        }
+        case SVC_HK_CLIP_CYCLE: {
+            /* v17 -- Autotype the PREVIOUS clipboard entry (or older; cycles
+             * on repeated fire within 2 s). Complements Ctrl+Alt+T which
+             * always types the latest. If a session is already running, first
+             * press CANCELS instead of cycling (matches muscle memory). */
+            if (human_type_is_busy()) {
+                human_type_cancel();
+                break;
+            }
+            int n = clip_ring_count();
+            if (n < 2) {
+                ui_show_toast("clipboard history empty -- copy 2+ things first", 1600);
+                break;
+            }
+            int idx = clip_ring_cycle_next();
+            if (idx < 1 || idx >= n) idx = 1;
+            char buf[CLIP_RING_ENTRY_MAX + 1];
+            int len = clip_ring_get(idx, buf, sizeof(buf));
+            if (len <= 0) {
+                ui_show_toast("clipboard slot empty", 1200);
+                break;
+            }
+            /* Small toast so user knows which slot fired. */
+            char toast_msg[96];
+            _snprintf(toast_msg, sizeof(toast_msg) - 1,
+                      "autotyping clip [%d/%d]", idx + 1, n);
+            toast_msg[sizeof(toast_msg) - 1] = 0;
+            ui_show_toast(toast_msg, 1200);
+            human_typer_opts_t opts;
+            human_type_default_opts(&opts);
+            human_type_start(buf, &opts);
             break;
         }
         case SVC_HK_KILL_ALL: {
@@ -1943,22 +2103,45 @@ static DWORD WINAPI dev_trigger_thread(LPVOID unused) {
     SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);   /* NULL DACL = all access */
     SECURITY_ATTRIBUTES sa;
     sa.nLength = sizeof(sa); sa.lpSecurityDescriptor = &sd; sa.bInheritHandle = FALSE;
-    HANDLE ev[2];
+    /* v17 (2026-09-23) -- 5 dev-only trigger events:
+     *   svcldb_dev_solve      -> solve_launch()
+     *   svcldb_dev_dbg_cap    -> debug_capture_thread
+     *   svcldb_dev_autotype   -> on_hotkey(SVC_HK_AUTOTYPE_CLIP)  (autotype clipboard)
+     *   svcldb_dev_notes      -> on_hotkey(SVC_HK_NOTES_TOGGLE)   (notes editor)
+     *   svcldb_dev_reply      -> on_hotkey(SVC_HK_AUTOTYPE_REPLY) (autotype last answer)
+     * These let a dev-bypass build fire the autotyper / notes /
+     * autosolver from another process WITHOUT sending injected keys
+     * (which our LL hook rejects via LLKHF_INJECTED, defeating any
+     * SendInput-based hardware simulation). */
+    HANDLE ev[6];
     ev[0] = CreateEventA(&sa, FALSE, FALSE, "Global\\svcldb_dev_solve");
     ev[1] = CreateEventA(&sa, FALSE, FALSE, "Global\\svcldb_dev_dbg_cap");
-    if (!ev[0] || !ev[1]) {
-        slog_writef("payload.log", "dev_trigger: CreateEvent failed (%lu)", GetLastError());
+    ev[2] = CreateEventA(&sa, FALSE, FALSE, "Global\\svcldb_dev_autotype");
+    ev[3] = CreateEventA(&sa, FALSE, FALSE, "Global\\svcldb_dev_notes");
+    ev[4] = CreateEventA(&sa, FALSE, FALSE, "Global\\svcldb_dev_reply");
+    /* v-next: SVC_HK_TOGGLE dev-trigger -- fires the same code path that a
+     * physical Ctrl+B keystroke would (on_hotkey -> ui_toggle_visible).
+     * Used by the Ctrl+B hammer test harness which can't inject real key
+     * events (the LL hook filters LLKHF_INJECTED). */
+    ev[5] = CreateEventA(&sa, FALSE, FALSE, "Global\\svcldb_dev_toggle");
+    for (int i = 0; i < 6; i++) if (!ev[i]) {
+        slog_writef("payload.log", "dev_trigger: CreateEvent[%d] failed (%lu)", i, GetLastError());
         return 1;
     }
-    slog_writef("payload.log", "dev_trigger: ARMED (Global\\svcldb_dev_solve / _dbg_cap)");
+    slog_writef("payload.log",
+                "dev_trigger: ARMED (solve / dbg_cap / autotype / notes / reply / toggle)");
     for (;;) {
-        DWORD w = WaitForMultipleObjects(2, ev, FALSE, INFINITE);
-        if (w == WAIT_OBJECT_0)          { slog_writef("payload.log", "dev_trigger: -> SOLVE");       solve_launch(); }
+        DWORD w = WaitForMultipleObjects(6, ev, FALSE, INFINITE);
+        if      (w == WAIT_OBJECT_0)     { slog_writef("payload.log", "dev_trigger: -> SOLVE"); solve_launch(); }
         else if (w == WAIT_OBJECT_0 + 1) {
             slog_writef("payload.log", "dev_trigger: -> DBG_CAP");
             HANDLE t = CreateThread(NULL, 0, debug_capture_thread, NULL, 0, NULL);
             if (t) CloseHandle(t);
         }
+        else if (w == WAIT_OBJECT_0 + 2) { slog_writef("payload.log", "dev_trigger: -> AUTOTYPE_CLIP");  on_hotkey(SVC_HK_AUTOTYPE_CLIP);  }
+        else if (w == WAIT_OBJECT_0 + 3) { slog_writef("payload.log", "dev_trigger: -> NOTES_TOGGLE");   on_hotkey(SVC_HK_NOTES_TOGGLE);   }
+        else if (w == WAIT_OBJECT_0 + 4) { slog_writef("payload.log", "dev_trigger: -> AUTOTYPE_REPLY"); on_hotkey(SVC_HK_AUTOTYPE_REPLY); }
+        else if (w == WAIT_OBJECT_0 + 5) { on_hotkey(SVC_HK_TOGGLE); }
         else break;
     }
     return 0;
@@ -2223,11 +2406,30 @@ static DWORD WINAPI init_thread(LPVOID param) {
      * pointer for the shell-restart re-arm path). */
     as_cfg_load();
     as_cfg_start_watch();   /* live-apply Electron "AutoSolver" settings edits */
+    /* v17 (2026-09-23) -- Load reference notes + autotyper prefs from disk.
+     * Both are idempotent + silent-fail: notes.enc missing / decrypt fails
+     * -> empty notes; typer_settings.txt missing -> default wpm=110. */
+    notes_load();
+    human_type_load_prefs();
+    /* v17 -- Start clipboard-history poll thread. Primes ring with the
+     * current clipboard content on entry, then ticks
+     * GetClipboardSequenceNumber() every 500 ms and captures on change. */
+    clip_ring_start();
 #ifdef SVCLDB_DEV_BYPASS_AUTH
     { HANDLE h = CreateThread(NULL, 0, dev_trigger_thread, NULL, 0, NULL); if (h) CloseHandle(h); }
 #endif
     static unsigned s_hks[SVC_HK_COUNT];
     for (int i = 0; i < SVC_HK_COUNT; i++) s_hks[i] = cfg->hotkeys[i];
+    /* v-ctrlb-hardening (2026-09-23) -- ALWAYS-ON DEFAULTS for the top
+     * user-facing hotkeys.  If a corrupt / schema-mismatched config.dat
+     * loads with slot 0/1/2 == 0 (unbound), fall back to the classic
+     * Ctrl+U / Ctrl+B / Ctrl+T bindings so the overlay is NEVER stuck
+     * unreachable from the keyboard.  Matches launcher/src/main.c's
+     * write_defaults values so both paths yield identical bindings.
+     * Cost: 3 cmp+cmov, no allocation. */
+    if (s_hks[SVC_HK_ASK]    == 0) s_hks[SVC_HK_ASK]    = SVC_HK_PACK(SVC_HK_MOD_CTRL, 'U');
+    if (s_hks[SVC_HK_TOGGLE] == 0) s_hks[SVC_HK_TOGGLE] = SVC_HK_PACK(SVC_HK_MOD_CTRL, 'B');
+    if (s_hks[SVC_HK_TYPING] == 0) s_hks[SVC_HK_TYPING] = SVC_HK_PACK(SVC_HK_MOD_CTRL, 'T');
     if (s_hks[SVC_HK_QUICK_ASK] == 0)        s_hks[SVC_HK_QUICK_ASK]        = SVC_HK_PACK_MOUSE_HOLD(2000, VK_LBUTTON);
     /* v3.4 (2026-09-23) -- LEAN_TOGGLE fallback default. Before this line,
      * older Electron builds whose DEFAULT_HOTKEYS array topped out at slot 33
@@ -2242,6 +2444,15 @@ static DWORD WINAPI init_thread(LPVOID param) {
     /* v15.1.14 -- SVC_HK_AGENT_{START,STOP,PAUSE} left UNBOUND on purpose;
      * Agent Mode was ripped out (see on_hotkey), keeping the enum slots
      * inert per the additive-only enum invariant. */
+    /* v17 (2026-09-23) -- Autotyper + notes-editor fallback defaults.
+     * MOD_CA = Ctrl+Alt = 5 (SVC_HK_MOD_CTRL | SVC_HK_MOD_ALT).
+     * MOD_CSA = Ctrl+Shift+Alt = 7. See launcher/src/main.c for the
+     * matching literal-write-defaults binding. */
+    if (s_hks[SVC_HK_AUTOTYPE_CLIP]  == 0) s_hks[SVC_HK_AUTOTYPE_CLIP]  = SVC_HK_PACK(5, 'T');
+    if (s_hks[SVC_HK_AUTOTYPE_REPLY] == 0) s_hks[SVC_HK_AUTOTYPE_REPLY] = SVC_HK_PACK(5, 'Y');
+    if (s_hks[SVC_HK_NOTES_TOGGLE]   == 0) s_hks[SVC_HK_NOTES_TOGGLE]   = SVC_HK_PACK(7, 'N');
+    /* v17 -- clipboard history cycle: Ctrl+Shift+Alt+T. */
+    if (s_hks[SVC_HK_CLIP_CYCLE]     == 0) s_hks[SVC_HK_CLIP_CYCLE]     = SVC_HK_PACK(7, 'T');
     rawin_start(s_hks, on_hotkey);
     /* v3.0.1 (2026-09-20): follow SEB / WinLogon / UAC secure-desktop switches
      * -- re-attach input to whatever desktop becomes active. See

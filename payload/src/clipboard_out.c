@@ -4,6 +4,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>   /* malloc/free */
 #include <limits.h>   /* INT_MAX */
 
 /* Internal worker used by both clip_set_utf8 and clip_set_utf8_bytes.
@@ -77,6 +78,97 @@ int clip_set_utf8(const char *utf8) {
 
 int clip_set_utf8_bytes(const char *bytes, size_t len) {
     return clip_publish_utf16_from_bytes(bytes, len);
+}
+
+/* v17 (2026-09-23) -- Read whatever CF_UNICODETEXT (or CF_TEXT fallback) is
+ * currently on the interactive clipboard, decoded to a freshly-allocated
+ * NUL-terminated UTF-8 buffer. Ownership passes to caller (free() when done).
+ *
+ * Used by:
+ *   1. ui_chat_feed_clipboard_paste() -- Ctrl+V in the composer.
+ *   2. hotkey_autotype_clipboard()    -- Ctrl+Alt+T grabs clipboard for the
+ *                                        human autotyper.
+ *
+ * Robustness:
+ *   - Same 5-attempt OpenClipboard retry loop as clip_set_utf8 -- the
+ *     clipboard is a global shared resource; other apps' clipboard hooks
+ *     (Chrome, screen recorders, password managers) can block briefly.
+ *   - CF_UNICODETEXT is preferred (survives codepoint round-trips); we fall
+ *     back to CF_TEXT via CP_ACP if only ANSI is available (very old apps).
+ *   - Returns NULL on any failure (empty clipboard, no text formats, alloc
+ *     fail). Callers must NULL-check before dereferencing.
+ *   - Caps returned buffer at INT_MAX bytes because WideCharToMultiByte's
+ *     size prototype is int. In practice clipboards over ~64 MB behave
+ *     poorly in every app, so this ceiling is unreachable. */
+char *clip_get_utf8(void) {
+    int opened = 0;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        if (OpenClipboard(NULL)) { opened = 1; break; }
+        Sleep(30 * (attempt + 1));
+    }
+    if (!opened) {
+        slog_writef("payload.log", "clip_get: OpenClipboard failed (gle=%lu)",
+                    GetLastError());
+        return NULL;
+    }
+
+    char *out = NULL;
+
+    /* Preferred: CF_UNICODETEXT -> UTF-8. */
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    if (h) {
+        LPCWSTR wsrc = (LPCWSTR)GlobalLock(h);
+        if (wsrc) {
+            int wlen = (int)wcslen(wsrc);
+            if (wlen > 0) {
+                int u8len = WideCharToMultiByte(CP_UTF8, 0, wsrc, wlen,
+                                                NULL, 0, NULL, NULL);
+                if (u8len > 0 && u8len < INT_MAX - 1) {
+                    out = (char *)malloc((size_t)u8len + 1);
+                    if (out) {
+                        WideCharToMultiByte(CP_UTF8, 0, wsrc, wlen,
+                                            out, u8len, NULL, NULL);
+                        out[u8len] = 0;
+                    }
+                }
+            }
+            GlobalUnlock(h);
+        }
+    } else {
+        /* Fallback: CF_TEXT (ANSI) -> UTF-8. Rare on Win10+, but some legacy
+         * apps still only publish ANSI. */
+        HANDLE ha = GetClipboardData(CF_TEXT);
+        if (ha) {
+            LPCSTR asrc = (LPCSTR)GlobalLock(ha);
+            if (asrc) {
+                int alen = (int)strlen(asrc);
+                if (alen > 0) {
+                    int wlen = MultiByteToWideChar(CP_ACP, 0, asrc, alen, NULL, 0);
+                    if (wlen > 0) {
+                        WCHAR *wbuf = (WCHAR *)malloc((size_t)(wlen + 1) * sizeof(WCHAR));
+                        if (wbuf) {
+                            MultiByteToWideChar(CP_ACP, 0, asrc, alen, wbuf, wlen);
+                            wbuf[wlen] = 0;
+                            int u8len = WideCharToMultiByte(CP_UTF8, 0, wbuf, wlen,
+                                                            NULL, 0, NULL, NULL);
+                            if (u8len > 0 && u8len < INT_MAX - 1) {
+                                out = (char *)malloc((size_t)u8len + 1);
+                                if (out) {
+                                    WideCharToMultiByte(CP_UTF8, 0, wbuf, wlen,
+                                                        out, u8len, NULL, NULL);
+                                    out[u8len] = 0;
+                                }
+                            }
+                            free(wbuf);
+                        }
+                    }
+                }
+                GlobalUnlock(ha);
+            }
+        }
+    }
+    CloseClipboard();
+    return out;
 }
 
 void clip_dump_to_file(const char *utf8) {

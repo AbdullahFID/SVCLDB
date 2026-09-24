@@ -32,6 +32,13 @@ int  clip_set_utf8(const char *utf8);
  * the ANSI codepage round-trip. */
 int  clip_set_utf8_bytes(const char *bytes, size_t len);
 
+/* v17 (2026-09-23) -- Read whatever text is on the interactive clipboard,
+ * as a freshly-allocated NUL-terminated UTF-8 string. Caller owns the
+ * pointer (must free()). Returns NULL when the clipboard is empty, has
+ * no text formats, or the OpenClipboard retry loop fails after ~150ms
+ * of contention. Prefers CF_UNICODETEXT; falls back to CF_TEXT (ANSI). */
+char *clip_get_utf8(void);
+
 /* Fallback: write reply to <install-dir>\last_reply.txt (readable for support). */
 void clip_dump_to_file(const char *utf8);
 

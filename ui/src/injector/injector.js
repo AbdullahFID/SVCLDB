@@ -562,6 +562,15 @@ const DEFAULT_HOTKEYS = [
   0,                            // 37 AGENT_START       (unbound -- Agent Mode ripped out per dllmain.c v15.1.14)
   0,                            // 38 AGENT_STOP        (unbound -- Agent Mode ripped out)
   0,                            // 39 AGENT_PAUSE       (unbound -- Agent Mode ripped out)
+  /* v17 (2026-09-23) -- Human autotyper + reference notes editor.
+   * Matches launcher/src/main.c and payload dllmain fallback defaults so
+   * all three arm paths agree. Autotype-clipboard on Ctrl+Alt+T mirrors
+   * hooksdll's Ctrl+Shift+T ("type this to me") but shifted to Ctrl+Alt+T
+   * to avoid the existing SVC_HK_STREAM_TOGGLE=Ctrl+Shift+T binding. */
+  pack(MOD_CA,  0x54),         // 40 AUTOTYPE_CLIP     Ctrl+Alt+T
+  pack(MOD_CA,  0x59),         // 41 AUTOTYPE_REPLY    Ctrl+Alt+Y
+  pack(MOD_CSA, 0x4E),         // 42 NOTES_TOGGLE      Ctrl+Shift+Alt+N
+  pack(MOD_CSA, 0x54),         // 43 CLIP_CYCLE        Ctrl+Shift+Alt+T
 ];
 
 /* Old stealth-multitap map kept for users who preferred it. Flip
@@ -590,6 +599,11 @@ const LEGACY_STEALTH_HOTKEYS = [
   0,                            // 37 AGENT_START  (Agent Mode inert)
   0,                            // 38 AGENT_STOP
   0,                            // 39 AGENT_PAUSE
+  /* v17 (2026-09-23) -- stealth-preset entries for autotyper + notes. */
+  _MT(0x54, 500, true),        // 40 AUTOTYPE_CLIP     -- triple-T watch-only
+  _MT(0x59, 500, true),        // 41 AUTOTYPE_REPLY    -- triple-Y watch-only
+  _MT(0x4E, 500, true),        // 42 NOTES_TOGGLE      -- triple-N watch-only
+  packLongpress(0x54, 900),    // 43 CLIP_CYCLE        -- hold T 900ms (stealth: no chord)
 ];
 
 // Legacy "all modifier combos" preset — user can select this via
@@ -624,6 +638,10 @@ const LEGACY_MODIFIER_HOTKEYS = [
   0,                            // 37 AGENT_START      (inert)
   0,                            // 38 AGENT_STOP       (inert)
   0,                            // 39 AGENT_PAUSE      (inert)
+  pack(MOD_CA,  0x54),         // 40 AUTOTYPE_CLIP    Ctrl+Alt+T
+  pack(MOD_CA,  0x59),         // 41 AUTOTYPE_REPLY   Ctrl+Alt+Y
+  pack(MOD_CSA, 0x4E),         // 42 NOTES_TOGGLE     Ctrl+Shift+Alt+N
+  pack(MOD_CSA, 0x54),         // 43 CLIP_CYCLE       Ctrl+Shift+Alt+T
 ];
 
 /* v10 (2026-07-17) — STEALTH MODE overlay.

@@ -51,7 +51,7 @@ AUTH_HEADER_FMT|Authorization: Bearer %s
 ANTHROPIC_VERSION|anthropic-version: 2023-06-01
 OPENAI_CHAT_URL|https://api.openai.com/v1/chat/completions
 ANTHROPIC_MSG_URL|https://api.anthropic.com/v1/messages
-GOOGLE_GEN_URL|https://generativelanguage.googleapis.com/v1beta/models
+GOOGLE_GEN_URL|https://generativelanguage.googleapis.com/v1beta
 OPENROUTER_URL|https://openrouter.ai/api/v1/chat/completions
 
 # ─── Model names (leak specific model choices) ───────────────────

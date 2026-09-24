@@ -368,6 +368,30 @@ void ui_chat_cancel(void);
  * NULL if buffer empty. */
 char *ui_chat_take_and_clear(void);
 
+/* v17 (2026-09-23) -- multi-line + editor keybinds (Shift+Enter for
+ * newline, Ctrl+V paste, Ctrl+Backspace word-delete, Ctrl+Left/Right
+ * word-jump, Up/Down row navigation). Called from rawinput_hook.c on
+ * both the default-desktop LL path and the isolated-desktop pipe
+ * dispatch. */
+void ui_chat_feed_newline(void);
+void ui_chat_feed_clipboard_paste(void);
+void ui_chat_feed_word_backspace(void);
+void ui_chat_feed_word_delete(void);
+void ui_chat_cursor_word_left(void);
+void ui_chat_cursor_word_right(void);
+void ui_chat_cursor_up(void);
+void ui_chat_cursor_down(void);
+
+/* v17 (2026-09-23) -- Autotyper access to the current AI answer.
+ * Copies up to (cap-1) bytes of the dot's full answer (or short
+ * answer as fallback) into `out`, NUL-terminates, returns the byte
+ * count written. Zero-length = nothing to type. Thread-safe. */
+int  ui_dot_snapshot_answer(char *out, int cap);
+
+/* v17 (2026-09-23) -- Force overlay ON (idempotent). Used by the
+ * notes editor toggle so the editor panel is on screen when opened. */
+void ui_force_visible(void);
+
 #ifdef __cplusplus
 }
 #endif

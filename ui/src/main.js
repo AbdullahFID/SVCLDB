@@ -1683,6 +1683,15 @@ const AUTOSOLVER_DEFAULTS = {
   dot_col_executing:  0xFFAF52DE,
   dot_col_done:       0xFF34C759,
   dot_col_error:      0xFFFF3B30,
+  // v17 (2026-09-23) — Human autotyper (see payload/src/input/human_typer.c).
+  // svchelper is master; payload reads these on every human_type_default_opts()
+  // call, so a live edit here takes effect on the NEXT autotype run (no
+  // re-inject needed). WPM range is enforced payload-side (30..500) too.
+  typer_wpm:          110,   // words per minute — 110 is a comfortable average
+  typer_humanize:     1,     // 1 = full Dhakal engine, 0 = constant timing
+  typer_paste_mode:   0,     // 1 = Ctrl+V paste (fast), 0 = per-keystroke
+  typer_planning:     1,     // 1 = 0.2..0.85 s initial planning pause
+  typer_wait_mods:    1,     // 1 = wait for Ctrl/Shift/Alt release before typing
 };
 
 function _clampNum(v, lo, hi, dflt) {
@@ -1743,6 +1752,12 @@ function saveAutosolver(partial) {
     dot_col_executing:      _preserveUint(m.dot_col_executing, 0xFFAF52DE),
     dot_col_done:           _preserveUint(m.dot_col_done,      0xFF34C759),
     dot_col_error:          _preserveUint(m.dot_col_error,     0xFFFF3B30),
+    // v17 (2026-09-23) — Human autotyper.
+    typer_wpm:              Math.round(_clampNum(m.typer_wpm, 30, 500, 110)),
+    typer_humanize:         (m.typer_humanize === undefined || m.typer_humanize === null) ? 1 : (m.typer_humanize ? 1 : 0),
+    typer_paste_mode:       m.typer_paste_mode ? 1 : 0,
+    typer_planning:         (m.typer_planning  === undefined || m.typer_planning  === null) ? 1 : (m.typer_planning  ? 1 : 0),
+    typer_wait_mods:        (m.typer_wait_mods === undefined || m.typer_wait_mods === null) ? 1 : (m.typer_wait_mods ? 1 : 0),
   };
   try { if (!fs.existsSync(SVC_INSTALL_DIR)) fs.mkdirSync(SVC_INSTALL_DIR, { recursive: true }); } catch {}
   try {
