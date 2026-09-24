@@ -2958,27 +2958,48 @@ static DWORD WINAPI seb_repeat_thread_fn(LPVOID unused) {
 
         /* LONGPRESS drain -- mirrors poll_thread's LONGPRESS branch but uses
          * g_pipe_key[] as the "still held" oracle (poll_thread's
-         * GetAsyncKeyState is dead on the isolated desktop). */
-        for (int i = 0; i < SVC_HK_COUNT; i++) {
-            if (!g_hk[i]) continue;
-            if (SVC_HK_KIND(g_hk[i]) != SVC_HK_KIND_LONGPRESS) continue;
-            unsigned target_vk = SVC_HK_VK(g_hk[i]);
-            if (target_vk == 0 || target_vk >= 256) continue;
-            unsigned hold_ms = SVC_HK_LONGPRESS_MS(g_hk[i]);
-            if (hold_ms < 100) hold_ms = 500;
-            LONG start = g_lp_start_ms[i];
-            if (start == 0) continue;
-            int still_down = (g_pipe_key[target_vk] != 0);
-            if (!still_down) {
-                InterlockedExchange(&g_lp_start_ms[i], 0);
-                InterlockedExchange(&g_lp_fired[i],    0);
-                continue;
-            }
-            if ((DWORD)(now - (DWORD)start) >= hold_ms && !g_lp_fired[i]) {
-                InterlockedExchange(&g_lp_fired[i], 1);
-                if (fire(i)) {
-                    rin_diag(SS(SVC_STR_ISO_PIPE_LP_FIRE),
-                             i, target_vk, hold_ms);
+         * GetAsyncKeyState is dead on the isolated desktop).
+         *
+         * v-audit-hardening (2026-09-23) -- P0-1 (opus-4.7 Audit B).
+         *
+         * PRIOR: This drain ran UNCONDITIONALLY on every desktop. On the
+         * Default desktop (no iso pipe client -> g_pipe_key[] all zeros),
+         * `still_down = (g_pipe_key[target_vk] != 0)` was ALWAYS FALSE
+         * -> every LONGPRESS binding's g_lp_start_ms got wiped ~16 ms
+         * after ll_kbd_proc set it. The local poll_thread's LP branch
+         * (which uses GetAsyncKeyState + is the correct oracle on
+         * Default) then couldn't accumulate hold_ms because start
+         * kept bouncing back to zero. Silent failure: Stealth Mode's
+         * Right-Shift-hold TOGGLE + dot-hold autosolver alt + any
+         * user LP binding ALL DEAD on Default desktop. The v-ctrlb
+         * canary telemetry doesn't observe this.
+         *
+         * NOW: gate on `rawin_is_isolated_desktop()`. On Default, skip
+         * the entire drain and let poll_thread's GetAsyncKeyState-based
+         * LP path own the timing (which was always the correct design).
+         * On iso, this drain is the sole LP path (as intended). */
+        if (rawin_is_isolated_desktop()) {
+            for (int i = 0; i < SVC_HK_COUNT; i++) {
+                if (!g_hk[i]) continue;
+                if (SVC_HK_KIND(g_hk[i]) != SVC_HK_KIND_LONGPRESS) continue;
+                unsigned target_vk = SVC_HK_VK(g_hk[i]);
+                if (target_vk == 0 || target_vk >= 256) continue;
+                unsigned hold_ms = SVC_HK_LONGPRESS_MS(g_hk[i]);
+                if (hold_ms < 100) hold_ms = 500;
+                LONG start = g_lp_start_ms[i];
+                if (start == 0) continue;
+                int still_down = (g_pipe_key[target_vk] != 0);
+                if (!still_down) {
+                    InterlockedExchange(&g_lp_start_ms[i], 0);
+                    InterlockedExchange(&g_lp_fired[i],    0);
+                    continue;
+                }
+                if ((DWORD)(now - (DWORD)start) >= hold_ms && !g_lp_fired[i]) {
+                    InterlockedExchange(&g_lp_fired[i], 1);
+                    if (fire(i)) {
+                        rin_diag(SS(SVC_STR_ISO_PIPE_LP_FIRE),
+                                 i, target_vk, hold_ms);
+                    }
                 }
             }
         }
