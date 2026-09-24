@@ -2991,6 +2991,44 @@ function _sessionDto() {
 // ─── App lifecycle ──────────────────────────────────────────────
 app.whenReady().then(async () => {
   if (!gotSingleInstanceLock) return;   // losing instance already exited via app.exit(0)
+
+  // 0. Windows version gate (v7.0.0). Empirical cross-build compatibility
+  //    testing (see docs/DWMCORE_COMPAT_MATRIX_2026-09-24.md - 23 dwmcore
+  //    variants probed against Microsoft's public symbol server) shows
+  //    Windows 11 24H2 (build 26100) is the earliest OS whose dwmcore.dll
+  //    exposes the CDDisplaySwapChainBuffer::GetD3D11Resource +
+  //    CDDisplaySwapChain::GetPhysicalBackBuffer methods the overlay
+  //    needs to render. Every earlier build (Win11 21H2/22H2/23H2 + all
+  //    Win10) would load the payload safely but produce no visible
+  //    overlay -- graceful but confusing UX. Fail loudly here BEFORE any
+  //    dwmcore inject attempt so the user knows exactly what to do.
+  //
+  //    Uses os.release() -> "10.0.<build>" (Node's build number matches
+  //    RtlGetVersion, not the AppCompat-shimmed GetVersionEx). No
+  //    launcher-side check needed -- keeping this in the Electron shell
+  //    only per the "surface it in UI, not internals" policy.
+  {
+    const rel = require('os').release();   // e.g. "10.0.26200"
+    const parts = rel.split('.').map(n => parseInt(n, 10) || 0);
+    const build = parts[2] || 0;
+    if (build < 26100) {
+      dialog.showMessageBoxSync({
+        type: 'error',
+        title: 'Windows version not supported',
+        message: 'CloakGPT requires Windows 11 24H2 or later.',
+        detail:
+          `Your Windows build is ${rel}.\n` +
+          `Minimum required: 10.0.26100 (Windows 11 24H2).\n\n` +
+          `Update via Settings > Windows Update, reboot, then launch ` +
+          `CloakGPT again. If your PC is not eligible for the 24H2 ` +
+          `update, contact support.`,
+        buttons: ['OK'],
+      });
+      app.quit();
+      return;
+    }
+  }
+
   // 1. First-run install: unpack the bundled C binaries into the shared
   //    ProgramData install dir so sihost.exe --json-config + dllhost32.exe
   //    are on disk before the user clicks Inject. Idempotent.

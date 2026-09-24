@@ -1,6 +1,6 @@
 ﻿# CloakGPT — Setup Guide
 
-Everything you need to install and run CloakGPT on Windows 10 or 11.
+Everything you need to install and run CloakGPT on Windows 11 24H2 or later.
 Read once, top to bottom — takes ~5 minutes.
 
 ---
@@ -30,7 +30,13 @@ zip, ask them for this doc too.
 
 ## 2. System requirements
 
-- **Windows 10** (version 20H2 or newer) or **Windows 11** (any version)
+- **Windows 11 24H2 or later** (build 26100+ on x64). Check via
+  `Settings > System > About > OS build`. If you're on an older
+  Windows 11 (21H2 / 22H2 / 23H2) or Windows 10, run Windows Update
+  and reboot before installing — CloakGPT relies on the modern DWM
+  compose surface that only ships in 24H2 and up. Trying to install
+  on an older build shows a friendly "not supported" dialog and quits
+  cleanly; nothing on your system gets modified.
 - **64-bit CPU** with AVX2 support (any laptop from 2015 or later)
 - **Local admin** on the machine — the installer self-elevates via UAC, so
   right-click → Run with PowerShell is enough. If your account isn't a
