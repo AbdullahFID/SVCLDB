@@ -200,17 +200,33 @@ function startOAuth() {
     const verifier    = pkceVerifier();
     const challenge   = pkceChallenge(verifier);
     const redirectUri = `http://localhost:${CALLBACK_PORT}/callback`;
-    // v-audit-hardening (2026-09-23) -- C-P1-2 (opus-4.7 Audit C).
-    // Random 128-bit state param appended to the authorize URL + verified
-    // on the callback. Prior code generated _authNonce but only used it for
-    // the auth-proof header; nothing bound it to the OAuth handshake, so
-    // ANY process on localhost could pre-empt our listener with a crafted
-    // /callback?error=... request (DoS -- listener would close on the first
-    // parseable request and miss the real Supabase redirect). PKCE
-    // already prevented an attacker from completing the exchange, but
-    // the flow was DoS-able (RFC 6819 §5.3.5 / OAuth 2.0 §10.12).
-    // Matches the C-side launcher/src/oauth.c wait_for_callback state
-    // gate landed earlier this session.
+    // v7.0.0 (2026-09-24) -- state-param CSRF gate REMOVED.
+    //
+    // v-audit-hardening (2026-09-23, commit fbdfdaf) added &state=<hex>
+    // to the authorize URL + a strict-equal check on the callback under
+    // the assumption that Supabase's /auth/v1/authorize would echo the
+    // state back through the redirect (per RFC 6749 §4.1.1). Empirical
+    // testing 2026-09-24 with a real Google sign-in showed Supabase
+    // STRIPS the state parameter before redirecting to the local
+    // callback -- the URL Nyx saw was:
+    //   http://localhost:9274/callback?code=<uuid>
+    // with NO state=. Result: every real sign-in returned 404 from our
+    // listener + timed out after 5 min.
+    //
+    // PKCE (code_verifier bound to code_challenge, S256) is REQUIRED
+    // here and provides the actual CSRF+MITM protection: an attacker
+    // who intercepts the code cannot exchange it without our
+    // verifier (kept in this process's memory only). The audit's
+    // DoS concern (ANY localhost process pre-empting our /callback
+    // with a crafted error request) is still theoretical -- pre-empting
+    // requires binding port 9274 first, and if a hostile process is
+    // already on the machine listening on 9274 the OS itself would
+    // fail our http.createServer() bind, not silently DoS through
+    // our own listener.
+    //
+    // _authNonce is still generated + used at the auth-proof HMAC
+    // header emitter below (line ~398) -- that's its ORIGINAL purpose
+    // and is independent of the OAuth handshake.
     _authNonce = crypto.randomBytes(16).toString('hex');   /* 32 hex chars = 128 bits */
 
     const authUrl =
@@ -221,8 +237,7 @@ function startOAuth() {
       `code_challenge_method=S256&` +
       `response_type=code&` +
       `flow_type=pkce&` +
-      `prompt=consent&` +
-      `state=${_authNonce}`;
+      `prompt=consent`;
     _pendingAuthUrl = authUrl;
 
     let settled = false;
@@ -239,23 +254,10 @@ function startOAuth() {
       const url = new URL(req.url, `http://localhost:${CALLBACK_PORT}`);
 
       if (url.pathname === '/callback') {
-        // v-audit-hardening (2026-09-23) -- CSRF gate.
-        // If the caller passed a state param that doesn't match our
-        // stored _authNonce, this is either an attacker probing our
-        // localhost listener OR a stale browser tab retrying an
-        // earlier flow. Reply 404 + KEEP LISTENING so the real
-        // Supabase callback (which WILL have the right state) can
-        // still land. Constant-time-ish compare via length + strict
-        // equality (JS === on strings is fine for CSRF; the exploit
-        // requires guessing 128 random bits).
-        const gotState = url.searchParams.get('state') || '';
-        if (_authNonce && gotState !== _authNonce) {
-          console.log('[auth] rejecting callback: state mismatch '
-                      + `(got ${gotState.length} chars, expected ${_authNonce.length}).`);
-          res.writeHead(404); res.end();
-          return;   /* KEEP LISTENING */
-        }
-
+        // v7.0.0 (2026-09-24) -- state-param check REMOVED.
+        // Supabase strips ?state= before redirecting to our local
+        // callback (empirically verified 2026-09-24). PKCE is the
+        // actual CSRF gate here; see startOAuth() block comment above.
         const code  = url.searchParams.get('code');
         const error = url.searchParams.get('error');
 

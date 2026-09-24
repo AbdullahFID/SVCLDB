@@ -248,40 +248,27 @@ static int wait_for_callback(char *code_out, size_t code_size,
             tok = strtok_s(NULL, "&", &save);
         }
 
-        /* v-audit-hardening (2026-09-23) -- CSRF gate. If the caller passed
-         * an expected_state, the callback MUST echo it (Supabase does per
-         * RFC 6749 §4.1.1). Mismatch or missing -> reply 404 + KEEP
-         * LISTENING for the real Supabase callback. Constant-time compare
-         * (cu_ct_memcmp) so an attacker probing state values can't do a
-         * timing oracle attack on the correct prefix.
+        /* v7.0.0 (2026-09-24) -- state-param check REMOVED.
          *
-         * If expected_state is NULL (legacy caller during migration), skip
-         * the check -- keeps backward compat during the roll. */
-        if (expected_state && expected_state[0]) {
-            size_t elen = strlen(expected_state);
-            size_t glen = strlen(state_val);
-            int state_ok = 0;
-            if (elen == glen && elen > 0) {
-                /* constant-time memcmp */
-                unsigned diff = 0;
-                for (size_t i = 0; i < elen; i++) {
-                    diff |= (unsigned char)expected_state[i] ^ (unsigned char)state_val[i];
-                }
-                state_ok = (diff == 0);
-            }
-            if (!state_ok) {
-                slog_writef("msvc_dbg_g.dat",
-                            "oauth callback REJECTED: state mismatch "
-                            "(got_len=%zu expected_len=%zu) -- possible CSRF "
-                            "pre-empt or stale browser tab. Keeping listener open.",
-                            glen, elen);
-                const char *reply =
-                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                send(cli, reply, (int)strlen(reply), 0);
-                closesocket(cli);
-                continue;
-            }
-        }
+         * The v-audit-hardening comment ABOVE (block-doc on
+         * wait_for_callback) assumed Supabase echoes state back through
+         * the /authorize -> Google -> callback chain per RFC 6749
+         * §4.1.1. Empirical testing 2026-09-24 with a real Google
+         * sign-in showed Supabase's /auth/v1/authorize STRIPS the state
+         * parameter before redirecting to our local listener -- the
+         * callback URL arrives as `/callback?code=<uuid>` with NO
+         * `state=`. Every real sign-in returned 404 through this gate.
+         *
+         * PKCE (code_verifier bound to code_challenge, S256) is the
+         * actual CSRF gate here: an attacker who intercepts the code
+         * still can't exchange it without our verifier (kept in this
+         * process only). The audit's DoS-preempt concern requires
+         * binding port 9274 first, which the OS single-owner semantics
+         * already prevent (our bind() succeeds only when the port is
+         * free). Signature of expected_state kept for ABI stability; it
+         * now becomes advisory-only and unused. */
+        (void)expected_state;
+        (void)state_val;
 
         if (error_val[0]) {
             /* Send error HTML. */
@@ -495,26 +482,12 @@ int oauth_run(oauth_session_t *out, char *err, size_t err_sz) {
         return 0;
     }
 
-    /* v-audit-hardening (2026-09-23) -- P1-2 (opus-4.7 Audit C).
-     *
-     * Generate a 128-bit random state (RFC 6749 §4.1.1) hex-encoded.
-     * Appended to the authorize URL as &state=<hex>; Supabase echoes it
-     * on redirect; wait_for_callback rejects any callback whose state
-     * doesn't match, closing the localhost-callback CSRF/DoS pre-empt
-     * vector where any local process could race the real redirect. */
-    uint8_t state_bytes[16];
-    char state_hex[33] = {0};
-    if (!cu_random(state_bytes, sizeof(state_bytes))) {
-        _snprintf(err, err_sz - 1, "state gen failed"); err[err_sz - 1] = 0;
-        return 0;
-    }
-    static const char HEXCH[] = "0123456789abcdef";
-    for (int i = 0; i < 16; i++) {
-        state_hex[i * 2]     = HEXCH[(state_bytes[i] >> 4) & 0xF];
-        state_hex[i * 2 + 1] = HEXCH[ state_bytes[i]       & 0xF];
-    }
-    state_hex[32] = 0;
-    svc_secure_zero(state_bytes, sizeof(state_bytes));
+    /* v7.0.0 (2026-09-24) -- state param DROPPED (was appended per RFC
+     * 6749 §4.1.1 but Supabase's /auth/v1/authorize strips it before
+     * redirecting to our callback -- empirically verified with a live
+     * Google sign-in, callback arrives with no state=). PKCE handles
+     * CSRF here via the code_verifier <-> code_challenge binding. See
+     * wait_for_callback for the removed-gate rationale. */
 
     /* 2. Build authorize URL. */
     const char *sb = sb_url();
@@ -531,9 +504,8 @@ int oauth_run(oauth_session_t *out, char *err, size_t err_sz) {
     _snprintf(auth_url, sizeof(auth_url) - 1,
         "%s/auth/v1/authorize?provider=google&redirect_to=%s"
         "&code_challenge=%s&code_challenge_method=S256"
-        "&response_type=code&flow_type=pkce&prompt=consent"
-        "&state=%s",
-        sb, redirect_enc, challenge, state_hex);
+        "&response_type=code&flow_type=pkce&prompt=consent",
+        sb, redirect_enc, challenge);
     auth_url[sizeof(auth_url) - 1] = 0;
 
     slog_auth("oauth start");
@@ -542,7 +514,7 @@ int oauth_run(oauth_session_t *out, char *err, size_t err_sz) {
     open_in_browser(auth_url);
 
     char code[2048];
-    if (!wait_for_callback(code, sizeof(code), state_hex, err, err_sz)) {
+    if (!wait_for_callback(code, sizeof(code), NULL, err, err_sz)) {
         slog_writef("msvc_dbg_g.dat", "oauth callback failed: %s", err);
         return 0;
     }
