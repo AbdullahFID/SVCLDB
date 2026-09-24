@@ -9,6 +9,51 @@ memory from prior sessions (~4.8k lines).
 For live operational stuff (launch/test/deploy procedure), see `AGENTS.md`
 and `.cursor/rules/fast-testing-launch.mdc`.
 
+## ✅ v-multibuild LANDED (2026-09-24) — universal Windows 11 dwmcore support + crash-proof SAFE-MODE
+
+Closes the class of "DWM crashes on a Windows patch we haven't RE'd
+against" regressions. Three-layer defense; full handoff at
+`docs/HANDOFF_2026-09-24_MULTIBUILD_UNIVERSAL_SUPPORT.md`.
+
+1. **Resolver: `SymEnumSymbols` first, `SymFromName` fallback.** Fixes
+   the "older PDB, SymFromName returns GLE=126 for every symbol"
+   failure mode empirically observed via `tools/dwmcore_shape_probe`
+   against `hooksdll/dwm/dwmcore_clean.dll` (build 26100.7920, mid-
+   2025). ALL critical + supporting symbols now resolve via
+   `Enum-Full` on both the current (26100.9549) AND the old
+   (26100.7920) dwmcore builds. Proven via probe run at commit time.
+
+2. **Blob v2 with validation snapshot.** Resolver writes a 112-byte
+   `pl_offsets_ext_t` extension after the existing 192-byte core
+   (total blob size 304 bytes). Extension captures: dwmcore TDS +
+   SizeOfImage + first 32 bytes at `COverlayContext::Present` + first
+   32 bytes at `IsOverlayPrevented` + 16 bytes at `ForceFullDirty`.
+   Backward-compatible: legacy 168-byte and current 192-byte v1 blobs
+   still load, validation just gets skipped.
+
+3. **Payload pre-hook validation gate.** `dwm_hooks.c::hooks_install`
+   now runs `validate_blob_snapshot()` BEFORE `MH_Initialize` or any
+   byte-patch. On mismatch (TDS drift OR Present/IOP prologue bytes
+   differ), sets `g_compose_degraded=1`, logs verbosely, returns
+   SAFE-MODE. Payload stays loaded (rawinput + hotkeys + token_refresh
+   + winlogon helper all live); only DWM hooks are silent. **NEVER
+   installs hooks against a mismatched blob → DWM crashes-on-unfamiliar
+   -Windows becomes structurally impossible.**
+
+**Live verified 2026-09-24 ~4:25 PM:** normal arm on 25H2 26200.9550
+passes MATCH, Present fires 60/600/6000. Corrupted-blob test (32 bytes
+of `prologue_present` overwritten with 0xFF) triggers SAFE-MODE cleanly
+(`validate: Present prologue MISMATCH ... Refusing to hook`), DWM pid
+holds, no crash. Recovery via restore-blob + single `--reinject` — no
+reboot, no unload.
+
+Files: `resolver/src/main.c`, `payload/src/blob_read.{c,h}`,
+`payload/src/dwm_hooks.c`, `tools/dwmcore_shape_probe/*`,
+`tools/{health_check,arm_and_verify,test_safe_mode,dwmcore_probe}.ps1`.
+
+Testing checklist for future dwmcore-touching work in the handoff doc
+under "For the next agent".
+
 ## ✅ v14.2 AUTH-6H CERTAINTY PASS (2026-09-23) — TOK2 + cfg_persist fixes
 
 Landed today: the "coordination edge case" from
