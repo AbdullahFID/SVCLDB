@@ -2123,9 +2123,21 @@ int ai_ask_metered_multi(const svc_config_t *cfg,
         free(prep_data_urls);
         return 0;
     }
+    /* v18-hotfix (2026-09-25) -- If the caller supplied a custom system_prompt
+     * (e.g. AutoSolver's schema that requires `actions[]` with x/y coords),
+     * forward it to the worker under the `system` field.  The worker uses it
+     * verbatim INSTEAD of its default `{answer, explanation}` prompt AND
+     * relaxes its response_format from strict json_schema to plain
+     * json_object so the AI is free to include additional fields.  Empty /
+     * missing `system` -> worker keeps its legacy default (back-compat with
+     * pre-hotfix payloads). */
+    int has_custom_sys = cfg->system_prompt[0] != 0;
     jb_obj_begin(&jb);
       jb_key(&jb, "question"); jb_str(&jb, last_user_text);
       jb_key(&jb, "explain");  jb_bool(&jb, cfg->direct_answer_mode ? 0 : 1);
+      if (has_custom_sys) {
+          jb_key(&jb, "system"); jb_str(&jb, cfg->system_prompt);
+      }
       /* Tier preset -- worker maps strong|medium|cheap -> model + reasoning effort. */
       jb_key(&jb, "tier");     jb_str(&jb, metered_tier_slug(cfg->tier));
       if (last_user_data_url) {

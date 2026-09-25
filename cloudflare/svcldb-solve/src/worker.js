@@ -200,6 +200,18 @@ export default {
 
     const question = typeof body.question === "string" ? body.question : "";
     const explain = body.explain === true;
+    // v18-hotfix (2026-09-25) -- Optional caller-supplied system prompt.  Used by
+    // svcldb's AutoSolver path to request the full solve schema
+    // `{status, question, answer, answer_formatted, confidence, actions[...]}`
+    // instead of this worker's default `{answer, explanation}`.  When present,
+    // we forward it verbatim to OpenRouter AND drop the strict `json_schema`
+    // response_format down to a plain `json_object` so the AI can include any
+    // fields the caller's system prompt asked for (actions, coordinates, etc.)
+    // Empty / missing `system` -> legacy behaviour (default prompt + strict
+    // 2-field schema) for pre-v18 payloads.
+    const customSystem = typeof body.system === "string" && body.system.trim().length > 0
+      ? body.system.trim().slice(0, 32 * 1024)   // cap 32 KB — sane upper bound
+      : null;
 
     // Tier preset selects model + effort; an explicit body.model / reasoning_effort
     // still overrides it (kept for flexibility). Unknown/missing tier -> Strong.
@@ -322,16 +334,26 @@ export default {
         question.trim() ||
         "Answer the question(s) in this screenshot. If it is not a question, briefly describe what is shown.";
 
+      // v18-hotfix (2026-09-25) -- Response-format ladder:
+      //   customSystem present -> plain json_object (any JSON shape allowed)
+      //   default              -> strict json_schema {answer,[explanation]} for OpenAI models
+      //                           or json_object for non-OpenAI
+      // The `customSystem` path assumes the caller's prompt already constrains
+      // the model to a specific JSON shape (AutoSolver system prompt does).
       const schemaProps = explain ? { answer: { type: "string" }, explanation: { type: "string" } } : { answer: { type: "string" } };
-      const response_format = /^openai\//.test(model)
-        ? { type: "json_schema", json_schema: { name: "svcldb_answer", strict: true, schema: { type: "object", additionalProperties: false, properties: schemaProps, required: explain ? ["answer", "explanation"] : ["answer"] } } }
-        : { type: "json_object" };
+      const response_format = customSystem
+        ? { type: "json_object" }
+        : (/^openai\//.test(model)
+            ? { type: "json_schema", json_schema: { name: "svcldb_answer", strict: true, schema: { type: "object", additionalProperties: false, properties: schemaProps, required: explain ? ["answer", "explanation"] : ["answer"] } } }
+            : { type: "json_object" });
 
       // v7.4 (2026-09-25) -- Multi-turn conversation history. When the
       // caller sent a `messages` array we forward it verbatim (already
       // validated + normalized above); otherwise fall back to the legacy
       // one-turn shape (question + images). All routes prepend the same
       // svcldb system prompt so JSON-schema response contract is honored.
+      // v18-hotfix (2026-09-25) -- customSystem overrides the default prompt.
+      const systemMsg = customSystem ? customSystem : buildSystemPrompt(explain);
       let orMessages;
       if (hasHistory) {
         // Verified against provider docs (2026-09-25):
@@ -340,7 +362,7 @@ export default {
         // Both accept alternating user/assistant turns with per-user-turn
         // content arrays for text + multi-image parts.
         orMessages = [
-          { role: "system", content: buildSystemPrompt(explain) },
+          { role: "system", content: systemMsg },
           ...validatedHistory,
         ];
       } else {
@@ -349,7 +371,7 @@ export default {
             ? [{ type: "text", text: userText }, ...images.map((u) => ({ type: "image_url", image_url: { url: u, detail: "high" } }))]
             : userText;
         orMessages = [
-          { role: "system", content: buildSystemPrompt(explain) },
+          { role: "system", content: systemMsg },
           { role: "user", content },
         ];
       }
@@ -372,7 +394,17 @@ export default {
 
       const ai = await orRes.json();
       const raw = ai.choices?.[0]?.message?.content?.trim() ?? "";
-      const { answer, explanation } = extractAnswer(raw);
+      // v18-hotfix (2026-09-25) -- If the caller sent a custom system prompt
+      // it is defining its own JSON shape (AutoSolver: {status, question,
+      // answer, answer_formatted, confidence, actions[]}). We must NOT strip
+      // that down to the worker's default `{answer, explanation}` — the
+      // caller needs the full JSON string verbatim to extract action
+      // coordinates on the client side. Return `raw` in the `answer` field
+      // (payload's ai_ask_metered re-parses it as JSON via strchr('{') +
+      // json_skip_object, so the whole object flows through untouched).
+      const { answer, explanation } = customSystem
+        ? { answer: raw, explanation: "" }
+        : extractAnswer(raw);
 
       const rawCost = typeof ai.usage?.cost === "number" ? ai.usage.cost : COST_FALLBACK;
       const cost = Math.max(0, rawCost);

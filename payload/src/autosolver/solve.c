@@ -500,7 +500,16 @@ static DWORD WINAPI solve_thread(LPVOID unused) {
     char *reply = NULL; char err[512] = {0};
     int got = 0;
     if (cfg->provider == SVC_PROVIDER_CREDITS && cfg->access_token[0]) {
-        int mrc = ai_ask_metered_multi(cfg, turns, n_turns_ai,
+        /* v18-hotfix (2026-09-25) -- pass `&lc` (which has AUTOSOLVER_SYSTEM_PROMPT
+         * baked in) instead of `cfg`. Pre-hotfix the CREDITS path invoked
+         * ai_ask_metered_multi with the user's DEFAULT system prompt (usually
+         * empty), so the svcldb-solve worker used its own generic system
+         * prompt that only asked for `{answer, explanation}` -- no `actions[]`,
+         * no coordinates.  Result: dot never moved, autoclick never fired on
+         * CREDITS.  Now the AutoSolver-specific system prompt is forwarded
+         * to the worker (which honors it via the new `system` request field
+         * introduced in the same hotfix). */
+        int mrc = ai_ask_metered_multi(&lc, turns, n_turns_ai,
                                         &reply, err, sizeof(err));
         got = (mrc == 1 && reply);
         if (!got) {
