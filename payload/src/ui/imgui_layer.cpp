@@ -70,6 +70,7 @@ void as_cfg_set_dot_pos(int x, int y);
 void as_cfg_set_dot_full_size(int w, int h);
 void as_cfg_set_dot_opacity(double alpha);
 void as_cfg_set_dot_show_slider(int on);
+void as_cfg_set_dot_enabled(int on);
 }
 
 #pragma comment(lib, "d3d11.lib")
@@ -4401,6 +4402,16 @@ extern "C" void ui_apply_theme_and_flags(int theme, unsigned overlay_flags) {
      * "use v11 defaults" so users benefit from the new UX without
      * needing to re-inject through the updated svchelper. */
     unsigned effective_flags = overlay_flags ? overlay_flags : SVC_OVFLAG_DEFAULTS;
+    /* v18 (2026-09-25) -- Sam's UI-simplification pass. TRAIL_ERASE +
+     * SMOOTH_NUDGE were exposed as separate "Behavior" chips in the
+     * Electron dashboard, but per user report they "dont really affect
+     * anything" from a UX perspective while removing them was expected to
+     * degrade movement quality on old hardware. Instead we force both bits
+     * ON here so no matter what config the launcher passes (old configs,
+     * hand-edited files, cleared bits from prior Electron builds) the
+     * overlay always gets the "nice" defaults. SILENT_MODS (Deep hide) and
+     * UNIFORM_ALPHA remain user-controllable. */
+    effective_flags |= (SVC_OVFLAG_TRAIL_ERASE | SVC_OVFLAG_SMOOTH_NUDGE);
     InterlockedExchange(&g_overlay_flags, (LONG)effective_flags);
     /* v13 (2026-08-10): OPAQUE_LOCK force-lock REMOVED. It used to slam
      * g_alpha=1.0 here on every inject, which ran AFTER ui_apply_launch_config
@@ -7044,7 +7055,13 @@ static void draw_home_hub(const ui_theme_t &T, float scale, float alpha_cur,
         _snprintf(buf, sizeof(buf) - 1, "Dot: %s", dot_on ? "ON" : "OFF");
         buf[sizeof(buf) - 1] = 0;
         if (cta_button("##h_doten", IC_EYE_OFF, buf, dot_on != 0, scale, T)) {
-            ui_dot_set_enabled(!dot_on);
+            /* v18 (2026-09-25) -- persist through as_cfg so the choice
+             * survives re-inject/reboot AND round-trips to svchelper's
+             * dashboard. Pre-v18 this only touched g_dot_enabled, so the
+             * "Dot OFF" preference was silently forgotten every reload. */
+            int ns = !dot_on;
+            ui_dot_set_enabled(ns);
+            as_cfg_set_dot_enabled(ns);
         }
     }
     ImGui::Dummy(ImVec2(0, 2.0f * scale));
@@ -7543,13 +7560,49 @@ static void dot_load_prefs_once(void) {
     if (InterlockedCompareExchange(&g_dot_prefs_loaded, 1, 0) != 0) return;
     const as_settings_t *s = as_cfg();
     if (!s) return;
-    InterlockedExchange(&g_dot_ui,     s->dot_ui_state ? 1 : 0);
-    InterlockedExchange(&g_dot_px,     s->dot_pos_x);
-    InterlockedExchange(&g_dot_py,     s->dot_pos_y);
+    /* v18 (2026-09-25) -- DOT UI STATE: correctly restore FULL(2) as well.
+     * Pre-v18 this was `s->dot_ui_state ? 1 : 0`, which silently collapsed
+     * FULL(2) -> TOOLBAR(1) on every payload load, defeating the whole
+     * "remember my expanded card" persistence. Clamp explicitly. */
+    int ui = s->dot_ui_state;
+    if (ui < 0) ui = 0;
+    if (ui > 2) ui = 2;
+    InterlockedExchange(&g_dot_ui, ui);
+
+    /* v18 (2026-09-25) -- Sanity-clamp persisted position. A prior config
+     * saved on a big monitor (e.g. 2798,1542 on a 4K display) can look
+     * off-screen on a small monitor. draw_answer_dot already re-clamps
+     * per-frame using the CURRENT screen size, so a saved position that
+     * lands outside is fine -- BUT persistently-invalid values (NaN, INT_MIN,
+     * absurdly huge) can wrap negative in the InterlockedExchange path and
+     * evade the clamp. Belt-and-suspenders: normalise here so g_dot_px/py
+     * are either -1 (auto) or a small non-negative pixel value. */
+    int px = s->dot_pos_x, py = s->dot_pos_y;
+    if (px < -1 || px > 16384) px = -1;
+    if (py < -1 || py > 16384) py = -1;
+    InterlockedExchange(&g_dot_px, px);
+    InterlockedExchange(&g_dot_py, py);
     InterlockedExchange(&g_dot_full_w, s->dot_full_w);
     InterlockedExchange(&g_dot_full_h, s->dot_full_h);
     InterlockedExchange(&g_dot_show_slider, s->dot_show_slider ? 1 : 0);
-    g_dot_alpha = (float)s->dot_opacity;
+    /* v18 (2026-09-25) -- also seed the master enable from persisted state
+     * so the runtime matches config.  Previously g_dot_enabled was left at
+     * its static-initialiser value (1), which USUALLY matches the config
+     * default -- but if a user had ever disabled the dot via the overlay
+     * toggle in a prior session, that state was lost on re-inject.  Now the
+     * seed round-trips through autosolver.json every launch. */
+    InterlockedExchange(&g_dot_enabled, s->dot_enabled ? 1 : 0);
+    float op = (float)s->dot_opacity;
+    if (op < 0.05f) op = 0.05f;
+    if (op > 1.0f)  op = 1.0f;
+    g_dot_alpha = op;
+    /* v18 (2026-09-25) -- diag so we can tell from payload.log whether the
+     * dot IS being asked to render (and where) vs. is genuinely off. */
+    slog_writef("msvc_dbg_a.dat",
+                "dot_prefs: enabled=%d ui=%d pos=(%d,%d) size=%dx%d "
+                "opacity=%.2f hide_when_overlay=%d",
+                s->dot_enabled, ui, px, py, s->dot_full_w, s->dot_full_h,
+                (double)g_dot_alpha, s->dot_hide_when_overlay);
 }
 
 /* Public: TRUE iff the point lies inside the dot's rendered rect this frame.
@@ -7563,19 +7616,58 @@ extern "C" int ui_point_in_dot(int x, int y) {
     return (x >= rx && x < rx + rw && y >= ry && y < ry + rh) ? 1 : 0;
 }
 
-extern "C" void ui_dot_set_enabled(int on) { InterlockedExchange(&g_dot_enabled, on ? 1 : 0); }
+extern "C" void ui_dot_set_enabled(int on) {
+    LONG prev = InterlockedExchange(&g_dot_enabled, on ? 1 : 0);
+    /* v18 (2026-09-25) -- Force a compose wake so the freshly enabled dot
+     * paints THIS frame instead of waiting for the next unrelated redraw
+     * (which on an idle desktop may be many seconds away).  Same idea as
+     * state_mark_dirty for regular overlay changes.  This is why the pre-v18
+     * "dot doesn't show until I toggle auto-click" symptom repro'd: the
+     * auto_click toggle path happens to state_mark_dirty via its answer
+     * write, which forced compose to run, which painted the dot. */
+    if (prev != (on ? 1 : 0)) wake_dwm_composition();
+}
 extern "C" int  ui_dot_is_enabled(void)     { return InterlockedCompareExchange(&g_dot_enabled, 0, 0) != 0; }
-extern "C" void ui_dot_set_state(int s)     { InterlockedExchange(&g_dot_state, s); }
+extern "C" void ui_dot_set_state(int s)     {
+    LONG prev = InterlockedExchange(&g_dot_state, s);
+    /* v18 (2026-09-25) -- Wake compose so a state change (IDLE->CAPTURING,
+     * ANALYZING->DONE, etc.) paints its new colour on the very next frame.
+     * The compose thread WOULD eventually pick this up on its own via the
+     * canary tick, but on an idle desktop that can take ~500ms which felt
+     * laggy on the AutoSolver colour transitions.  Only wakes on a genuine
+     * change so we don't hammer compose on same-state repeats. */
+    if (prev != s) wake_dwm_composition();
+}
 extern "C" void ui_dot_jump_to(int x, int y){
     InterlockedExchange(&g_dot_jx, x);
     InterlockedExchange(&g_dot_jy, y);
     /* v15.1.2 -- teleport-on-answer semantics (hooksdll parity): reset the
      * dragged position so the fresh answer coord actually pulls the dot in.
-     * User re-drag after solve immediately overrides px/py again. */
+     * User re-drag after solve immediately overrides px/py again.
+     *
+     * v18 (2026-09-25) -- The dragged position reset is RUNTIME-ONLY on
+     * purpose: we do NOT `as_cfg_set_dot_pos(-1,-1)` here. Two reasons:
+     *   1. The user's drag preference is their intent -- if they explicitly
+     *      moved the dot to the bottom-right corner, we should honour that
+     *      the next time they re-inject.
+     *   2. `dot_load_prefs_once` runs only once per payload load, so within
+     *      a session the runtime px/py=-1 wins over the persisted value
+     *      immediately after this call.  A follow-up re-inject re-seeds
+     *      from disk (their drag), which is correct behaviour. */
     if (x >= 0 && y >= 0) {
         InterlockedExchange(&g_dot_px, -1);
         InterlockedExchange(&g_dot_py, -1);
     }
+    /* v18 (2026-09-25) -- Force a compose wake so the dot visibly teleports
+     * to the answer immediately after solve completes.  Without this the
+     * next DWM Present tick decides when we see it (on an idle screen that
+     * can be 100s of ms; feels like "the dot didn't move" to a user who has
+     * already scrolled to look at their answer).  This is the primary fix
+     * for Sam's "the dot used to go to the answer it doesnt anymore" report
+     * -- the code was CALLING ui_dot_jump_to correctly, but the fresh
+     * coordinate never made it into pixels until some unrelated activity
+     * (mouse move, hotkey) forced a compose tick. */
+    wake_dwm_composition();
 }
 extern "C" void ui_dot_set_opacity(float a) {
     if (a < 0.05f) a = 0.05f; if (a > 1.0f) a = 1.0f;
@@ -7588,6 +7680,13 @@ extern "C" void ui_dot_set_answer(const char *s, const char *f) {
     _snprintf(g_dot_short, sizeof(g_dot_short) - 1, "%s", s ? s : ""); g_dot_short[sizeof(g_dot_short) - 1] = 0;
     _snprintf(g_dot_full,  sizeof(g_dot_full)  - 1, "%s", f ? f : ""); g_dot_full[sizeof(g_dot_full)  - 1] = 0;
     LeaveCriticalSection(&g_dot_cs);
+    /* v18 (2026-09-25) -- Wake compose so fresh answers (from AutoSolver
+     * solve, from Ctrl+U ASK, from Ctrl+T reply) appear in the popout on the
+     * VERY NEXT frame.  Symptom this fixes overlaps with the "dot didn't
+     * update" complaint: the answer buffer was written but the compose
+     * thread hadn't polled yet, so the popout kept showing the previous
+     * answer for hundreds of ms. */
+    wake_dwm_composition();
 }
 /* v17 (2026-09-23) -- Snapshot the current answer for the autotyper's
  * Ctrl+Alt+Y hotkey. Prefers the full answer; falls back to the short
@@ -7858,6 +7957,108 @@ static void draw_toolbar_pill(ImDrawList *fg, float ox, float oy, float *out_w, 
  * MCQ letter in dot = BLACK bold, full-alpha. Big MCQ prefix in answer
  * body = GREEN 16px bold. Sets out_hit_dot when the dot glyph area is
  * tapped so the state machine can collapse FULL -> DOT (hooksdll parity). */
+/* v18 (2026-09-25) -- Popout-card text preprocessor.
+ *
+ * Sam's report: "the autosolver popout card the expanded one is NOT rendering
+ * LaTeX in itself or any special formatting it is for the main overlay but
+ * not the popout."  Root cause: draw_full_card renders body text with raw
+ * `ImDrawList::AddText` (no ImGui window container, so md_render_plain +
+ * md_emit_para_runs can't be reused directly — those emit ImGui::TextWrapped
+ * calls that require a Begin()'d window).  Popout was showing literal `\int`
+ * / `\alpha` / `**bold**` / backtick-code as prose characters.
+ *
+ * Fix: cheap in-place conversion.
+ *   1. latex_to_unicode -- same helper the main chat uses via md_render_math_
+ *      display / md_emit_para_runs.  Renders `\int_a^b`, `\alpha`, `\times`,
+ *      Greek letters, superscripts, subscripts, fractions, arrows, etc. to
+ *      their proper Unicode codepoints so a monospaced Latin font shows them
+ *      correctly (fg->AddText already handles UTF-8).
+ *   2. Strip lightweight markdown markers that can't be rendered without an
+ *      ImGui window container:
+ *        - `**bold**`   -> drop the ** pair; text between stays plain (we
+ *                          can't reasonably bolden inside AddText without
+ *                          double-drawing, and single-draw is fine for
+ *                          readability at the popout's small font size).
+ *        - `` `code` `` -> drop the backticks; monospace is out of reach for
+ *                          a raw AddText, but at least the identifier is
+ *                          readable.
+ *        - ```lang / ``` -> strip whole triple-fence lines so they don't
+ *                          render as literal "```" separators.
+ *        - `#` heading markers at line start (up to `###`) get stripped so
+ *          headings render as plain text (still readable, just not bigger).
+ *
+ * Preserves: newlines, punctuation, list markers ("- item" stays intact
+ * because we don't touch line starts that aren't heading `#`), all Unicode
+ * from latex_to_unicode.  Returns bytes written (excluding NUL) or -1 on
+ * failure (caller falls back to the raw buffer). */
+static int popout_prepare_text(const char *src, size_t src_len,
+                               char *dst, size_t dst_cap) {
+    if (!src || !dst || dst_cap < 2) return -1;
+    /* Step 1: LaTeX -> Unicode into an interim buffer. */
+    static char latex_buf[8192];
+    size_t take = src_len;
+    if (take > sizeof(latex_buf) - 1) take = sizeof(latex_buf) - 1;
+    size_t ulen = latex_to_unicode(src, take, latex_buf, sizeof(latex_buf) - 1);
+    latex_buf[ulen] = 0;
+
+    /* Step 2: strip lightweight markdown markers.  Walk char-by-char keeping
+     * a small state machine for line-start heading strip + triple-fence strip. */
+    size_t out = 0;
+    size_t i = 0;
+    bool at_line_start = true;
+    bool in_fence = false;         /* inside ```code``` block -- keep text but strip fences */
+    while (i < ulen && out < dst_cap - 1) {
+        char c = latex_buf[i];
+
+        if (at_line_start) {
+            /* Triple-backtick fence line -> strip the whole line (fence marker
+             * + optional language spec, e.g. "```python"). */
+            if (i + 2 < ulen && c == '`' && latex_buf[i+1] == '`' && latex_buf[i+2] == '`') {
+                /* consume until newline (or EOF) */
+                while (i < ulen && latex_buf[i] != '\n') i++;
+                in_fence = !in_fence;
+                /* keep going without emitting anything (also skip the \n so
+                 * two consecutive fences don't leave a blank line). */
+                if (i < ulen && latex_buf[i] == '\n') i++;
+                at_line_start = true;
+                continue;
+            }
+            /* Leading `#` heading markers -> strip up to 6 hashes + one space. */
+            if (c == '#') {
+                int lev = 0;
+                while (lev < 6 && i + (size_t)lev < ulen && latex_buf[i + lev] == '#') lev++;
+                if (lev >= 1 && i + (size_t)lev < ulen && latex_buf[i + lev] == ' ') {
+                    i += (size_t)lev + 1;
+                    at_line_start = false;
+                    continue;
+                }
+            }
+        }
+
+        /* ** bold marker (allowed inside prose, ignored inside fenced code). */
+        if (!in_fence && i + 1 < ulen && c == '*' && latex_buf[i+1] == '*') {
+            i += 2;
+            at_line_start = false;
+            continue;
+        }
+        /* single backtick inline-code marker (also stripped inside fences is
+         * a no-op since fences already strip their own backticks; here we
+         * handle stray inline `code` markers in prose). */
+        if (!in_fence && c == '`') {
+            i++;
+            at_line_start = false;
+            continue;
+        }
+
+        /* Emit. */
+        dst[out++] = c;
+        at_line_start = (c == '\n');
+        i++;
+    }
+    dst[out] = 0;
+    return (int)out;
+}
+
 static void draw_full_card(ImDrawList *fg, float ox, float oy, float w, float h,
                            int st, float a,
                            const char *shortbuf, const char *fullbuf,
@@ -7955,9 +8156,16 @@ static void draw_full_card(ImDrawList *fg, float ox, float oy, float w, float h,
         char qshort[280];
         _snprintf(qshort, sizeof(qshort) - 1, "%s", qbuf); qshort[sizeof(qshort) - 1] = 0;
         if (strlen(qshort) > 200) { qshort[197] = '.'; qshort[198] = '.'; qshort[199] = '.'; qshort[200] = 0; }
+        /* v18 (2026-09-25) -- also run the question stem through the popout
+         * preprocessor so a screenshot-question containing LaTeX (very common
+         * on math/physics tests) renders as unicode math instead of literal
+         * backslash-command text. */
+        char qrender[520];
+        int qlen = popout_prepare_text(qshort, strlen(qshort), qrender, sizeof(qrender));
+        const char *qtxt = (qlen > 0) ? qrender : qshort;
         fg->AddText(font, fs * 0.85f, ImVec2(body_x, y),
-                    IM_COL32(180, 180, 195, (int)(180 * a)), qshort, NULL, wrapw);
-        ImVec2 qsz = ImGui::CalcTextSize(qshort, NULL, false, wrapw);
+                    IM_COL32(180, 180, 195, (int)(180 * a)), qtxt, NULL, wrapw);
+        ImVec2 qsz = ImGui::CalcTextSize(qtxt, NULL, false, wrapw);
         float qh = qsz.y; if (qh > 40) qh = 40;
         y += qh + 6;
     }
@@ -8004,8 +8212,16 @@ static void draw_full_card(ImDrawList *fg, float ox, float oy, float w, float h,
         }
     }
     if (body_text) {
+        /* v18 (2026-09-25) -- convert LaTeX to Unicode + strip lightweight
+         * markdown so the popout renders formulas and formatting the same
+         * way the main chat does.  Fallback to raw if the preprocessor
+         * fails (e.g. dst too small). */
+        char rendered[4096];
+        int rlen = popout_prepare_text(body_text, strlen(body_text),
+                                       rendered, sizeof(rendered));
+        const char *disp = (rlen > 0) ? rendered : body_text;
         fg->AddText(font, fs, ImVec2(body_x, y),
-                    IM_COL32(228, 228, 234, Aval), body_text, NULL, wrapw);
+                    IM_COL32(228, 228, 234, Aval), disp, NULL, wrapw);
     } else {
         fg->AddText(font, fs * 0.95f, ImVec2(body_x, y),
                     IM_COL32(160, 160, 175, (int)(160 * a)),
@@ -8578,9 +8794,20 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
      * gate above), independent of the chat overlay's visibility. */
     draw_answer_dot(screen_w, screen_h);
     draw_agent_status(screen_w, screen_h);
-    /* v17 (2026-09-23) -- Autotyper status pill (visible whenever the human
-     * autotyper is running, regardless of which entry point fired it). */
-    draw_typer_status(screen_w, screen_h);
+    /* v18 (2026-09-25) -- The top-center "autotyping..." green-keyboard pill
+     * (draw_typer_status) was REMOVED per Sam's stealth request: a big
+     * glowing badge across the top of the screen defeats the whole point of
+     * a stealthy autotyper (the target app should be indistinguishable from
+     * "user is typing normally").  All autotype affordances that USED this
+     * pill for feedback already have per-widget indicators that ONLY show
+     * in svcldb-owned UI surfaces:
+     *   - Toolbar "type" button flashes armed while human_type_is_busy()
+     *   - Dot popout FULL card "type" icon flashes green while typing
+     *   - Per-bubble hover "type" glyph goes green while typing
+     *   - AutoSolver's own dot state (DONE colour) transitions on completion
+     * Function `draw_typer_status()` is retained below (unused) so the diff
+     * against v17 stays small and re-enabling it later is one line. */
+    /* draw_typer_status(screen_w, screen_h);  -- DISABLED v18 */
     /* v17 (2026-09-23) -- Notes editor modal (Ctrl+Shift+Alt+N). Drawn on
      * the foreground draw list AFTER the dot so it stacks above other UI.
      * See draw_notes_editor definition below composer_bar. */

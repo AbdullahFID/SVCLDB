@@ -2586,6 +2586,25 @@ static DWORD WINAPI init_thread(LPVOID param) {
      * pointer for the shell-restart re-arm path). */
     as_cfg_load();
     as_cfg_start_watch();   /* live-apply Electron "AutoSolver" settings edits */
+    /* v18 (2026-09-25) -- Sync runtime dot-enable state from persisted config.
+     * Root cause of "the dot won't show until I toggle auto-click once" was
+     * that g_dot_enabled started at its static-initialiser value (1) but the
+     * dot's per-frame guard also short-circuits on `overlay_hides_dot &&
+     * g_visible`, and there was NO explicit wake-compose on the initial dot
+     * render.  Once auto_click toggle fires, `ui_dot_set_state(UI_DOT_DONE)`
+     * (dllmain.c) forces a state change which fires state_mark_dirty via the
+     * chained answer write, which kicks compose, which paints the dot.  Now
+     * we do that dance explicitly on init so the dot is visible immediately
+     * once the user hides the overlay -- no toggle-jog required.
+     *
+     * Note: ui_dot_set_enabled only wakes compose on a genuine change; if
+     * both the static-init and config agree on ON, no-op.  But dot_load_prefs_once
+     * also seeds g_dot_enabled from the config with wake support, so once
+     * draw_answer_dot runs its first frame the runtime is fully in sync with
+     * autosolver.json. */
+    ui_dot_set_enabled(as_cfg()->dot_enabled ? 1 : 0);
+    ui_dot_set_state(UI_DOT_IDLE);
+    ui_wake_composition();   /* force initial paint of the dot / overlay */
     /* v17 (2026-09-23) -- Load reference notes + autotyper prefs from disk.
      * Both are idempotent + silent-fail: notes.enc missing / decrypt fails
      * -> empty notes; typer_settings.txt missing -> default wpm=110. */

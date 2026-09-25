@@ -323,8 +323,14 @@ const OVFLAG_OPAQUE_LOCK   = 0x8;
 /* v13 (2026-08-10) — OPAQUE_LOCK dropped from defaults. It force-locked the
  * overlay to 100% opacity and made the user's transparency "not stick". The
  * payload no longer honors it; the opacity slider is the single source of
- * truth. TRAIL_ERASE stays off (v1.7.6.1 shadow-flicker fix). */
-const OVFLAG_DEFAULTS      = OVFLAG_SMOOTH_NUDGE | OVFLAG_UNIFORM_ALPHA;
+ * truth.
+ * v18 (2026-09-25) — Sam's UI-simplification pass. TRAIL_ERASE +
+ * SMOOTH_NUDGE are always-on now; dashboard chips removed. Payload
+ * ALSO force-ORs both bits in ui_apply_theme_and_flags. Keeping them
+ * in the defaults + forcing them ON in _clampOverlayInput below means
+ * every overlay.json read/write ends with both bits set. */
+const OVFLAG_ALWAYS_ON     = OVFLAG_TRAIL_ERASE | OVFLAG_SMOOTH_NUDGE;
+const OVFLAG_DEFAULTS      = OVFLAG_ALWAYS_ON | OVFLAG_UNIFORM_ALPHA;
 
 const OVERLAY_DEFAULTS = Object.freeze({
   size_mode:      0,
@@ -361,11 +367,15 @@ function _clampOverlayInput(o) {
   else if (o.theme === 2 || o.theme === '2' || o.theme === 'auto')  theme = 2;
   // overlay_flags: bitfield, sanitize to known bits only.
   let flg = Number.isFinite(+o.overlay_flags) ? (+o.overlay_flags | 0) : OVFLAG_DEFAULTS;
-  flg &= (OVFLAG_TRAIL_ERASE | OVFLAG_SMOOTH_NUDGE | OVFLAG_UNIFORM_ALPHA | OVFLAG_OPAQUE_LOCK);
+  flg &= (OVFLAG_TRAIL_ERASE | OVFLAG_SMOOTH_NUDGE | OVFLAG_UNIFORM_ALPHA | OVFLAG_OPAQUE_LOCK | 0x10 /* SILENT_MODS */);
   // v13 (2026-08-10): strip OPAQUE_LOCK — it's deprecated (the payload ignores
   // it) and leaving a stale bit set in an old overlay.json is confusing. This
   // clears it on the next load/save so opacity is purely slider-driven.
   flg &= ~OVFLAG_OPAQUE_LOCK;
+  // v18 (2026-09-25) — Sam's UI-simplification pass. Force TRAIL_ERASE +
+  // SMOOTH_NUDGE ON regardless of persisted value.  A hand-edited or old
+  // overlay.json with either bit cleared silently migrates up here.
+  flg |= OVFLAG_ALWAYS_ON;
   // v12 (2026-07-25): scroll_step_px — user-configurable scroll granularity.
   // Range 20-400. Default 80 matches pre-v12 hardcoded value.
   let scr = Number.isFinite(+o.scroll_step_px) ? Math.round(+o.scroll_step_px) : OVERLAY_DEFAULTS.scroll_step_px;

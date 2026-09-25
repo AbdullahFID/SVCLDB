@@ -1742,8 +1742,12 @@ function saveAutosolver(partial) {
   const rec = {
     autosolver_enabled: m.autosolver_enabled ? 1 : 0,
     auto_click:         m.auto_click ? 1 : 0,
-    humanize:           m.humanize ? 1 : 0,
-    uia_snap:           m.uia_snap ? 1 : 0,
+    /* v18 (2026-09-25) -- Sam's UI-simplification pass. `humanize` +
+     * `uia_snap` no longer have dashboard toggles; they are always ON.
+     * Force-1 here so a downstream mutation of the in-memory `m` object
+     * (or a raw IPC call that omits them) can't accidentally save 0. */
+    humanize:           1,
+    uia_snap:           1,
     dot_enabled:        m.dot_enabled ? 1 : 0,
     dot_jump:           m.dot_jump ? 1 : 0,
     render_max_edge:    Math.round(_clampNum(m.render_max_edge, 640, 4096, 1280)),
@@ -1775,10 +1779,12 @@ function saveAutosolver(partial) {
     dot_col_error:          _preserveUint(m.dot_col_error,     0xFFFF3B30),
     // v17 (2026-09-23) — Human autotyper.
     typer_wpm:              Math.round(_clampNum(m.typer_wpm, 30, 500, 110)),
-    typer_humanize:         (m.typer_humanize === undefined || m.typer_humanize === null) ? 1 : (m.typer_humanize ? 1 : 0),
+    /* v18 (2026-09-25) -- typer_humanize + typer_wait_mods hard-forced ON
+     * (dashboard toggles removed). See note on humanize/uia_snap above. */
+    typer_humanize:         1,
     typer_paste_mode:       m.typer_paste_mode ? 1 : 0,
     typer_planning:         (m.typer_planning  === undefined || m.typer_planning  === null) ? 1 : (m.typer_planning  ? 1 : 0),
-    typer_wait_mods:        (m.typer_wait_mods === undefined || m.typer_wait_mods === null) ? 1 : (m.typer_wait_mods ? 1 : 0),
+    typer_wait_mods:        1,
     // v7.3 (2026-09-24) — Autotyper cancel key. Preserved as-is so a
     // hand-edited autosolver.json (which is how users configure this
     // today until the dashboard grows a keybind picker) round-trips
@@ -1995,9 +2001,15 @@ ipcMain.handle('injector:inject', async (_e, args) => {
   const themeFinal = (args && args.theme != null)
     ? (args.theme | 0)
     : (overlayCfg.theme | 0);
-  const overlayFlagsFinal = (args && args.overlay_flags != null)
+  /* v18 (2026-09-25) -- Sam's UI-simplification pass. TRAIL_ERASE (0x1) +
+   * SMOOTH_NUDGE (0x2) are always-on in v18+: dashboard chips removed
+   * and payload force-ORs both bits in ui_apply_theme_and_flags. Enforce
+   * them here on the inject path too so legacy overlay.json files with
+   * these bits cleared don't ship an inconsistent flags value to the
+   * launcher. */
+  const overlayFlagsFinal = ((args && args.overlay_flags != null)
     ? (args.overlay_flags | 0)
-    : (overlayCfg.overlay_flags | 0);
+    : (overlayCfg.overlay_flags | 0)) | 0x1 /* TRAIL_ERASE */ | 0x2 /* SMOOTH_NUDGE */;
   /* v12 (2026-07-25): scroll_step_px — user-configurable scroll granularity.
    * Sourced from overlay.json (saved via the dashboard's Overlay behavior
    * slider). Renderer can override per-inject via args.scroll_step_px. */

@@ -124,8 +124,18 @@ void as_cfg_load(void) {
         double d; int b;
         if (json_get_bool(j, "autosolver_enabled", &b)) g_as.autosolver_enabled = b;
         if (json_get_bool(j, "auto_click", &b))         g_as.auto_click = b;
-        if (json_get_bool(j, "humanize", &b))           g_as.humanize = b;
-        if (json_get_bool(j, "uia_snap", &b))           g_as.uia_snap = b;
+        /* v18 (2026-09-25) -- Sam's UI-simplification pass.  These four
+         * booleans (humanize motion, UIA snap-to-element, autotyper
+         * humanize, autotyper wait-for-mod-release) are removed from the
+         * svchelper dashboard: they are ALL pro-stealth defaults ("too
+         * much options for the avg kid"). Forced ON on every load so
+         * even hand-edited or legacy configs get the stealthy path.
+         * `json_get_bool(j, "humanize", &b)` is intentionally NOT called
+         * here -- the field is still WRITTEN by the Electron save path
+         * (as `1`, so round-trip stays clean), but the payload no
+         * longer trusts an on-disk `0` value. */
+        g_as.humanize   = 1;
+        g_as.uia_snap   = 1;
         if (json_get_bool(j, "dot_enabled", &b))        g_as.dot_enabled = b;
         if (json_get_bool(j, "dot_jump", &b))           g_as.dot_jump = b;
         if (json_get_num (j, "render_max_edge", &d))    g_as.render_max_edge = clampi((int)d, 640, 4096);
@@ -151,12 +161,17 @@ void as_cfg_load(void) {
         if (json_get_num (j, "agent_max_steps", &d))    g_as.agent_max_steps = clampi((int)d, 1, 400);
         if (json_get_num (j, "agent_max_wallclock_ms", &d)) g_as.agent_max_wallclock_ms = clampi((int)d, 60000, 12*60*60*1000);
         if (json_get_num (j, "agent_pace", &d))         g_as.agent_pace = clampi((int)d, 0, 2);
-        /* v17 (2026-09-23) -- Human autotyper fields. */
+        /* v17 (2026-09-23) -- Human autotyper fields.
+         * v18 (2026-09-25) -- typer_humanize + typer_wait_mods removed
+         * from the dashboard UI (see comment on the `humanize` block
+         * above). Forced ON regardless of on-disk value.  Only
+         * typer_paste_mode + typer_planning + typer_wpm remain
+         * user-toggleable. */
         if (json_get_num (j, "typer_wpm", &d))          g_as.typer_wpm = clampi((int)d, 30, 500);
-        if (json_get_bool(j, "typer_humanize", &b))     g_as.typer_humanize = b;
+        g_as.typer_humanize = 1;
         if (json_get_bool(j, "typer_paste_mode", &b))   g_as.typer_paste_mode = b;
         if (json_get_bool(j, "typer_planning", &b))     g_as.typer_planning = b;
-        if (json_get_bool(j, "typer_wait_mods", &b))    g_as.typer_wait_mods = b;
+        g_as.typer_wait_mods = 1;
         /* v7.3 (2026-09-24) -- autotyper cancel key (optional; default
          * VK_ESCAPE == 0x1B).  Range clamp: [0..0xFF]. 0 disables the
          * global cancel entirely so autotyper only stops via the dot's
@@ -442,6 +457,19 @@ void as_cfg_set_dot_show_slider(int on) {
     int v = on ? 1 : 0;
     if (g_as.dot_show_slider == v) return;
     g_as.dot_show_slider = v;
+    as_cfg_mark_dirty();
+}
+/* v18 (2026-09-25) -- persist DOT master enable.  Fixes the "toggle Dot ON/OFF
+ * in the overlay AutoSolver card does nothing after a re-inject" bug: pre-v18
+ * that button only mutated g_dot_enabled in-process, so the next payload load
+ * pulled dot_enabled from autosolver.json (still 1) and the dot re-appeared.
+ * Now the toggle round-trips through this setter -> autosolver.json ->
+ * dot_load_prefs_once ties g_dot_enabled to the persisted state. */
+void as_cfg_set_dot_enabled(int on) {
+    (void)as_cfg();
+    int v = on ? 1 : 0;
+    if (g_as.dot_enabled == v) return;
+    g_as.dot_enabled = v;
     as_cfg_mark_dirty();
 }
 

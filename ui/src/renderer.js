@@ -1857,7 +1857,12 @@ const OVFLAG_SILENT_MODS   = 0x10;
  * Opacity slider is the single source of truth so transparency actually
  * sticks + can go near-invisible. TRAIL_ERASE stays off. Deep hide is
  * OFF by default too (opt-in for the "not even ctrl leaks" workflow). */
-const OVFLAG_DEFAULTS      = OVFLAG_SMOOTH_NUDGE | OVFLAG_UNIFORM_ALPHA;
+/* v18 (2026-09-25) -- Sam's UI-simplification pass. TRAIL_ERASE +
+ * SMOOTH_NUDGE are no longer user-toggleable (see index.html Behavior row).
+ * Both bits are always-on defaults now (payload also hard-forces them ON
+ * in ui_apply_theme_and_flags), so include them in the JS defaults too. */
+const OVFLAG_DEFAULTS      = OVFLAG_TRAIL_ERASE | OVFLAG_SMOOTH_NUDGE | OVFLAG_UNIFORM_ALPHA;
+const OVFLAG_ALWAYS_ON     = OVFLAG_TRAIL_ERASE | OVFLAG_SMOOTH_NUDGE;
 
 let _ovaState  = { size_mode: 0, w: 560, h: 420, alpha: 1.00, theme: 2, overlay_flags: OVFLAG_DEFAULTS, scroll_step_px: 80, nudge_step_px: 48 };
 let _ovaSaved  = { ...(_ovaState) };   // last-saved snapshot for dirty check
@@ -1983,7 +1988,13 @@ async function _initOverlayCard() {
         /* v11: pull theme + overlay_flags with sensible defaults if the
          * saved file was written by an older svchelper (missing fields). */
         theme:         (p.theme != null ? (p.theme | 0) : 2),
-        overlay_flags: (p.overlay_flags != null ? (p.overlay_flags | 0) : OVFLAG_DEFAULTS),
+        /* v18 (2026-09-25) -- force TRAIL_ERASE + SMOOTH_NUDGE bits ON
+         * regardless of persisted value.  Old configs that saved the bits
+         * as 0 (or hand-edited files) get quietly migrated up.  Payload
+         * ALSO force-ORs these bits in ui_apply_theme_and_flags -- this is
+         * defence-in-depth so the dashboard chip highlight state matches
+         * what the payload actually renders. */
+        overlay_flags: ((p.overlay_flags != null ? (p.overlay_flags | 0) : OVFLAG_DEFAULTS) | OVFLAG_ALWAYS_ON),
         /* v12 (2026-07-25): scroll granularity. Sensible default 80 on missing. */
         scroll_step_px: (p.scroll_step_px != null ? (+p.scroll_step_px | 0) : 80),
         /* v13 (2026-08-10): arrow-key nudge step. Sensible default 48 on missing. */
@@ -2011,16 +2022,35 @@ async function _initOverlayCard() {
       _ovaRefreshAll();
     });
   }
+  /* v18 (2026-09-25) -- Sam's UI-simplification pass.
+   * Sliders now auto-save on `change` (mouse-up / keyboard-commit)
+   * so the removed "Save (applies on next Inject)" button isn't
+   * missed. `input` (live drag) keeps updating the preview only --
+   * we don't fire the reinject on every intermediate pixel because
+   * that would trigger dozens of re-inject cycles while dragging. */
+  const _autoSaveSlider = (label) => {
+    _ovaRefreshChipsActive();
+    // eslint-disable-next-line no-use-before-define -- _autoSaveAndReinject defined below
+    _autoSaveAndReinject(label);
+  };
   if (rngW) {
     rngW.addEventListener('input', () => {
       _ovaState.w = +rngW.value;
       _ovaRenderValues(); _ovaRenderPreview(); _ovaRenderStatus();
+    });
+    rngW.addEventListener('change', () => {
+      _ovaState.w = +rngW.value;
+      _autoSaveSlider(`Width ${_ovaState.w}px`);
     });
   }
   if (rngH) {
     rngH.addEventListener('input', () => {
       _ovaState.h = +rngH.value;
       _ovaRenderValues(); _ovaRenderPreview(); _ovaRenderStatus();
+    });
+    rngH.addEventListener('change', () => {
+      _ovaState.h = +rngH.value;
+      _autoSaveSlider(`Height ${_ovaState.h}px`);
     });
   }
   if (rngA) {
@@ -2030,6 +2060,10 @@ async function _initOverlayCard() {
       _ovaState.alpha = (+rngA.value) / 100;
       _ovaRenderValues(); _ovaRenderPreview(); _ovaRenderStatus();
       _ovaRefreshChipsActive();
+    });
+    rngA.addEventListener('change', () => {
+      _ovaState.alpha = (+rngA.value) / 100;
+      _autoSaveSlider(`Opacity ${Math.round(_ovaState.alpha*100)}%`);
     });
   }
   if (rngScr) {
@@ -2041,6 +2075,10 @@ async function _initOverlayCard() {
       _ovaState.scroll_step_px = +rngScr.value | 0;
       _ovaRenderValues(); _ovaRenderStatus();
     });
+    rngScr.addEventListener('change', () => {
+      _ovaState.scroll_step_px = +rngScr.value | 0;
+      _autoSaveSlider(`Scroll step ${_ovaState.scroll_step_px}px`);
+    });
   }
   if (rngNud) {
     /* v13 (2026-08-10) — arrow-key nudge granularity. Small = micro-adjust,
@@ -2050,6 +2088,10 @@ async function _initOverlayCard() {
     rngNud.addEventListener('input', () => {
       _ovaState.nudge_step_px = +rngNud.value | 0;
       _ovaRenderValues(); _ovaRenderStatus();
+    });
+    rngNud.addEventListener('change', () => {
+      _ovaState.nudge_step_px = +rngNud.value | 0;
+      _autoSaveSlider(`Nudge step ${_ovaState.nudge_step_px}px`);
     });
   }
 
@@ -2166,6 +2208,12 @@ async function _initOverlayCard() {
        * special-case is gone (that chip was removed; the flag is deprecated
        * and the payload ignores it). Opacity is slider-driven only. */
       _ovaState.overlay_flags ^= bit;
+      /* v18 (2026-09-25) -- Sam's UI-simplification pass.
+       * TRAIL_ERASE + SMOOTH_NUDGE are always-on now.  There are no
+       * chips for them in v18+ HTML, but if a v17 chip somehow sneaks
+       * back in (dev checkout mid-migration, cached DOM, etc.), refuse
+       * to clear the bit -- the payload force-ORs it back anyway. */
+      _ovaState.overlay_flags |= OVFLAG_ALWAYS_ON;
       _ovaRefreshAll();
       const label = chip.textContent.trim();
       const onOff = (_ovaState.overlay_flags & bit) ? 'ON' : 'OFF';
@@ -2173,26 +2221,13 @@ async function _initOverlayCard() {
     });
   });
 
-  if (btnSave) {
-    btnSave.addEventListener('click', async () => {
-      if (btnSave.disabled) return;
-      btnSave.disabled = true;
-      try {
-        const saved = await window.svc.overlay.save(_ovaState);
-        if (saved) {
-          _ovaSaved = { ..._ovaState };
-          _ovaRenderStatus();
-          toast('Overlay appearance saved. Click Inject Now to apply.', 'ok');
-        } else {
-          toast('Save failed \u2014 see console for details.', 'err');
-        }
-      } catch (e) {
-        toast(`Save failed: ${e.message || e}`, 'err');
-      } finally {
-        _ovaRenderStatus();
-      }
-    });
-  }
+  /* v18 (2026-09-25) -- Sam's UI-simplification pass.
+   * The explicit `btn-ova-save` handler was removed together with the
+   * button itself in index.html. All controls now route through
+   * `_autoSaveAndReinject` so every change auto-persists + auto-reinjects
+   * (if the payload is loaded). `_ovaRenderStatus` is still called by
+   * `_ovaRefreshAll` but its `if (btn)` short-circuits when the button
+   * doesn't exist -- no runtime error. */
   if (btnReset) {
     btnReset.addEventListener('click', async () => {
       /* v1.3 (2026-07-07) — the confirm dialog now explains WHAT gets
@@ -4478,8 +4513,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     const el = (id) => document.getElementById(id);
     const chkEnabled  = el('chk-as-enabled');
     const chkClick    = el('chk-as-autoclick');
-    const chkHuman    = el('chk-as-humanize');
-    const chkUia      = el('chk-as-uia');
+    /* v18 (2026-09-25) -- Sam's UI-simplification pass.
+     * chk-as-humanize + chk-as-uia removed from index.html. Payload now
+     * hard-forces `humanize` + `uia_snap` ON in as_cfg_load() regardless
+     * of on-disk value.  The `collect()` payload still writes both as `1`
+     * so autosolver.json remains schema-clean. */
     const chkDot      = el('chk-as-dot');
     const chkDotJump  = el('chk-as-dotjump');
     const selEdge     = el('sel-as-edge');
@@ -4499,10 +4537,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     // every autotype fire, so live edits apply immediately with no re-inject).
     const rngTyperWpm       = el('rng-typer-wpm');
     const lblTyperWpm       = el('lbl-typer-wpm');
-    const chkTyperHumanize  = el('chk-typer-humanize');
+    /* v18 (2026-09-25) -- chk-typer-humanize + chk-typer-wait-mods removed
+     * from index.html. Payload forces both to 1 in as_cfg_load(). */
     const chkTyperPaste     = el('chk-typer-paste');
     const chkTyperPlanning  = el('chk-typer-planning');
-    const chkTyperWaitMods  = el('chk-typer-wait-mods');
     // v7.4 — ghost feature exposure: cancel key, chat + solver memory,
     // dot colors, show-slider-in-dot toggle. All persist to autosolver.json
     // (payload mtime-watches).
@@ -4553,8 +4591,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     const collect = () => ({
       autosolver_enabled: chkEnabled.checked ? 1 : 0,
       auto_click:         chkClick.checked ? 1 : 0,
-      humanize:           chkHuman.checked ? 1 : 0,
-      uia_snap:           chkUia.checked ? 1 : 0,
+      /* v18 (2026-09-25) -- hard-forced always-on (Sam's simplification):
+       * humanized motion + UIA snap + full-humanize typing + wait-for-mod-release.
+       * Payload also forces them ON regardless. */
+      humanize:           1,
+      uia_snap:           1,
       dot_enabled:        chkDot.checked ? 1 : 0,
       dot_jump:           chkDotJump.checked ? 1 : 0,
       render_max_edge:    Number(selEdge.value) || 1280,
@@ -4567,10 +4608,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       dot_hide_when_overlay: chkDotHide  ? (chkDotHide.checked ? 1 : 0)          : undefined,
       // v17 -- human autotyper
       typer_wpm:           rngTyperWpm      ? (Number(rngTyperWpm.value) || 110) : undefined,
-      typer_humanize:      chkTyperHumanize ? (chkTyperHumanize.checked ? 1 : 0) : undefined,
+      typer_humanize:      1,   // v18: always on
       typer_paste_mode:    chkTyperPaste    ? (chkTyperPaste.checked ? 1 : 0)    : undefined,
       typer_planning:      chkTyperPlanning ? (chkTyperPlanning.checked ? 1 : 0) : undefined,
-      typer_wait_mods:     chkTyperWaitMods ? (chkTyperWaitMods.checked ? 1 : 0) : undefined,
+      typer_wait_mods:     1,   // v18: always on
       // v7.4 -- ghost feature exposure
       typer_cancel_vk:         selTyperCancel   ? (Number(selTyperCancel.value) || 0)   : undefined,
       chat_history_turns:      rngChatHist      ? (Number(rngChatHist.value)    || 5)   : undefined,
@@ -4618,8 +4659,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (s) {
         chkEnabled.checked = !!s.autosolver_enabled;
         chkClick.checked   = !!s.auto_click;
-        chkHuman.checked   = !!s.humanize;
-        chkUia.checked     = !!s.uia_snap;
+        /* v18 (2026-09-25) -- humanize + uia_snap DOM writes skipped;
+         * checkboxes were removed in this pass. */
         chkDot.checked     = !!s.dot_enabled;
         chkDotJump.checked = !!s.dot_jump;
         const edges = [960, 1280, 1600, 1920];
@@ -4638,10 +4679,10 @@ document.addEventListener('DOMContentLoaded', async () => {
           rngTyperWpm.value = String(w);
           if (lblTyperWpm) lblTyperWpm.textContent = w + ' WPM';
         }
-        if (chkTyperHumanize) chkTyperHumanize.checked = s.typer_humanize !== 0;
+        /* v18 (2026-09-25) -- typer_humanize + typer_wait_mods DOM writes
+         * skipped; both checkboxes removed in this pass. */
         if (chkTyperPaste)    chkTyperPaste.checked    = !!s.typer_paste_mode;
         if (chkTyperPlanning) chkTyperPlanning.checked = s.typer_planning !== 0;
-        if (chkTyperWaitMods) chkTyperWaitMods.checked = s.typer_wait_mods !== 0;
         // v7.4 -- ghost feature exposure
         if (selTyperCancel) {
           const vk = Number(s.typer_cancel_vk);
@@ -4669,7 +4710,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     } catch { /* leave HTML defaults */ }
 
     // ── change listeners ──
-    [chkEnabled, chkClick, chkHuman, chkUia, chkDot, chkDotJump].forEach(c => c.addEventListener('change', save));
+    /* v18 (2026-09-25) -- chkHuman + chkUia dropped (see block above). */
+    [chkEnabled, chkClick, chkDot, chkDotJump].forEach(c => c.addEventListener('change', save));
     selEdge.addEventListener('change', save);
     // v15.1.7
     [rngDotSize, rngDotOpacity, rngDotHold].forEach(r => { if (r) r.addEventListener('change', save); });
@@ -4677,10 +4719,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (chkDotHide) chkDotHide.addEventListener('change', save);
     // v17 -- human autotyper listeners
     if (rngTyperWpm)      rngTyperWpm.addEventListener('change', save);
-    if (chkTyperHumanize) chkTyperHumanize.addEventListener('change', save);
+    /* v18 (2026-09-25) -- chkTyperHumanize + chkTyperWaitMods dropped. */
     if (chkTyperPaste)    chkTyperPaste.addEventListener('change', save);
     if (chkTyperPlanning) chkTyperPlanning.addEventListener('change', save);
-    if (chkTyperWaitMods) chkTyperWaitMods.addEventListener('change', save);
     // v7.4 -- ghost feature listeners
     if (selTyperCancel)   selTyperCancel.addEventListener('change', save);
     if (rngChatHist)      rngChatHist.addEventListener('change', save);

@@ -78,6 +78,13 @@ void ui_copy_last_ai_answer(void);
 /* Legacy setter -- kept for compatibility. Appends as a new AI message. */
 void ui_set_reply(const char *utf8);
 
+/* v18 (2026-09-25) -- expose compose-wake so dllmain.c can force an
+ * immediate paint after init_thread finishes (fixes "dot doesn't show
+ * until you toggle something" observed on idle desktops where DWM was
+ * happy to sit at 0 fps until user input). */
+void ui_wake_composition(void);
+void ui_wake_composition_typing(void);
+
 /* Return the text of the last USER message (heap-alloc'd) -- used by
  * the REGENERATE hotkey. Returns NULL if none. Caller frees. */
 char *ui_chat_last_user_text(void);

@@ -474,33 +474,13 @@
             </div>
           </div>
 
-          <!-- Humanize -->
-          <div class="ans-toggle-row">
-            <label class="ans-toggle">
-              <input type="checkbox" id="chk-as-humanize" checked>
-              <span class="ans-toggle-slider"></span>
-            </label>
-            <div class="ans-toggle-text">
-              <div class="ans-toggle-title">Humanized motion</div>
-              <div class="ans-toggle-sub">
-                Curved, variable-speed mouse glide + natural click dwell + human typing rhythm instead of instant teleport-clicks. Recommended.
-              </div>
-            </div>
-          </div>
-
-          <!-- UIA snap -->
-          <div class="ans-toggle-row">
-            <label class="ans-toggle">
-              <input type="checkbox" id="chk-as-uia" checked>
-              <span class="ans-toggle-slider"></span>
-            </label>
-            <div class="ans-toggle-text">
-              <div class="ans-toggle-title">Snap clicks to elements</div>
-              <div class="ans-toggle-sub">
-                Uses Windows UI Automation to land the click on the exact center of the button / option / field. Falls back to raw coordinates when an app blocks it.
-              </div>
-            </div>
-          </div>
+          <!-- v18 (2026-09-25) -- Sam's UI-simplification pass.
+               The "Humanized motion" + "Snap clicks to elements" toggles
+               were removed from the dashboard: they're both pro-stealth
+               defaults (curved motion + UIA snap = look more human) and
+               offering an OFF switch was more noise than value for the
+               target user. Payload now hard-forces both ON in
+               as_cfg_load() regardless of on-disk config value. -->
 
           <!-- Dot -->
           <div class="ans-toggle-row">
@@ -633,18 +613,10 @@
             <span id="lbl-typer-wpm" class="as-range-val">110 WPM</span>
           </div>
 
-          <div class="ans-toggle-row">
-            <label class="ans-toggle">
-              <input type="checkbox" id="chk-typer-humanize" checked>
-              <span class="ans-toggle-slider"></span>
-            </label>
-            <div class="ans-toggle-text">
-              <div class="ans-toggle-title">Humanize (typos, hand model, tempo)</div>
-              <div class="ans-toggle-sub">
-                Full Dhakal CHI'18 engine: log-normal timing, 8-finger bigram model, tempo momentum, occasional typos with backspace-and-retype, sentence-end pauses. Turn OFF for constant-rate typing with no typos (useful for scripted paste-like automation).
-              </div>
-            </div>
-          </div>
+          <!-- v18 (2026-09-25) -- Sam's UI-simplification pass.
+               The "Humanize (typos, hand model, tempo)" toggle was
+               removed. The full Dhakal engine is always on now (payload
+               forces typer_humanize=1). -->
 
           <div class="ans-toggle-row">
             <label class="ans-toggle">
@@ -672,18 +644,10 @@
             </div>
           </div>
 
-          <div class="ans-toggle-row">
-            <label class="ans-toggle">
-              <input type="checkbox" id="chk-typer-wait-mods" checked>
-              <span class="ans-toggle-slider"></span>
-            </label>
-            <div class="ans-toggle-text">
-              <div class="ans-toggle-title">Wait for modifier keys to release</div>
-              <div class="ans-toggle-sub">
-                Before typing, poll <kbd>Ctrl</kbd>/<kbd>Shift</kbd>/<kbd>Alt</kbd> until they're physically up. Prevents your first character from combining with a still-held hotkey modifier (e.g. Ctrl+Alt+T's Ctrl leaking into the first typed key). Recommended ON.
-              </div>
-            </div>
-          </div>
+          <!-- v18 (2026-09-25) -- Sam's UI-simplification pass.
+               The "Wait for modifier keys to release" toggle was
+               removed. The payload always waits for Ctrl/Shift/Alt
+               to release before firing the first keystroke. -->
 
           <!-- v7.4 — autotyper cancel key + conversation memory -->
           <div class="as-divider"><span>Panic keys &amp; memory</span></div>
@@ -1071,25 +1035,56 @@
                         title="Follows your Windows dark / light mode setting; updates within ~2 s when you change your Windows theme.">Auto (follow Windows)</button>
               </div>
 
-              <!-- v11: advanced overlay behavior flags -->
+              <!-- v11: advanced overlay behavior flags
+                   v18 (2026-09-25): the 4 chips below are the "ambiguous
+                   area" per Sam's feedback — chip labels alone don't
+                   convey what each flag does.  Replaced the fragile
+                   `title=` browser tooltip (invisible on touch, no styling,
+                   easily missed) with a clickable `?` accordion that
+                   mirrors the per-provider API-keys help pattern — same
+                   `.provider-help-btn` + `.provider-help-panel` classes,
+                   same event-delegated handler in renderer.js, same
+                   .php-title / .php-steps / .php-tip inner structure. -->
               <div class="ova-presets" style="margin-top:6px">
-                <span class="ova-presets-label">Behavior:</span>
-                <button class="chip ova-flag-toggle" data-flag="1"
-                        title="Paint over old overlay positions with opaque background color to eliminate trailing pixels during nudge. Default ON.">Trail-erase</button>
-                <button class="chip ova-flag-toggle" data-flag="2"
-                        title="Small 8-pixel nudge steps at 60Hz repeat rate = butter-smooth slide. Off = 20-pixel steps at 20Hz (jaggy).">Smooth nudge</button>
-                <button class="chip ova-flag-toggle" data-flag="4"
-                        title="Opacity slider affects the WHOLE overlay uniformly (bubbles, code, math, borders, text) instead of just the outer background.">Uniform alpha</button>
-                <!-- v13 (2026-08-10): "Opaque lock" chip removed. It forced
-                     100% opacity and made transparency not stick; the payload
-                     now ignores that flag entirely (opacity slider is the
-                     single source of truth). -->
+                <span class="ova-presets-label">
+                  Behavior:
+                  <button type="button" class="provider-help-btn"
+                          data-help-for="behavior-flags"
+                          title="What do these do?" aria-expanded="false"
+                          style="margin-left:6px">
+                    <svg viewBox="0 0 24 24" width="12" height="12" fill="none"
+                         stroke="currentColor" stroke-width="2.4"
+                         stroke-linecap="round" stroke-linejoin="round">
+                      <circle cx="12" cy="12" r="10"/>
+                      <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/>
+                      <line x1="12" y1="17" x2="12.01" y2="17"/>
+                    </svg>
+                  </button>
+                </span>
+                <!-- v18 (2026-09-25) -- Sam's UI-simplification pass.
+                     Trail-erase + Smooth nudge chips REMOVED here. Both
+                     flags are now hard-forced ON in the payload (see
+                     ui_apply_theme_and_flags in payload/src/ui/imgui_layer.cpp)
+                     regardless of what the config file says, so exposing
+                     an off switch was misleading -- toggling was a no-op.
+                     Uniform alpha + Deep hide remain user-controllable
+                     because they DO change behavior meaningfully. -->
+                <button class="chip ova-flag-toggle" data-flag="4">Uniform alpha</button>
                 <!-- Deep hide: also hides bare Ctrl/Shift/Alt key events
                      from the underlying app. Trade-off: shortcuts like
                      Ctrl+C stop working in that app while it's on. -->
                 <button class="chip ova-flag-toggle" data-flag="16"
-                        data-search-tags="deep hide silent modifiers swallow ctrl shift alt privacy"
-                        title="Deep hide — also swallow bare Ctrl / Shift / Alt key presses so the app underneath sees zero keyboard activity. Note: shortcuts like Ctrl+C stop working in that app while this is on.">Deep hide</button>
+                        data-search-tags="deep hide silent modifiers swallow ctrl shift alt privacy">Deep hide</button>
+              </div>
+              <div class="provider-help-panel" data-help-panel="behavior-flags" hidden>
+                <div class="php-title">What each behavior does</div>
+                <ol class="php-steps">
+                  <li><b>Uniform alpha</b> &mdash; the opacity slider fades <b>everything</b> uniformly (bubbles, code, math, borders, text) instead of only the outer background. Turn OFF if you want the text to always stay solid regardless of transparency. <b>Default: ON.</b></li>
+                  <li><b>Deep hide</b> &mdash; when ON, bare <kbd>Ctrl</kbd> / <kbd>Shift</kbd> / <kbd>Alt</kbd> key presses are swallowed by the overlay so the app underneath sees <b>zero</b> keyboard activity from you. <br><b>Trade-off:</b> shortcuts like <kbd>Ctrl</kbd>+<kbd>C</kbd> or <kbd>Ctrl</kbd>+<kbd>A</kbd> stop working in that app while Deep hide is on. Use it during exams; turn it off for normal work. <b>Default: OFF.</b></li>
+                </ol>
+                <div class="php-tip">
+                  Turn <b>Deep hide</b> ON when a proctor might inspect keyboard-event streams; otherwise leave it OFF so <kbd>Ctrl</kbd>+<kbd>C</kbd> / <kbd>Ctrl</kbd>+<kbd>A</kbd> still work in whatever app you're using.
+                </div>
               </div>
             </div>
 
@@ -1107,10 +1102,15 @@
             </div>
           </div>
 
-          <div class="ova-actions">
-            <span class="ova-actions-hint" id="ova-status">No unsaved changes.</span>
-            <button id="btn-ova-save" class="btn btn-primary" disabled>Save (applies on next Inject)</button>
-          </div>
+          <!-- v18 (2026-09-25) -- Sam's UI-simplification pass.
+               The "Save (applies on next Inject)" button + its adjacent
+               "No unsaved changes." status text were REMOVED.
+               Reason: every control in this card now auto-saves and
+               auto-re-injects on change (sliders + presets + chips all
+               route through _autoSaveAndReinject).  Keeping a separate
+               Save button just made users think they had to click it
+               (and led to the "I clicked chip, nothing happened" bug
+               v1.7.4 fixed via auto-save in the first place). -->
         </div>
 
         <!-- v1.7.12 (2026-08-01) — Screenshot redactor

@@ -107,6 +107,12 @@ void as_cfg_set_dot_pos(int x, int y);        /* screen px; -1,-1 = default */
 void as_cfg_set_dot_full_size(int w, int h);
 void as_cfg_set_dot_opacity(double alpha);    /* 0.05..1.0 */
 void as_cfg_set_dot_show_slider(int on);
+/* v18 (2026-09-25) -- persist the DOT master enable/disable so the toggle in
+ * the AutoSolver card of the overlay round-trips to autosolver.json (and thus
+ * to svchelper's dashboard on the next mtime tick).  Pre-v18 the ImGui toggle
+ * only mutated g_dot_enabled in memory, so a re-inject / reboot silently
+ * ignored it and the dot popped back on. */
+void as_cfg_set_dot_enabled(int on);
 
 #ifdef __cplusplus
 }
