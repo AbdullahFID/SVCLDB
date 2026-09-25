@@ -242,6 +242,29 @@ static int rect_plausible(const RECT *r) {
     return 1;
 }
 
+/* v7.5.3 (2026-09-25) -- distance cap for UIA snap acceptance.
+ *
+ * Sam's live reproduce today: AI told AutoSolver to click at screen(173, 887)
+ * (bottom-left MCQ option). ground_snap_screen ran ElementFromPoint(173,887)
+ * and got back a big container (probably the exam's outer <body> / iframe)
+ * whose "clickable point" is (1440, 939) -- 1268 pixels away, essentially
+ * screen center. act_click_image glided the cursor there (with cursor_after
+ * matching = the click landed as aimed) but the answer option was nowhere
+ * near it. Mouse visibly moved DOWN-RIGHT to the middle instead of UP-LEFT
+ * to the answer.
+ *
+ * The AI's coordinates on MCQ answers are accurate within a few dozen
+ * pixels -- if the UIA snap says "actually click over here 1200+ pixels
+ * away" the snap is almost certainly landing on the wrong element.
+ * Reject snaps that move the target further than SNAP_MAX_DELTA px in
+ * either axis and fall back to the raw input coordinate.
+ *
+ * SNAP_MAX_DELTA = 150 px chosen to comfortably cover: hooksdll-parity
+ * MCQ button hit-region (~80x40), typical exam radio button + label
+ * width (up to ~300), and small-form form-field snap-to-center (~120).
+ * Anything past 150px is empirically container-center junk. */
+#define SNAP_MAX_DELTA 150
+
 extern "C" int ground_snap_screen(int sx, int sy, int *out_sx, int *out_sy) {
     if (out_sx) *out_sx = sx;
     if (out_sy) *out_sy = sy;
@@ -253,9 +276,17 @@ extern "C" int ground_snap_screen(int sx, int sy, int *out_sx, int *out_sy) {
     if (rawin_is_isolated_desktop()) {
         int hx = sx, hy = sy;
         if (uia_snap_via_helper(sx, sy, &hx, &hy)) {
-            if (out_sx) *out_sx = hx;
-            if (out_sy) *out_sy = hy;
-            return 1;
+            /* v7.5.3 (2026-09-25) -- same distance guard on the helper path. */
+            if (abs(hx - sx) <= SNAP_MAX_DELTA && abs(hy - sy) <= SNAP_MAX_DELTA) {
+                if (out_sx) *out_sx = hx;
+                if (out_sy) *out_sy = hy;
+                return 1;
+            }
+            slog_writef("msvc_dbg_a.dat",
+                        "ground_snap_screen: iso helper REJECT delta=(%d,%d) > %d "
+                        "input=(%d,%d) snap=(%d,%d) -- using raw",
+                        abs(hx - sx), abs(hy - sy), SNAP_MAX_DELTA,
+                        sx, sy, hx, hy);
         }
         /* Helper unavailable or no snap -- try local UIA anyway (harmless;
          * usually returns nothing on an isolated desktop but no crash). */
@@ -265,6 +296,7 @@ extern "C" int ground_snap_screen(int sx, int sy, int *out_sx, int *out_sy) {
     if (!uia) return 0;
 
     int snapped = 0;
+    int cand_x = sx, cand_y = sy;
     __try {
         POINT pt = { sx, sy };
         IUIAutomationElement *el = nullptr;
@@ -272,14 +304,14 @@ extern "C" int ground_snap_screen(int sx, int sy, int *out_sx, int *out_sy) {
             /* Prefer the element's own clickable point. */
             POINT cp; BOOL got = FALSE;
             if (SUCCEEDED(el->GetClickablePoint(&cp, &got)) && got) {
-                if (out_sx) *out_sx = cp.x;
-                if (out_sy) *out_sy = cp.y;
+                cand_x = cp.x;
+                cand_y = cp.y;
                 snapped = 1;
             } else {
                 RECT r;
                 if (SUCCEEDED(el->get_CurrentBoundingRectangle(&r)) && rect_plausible(&r)) {
-                    if (out_sx) *out_sx = (int)((r.left + r.right) / 2);
-                    if (out_sy) *out_sy = (int)((r.top + r.bottom) / 2);
+                    cand_x = (int)((r.left + r.right) / 2);
+                    cand_y = (int)((r.top + r.bottom) / 2);
                     snapped = 1;
                 }
             }
@@ -287,8 +319,22 @@ extern "C" int ground_snap_screen(int sx, int sy, int *out_sx, int *out_sy) {
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         snapped = 0;
-        if (out_sx) *out_sx = sx;
-        if (out_sy) *out_sy = sy;
+    }
+    /* v7.5.3 (2026-09-25) -- Distance cap: reject snaps that move the
+     * target too far.  Chebyshev distance (max of dx/dy) is faster than
+     * Euclidean and matches the "either axis > threshold" intuition better
+     * for rectangular UI elements. */
+    if (snapped &&
+        (abs(cand_x - sx) > SNAP_MAX_DELTA || abs(cand_y - sy) > SNAP_MAX_DELTA)) {
+        slog_writef("msvc_dbg_a.dat",
+                    "ground_snap_screen: REJECT delta=(%d,%d) > %d "
+                    "input=(%d,%d) snap=(%d,%d) -- likely container/whole-desktop element; using raw",
+                    abs(cand_x - sx), abs(cand_y - sy), SNAP_MAX_DELTA,
+                    sx, sy, cand_x, cand_y);
+        snapped = 0;   /* fall back to raw input coord */
+    } else if (snapped) {
+        if (out_sx) *out_sx = cand_x;
+        if (out_sy) *out_sy = cand_y;
     }
     return snapped;
 }

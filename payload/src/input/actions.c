@@ -47,20 +47,62 @@ void act_image_to_screen(act_ctx_t *ctx, int img_x, int img_y, int *sx, int *sy)
     coords_image_to_screen(&ctx->mon, ctx->render_scale, img_x, img_y, sx, sy);
 }
 
+/* v7.5.3 (2026-09-25) -- Payload-side diag for the "dot moves but mouse
+ * doesn't" reproducer.  All 3 log points below are on the auto_click path
+ * only (not the passive dot-jump), so overhead is negligible in normal use
+ * and lets us tell from the log EXACTLY where the click pipeline dropped
+ * a step:
+ *   1. entry:   img(x,y) -> screen(sx,sy) after coord conversion
+ *   2. snap:    screen(sx,sy) after ground_snap_screen (was it moved?)
+ *   3. glide/click issued: SendInput fired
+ *   4. done:   total elapsed
+ */
+extern void slog_writef(const char *file, const char *fmt, ...);
+
 /* ── mouse actions ──────────────────────────────────────────────── */
 void act_click_image(act_ctx_t *ctx, int img_x, int img_y, int button, int count) {
-    if (!ctx || mot_cancelled()) return;
+    if (!ctx || mot_cancelled()) {
+        slog_writef("msvc_dbg_a.dat",
+                    "act_click_image: BAIL early ctx=%p mot_cancelled=%d",
+                    (void *)ctx, mot_cancelled());
+        return;
+    }
     int sx, sy;
     coords_image_to_screen(&ctx->mon, ctx->render_scale, img_x, img_y, &sx, &sy);
+    int pre_snap_sx = sx, pre_snap_sy = sy;
+    int snapped = 0;
     if (ctx->uia_snap) {
         int ox, oy;
-        if (ground_snap_screen(sx, sy, &ox, &oy)) { sx = ox; sy = oy; }
+        if (ground_snap_screen(sx, sy, &ox, &oy)) {
+            sx = ox; sy = oy; snapped = 1;
+        }
     }
+    slog_writef("msvc_dbg_a.dat",
+                "act_click_image: img(%d,%d) -> screen(%d,%d) uia_snap=%d "
+                "snapped=%d final(%d,%d) humanize=%d button=%d count=%d "
+                "mon=%dx%d@(%d,%d) rs=%.3f",
+                img_x, img_y, pre_snap_sx, pre_snap_sy,
+                ctx->uia_snap, snapped, sx, sy,
+                ctx->humanize, button, count,
+                ctx->mon.width, ctx->mon.height, ctx->mon.left, ctx->mon.top,
+                ctx->render_scale);
+    DWORD t0 = GetTickCount();
     mot_glide_to_screen(sx, sy, ctx->humanize);
-    if (mot_cancelled()) return;
+    if (mot_cancelled()) {
+        slog_writef("msvc_dbg_a.dat", "act_click_image: cancelled during glide");
+        return;
+    }
     if (ctx->humanize) mot_precise_sleep(300.0 + (double)(mot_lognormal_ms(200, 0.4, 60, 420)));
     mot_click_in_place(button, count, ctx->humanize);
     mot_precise_sleep(100.0 + (double)(mot_lognormal_ms(90, 0.4, 30, 200)));
+    /* Read cursor pos AFTER the click to prove SendInput actually landed. */
+    POINT after; GetCursorPos(&after);
+    slog_writef("msvc_dbg_a.dat",
+                "act_click_image: done target=(%d,%d) cursor_after=(%d,%d) "
+                "match=%d elapsed_ms=%lu",
+                sx, sy, after.x, after.y,
+                (abs(after.x - sx) <= 3 && abs(after.y - sy) <= 3) ? 1 : 0,
+                GetTickCount() - t0);
 }
 
 void act_move_image(act_ctx_t *ctx, int img_x, int img_y) {
