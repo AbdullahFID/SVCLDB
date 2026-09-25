@@ -816,15 +816,106 @@ static int is_openai_reasoning_model(const char *model) {
     return 0;
 }
 
-/* ── OpenAI-compatible body builder (also used for OpenRouter) ─── *
+/* ── Multi-turn "prepared turn" -- internal to ai_provider.c.
  *
- * Content ordering: TEXT before IMAGE (proven best practice per
- * both Anthropic + OpenAI computer-use docs). */
-static int build_openai_body(const svc_config_t *cfg, const char *user_prompt,
-                             const char *image_b64, const char *model_id,
+ * Populated by prep_turns_from_ai_turns() below: pre-encodes each
+ * turn's PNG once (b64) so retries/model-fallback paths don't
+ * re-base64 the same bytes. Owned by the caller; freed via
+ * prep_turns_free(). */
+typedef struct {
+    int         role;         /* 0 = user, 1 = assistant */
+    const char *text;         /* borrowed pointer -- lives with ai_turn_t input */
+    char       *image_b64;    /* NULL when no image; owned (free on cleanup) */
+} prep_turn_t;
+
+static void prep_turns_free(prep_turn_t *arr, int n) {
+    if (!arr) return;
+    for (int i = 0; i < n; i++) {
+        if (arr[i].image_b64) { free(arr[i].image_b64); arr[i].image_b64 = NULL; }
+    }
+}
+
+/* Convert public ai_turn_t[] -> prep_turn_t[] by b64-encoding each
+ * turn's PNG bytes once. Returns 1 on success (arr populated; caller
+ * frees via prep_turns_free); 0 on OOM. `out_arr` must have room for
+ * n_turns entries. */
+static int prep_turns_from_ai_turns(const ai_turn_t *turns, int n_turns,
+                                    prep_turn_t *out_arr) {
+    if (n_turns <= 0) return 0;
+    memset(out_arr, 0, sizeof(prep_turn_t) * (size_t)n_turns);
+    for (int i = 0; i < n_turns; i++) {
+        out_arr[i].role = turns[i].role;
+        out_arr[i].text = turns[i].text ? turns[i].text : "";
+        if (turns[i].image_png && turns[i].image_png_len > 0) {
+            out_arr[i].image_b64 = png_to_b64(turns[i].image_png,
+                                              turns[i].image_png_len);
+            if (!out_arr[i].image_b64) {
+                prep_turns_free(out_arr, i);
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+/* Emit one OpenAI user-role message with text (first, per best practice)
+ * followed by any image_b64 as an image_url content part. When there's
+ * no image and text is empty, still emit an empty content array so the
+ * request is valid JSON. */
+static void emit_openai_user_content(json_builder_t *jb, const prep_turn_t *t) {
+    jb_key(jb, "content"); jb_arr_begin(jb);
+      jb_obj_begin(jb);
+        jb_key(jb, "type"); jb_str(jb, "text");
+        jb_key(jb, "text"); jb_str(jb, t->text ? t->text : "");
+      jb_obj_end(jb);
+      if (t->image_b64) {
+        jb_obj_begin(jb);
+          jb_key(jb, "type"); jb_str(jb, "image_url");
+          jb_key(jb, "image_url");
+          jb_obj_begin(jb);
+            jb_key(jb, "url");
+            {
+              size_t need = strlen(t->image_b64) + 32;
+              char *dat = (char *)malloc(need);
+              if (dat) {
+                _snprintf(dat, need - 1, "data:image/png;base64,%s", t->image_b64);
+                dat[need - 1] = 0;
+                jb_str(jb, dat);
+                free(dat);
+              }
+            }
+            /* `detail: high` for vision-heavy tasks (exam questions
+             * often have small text that needs full-res inference).
+             * OpenAI docs: high = detailed, low = fast (512x512),
+             * auto = model chooses. High is worth the ~150 tokens
+             * per tile. */
+            jb_key(jb, "detail"); jb_str(jb, "high");
+          jb_obj_end(jb);
+        jb_obj_end(jb);
+      }
+    jb_arr_end(jb);
+}
+
+/* ── OpenAI-compatible body builder (also used for OpenRouter) -- MULTI-TURN.
+ *
+ * Emits {model, messages:[{system}, ...turns], max_tokens/effort/stream}.
+ * Turns are emitted as-provided; assistant turns get a plain-string
+ * content; user turns get a content-array (text-first, then images) so
+ * per-turn image attachments survive round-tripping through OpenRouter
+ * (which normalizes to the OpenAI schema; multi-image per turn + across
+ * turns confirmed via https://openrouter.ai/docs/guides/overview/multimodal/image-understanding).
+ * TEXT-BEFORE-IMAGE ordering per OpenAI + Anthropic vision-accuracy docs. */
+static int build_openai_body(const svc_config_t *cfg,
+                             const prep_turn_t *turns, int n_turns,
+                             const char *model_id,
                              int is_openrouter, int enable_streaming,
                              json_builder_t *jb) {
-    if (!jb_init(jb, 8192 + (image_b64 ? strlen(image_b64) : 0))) return 0;
+    size_t est = 8192;
+    for (int i = 0; i < n_turns; i++) {
+        if (turns[i].image_b64) est += strlen(turns[i].image_b64) + 128;
+        if (turns[i].text)      est += strlen(turns[i].text)      + 128;
+    }
+    if (!jb_init(jb, est)) return 0;
     jb_obj_begin(jb);
       jb_key(jb, "model");    jb_str(jb, model_id);
       jb_key(jb, "messages"); jb_arr_begin(jb);
@@ -834,43 +925,17 @@ static int build_openai_body(const svc_config_t *cfg, const char *user_prompt,
             jb_key(jb, "content"); jb_str(jb, cfg->system_prompt);
           jb_obj_end(jb);
         }
-        jb_obj_begin(jb);
-          jb_key(jb, "role"); jb_str(jb, "user");
-          if (image_b64) {
-            /* Vision: content is array. Text FIRST, image SECOND. */
-            jb_key(jb, "content"); jb_arr_begin(jb);
-              jb_obj_begin(jb);
-                jb_key(jb, "type"); jb_str(jb, "text");
-                jb_key(jb, "text"); jb_str(jb, user_prompt);
-              jb_obj_end(jb);
-              jb_obj_begin(jb);
-                jb_key(jb, "type"); jb_str(jb, "image_url");
-                jb_key(jb, "image_url");
-                jb_obj_begin(jb);
-                  jb_key(jb, "url");
-                  {
-                    size_t need = strlen(image_b64) + 32;
-                    char *dat = (char *)malloc(need);
-                    if (dat) {
-                      _snprintf(dat, need - 1, "data:image/png;base64,%s", image_b64);
-                      dat[need - 1] = 0;
-                      jb_str(jb, dat);
-                      free(dat);
-                    }
-                  }
-                  /* `detail: high` for vision-heavy tasks (exam questions
-                   * often have small text that needs full-res inference).
-                   * OpenAI docs: high = detailed, low = fast (512x512),
-                   * auto = model chooses. High is worth the ~150 tokens
-                   * per tile. */
-                  jb_key(jb, "detail"); jb_str(jb, "high");
-                jb_obj_end(jb);
-              jb_obj_end(jb);
-            jb_arr_end(jb);
-          } else {
-            jb_key(jb, "content"); jb_str(jb, user_prompt);
-          }
-        jb_obj_end(jb);
+        for (int i = 0; i < n_turns; i++) {
+          jb_obj_begin(jb);
+            if (turns[i].role == 1) {
+              jb_key(jb, "role"); jb_str(jb, "assistant");
+              jb_key(jb, "content"); jb_str(jb, turns[i].text ? turns[i].text : "");
+            } else {
+              jb_key(jb, "role"); jb_str(jb, "user");
+              emit_openai_user_content(jb, &turns[i]);
+            }
+          jb_obj_end(jb);
+        }
       jb_arr_end(jb);
 
       /* Max tokens. GPT-5 reasoning family needs max_completion_tokens
@@ -906,15 +971,90 @@ static int build_openai_body(const svc_config_t *cfg, const char *user_prompt,
     return !jb->err;
 }
 
-/* ── Anthropic body builder ───────────────────────────────────────
+/* Emit an Anthropic user-role message content array with (optional
+ * "Image N:" label + image block for each attached image, followed by)
+ * the user text block. Per Anthropic vision docs, when a request holds
+ * multiple images the recommended pattern is to label them so follow-
+ * up turns can reference them by name. We follow that convention only
+ * when the image_index >= 1 (i.e. this isn't the very first image in
+ * the whole conversation) so the common single-image case stays
+ * pristine. TEXT-before-IMAGE for single-image, IMAGE-before-TEXT with
+ * a label for later images (matches the example at
+ * https://platform.claude.com/docs/en/build-with-claude/vision). */
+static void emit_anthropic_user_content(json_builder_t *jb,
+                                        const prep_turn_t *t,
+                                        int global_image_index) {
+    jb_key(jb, "content"); jb_arr_begin(jb);
+      if (t->image_b64) {
+        if (global_image_index >= 1) {
+          char label[24];
+          _snprintf(label, sizeof(label) - 1, "Image %d:", global_image_index + 1);
+          label[sizeof(label) - 1] = 0;
+          jb_obj_begin(jb);
+            jb_key(jb, "type"); jb_str(jb, "text");
+            jb_key(jb, "text"); jb_str(jb, label);
+          jb_obj_end(jb);
+          jb_obj_begin(jb);
+            jb_key(jb, "type"); jb_str(jb, "image");
+            jb_key(jb, "source");
+            jb_obj_begin(jb);
+              jb_key(jb, "type");        jb_str(jb, "base64");
+              jb_key(jb, "media_type");  jb_str(jb, "image/png");
+              jb_key(jb, "data");        jb_str(jb, t->image_b64);
+            jb_obj_end(jb);
+          jb_obj_end(jb);
+          jb_obj_begin(jb);
+            jb_key(jb, "type"); jb_str(jb, "text");
+            jb_key(jb, "text"); jb_str(jb, t->text ? t->text : "");
+          jb_obj_end(jb);
+        } else {
+          /* First image in the conversation -- use classic text-then-
+           * image ordering per Anthropic docs. */
+          jb_obj_begin(jb);
+            jb_key(jb, "type"); jb_str(jb, "text");
+            jb_key(jb, "text"); jb_str(jb, t->text ? t->text : "");
+          jb_obj_end(jb);
+          jb_obj_begin(jb);
+            jb_key(jb, "type"); jb_str(jb, "image");
+            jb_key(jb, "source");
+            jb_obj_begin(jb);
+              jb_key(jb, "type");        jb_str(jb, "base64");
+              jb_key(jb, "media_type");  jb_str(jb, "image/png");
+              jb_key(jb, "data");        jb_str(jb, t->image_b64);
+            jb_obj_end(jb);
+          jb_obj_end(jb);
+        }
+      } else {
+        jb_obj_begin(jb);
+          jb_key(jb, "type"); jb_str(jb, "text");
+          jb_key(jb, "text"); jb_str(jb, t->text ? t->text : "");
+        jb_obj_end(jb);
+      }
+    jb_arr_end(jb);
+}
+
+/* ── Anthropic body builder -- MULTI-TURN.
  *
  * Uses adaptive thinking (Fable/Opus/Sonnet: always-on; Haiku:
  * extended). System prompt in ARRAY-of-typed-text with ephemeral
- * cache_control for 90% discount on repeat solves. TEXT before IMAGE. */
-static int build_anthropic_body(const svc_config_t *cfg, const char *user_prompt,
-                                const char *image_b64, const char *model_id,
+ * cache_control for 90% discount on repeat solves. Multi-turn
+ * conversation history is provided via `turns[]` with alternating
+ * user/assistant roles (Anthropic combines consecutive same-role
+ * turns automatically per the /v1/messages docs). Multi-image
+ * support verified at
+ * https://platform.claude.com/docs/en/build-with-claude/vision
+ * ("You can include multiple images in a single request; in a multi-
+ * turn conversation, add new images in later user turns the same way"). */
+static int build_anthropic_body(const svc_config_t *cfg,
+                                const prep_turn_t *turns, int n_turns,
+                                const char *model_id,
                                 int enable_streaming, json_builder_t *jb) {
-    if (!jb_init(jb, 8192 + (image_b64 ? strlen(image_b64) : 0))) return 0;
+    size_t est = 8192;
+    for (int i = 0; i < n_turns; i++) {
+        if (turns[i].image_b64) est += strlen(turns[i].image_b64) + 128;
+        if (turns[i].text)      est += strlen(turns[i].text)      + 128;
+    }
+    if (!jb_init(jb, est)) return 0;
 
     int is_fable  = (strstr(model_id, "fable")  != NULL) ||
                     (strstr(model_id, "mythos") != NULL);
@@ -1007,30 +1147,26 @@ static int build_anthropic_body(const svc_config_t *cfg, const char *user_prompt
         jb_key(jb, "temperature"); jb_num_d(jb, 0.1);
       }
 
-      /* Messages: text-first, image-second in the user array. */
+      /* Messages: emit each turn (user/assistant alternation). User
+       * turns get a content-array with text-first-image-second (or a
+       * labeled multi-image layout for later images) so multi-turn
+       * multi-image conversations survive round-tripping through
+       * Anthropic's message combiner (consecutive same-role turns
+       * are joined per the /v1/messages docs). */
       jb_key(jb, "messages"); jb_arr_begin(jb);
-        jb_obj_begin(jb);
-          jb_key(jb, "role"); jb_str(jb, "user");
-          if (image_b64) {
-            jb_key(jb, "content"); jb_arr_begin(jb);
-              jb_obj_begin(jb);
-                jb_key(jb, "type"); jb_str(jb, "text");
-                jb_key(jb, "text"); jb_str(jb, user_prompt);
-              jb_obj_end(jb);
-              jb_obj_begin(jb);
-                jb_key(jb, "type"); jb_str(jb, "image");
-                jb_key(jb, "source");
-                jb_obj_begin(jb);
-                  jb_key(jb, "type");        jb_str(jb, "base64");
-                  jb_key(jb, "media_type");  jb_str(jb, "image/png");
-                  jb_key(jb, "data");        jb_str(jb, image_b64);
-                jb_obj_end(jb);
-              jb_obj_end(jb);
-            jb_arr_end(jb);
-          } else {
-            jb_key(jb, "content"); jb_str(jb, user_prompt);
-          }
-        jb_obj_end(jb);
+        int global_img_ix = 0;
+        for (int i = 0; i < n_turns; i++) {
+          jb_obj_begin(jb);
+            if (turns[i].role == 1) {
+              jb_key(jb, "role"); jb_str(jb, "assistant");
+              jb_key(jb, "content"); jb_str(jb, turns[i].text ? turns[i].text : "");
+            } else {
+              jb_key(jb, "role"); jb_str(jb, "user");
+              emit_anthropic_user_content(jb, &turns[i], global_img_ix);
+              if (turns[i].image_b64) global_img_ix++;
+            }
+          jb_obj_end(jb);
+        }
       jb_arr_end(jb);
 
       if (enable_streaming) {
@@ -1100,10 +1236,16 @@ static const char *gemini_thinking_level(int effort) {
  *                             "thinkingConfig": { "thinkingBudget": -1 } } }
  *
  * TEXT before IMAGE in both shapes (documented best practice). */
-static int build_google_body(const svc_config_t *cfg, const char *user_prompt,
-                             const char *image_b64, const char *model_id,
+static int build_google_body(const svc_config_t *cfg,
+                             const prep_turn_t *turns, int n_turns,
+                             const char *model_id,
                              int enable_streaming, json_builder_t *jb) {
-    if (!jb_init(jb, 8192 + (image_b64 ? strlen(image_b64) : 0))) return 0;
+    size_t est = 8192;
+    for (int i = 0; i < n_turns; i++) {
+        if (turns[i].image_b64) est += strlen(turns[i].image_b64) + 128;
+        if (turns[i].text)      est += strlen(turns[i].text)      + 128;
+    }
+    if (!jb_init(jb, est)) return 0;
 
     int new_endpoint = is_gemini_new_endpoint(model_id);
 
@@ -1111,31 +1253,43 @@ static int build_google_body(const svc_config_t *cfg, const char *user_prompt,
 
     if (new_endpoint) {
         /* New /v1beta/interactions shape. Model goes in the BODY (not
-         * the URL path like the legacy generateContent endpoint). */
+         * the URL path like the legacy generateContent endpoint).
+         *
+         * Multi-turn is expressed via `input[]` populated with step
+         * envelopes: {type: "user_input" | "model_output", content:[...]}.
+         * We set `store: false` so the server does NOT retain state --
+         * the payload manages history client-side (svc_config_t.chat_msgs).
+         * Per https://ai.google.dev/gemini-api/docs/text-generation
+         * ("Stateless Mode"). */
         jb_key(jb, "model"); jb_str(jb, model_id);
+        jb_key(jb, "store"); jb_bool(jb, 0);
 
         if (cfg->system_prompt[0]) {
             jb_key(jb, "system_instruction"); jb_str(jb, cfg->system_prompt);
         }
 
-        /* Input is a flat array of typed content blocks -- no role
-         * wrapper, no parts nesting. Text first, image second. */
         jb_key(jb, "input");
         jb_arr_begin(jb);
+        for (int i = 0; i < n_turns; i++) {
             jb_obj_begin(jb);
-                jb_key(jb, "type"); jb_str(jb, "text");
-                jb_key(jb, "text"); jb_str(jb, user_prompt);
-            jb_obj_end(jb);
-            if (image_b64) {
+              jb_key(jb, "type");
+              jb_str(jb, turns[i].role == 1 ? "model_output" : "user_input");
+              jb_key(jb, "content"); jb_arr_begin(jb);
                 jb_obj_begin(jb);
-                    jb_key(jb, "type");      jb_str(jb, "image");
-                    /* Inline bytes: `data` (base64) + `mime_type`. The
-                     * alternative is `uri: "..."` from the Files API,
-                     * which we don't use -- we always inline. */
-                    jb_key(jb, "data");      jb_str(jb, image_b64);
-                    jb_key(jb, "mime_type"); jb_str(jb, "image/png");
+                    jb_key(jb, "type"); jb_str(jb, "text");
+                    jb_key(jb, "text"); jb_str(jb, turns[i].text ? turns[i].text : "");
                 jb_obj_end(jb);
-            }
+                if (turns[i].role != 1 && turns[i].image_b64) {
+                    jb_obj_begin(jb);
+                        jb_key(jb, "type");      jb_str(jb, "image");
+                        /* Inline bytes: `data` (base64) + `mime_type`. */
+                        jb_key(jb, "data");      jb_str(jb, turns[i].image_b64);
+                        jb_key(jb, "mime_type"); jb_str(jb, "image/png");
+                    jb_obj_end(jb);
+                }
+              jb_arr_end(jb);
+            jb_obj_end(jb);
+        }
         jb_arr_end(jb);
 
         if (enable_streaming) {
@@ -1150,8 +1304,10 @@ static int build_google_body(const svc_config_t *cfg, const char *user_prompt,
         jb_obj_end(jb);
     } else {
         /* LEGACY /v1beta/models/{model}:generateContent shape (Gemini
-         * 2.5.x). Kept working for the ai_google_stable_fallback path
-         * ("3.x overloaded -> retry on 2.5-flash"). */
+         * 2.5.x). Multi-turn is expressed via `contents[]` populated
+         * with role=user|model + parts[] arrays. Per
+         * https://ai.google.dev/gemini-api/docs/generate-content/text-generation
+         * ("Multi-turn conversations"). */
         if (cfg->system_prompt[0]) {
             jb_key(jb, "systemInstruction");
             jb_obj_begin(jb);
@@ -1165,24 +1321,26 @@ static int build_google_body(const svc_config_t *cfg, const char *user_prompt,
         }
         jb_key(jb, "contents");
         jb_arr_begin(jb);
+        for (int i = 0; i < n_turns; i++) {
             jb_obj_begin(jb);
-                jb_key(jb, "role"); jb_str(jb, "user");
+                jb_key(jb, "role"); jb_str(jb, turns[i].role == 1 ? "model" : "user");
                 jb_key(jb, "parts");
                 jb_arr_begin(jb);
                     jb_obj_begin(jb);
-                        jb_key(jb, "text"); jb_str(jb, user_prompt);
+                        jb_key(jb, "text"); jb_str(jb, turns[i].text ? turns[i].text : "");
                     jb_obj_end(jb);
-                    if (image_b64) {
+                    if (turns[i].role != 1 && turns[i].image_b64) {
                         jb_obj_begin(jb);
                             jb_key(jb, "inline_data");
                             jb_obj_begin(jb);
                                 jb_key(jb, "mime_type"); jb_str(jb, "image/png");
-                                jb_key(jb, "data");      jb_str(jb, image_b64);
+                                jb_key(jb, "data");      jb_str(jb, turns[i].image_b64);
                             jb_obj_end(jb);
                         jb_obj_end(jb);
                     }
                 jb_arr_end(jb);
             jb_obj_end(jb);
+        }
         jb_arr_end(jb);
 
         jb_key(jb, "generationConfig");
@@ -1585,9 +1743,12 @@ static void materialize_default_system(svc_config_t *eff_cfg) {
 
 /* Build the URL + headers + body for a given provider. Returns 1 on
  * success. `url`, `auth_hdr`, `extra_hdr` are caller-provided
- * buffers. hdrs[] is caller-provided array of at least 6 slots. */
-static int build_request(const svc_config_t *cfg, const char *user_prompt,
-                         const char *image_b64, const char *model_id,
+ * buffers. hdrs[] is caller-provided array of at least 6 slots.
+ *
+ * v7.4 (2026-09-25) -- takes prep_turn_t[] for multi-turn support. */
+static int build_request(const svc_config_t *cfg,
+                         const prep_turn_t *turns, int n_turns,
+                         const char *model_id,
                          int enable_streaming,
                          json_builder_t *jb, char *url, size_t url_sz,
                          char *auth_hdr, size_t auth_sz,
@@ -1596,7 +1757,7 @@ static int build_request(const svc_config_t *cfg, const char *user_prompt,
                          char *err, size_t err_sz) {
     switch (cfg->provider) {
         case SVC_PROVIDER_OPENAI:
-            if (!build_openai_body(cfg, user_prompt, image_b64, model_id,
+            if (!build_openai_body(cfg, turns, n_turns, model_id,
                                     0 /*openrouter*/, enable_streaming, jb)) {
                 _snprintf(err, err_sz - 1, "openai json build failed");
                 return 0;
@@ -1608,7 +1769,7 @@ static int build_request(const svc_config_t *cfg, const char *user_prompt,
             hdrs[2] = NULL;
             break;
         case SVC_PROVIDER_OPENROUTER:
-            if (!build_openai_body(cfg, user_prompt, image_b64, model_id,
+            if (!build_openai_body(cfg, turns, n_turns, model_id,
                                     1 /*openrouter*/, enable_streaming, jb)) {
                 _snprintf(err, err_sz - 1, "openrouter json build failed");
                 return 0;
@@ -1623,7 +1784,7 @@ static int build_request(const svc_config_t *cfg, const char *user_prompt,
             hdrs[4] = NULL;
             break;
         case SVC_PROVIDER_ANTHROPIC:
-            if (!build_anthropic_body(cfg, user_prompt, image_b64, model_id,
+            if (!build_anthropic_body(cfg, turns, n_turns, model_id,
                                        enable_streaming, jb)) {
                 _snprintf(err, err_sz - 1, "anthropic json build failed");
                 return 0;
@@ -1636,7 +1797,7 @@ static int build_request(const svc_config_t *cfg, const char *user_prompt,
             hdrs[3] = NULL;
             break;
         case SVC_PROVIDER_GOOGLE:
-            if (!build_google_body(cfg, user_prompt, image_b64, model_id,
+            if (!build_google_body(cfg, turns, n_turns, model_id,
                                     enable_streaming, jb)) {
                 _snprintf(err, err_sz - 1, "google json build failed");
                 return 0;
@@ -1672,11 +1833,26 @@ static int build_request(const svc_config_t *cfg, const char *user_prompt,
     return 1;
 }
 
-/* ── Public: non-streaming ai_ask ─────────────────────────────── */
+/* ── Public: non-streaming ai_ask (single-shot wrapper) ─────────
+ * v7.4 (2026-09-25) -- thin wrapper around ai_ask_multi with a
+ * 1-element turn array. Kept for source compat with pre-multi
+ * callers. */
 int ai_ask(const svc_config_t *cfg, const char *user_prompt,
            const uint8_t *screenshot_png, size_t screenshot_len,
            char **out_reply, char *err, size_t err_sz) {
-    if (!cfg || !user_prompt || !out_reply || !err) return 0;
+    ai_turn_t turns[1];
+    turns[0].role          = 0;
+    turns[0].text          = user_prompt ? user_prompt : "";
+    turns[0].image_png     = screenshot_png;
+    turns[0].image_png_len = (screenshot_png && screenshot_len > 0) ? screenshot_len : 0;
+    return ai_ask_multi(cfg, turns, 1, out_reply, err, err_sz);
+}
+
+/* ── Public: multi-turn ai_ask_multi ───────────────────────────── */
+int ai_ask_multi(const svc_config_t *cfg,
+                 const ai_turn_t *turns, int n_turns,
+                 char **out_reply, char *err, size_t err_sz) {
+    if (!cfg || !turns || n_turns <= 0 || !out_reply || !err) return 0;
     *out_reply = NULL;
     err[0] = 0;
 
@@ -1695,16 +1871,27 @@ int ai_ask(const svc_config_t *cfg, const char *user_prompt,
     memcpy(&eff_cfg, cfg, sizeof(eff_cfg));
     materialize_default_system(&eff_cfg);
 
-    /* Base64-encode screenshot once -- kept alive across the model-fallback
-     * retry below so we never re-encode an 8MB PNG per attempt. */
-    char *image_b64 = NULL;
-    if (screenshot_png && screenshot_len > 0) {
-        image_b64 = png_to_b64(screenshot_png, screenshot_len);
-        if (!image_b64) {
-            _snprintf(err, err_sz - 1, "b64 encode failed"); err[err_sz - 1] = 0;
-            return 0;
-        }
+    /* Pre-encode all images ONCE (b64) -- kept alive across the
+     * model-fallback retry below so we never re-base64 the same PNGs
+     * per attempt. Heap-alloc so we can support large turn counts. */
+    prep_turn_t *prep = (prep_turn_t *)calloc((size_t)n_turns, sizeof(prep_turn_t));
+    if (!prep) {
+        _snprintf(err, err_sz - 1, "oom (prep_turn_t)"); err[err_sz - 1] = 0;
+        return 0;
     }
+    if (!prep_turns_from_ai_turns(turns, n_turns, prep)) {
+        _snprintf(err, err_sz - 1, "b64 encode failed"); err[err_sz - 1] = 0;
+        free(prep);
+        return 0;
+    }
+    /* Count turns / images for the diag log. */
+    int last_turn_ix = n_turns - 1;
+    int total_images = 0;
+    size_t last_user_text_len = 0;
+    for (int i = 0; i < n_turns; i++) {
+        if (prep[i].image_b64) total_images++;
+    }
+    if (turns[last_turn_ix].text) last_user_text_len = strlen(turns[last_turn_ix].text);
 
     /* v-bump 2026-09-08 -- non-streaming Anthropic model-fallback. STRONG
      * Anthropic is now Fable 5.1; if the send fails because Fable is
@@ -1727,7 +1914,7 @@ int ai_ask(const svc_config_t *cfg, const char *user_prompt,
         char extra_hdr[256] = {0};
         const char *hdrs[6] = { NULL };
 
-        if (!build_request(&eff_cfg, user_prompt, image_b64, use_model,
+        if (!build_request(&eff_cfg, prep, n_turns, use_model,
                            0 /*no streaming*/, &jb, url, sizeof(url),
                            auth_hdr, sizeof(auth_hdr),
                            extra_hdr, sizeof(extra_hdr),
@@ -1736,12 +1923,13 @@ int ai_ask(const svc_config_t *cfg, const char *user_prompt,
             break;   /* build error -- ret stays 0 */
         }
 
-        slog_writef("msvc_dbg_d.dat", "ai_ask provider=%s model=%s tier=%s prompt_len=%zu img=%d",
+        slog_writef("msvc_dbg_d.dat", "ai_ask provider=%s model=%s tier=%s prompt_len=%zu img=%d turns=%d",
                     ai_provider_name(cfg->provider),
                     use_model,
                     ai_tier_name(cfg->tier),
-                    strlen(user_prompt),
-                    screenshot_png ? 1 : 0);
+                    last_user_text_len,
+                    total_images,
+                    n_turns);
 
         /* Retry with backoff on 429 / 5xx. */
         whreq_result_t r = {0};
@@ -1834,7 +2022,8 @@ int ai_ask(const svc_config_t *cfg, const char *user_prompt,
         break;
     }
 
-    if (image_b64) free(image_b64);
+    prep_turns_free(prep, n_turns);
+    free(prep);
     return ret;
 }
 
@@ -1850,12 +2039,28 @@ static const char *metered_tier_slug(int tier) {
     }
 }
 
-/* ── Metered path: POST to the svcldb-solve worker with the Supabase JWT ── */
+/* ── Metered path: POST to the svcldb-solve worker with the Supabase JWT.
+ *
+ * v7.4 (2026-09-25) -- single-turn wrapper around ai_ask_metered_multi
+ * (which sends a multi-turn `messages` array to the worker's /solve
+ * endpoint and preserves the legacy single-turn `question` + `images`
+ * fields for the current user turn's screenshot). */
 int ai_ask_metered(const svc_config_t *cfg, const char *user_prompt,
                    const uint8_t *screenshot_png, size_t screenshot_len,
                    char **out_reply, char *err, size_t err_sz) {
+    ai_turn_t turns[1];
+    turns[0].role          = 0;
+    turns[0].text          = user_prompt ? user_prompt : "";
+    turns[0].image_png     = screenshot_png;
+    turns[0].image_png_len = (screenshot_png && screenshot_len > 0) ? screenshot_len : 0;
+    return ai_ask_metered_multi(cfg, turns, 1, out_reply, err, err_sz);
+}
+
+int ai_ask_metered_multi(const svc_config_t *cfg,
+                          const ai_turn_t *turns, int n_turns,
+                          char **out_reply, char *err, size_t err_sz) {
     if (out_reply) *out_reply = NULL;
-    if (!cfg || !out_reply || !err || err_sz == 0) return 0;
+    if (!cfg || !turns || n_turns <= 0 || !out_reply || !err || err_sz == 0) return 0;
     err[0] = 0;
     /* v2.0.1 (2026-09-10) -- snapshot access_token under the config CS at
      * function entry so a concurrent cfg_update_access_token (token-
@@ -1872,39 +2077,97 @@ int ai_ask_metered(const svc_config_t *cfg, const char *user_prompt,
     _snprintf(url, sizeof(url) - 1, "%s/solve", base);
     url[sizeof(url) - 1] = 0;
 
-    /* Screenshot -> data URL for the worker. */
-    char *data_url = NULL;
-    if (screenshot_png && screenshot_len > 0) {
-        char *b64 = png_to_b64(screenshot_png, screenshot_len);
-        if (b64) {
-            size_t need = strlen(b64) + 32;
-            data_url = (char *)malloc(need);
-            if (data_url) {
-                _snprintf(data_url, need - 1, "data:image/png;base64,%s", b64);
-                data_url[need - 1] = 0;
+    /* Encode every image ONCE into data URLs (owned by prep_data_urls[]
+     * heap alloc). Freed at the end regardless of success. */
+    char **prep_data_urls = (char **)calloc((size_t)n_turns, sizeof(char *));
+    if (!prep_data_urls) return 0;
+    /* Also record the LAST user turn's data URL separately for the
+     * legacy back-compat `images` array in the request body. */
+    const char *last_user_text = "";
+    const char *last_user_data_url = NULL;
+    int last_user_ix = -1;
+    for (int i = 0; i < n_turns; i++) {
+        if (turns[i].role != 1) last_user_ix = i;
+        if (turns[i].image_png && turns[i].image_png_len > 0) {
+            char *b64 = png_to_b64(turns[i].image_png, turns[i].image_png_len);
+            if (b64) {
+                size_t need = strlen(b64) + 32;
+                char *du = (char *)malloc(need);
+                if (du) {
+                    _snprintf(du, need - 1, "data:image/png;base64,%s", b64);
+                    du[need - 1] = 0;
+                    prep_data_urls[i] = du;
+                }
+                free(b64);
             }
-            free(b64);
         }
     }
+    if (last_user_ix >= 0) {
+        last_user_text = turns[last_user_ix].text ? turns[last_user_ix].text : "";
+        last_user_data_url = prep_data_urls[last_user_ix];
+    }
 
-    /* Body: {"question":"...","explain":bool[,"images":["data:..."]]} */
+    /* Body: v7.4 (2026-09-25) -- `messages` array carries multi-turn
+     * conversation memory; `question` + `images` remain as pre-v7.4
+     * single-shot shortcuts (worker prefers `messages` when non-empty,
+     * falls back to `question`/`images` otherwise). Also carries the
+     * `explain` + `tier` selectors as before. */
     json_builder_t jb;
-    if (!jb_init(&jb, 8192 + (data_url ? strlen(data_url) : 0))) {
-        if (data_url) free(data_url);
+    size_t est = 8192;
+    for (int i = 0; i < n_turns; i++) {
+        if (prep_data_urls[i]) est += strlen(prep_data_urls[i]) + 128;
+        if (turns[i].text)     est += strlen(turns[i].text)     + 128;
+    }
+    if (!jb_init(&jb, est)) {
+        for (int i = 0; i < n_turns; i++) if (prep_data_urls[i]) free(prep_data_urls[i]);
+        free(prep_data_urls);
         return 0;
     }
     jb_obj_begin(&jb);
-      jb_key(&jb, "question"); jb_str(&jb, user_prompt ? user_prompt : "");
+      jb_key(&jb, "question"); jb_str(&jb, last_user_text);
       jb_key(&jb, "explain");  jb_bool(&jb, cfg->direct_answer_mode ? 0 : 1);
       /* Tier preset -- worker maps strong|medium|cheap -> model + reasoning effort. */
       jb_key(&jb, "tier");     jb_str(&jb, metered_tier_slug(cfg->tier));
-      if (data_url) {
+      if (last_user_data_url) {
         jb_key(&jb, "images"); jb_arr_begin(&jb);
-          jb_str(&jb, data_url);
+          jb_str(&jb, last_user_data_url);
         jb_arr_end(&jb);
       }
+      /* Multi-turn conversation history (worker preferred path).
+       * Shape matches the OpenAI-compatible messages array so the
+       * worker can forward it near-verbatim to OpenRouter. Skip empty
+       * assistant turns so we don't confuse the model with placeholders. */
+      jb_key(&jb, "messages"); jb_arr_begin(&jb);
+        for (int i = 0; i < n_turns; i++) {
+          jb_obj_begin(&jb);
+            if (turns[i].role == 1) {
+              jb_key(&jb, "role");    jb_str(&jb, "assistant");
+              jb_key(&jb, "content"); jb_str(&jb, turns[i].text ? turns[i].text : "");
+            } else {
+              jb_key(&jb, "role"); jb_str(&jb, "user");
+              jb_key(&jb, "content"); jb_arr_begin(&jb);
+                jb_obj_begin(&jb);
+                  jb_key(&jb, "type"); jb_str(&jb, "text");
+                  jb_key(&jb, "text"); jb_str(&jb, turns[i].text ? turns[i].text : "");
+                jb_obj_end(&jb);
+                if (prep_data_urls[i]) {
+                  jb_obj_begin(&jb);
+                    jb_key(&jb, "type"); jb_str(&jb, "image_url");
+                    jb_key(&jb, "image_url");
+                    jb_obj_begin(&jb);
+                      jb_key(&jb, "url"); jb_str(&jb, prep_data_urls[i]);
+                      jb_key(&jb, "detail"); jb_str(&jb, "high");
+                    jb_obj_end(&jb);
+                  jb_obj_end(&jb);
+                }
+              jb_arr_end(&jb);
+            }
+          jb_obj_end(&jb);
+        }
+      jb_arr_end(&jb);
     jb_obj_end(&jb);
-    if (data_url) { free(data_url); data_url = NULL; }
+    for (int i = 0; i < n_turns; i++) if (prep_data_urls[i]) free(prep_data_urls[i]);
+    free(prep_data_urls);
     if (jb.err) { jb_free(&jb); return 0; }
 
     char auth_hdr[4200];
@@ -1912,8 +2175,8 @@ int ai_ask_metered(const svc_config_t *cfg, const char *user_prompt,
     auth_hdr[sizeof(auth_hdr) - 1] = 0;
     const char *hdrs[] = { "Content-Type: application/json", auth_hdr, NULL };
 
-    slog_writef("msvc_dbg_d.dat", "ai_ask_metered POST /solve tier=%s img=%d",
-                metered_tier_slug(cfg->tier), screenshot_png ? 1 : 0);
+    slog_writef("msvc_dbg_d.dat", "ai_ask_metered POST /solve tier=%s turns=%d",
+                metered_tier_slug(cfg->tier), n_turns);
 
     whreq_result_t r = {0};
     int ok = whreq_post_ex(url, hdrs, jb.buf, jb.len, AI_TIMEOUT_BALANCED_MS, &r);
@@ -2308,8 +2571,7 @@ typedef struct {
 static int ai_try_streaming_once(const svc_config_t *cfg_active,
                                  int provider, const char *api_key,
                                  const char *model_override,
-                                 const char *user_prompt,
-                                 const char *image_b64,
+                                 const prep_turn_t *turns, int n_turns,
                                  ai_stream_chunk_cb on_chunk,
                                  void *userdata,
                                  try_result_t *result) {
@@ -2347,7 +2609,7 @@ static int ai_try_streaming_once(const svc_config_t *cfg_active,
     char extra_hdr[256] = {0};
     const char *hdrs[6] = { NULL };
 
-    if (!build_request(&eff, user_prompt, image_b64, model_id,
+    if (!build_request(&eff, turns, n_turns, model_id,
                        1 /*streaming*/, &jb, url, sizeof(url),
                        auth_hdr, sizeof(auth_hdr),
                        extra_hdr, sizeof(extra_hdr),
@@ -2432,7 +2694,20 @@ int ai_ask_streaming(const svc_config_t *cfg,
                      ai_stream_chunk_cb on_chunk,
                      ai_stream_done_cb on_done,
                      void *userdata) {
-    if (!cfg || !user_prompt) {
+    ai_turn_t turns[1];
+    turns[0].role          = 0;
+    turns[0].text          = user_prompt ? user_prompt : "";
+    turns[0].image_png     = screenshot_png;
+    turns[0].image_png_len = (screenshot_png && screenshot_len > 0) ? screenshot_len : 0;
+    return ai_ask_streaming_multi(cfg, turns, 1, on_chunk, on_done, userdata);
+}
+
+int ai_ask_streaming_multi(const svc_config_t *cfg,
+                            const ai_turn_t *turns, int n_turns,
+                            ai_stream_chunk_cb on_chunk,
+                            ai_stream_done_cb on_done,
+                            void *userdata) {
+    if (!cfg || !turns || n_turns <= 0) {
         if (on_done) on_done(0, NULL, 0, "bad args", userdata);
         return 0;
     }
@@ -2441,15 +2716,17 @@ int ai_ask_streaming(const svc_config_t *cfg,
      * before its first token. */
     ai_clear_abort();
 
-    /* Encode image ONCE -- reused across every fallback attempt so we don't
-     * re-base64 an 8MB PNG per retry. */
-    char *image_b64 = NULL;
-    if (screenshot_png && screenshot_len > 0) {
-        image_b64 = png_to_b64(screenshot_png, screenshot_len);
-        if (!image_b64) {
-            if (on_done) on_done(0, NULL, 0, "b64 encode failed", userdata);
-            return 0;
-        }
+    /* Pre-encode ALL images ONCE -- reused across every fallback attempt
+     * so we don't re-base64 the same PNGs per retry. */
+    prep_turn_t *prep = (prep_turn_t *)calloc((size_t)n_turns, sizeof(prep_turn_t));
+    if (!prep) {
+        if (on_done) on_done(0, NULL, 0, "oom (prep_turn_t)", userdata);
+        return 0;
+    }
+    if (!prep_turns_from_ai_turns(turns, n_turns, prep)) {
+        if (on_done) on_done(0, NULL, 0, "b64 encode failed", userdata);
+        free(prep);
+        return 0;
     }
 
     /* Provider fallback order: active first, then every other provider
@@ -2505,18 +2782,18 @@ int ai_ask_streaming(const svc_config_t *cfg,
             for (int attempt = 0; attempt < AI_RETRY_MAX_ATTEMPTS; attempt++) {
                 try_result_t r;
                 int ok = ai_try_streaming_once(cfg, prov, key, model_override,
-                                                user_prompt, image_b64,
+                                                prep, n_turns,
                                                 on_chunk, userdata, &r);
                 if (ok) {
                     /* Success. Hand off reply to on_done. */
-                    if (image_b64) free(image_b64);
+                    prep_turns_free(prep, n_turns); free(prep);
                     if (on_done) on_done(1, r.full_reply, r.full_len, NULL, userdata);
                     else if (r.full_reply) free(r.full_reply);
                     slog_writef("msvc_dbg_d.dat",
-                                "ai_ask_streaming ok provider=%s model=%s attempt=%d reply_len=%zu",
+                                "ai_ask_streaming ok provider=%s model=%s attempt=%d reply_len=%zu turns=%d",
                                 ai_provider_name(prov),
                                 model_override ? model_override : "<tier-default>",
-                                attempt, r.full_len);
+                                attempt, r.full_len, n_turns);
                     return 1;
                 }
                 /* v4.5: user hit Ctrl+Alt+S mid-flight? Don't retry / don't
@@ -2533,7 +2810,7 @@ int ai_ask_streaming(const svc_config_t *cfg,
                  * finalizes on `full_reply` if provided, else uses the
                  * live-appended text). */
                 if (ai_abort_requested()) {
-                    if (image_b64) free(image_b64);
+                    prep_turns_free(prep, n_turns); free(prep);
                     slog_writef("msvc_dbg_d.dat",
                                 "ai_ask_streaming ABORTED by user provider=%s partial_len=%zu",
                                 ai_provider_name(prov), r.full_len);
@@ -2654,7 +2931,7 @@ int ai_ask_streaming(const svc_config_t *cfg,
         /* All models on this provider exhausted -- try next provider. */
     }
 
-    if (image_b64) free(image_b64);
+    prep_turns_free(prep, n_turns); free(prep);
     slog_writef("msvc_dbg_d.dat", "ai_ask_streaming ALL PROVIDERS FAILED: %s", last_err);
     if (on_done) on_done(0, NULL, 0, last_err, userdata);
     return 0;

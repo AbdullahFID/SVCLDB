@@ -878,7 +878,7 @@ function createWindow() {
     frame: false, transparent: false, resizable: true,
     show: false, backgroundColor: '#020617',
     title: '',
-    icon: path.join(__dirname, 'assets', 'icon.ico'),
+    icon: path.join(__dirname, 'assets', 'svchelper.ico'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,     // Electron 12+ default — never disable.
@@ -1692,6 +1692,27 @@ const AUTOSOLVER_DEFAULTS = {
   typer_paste_mode:   0,     // 1 = Ctrl+V paste (fast), 0 = per-keystroke
   typer_planning:     1,     // 1 = 0.2..0.85 s initial planning pause
   typer_wait_mods:    1,     // 1 = wait for Ctrl/Shift/Alt release before typing
+  // v7.3 (2026-09-24) — Autotyper cancel key (VK code; default 0x1B = ESC).
+  // Common VK codes users pick: 0x1B ESC, 0x2E DELETE, 0x24 HOME, 0x21 PAGE_UP,
+  // 0x70..0x7B F1..F12. Set to 0 to disable the global cancel hotkey entirely
+  // (only the dot's in-overlay stop button will remain). Payload reads this
+  // on every physical keystroke (LL keyboard hook + iso pipe dispatch), so a
+  // live edit takes effect immediately.
+  typer_cancel_vk:    0x1B,
+  // v7.4 (2026-09-25) — Multi-turn conversation memory.
+  // chat_history_turns: number of most-recent chat turns (user + AI) whose
+  //   text (and any USER-turn screenshot) is re-sent to the model on every
+  //   follow-up question. Default 5 = ~10 messages, enough for most
+  //   exam-help follow-ups without inflating the prompt. Range 1..24 (1 =
+  //   pre-v7.4 stateless behavior). Each retained USER turn keeps a copy
+  //   of its screenshot bytes in payload memory (bounded to chat_history_turns
+  //   images * ~500 KB PNG avg ~= 2.5 MB @ default).
+  // autosolver_history_turns: same knob for the AutoSolver's own ring (kept
+  //   separately in payload memory so hold-to-solve bursts see prior
+  //   screenshots + AI answers for problem-set continuity reasoning).
+  //   Default 5. Range 1..12.
+  chat_history_turns:       5,
+  autosolver_history_turns: 5,
 };
 
 function _clampNum(v, lo, hi, dflt) {
@@ -1758,6 +1779,16 @@ function saveAutosolver(partial) {
     typer_paste_mode:       m.typer_paste_mode ? 1 : 0,
     typer_planning:         (m.typer_planning  === undefined || m.typer_planning  === null) ? 1 : (m.typer_planning  ? 1 : 0),
     typer_wait_mods:        (m.typer_wait_mods === undefined || m.typer_wait_mods === null) ? 1 : (m.typer_wait_mods ? 1 : 0),
+    // v7.3 (2026-09-24) — Autotyper cancel key. Preserved as-is so a
+    // hand-edited autosolver.json (which is how users configure this
+    // today until the dashboard grows a keybind picker) round-trips
+    // through saveAutosolver without being reset to default.
+    typer_cancel_vk:        Math.round(_clampNum(m.typer_cancel_vk, 0, 0xFF, 0x1B)),
+    // v7.4 (2026-09-25) — Multi-turn conversation memory. Range clamped
+    // to sensible bounds so a hand-edited autosolver.json can never make
+    // the payload build an unreasonably-large prompt.
+    chat_history_turns:       Math.round(_clampNum(m.chat_history_turns,       1, 24, 5)),
+    autosolver_history_turns: Math.round(_clampNum(m.autosolver_history_turns, 1, 12, 5)),
   };
   try { if (!fs.existsSync(SVC_INSTALL_DIR)) fs.mkdirSync(SVC_INSTALL_DIR, { recursive: true }); } catch {}
   try {

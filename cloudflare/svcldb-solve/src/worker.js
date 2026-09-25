@@ -62,6 +62,15 @@ const DEFAULT_TIER = "strong";
 const MAX_IMAGES = 8;
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_QUESTION_CHARS = 8000;
+// v7.4 (2026-09-25) -- multi-turn conversation memory. Caps for the
+// optional `messages` array (payload sends the last ~5 chat turns +
+// current question; each turn may carry up to a couple of images).
+// These caps are intentionally generous compared to what the payload
+// sends (24 hard cap, 12 default) so a rare 20-turn power-user chat
+// still goes through. Anything over the cap is silently truncated to
+// the newest entries so the tail (current question) is always kept.
+const MAX_MESSAGES = 32;
+const MAX_TOTAL_IMAGES_IN_HISTORY = 12;
 // GPT-6 Astra's OUTPUT ceiling is 128K tokens (large ctx window ≠ output
 // budget). We cap at that max so reasoning + answer never truncate. It's a
 // CAP: normal exam answers spend a few hundred/thousand tokens and only those
@@ -213,7 +222,86 @@ export default {
       if (base64Bytes(img) > MAX_IMAGE_BYTES) return jsonRes({ error: "image_too_large", max_bytes: MAX_IMAGE_BYTES }, 400);
     }
     if (question.length > MAX_QUESTION_CHARS) return jsonRes({ error: "question_too_long", max: MAX_QUESTION_CHARS }, 400);
-    if (images.length === 0 && !question.trim()) return jsonRes({ error: "no_image_or_question" }, 400);
+
+    // v7.4 (2026-09-25) -- multi-turn conversation history. Payload sends
+    // `messages: [{role, content}]` with alternating user/assistant turns
+    // (last one = current question). We validate + normalize each turn's
+    // shape and re-cap image counts + sizes for SSRF safety. If `messages`
+    // is empty/absent we fall back to the legacy single-turn shape
+    // (`question` + `images`).
+    let historyMessages = Array.isArray(body.messages) ? body.messages : [];
+    // Truncate to the tail if beyond cap (preserve the most recent, which
+    // ends with the current question).
+    if (historyMessages.length > MAX_MESSAGES) {
+      historyMessages = historyMessages.slice(-MAX_MESSAGES);
+    }
+    let totalHistoryImages = 0;
+    const validatedHistory = [];
+    for (const m of historyMessages) {
+      if (!m || typeof m !== "object") continue;
+      const role = m.role === "assistant" ? "assistant" : "user";
+      // Assistant content is a plain string (per OpenAI schema). We coerce
+      // whatever the client sent to a string via JSON.stringify only when
+      // it's an object; otherwise treat as text. Truncate to a sane cap
+      // so a wild long assistant reply can't blow up the request body.
+      if (role === "assistant") {
+        let txt = "";
+        if (typeof m.content === "string") txt = m.content;
+        else if (m.content != null) txt = String(m.content);
+        if (txt.length > MAX_QUESTION_CHARS * 4) txt = txt.slice(0, MAX_QUESTION_CHARS * 4);
+        validatedHistory.push({ role, content: txt });
+        continue;
+      }
+      // user role -- accept either { content: string } OR
+      // { content: [{type,text}|{type,image_url,image_url:{url}}] }.
+      // Normalize to the array form so we can splice more images cleanly
+      // downstream.
+      let parts = [];
+      if (typeof m.content === "string") {
+        if (m.content.length > MAX_QUESTION_CHARS) {
+          return jsonRes({ error: "question_too_long", max: MAX_QUESTION_CHARS }, 400);
+        }
+        parts.push({ type: "text", text: m.content });
+      } else if (Array.isArray(m.content)) {
+        for (const p of m.content) {
+          if (!p || typeof p !== "object") continue;
+          if (p.type === "text") {
+            let txt = typeof p.text === "string" ? p.text : String(p.text ?? "");
+            if (txt.length > MAX_QUESTION_CHARS) {
+              return jsonRes({ error: "question_too_long", max: MAX_QUESTION_CHARS }, 400);
+            }
+            parts.push({ type: "text", text: txt });
+          } else if (p.type === "image_url") {
+            const u = p.image_url && typeof p.image_url === "object" ? p.image_url.url : null;
+            if (!u || typeof u !== "string") continue;
+            if (!u.startsWith("data:image/")) {
+              return jsonRes({ error: "invalid_image_scheme", detail: "history images must be data:image/... URIs" }, 400);
+            }
+            if (base64Bytes(u) > MAX_IMAGE_BYTES) {
+              return jsonRes({ error: "image_too_large", max_bytes: MAX_IMAGE_BYTES }, 400);
+            }
+            if (totalHistoryImages >= MAX_TOTAL_IMAGES_IN_HISTORY) {
+              // Silently drop extras -- prefer to complete the request
+              // over 400ing on a slightly-too-verbose history. Log
+              // via header response would be nice but we keep this
+              // side-effect-free.
+              continue;
+            }
+            totalHistoryImages++;
+            parts.push({ type: "image_url", image_url: { url: u, detail: "high" } });
+          }
+        }
+      } else {
+        continue;   /* skip malformed */
+      }
+      if (parts.length === 0) continue;
+      validatedHistory.push({ role, content: parts });
+    }
+    const hasHistory = validatedHistory.length > 0;
+
+    if (!hasHistory && images.length === 0 && !question.trim()) {
+      return jsonRes({ error: "no_image_or_question" }, 400);
+    }
 
     // Acquire slot (atomic: active plan + credits>0 + concurrency<5).
     const { data: acquired, error: acqErr } = await sb.rpc("acquire_call_slot", {
@@ -233,22 +321,42 @@ export default {
       const userText =
         question.trim() ||
         "Answer the question(s) in this screenshot. If it is not a question, briefly describe what is shown.";
-      const content =
-        images.length > 0
-          ? [{ type: "text", text: userText }, ...images.map((u) => ({ type: "image_url", image_url: { url: u } }))]
-          : userText;
 
       const schemaProps = explain ? { answer: { type: "string" }, explanation: { type: "string" } } : { answer: { type: "string" } };
       const response_format = /^openai\//.test(model)
         ? { type: "json_schema", json_schema: { name: "svcldb_answer", strict: true, schema: { type: "object", additionalProperties: false, properties: schemaProps, required: explain ? ["answer", "explanation"] : ["answer"] } } }
         : { type: "json_object" };
 
-      const payload = {
-        model,
-        messages: [
+      // v7.4 (2026-09-25) -- Multi-turn conversation history. When the
+      // caller sent a `messages` array we forward it verbatim (already
+      // validated + normalized above); otherwise fall back to the legacy
+      // one-turn shape (question + images). All routes prepend the same
+      // svcldb system prompt so JSON-schema response contract is honored.
+      let orMessages;
+      if (hasHistory) {
+        // Verified against provider docs (2026-09-25):
+        //   OpenAI    -- https://developers.openai.com/api/docs/guides/conversation-state
+        //   OpenRouter -- https://openrouter.ai/docs/guides/overview/multimodal/image-understanding
+        // Both accept alternating user/assistant turns with per-user-turn
+        // content arrays for text + multi-image parts.
+        orMessages = [
+          { role: "system", content: buildSystemPrompt(explain) },
+          ...validatedHistory,
+        ];
+      } else {
+        const content =
+          images.length > 0
+            ? [{ type: "text", text: userText }, ...images.map((u) => ({ type: "image_url", image_url: { url: u, detail: "high" } }))]
+            : userText;
+        orMessages = [
           { role: "system", content: buildSystemPrompt(explain) },
           { role: "user", content },
-        ],
+        ];
+      }
+
+      const payload = {
+        model,
+        messages: orMessages,
         temperature: 0,
         max_tokens: MAX_TOKENS,
         response_format,

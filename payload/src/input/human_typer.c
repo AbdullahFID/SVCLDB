@@ -33,6 +33,10 @@
 #include "secure_inject.h"
 #include "../clipboard_out.h"
 #include "../../../shared/log_secure.h"
+/* v7.3 (2026-09-24) -- hoisted from inside human_type_default_opts()
+ * (was at line ~469) so ht_is_esc() near the top of this file can also
+ * read as_cfg()->typer_cancel_vk. */
+#include "../autosolver/as_cfg.h"
 
 #include <windows.h>
 #include <stdio.h>
@@ -305,7 +309,21 @@ static void ht_sleep_ms(double ms) {
     Sleep((DWORD)(ms + 0.5));
 }
 static int ht_is_esc(void) {
-    return (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+    /* v7.3 (2026-09-24) -- Honor the user-configurable autotyper cancel
+     * key (default VK_ESCAPE).  This is a belt-and-suspenders secondary
+     * check -- the LL keyboard hook's cancel path (rawinput_hook.c
+     * ll_kbd_proc and dispatch_external_key) is the primary trigger
+     * because it fires INSTANTLY on the physical keydown even when
+     * this worker is deep inside a Sleep().  This check catches the
+     * rare case where the LL hook cancel hasn't yet propagated to
+     * g_cancel by the time we sample it here (e.g. rapid tap during
+     * a burst of typos).  Only fires on Default desktop -- on an iso
+     * desktop GetAsyncKeyState is desktop-blind so we rely 100% on
+     * the pipe-dispatched cancel from wl_input's LL hook. */
+    const as_settings_t *asc = as_cfg();
+    int cancel_vk = asc ? asc->typer_cancel_vk : VK_ESCAPE;
+    if (cancel_vk <= 0 || cancel_vk > 0xFF) return 0;  /* disabled */
+    return (GetAsyncKeyState(cancel_vk) & 0x8000) != 0;
 }
 
 /* Wait until Ctrl/Shift/Alt are all physically UP -- otherwise our first
@@ -451,8 +469,10 @@ void human_type_set_paste_mode(int p)   {
  * autosolver.json, so any live-edit there is picked up on the next
  * human_type_start() without a re-inject. If as_cfg is uninitialized
  * (e.g. very early boot before init_thread's as_cfg_load()), the load
- * call inside as_cfg() ensures we still get sane defaults. */
-#include "../autosolver/as_cfg.h"
+ * call inside as_cfg() ensures we still get sane defaults.
+ * v7.3 (2026-09-24) -- header moved to top-of-file so ht_is_esc()
+ * can also read from as_cfg (was previously only visible from this
+ * function down). */
 
 void human_type_default_opts(human_typer_opts_t *opts) {
     if (!opts) return;

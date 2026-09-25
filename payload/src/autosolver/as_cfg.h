@@ -55,15 +55,45 @@ typedef struct {
     int    typer_paste_mode;    /* 1 = Ctrl+V paste (fast), 0 = per-keystroke */
     int    typer_planning;      /* 1 = initial 0.2..0.85 s pre-type pause */
     int    typer_wait_mods;     /* 1 = poll VK_CONTROL/SHIFT/MENU until up before typing */
+    /* v7.3 (2026-09-24) -- USER-CONFIGURABLE AUTOTYPER CANCEL KEY.
+     * VK code that hard-cancels an in-flight autotyper session when
+     * pressed physically.  Default 0x1B == VK_ESCAPE.  Set to 0 to
+     * disable the global-hotkey cancel entirely (only the dot's
+     * in-overlay stop button still works).  Read by both the
+     * Default-desktop LL hook (rawinput_hook.c ll_kbd_proc) and the
+     * iso-desktop pipe dispatcher (dispatch_external_key), so the
+     * chosen key works on every input surface. */
+    int    typer_cancel_vk;
+    /* ── v7.4 (2026-09-25) -- multi-turn conversation memory ──────
+     * Number of prior chat turns (USER + AI) whose text is
+     * re-sent to the AI on every follow-up question, so the model
+     * can reference earlier context. Cap at ~24 for token/latency
+     * sanity; default 5 gives ~10 messages of context, enough for
+     * most exam-help follow-ups without blowing up the prompt.
+     * Each retained USER turn keeps a copy of its ORIGINAL
+     * screenshot bytes in the chat ring (bounded to `chat_history_turns`
+     * images = ~2.5 MB @ 500 KB avg PNG). Set to 1 for the pre-v7.4
+     * stateless behavior; set to 0 also treated as 1 (never silently
+     * disable memory). */
+    int    chat_history_turns;
+    /* Similar knob but for the autosolver's own history ring (kept
+     * separately in payload/src/autosolver/solve.c so hold-to-solve
+     * bursts see prior screenshots + answers as context). Default 5. */
+    int    autosolver_history_turns;
 } as_settings_t;
 
 /* Current settings (loads defaults + autosolver.json on first call). */
 const as_settings_t *as_cfg(void);
 
 void as_cfg_load(void);              /* (re)read autosolver.json */
-void as_cfg_save(void);              /* write autosolver.json */
+void as_cfg_save(void);              /* synchronous flush of current in-mem state */
 void as_cfg_reload_if_changed(void); /* reload only if the file's mtime moved */
-void as_cfg_start_watch(void);       /* start the ~1.5s mtime watcher (once) */
+void as_cfg_start_watch(void);       /* start the ~1.5s mtime watcher + debounce persister (once) */
+/* v7.3 (2026-09-24) -- Cancel-and-join the persister thread + flush any
+ * pending dirty state to disk.  Called from shutdown_watcher (dllmain.c)
+ * BEFORE FreeLibraryAndExitThread so unsaved dot state (position/size/
+ * opacity/ui_state) survives an --unload / user-Ctrl-Shift-Alt-Q kill. */
+void as_cfg_shutdown(void);
 
 /* Live toggles (persist immediately). Return new state where applicable. */
 int  as_cfg_toggle_autosolver(void);

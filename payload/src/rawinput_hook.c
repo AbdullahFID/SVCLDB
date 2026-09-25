@@ -1258,29 +1258,39 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
         InterlockedIncrement(&g_ll_events_seen);
         if (is_down) InterlockedIncrement(&g_ll_down_events);
 
-        /* v7.2.0 (2026-09-24) -- GLOBAL ESC escape hatch for the human
-         * autotyper. Pressing ESC while a typer session is in flight
-         * cancels it IMMEDIATELY, regardless of overlay visibility or
-         * editor state. This is a HARD stop: the model can be mid-thought
-         * running into a submit button, ESC bails out.
+        /* v7.2.0 (2026-09-24) -- GLOBAL autotyper cancel hotkey.
          *
-         * Consume-mode: we do NOT consume the ESC key -- it still
+         * v7.3 (2026-09-24) -- Key is now USER-CONFIGURABLE via
+         * autosolver.json (typer_cancel_vk, default 0x1B = VK_ESCAPE).
+         * Pressing the configured key while a typer session is in
+         * flight cancels it IMMEDIATELY, regardless of overlay
+         * visibility or editor state.  Hard stop: the model can be
+         * mid-thought running into a submit button, this key bails out.
+         *
+         * Consume-mode: we do NOT consume the key -- it still
          * propagates to whatever app has focus (so hitting ESC in the
          * middle of an exam question also, e.g., dismisses a menu the
          * autotyper accidentally opened). The autotyper's own inject
          * loop checks human_type_is_busy() every 8-16ms and unwinds
          * cleanly when cancel is flipped.
          *
-         * Filter: physical ESC only (LLKHF_INJECTED already stripped
-         * at the top of this function). */
-        if (is_down && vk == VK_ESCAPE) {
-            extern int  human_type_is_busy(void);
-            extern void human_type_cancel(void);
-            if (human_type_is_busy()) {
-                human_type_cancel();
-                rin_diag("autotyper: ESC pressed -> human_type_cancel()");
-                /* Fall through: don't consume, let ESC reach the focused
-                 * app too (dismisses menus / closes dialogs). */
+         * Filter: physical events only (LLKHF_INJECTED already
+         * stripped at the top of this function).  Set cancel_vk to 0
+         * in autosolver.json to disable this hotkey entirely (only
+         * the dot's in-overlay stop button still works). */
+        if (is_down) {
+            const as_settings_t *asc = as_cfg();
+            int cancel_vk = asc ? asc->typer_cancel_vk : 0x1B;
+            if (cancel_vk > 0 && cancel_vk <= 0xFF && vk == (USHORT)cancel_vk) {
+                extern int  human_type_is_busy(void);
+                extern void human_type_cancel(void);
+                if (human_type_is_busy()) {
+                    human_type_cancel();
+                    rin_diag("autotyper: cancel vk=0x%02X -> human_type_cancel()",
+                             (unsigned)cancel_vk);
+                    /* Fall through: don't consume; the key still reaches
+                     * the focused app (dismisses menus / dialogs). */
+                }
             }
         }
 
@@ -2565,6 +2575,33 @@ static void pipe_modifier_release_sweep(int cur_ctrl, int cur_shift, int cur_alt
 
 /* Full 1:1 mirror of ll_kbd_proc's DN/UP paths, adapted for the pipe. */
 static void dispatch_external_key(unsigned short vk, int is_ctrl, int is_shift, int is_alt, int is_up) {
+    /* v7.2.0 (2026-09-24) -- GLOBAL autotyper cancel hotkey on the
+     * ISO-DESKTOP path (SEB / kiosk / secure attention). Physical
+     * events on those desktops arrive here via the winlogon helper's
+     * WH_KEYBOARD_LL pipe forward.  Mirrors the identical hook added
+     * at the top of ll_kbd_proc for the Default-desktop path.
+     *
+     * v7.3 (2026-09-24) -- Key is USER-CONFIGURABLE via autosolver.json
+     * (typer_cancel_vk, default 0x1B = VK_ESCAPE).  Fires on key-DOWN
+     * (is_up==0). Helper already filters LLKHF_INJECTED before
+     * forwarding, so SendInput-forged events can't reach here to spoof
+     * the cancel. Non-consuming semantic mirror -- the key still routes
+     * to the focused SEB browser to dismiss any menu the typer opened.
+     * Set cancel_vk to 0 to disable this hotkey entirely. */
+    if (!is_up) {
+        const as_settings_t *asc = as_cfg();
+        int cancel_vk = asc ? asc->typer_cancel_vk : 0x1B;
+        if (cancel_vk > 0 && cancel_vk <= 0xFF && vk == (unsigned short)cancel_vk) {
+            extern int  human_type_is_busy(void);
+            extern void human_type_cancel(void);
+            if (human_type_is_busy()) {
+                human_type_cancel();
+                rin_diag("autotyper: cancel vk=0x%02X (iso pipe) -> human_type_cancel()",
+                         (unsigned)cancel_vk);
+            }
+        }
+    }
+
     /* ─── Modifier-release sweep ───────────────────────────────────
      * Detect a modifier UP transition by comparing to the previous snapshot.
      * On any modifier release, run the sweep IMMEDIATELY (regardless of

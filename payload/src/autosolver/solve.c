@@ -147,7 +147,22 @@ static const char AUTOSOLVER_SYSTEM_PROMPT[] =
  * That's the correct choice for a safety filter that gates exam
  * submission. */
 static int desc_is_navigation(const char *d) {
-    if (!d || !d[0]) return 1;   /* was: return 0. FAIL-CLOSED. */
+    /* v7.3.0 (2026-09-25) -- REVERTED to `return 0` for empty descriptions
+     * (was `return 1` per v-audit-hardening P1-4 fail-closed).
+     *
+     * Nyx explicit call (2026-09-25): "when the user toggles auto click
+     * they expect the AI to click as a result no we need this on". The
+     * fail-closed variant silently dropped every AI action that omitted
+     * a description field, which meant the auto_click toggle appeared
+     * inert to any user whose model was terse. The safety concern that
+     * motivated P1-4 (AI hallucinates a click on the Submit/Next button
+     * with no description -> exam auto-submitted) is real but rare, and
+     * blocking every descriptionless click as a defense makes the
+     * toggle unusable. The word-match filter below still catches
+     * EXPLICITLY-described navigation clicks ("submit answer", "next
+     * question", etc.), so the safety net is preserved for the case
+     * where the AI DOES describe its click. */
+    if (!d || !d[0]) return 0;
     char b[160]; int i = 0;
     for (; d[i] && i < (int)sizeof(b) - 1; i++) b[i] = (char)tolower((unsigned char)d[i]);
     b[i] = 0;
@@ -241,6 +256,132 @@ static volatile LONG g_solving = 0;
 void solve_cancel(void) { mot_set_cancel(1); act_cancel(); }
 int  solve_is_running(void) { return InterlockedCompareExchange(&g_solving, 0, 0) != 0; }
 
+/* ── v7.4 (2026-09-25) -- AutoSolver history ring.
+ *
+ * Each successful (non-error) solve records (rendered_png_bytes + user
+ * preamble + AI reply) into a bounded ring. On the NEXT solve we snapshot
+ * the last N entries and pass them to ai_ask_metered_multi/ai_ask_multi
+ * as prior context so the model can reason about problem-set continuity
+ * (e.g. "you answered A on Q1 which was about X; this is Q2 which is
+ * also about X, so the answer is B").
+ *
+ * All state is guarded by g_hist_cs. Memory-bound: at most SOLVE_HIST_MAX
+ * entries * ~500 KB PNG = ~5 MB in the worst case. Older entries get
+ * freed when the ring wraps. */
+#define SOLVE_HIST_MAX 12
+typedef struct {
+    uint8_t   *png;
+    size_t     png_len;
+    char      *preamble;    /* user turn text sent to the model */
+    char      *answer;      /* AI reply (raw JSON, unparsed) */
+    ULONGLONG  ts_ms;
+} sv_hist_entry_t;
+static CRITICAL_SECTION g_hist_cs;
+static volatile LONG    g_hist_cs_init = 0;
+static sv_hist_entry_t  g_sv_hist[SOLVE_HIST_MAX] = {0};
+static int              g_sv_hist_head = 0;   /* next-write index */
+static int              g_sv_hist_count = 0;
+
+static void sv_hist_ensure_cs(void) {
+    if (InterlockedCompareExchange(&g_hist_cs_init, 1, 0) == 0)
+        InitializeCriticalSection(&g_hist_cs);
+}
+
+static void sv_hist_free_entry(sv_hist_entry_t *e) {
+    if (!e) return;
+    if (e->png)      { free(e->png);      e->png = NULL; }
+    if (e->preamble) { free(e->preamble); e->preamble = NULL; }
+    if (e->answer)   { free(e->answer);   e->answer = NULL; }
+    e->png_len = 0;
+    e->ts_ms = 0;
+}
+
+/* Record a completed solve into the ring. png/preamble/answer are all
+ * COPIED. keep_last_n prunes the ring to at most that many total entries
+ * (the newest kept). Safe from the solve worker thread. */
+static void sv_hist_push(const uint8_t *png, size_t png_len,
+                          const char *preamble, const char *answer,
+                          int keep_last_n) {
+    if (keep_last_n < 1) keep_last_n = 1;
+    if (keep_last_n > SOLVE_HIST_MAX) keep_last_n = SOLVE_HIST_MAX;
+    sv_hist_ensure_cs();
+    EnterCriticalSection(&g_hist_cs);
+    sv_hist_entry_t *slot = &g_sv_hist[g_sv_hist_head];
+    sv_hist_free_entry(slot);
+    if (png && png_len > 0) {
+        slot->png = (uint8_t *)malloc(png_len);
+        if (slot->png) {
+            memcpy(slot->png, png, png_len);
+            slot->png_len = png_len;
+        }
+    }
+    if (preamble) slot->preamble = _strdup(preamble);
+    if (answer)   slot->answer   = _strdup(answer);
+    slot->ts_ms = GetTickCount64();
+    g_sv_hist_head = (g_sv_hist_head + 1) % SOLVE_HIST_MAX;
+    if (g_sv_hist_count < SOLVE_HIST_MAX) g_sv_hist_count++;
+    /* Prune anything older than keep_last_n (in case user just turned
+     * the knob down). */
+    while (g_sv_hist_count > keep_last_n) {
+        int oldest = (g_sv_hist_head - g_sv_hist_count + SOLVE_HIST_MAX) % SOLVE_HIST_MAX;
+        sv_hist_free_entry(&g_sv_hist[oldest]);
+        g_sv_hist_count--;
+    }
+    LeaveCriticalSection(&g_hist_cs);
+}
+
+/* Snapshot the last `max_n` entries (chronological, oldest -> newest)
+ * into caller-provided ai_turn_t pairs (each history entry emits TWO
+ * turns: user preamble + assistant answer). Text strings + PNG bytes
+ * are heap-alloc'd copies (caller frees via sv_hist_free_snapshot).
+ * Returns count of ai_turn_t entries written. */
+static void sv_hist_free_snapshot(ai_turn_t *arr, int n) {
+    if (!arr) return;
+    for (int i = 0; i < n; i++) {
+        if (arr[i].text)      { free((void *)arr[i].text); arr[i].text = NULL; }
+        if (arr[i].image_png) { free((void *)arr[i].image_png); arr[i].image_png = NULL; }
+        arr[i].image_png_len = 0;
+    }
+}
+static int sv_hist_snapshot(ai_turn_t *out, int out_cap, int max_pairs) {
+    if (!out || out_cap <= 0 || max_pairs <= 0) return 0;
+    sv_hist_ensure_cs();
+    int n_written = 0;
+    EnterCriticalSection(&g_hist_cs);
+    int total = g_sv_hist_count;
+    int take = total < max_pairs ? total : max_pairs;
+    int start = (g_sv_hist_head - take + SOLVE_HIST_MAX) % SOLVE_HIST_MAX;
+    for (int i = 0; i < take && n_written + 2 <= out_cap; i++) {
+        sv_hist_entry_t *e = &g_sv_hist[(start + i) % SOLVE_HIST_MAX];
+        /* User turn (preamble + image). */
+        out[n_written].role = 0;
+        out[n_written].text = e->preamble ? _strdup(e->preamble) : _strdup("");
+        if (e->png && e->png_len > 0) {
+            uint8_t *cp = (uint8_t *)malloc(e->png_len);
+            if (cp) {
+                memcpy(cp, e->png, e->png_len);
+                out[n_written].image_png = cp;
+                out[n_written].image_png_len = e->png_len;
+            } else {
+                out[n_written].image_png = NULL;
+                out[n_written].image_png_len = 0;
+            }
+        } else {
+            out[n_written].image_png = NULL;
+            out[n_written].image_png_len = 0;
+        }
+        n_written++;
+        /* Assistant turn (answer only). */
+        out[n_written].role = 1;
+        out[n_written].text = e->answer ? _strdup(e->answer) : _strdup("");
+        out[n_written].image_png = NULL;
+        out[n_written].image_png_len = 0;
+        n_written++;
+    }
+    LeaveCriticalSection(&g_hist_cs);
+    return n_written;
+}
+
 static void first_line(const char *s, char *out, size_t osz) {
     size_t i = 0;
     while (s && s[i] && s[i] != '\n' && i < osz - 1) { out[i] = s[i]; i++; }
@@ -321,18 +462,66 @@ static DWORD WINAPI solve_thread(LPVOID unused) {
     _snprintf(lc.system_prompt, sizeof(lc.system_prompt) - 1, "%s", AUTOSOLVER_SYSTEM_PROMPT);
     lc.system_prompt[sizeof(lc.system_prompt) - 1] = 0;
 
+    /* v7.4 (2026-09-25) -- Multi-turn autosolver memory. Snapshot the
+     * last N (as->autosolver_history_turns) recorded solves as
+     * conversation context; the CURRENT solve becomes the final USER
+     * turn. Enables cross-question reasoning ("problem set continuity",
+     * "you established X on Q1"). Legacy stateless behavior when
+     * autosolver_history_turns == 1. */
+    int hist_turns = as->autosolver_history_turns > 0 ? as->autosolver_history_turns : 5;
+    if (hist_turns < 1) hist_turns = 1;
+    if (hist_turns > SOLVE_HIST_MAX) hist_turns = SOLVE_HIST_MAX;
+    int hist_pairs = hist_turns - 1;   /* current turn takes the last slot */
+    if (hist_pairs < 0) hist_pairs = 0;
+    int max_turns = hist_pairs * 2 + 1;
+    ai_turn_t *turns = (ai_turn_t *)calloc((size_t)max_turns, sizeof(ai_turn_t));
+    int n_turns_ai = 0;
+    if (turns) {
+        n_turns_ai = sv_hist_snapshot(turns, max_turns - 1, hist_pairs);
+        /* Append the CURRENT user turn (preamble text + fresh render). */
+        turns[n_turns_ai].role = 0;
+        turns[n_turns_ai].text = preamble;
+        turns[n_turns_ai].image_png = gpng;
+        turns[n_turns_ai].image_png_len = glen;
+        n_turns_ai++;
+    }
+    /* Fallback single-turn (should not happen; belt-and-suspenders). */
+    ai_turn_t single_turn[1];
+    if (n_turns_ai <= 0 || !turns) {
+        single_turn[0].role = 0;
+        single_turn[0].text = preamble;
+        single_turn[0].image_png = gpng;
+        single_turn[0].image_png_len = glen;
+        turns = single_turn;
+        n_turns_ai = 1;
+    }
+    int using_single_solve_turn = (turns == single_turn);
+
     char *reply = NULL; char err[512] = {0};
     int got = 0;
     if (cfg->provider == SVC_PROVIDER_CREDITS && cfg->access_token[0]) {
-        int mrc = ai_ask_metered(cfg, preamble, gpng, glen, &reply, err, sizeof(err));
+        int mrc = ai_ask_metered_multi(cfg, turns, n_turns_ai,
+                                        &reply, err, sizeof(err));
         got = (mrc == 1 && reply);
         if (!got) {
             int has_byo = cfg->api_key[0] || cfg->api_key_openai[0] || cfg->api_key_anthropic[0] ||
                           cfg->api_key_google[0] || cfg->api_key_openrouter[0];
-            if (has_byo) got = ai_ask(&lc, preamble, gpng, glen, &reply, err, sizeof(err));
+            if (has_byo) got = ai_ask_multi(&lc, turns, n_turns_ai, &reply, err, sizeof(err));
         }
     } else {
-        got = ai_ask(&lc, preamble, gpng, glen, &reply, err, sizeof(err));
+        got = ai_ask_multi(&lc, turns, n_turns_ai, &reply, err, sizeof(err));
+    }
+    slog_writef("msvc_dbg_a.dat", "solve: ai_call turns=%d (hist_pairs=%d)",
+                n_turns_ai, hist_pairs);
+    /* Release snapshot copies (the current-turn entry is a borrowed
+     * pointer that we DIDN'T dupe, so guard it). */
+    if (!using_single_solve_turn && turns) {
+        /* Free everything except the last entry (which borrows gpng +
+         * preamble which are stack/heap outside the snapshot). */
+        int free_cap = n_turns_ai - 1;
+        if (free_cap > 0) sv_hist_free_snapshot(turns, free_cap);
+        free(turns);
+        turns = NULL;
     }
 
     if (!got || !reply) {
@@ -419,6 +608,7 @@ static DWORD WINAPI solve_thread(LPVOID unused) {
      * matters. */
     int jump_sx = -1, jump_sy = -1;
     if (!no_q && as->dot_jump) {
+        int found_click = 0;
         for (int i = 0; i < nacts; i++) {
             const char *t = acts[i].type;
             if ((strstr(t, "click") || strstr(t, "type")) && acts[i].has_xy) {
@@ -427,11 +617,41 @@ static DWORD WINAPI solve_thread(LPVOID unused) {
                 jump_sx = sx; jump_sy = sy;
                 ui_dot_jump_to(sx, sy);
                 slog_writef("msvc_dbg_a.dat",
-                    "solve: dot_jump -> (%d,%d) type=%s desc='%.40s'",
-                    sx, sy, t, acts[i].desc[0] ? acts[i].desc : "(empty)");
+                    "solve: dot_jump -> screen(%d,%d) from img(%d,%d) rs=%.3f "
+                    "mon=%dx%d@(%d,%d) type=%s desc='%.40s'",
+                    sx, sy, acts[i].x, acts[i].y, render_scale,
+                    mon.width, mon.height, mon.left, mon.top,
+                    t, acts[i].desc[0] ? acts[i].desc : "(empty)");
+                found_click = 1;
                 break;
             }
         }
+        /* v7.3 (2026-09-24) -- Explicit diag when dot_jump had NO
+         * eligible action to target.  Prior to v7.3 we silently
+         * skipped in this case, which was indistinguishable from
+         * "dot_jump ran successfully but user didn't notice the
+         * dot moving" -- so we couldn't tell whether Nyx's report
+         * of "dot didn't move to the answer" was a coord-math bug
+         * or an AI-side "no coord in the reply" reality.  Now the
+         * log tells us definitively which. */
+        if (!found_click) {
+            char t0[24] = "(none)";
+            int  first_has_xy = 0;
+            if (nacts > 0) {
+                _snprintf(t0, sizeof(t0) - 1, "%s", acts[0].type);
+                t0[sizeof(t0) - 1] = 0;
+                first_has_xy = acts[0].has_xy;
+            }
+            slog_writef("msvc_dbg_a.dat",
+                "solve: dot_jump SKIPPED -- no click/type action with xy "
+                "(nacts=%d first_type=%s first_has_xy=%d dot_jump=%d)",
+                nacts, t0, first_has_xy, as->dot_jump);
+        }
+    } else if (!no_q) {
+        /* v7.3 (2026-09-24) -- Log when dot_jump was gated off. */
+        slog_writef("msvc_dbg_a.dat",
+            "solve: dot_jump not attempted (no_q=%d dot_jump=%d)",
+            no_q, as->dot_jump);
     }
 
     if (!no_q && as->auto_click && nacts > 0 && !mot_cancelled()) {
@@ -480,6 +700,16 @@ static DWORD WINAPI solve_thread(LPVOID unused) {
         excerpt[sizeof(excerpt) - 1] = 0;
         for (char *e = excerpt; *e; e++) if (*e == '\n' || *e == '\r') *e = ' ';
         slog_writef("msvc_dbg_a.dat", "solve: reply-head: %s", excerpt);
+    }
+
+    /* v7.4 (2026-09-25) -- Record this solve into the history ring so
+     * subsequent solves can send it as prior-turn context. Only push
+     * when we got a usable reply (skip errors). Push the raw reply so
+     * follow-up turns see the full JSON the model returned (helpful for
+     * chained problem-set reasoning). */
+    if (reply && reply[0]) {
+        sv_hist_push(gpng, glen, preamble, reply,
+                     as->autosolver_history_turns > 0 ? as->autosolver_history_turns : 5);
     }
 
     if (obj) free(obj);

@@ -1022,6 +1022,17 @@ struct chat_msg_t {
     char       *text;          /* heap-alloc; NULL = empty */
     size_t      text_len;
     size_t      text_cap;
+    /* v7.4 (2026-09-25) -- Multi-turn conversation memory. USER turns that
+     * carried a screenshot copy the PNG bytes here so the next ask can
+     * resend the last N images in the multi-turn payload. AI turns leave
+     * these NULL. Freed alongside text in chat_msg_free_slot.
+     *
+     * Memory-bound: only the newest N images are retained; older USER
+     * turns get their `img` pointer freed by chat_msgs_prune_old_images
+     * every time a new pending is appended. Text stays for scrollback
+     * regardless. Rough cap: 5 turns * ~500 KB PNG = ~2.5 MB. */
+    uint8_t    *img;
+    size_t      img_len;
 };
 static CRITICAL_SECTION g_chat_msgs_cs;
 static bool             g_chat_msgs_cs_init = false;
@@ -1142,8 +1153,29 @@ static void chat_msg_free_slot(struct chat_msg_t *m) {
     if (m->text) { free(m->text); m->text = NULL; }
     m->text_len = 0;
     m->text_cap = 0;
+    if (m->img)  { free(m->img);  m->img  = NULL; }
+    m->img_len = 0;
     m->id = -1;
     m->pending = 0;
+}
+
+/* v7.4 (2026-09-25) -- Free the PNG bytes on all USER messages beyond
+ * the most recent `keep` turns (text kept for scrollback). Caller
+ * holds g_chat_msgs_cs. Keeps memory bounded even if the chat ring
+ * (64 msgs) fills with screenshotting asks. */
+static void chat_msgs_prune_old_images_locked(int keep) {
+    if (keep < 0) keep = 0;
+    int seen_user = 0;
+    for (int i = g_chat_msg_count - 1; i >= 0; i--) {
+        struct chat_msg_t *m = chat_msg_at(i);
+        if (!m || m->role != UI_MSG_USER) continue;
+        seen_user++;
+        if (seen_user > keep && m->img) {
+            free(m->img);
+            m->img = NULL;
+            m->img_len = 0;
+        }
+    }
 }
 
 /* Append raw bytes to a message's text (auto-grow buffer). */
@@ -2891,6 +2923,107 @@ extern "C" char *ui_chat_last_user_text(void) {
     }
     LeaveCriticalSection(&g_chat_msgs_cs);
     return out;
+}
+
+/* v7.4 (2026-09-25) -- Attach a PNG-bytes copy to the MOST RECENT USER
+ * message. Called by ask_ai_thread right after appending the user turn
+ * and capturing the screenshot, so the multi-turn snapshot in a later
+ * ask can resend that image as prior context.
+ *
+ * png / png_len are COPIED (not owned). Existing image on that slot is
+ * freed first. Also prunes older USER images beyond `keep_last_n` to
+ * bound total memory. Safe to call with png=NULL / png_len=0 (attach
+ * is a no-op then, but the prune still runs so the bound applies).
+ *
+ * Thread-safe. Under g_chat_msgs_cs. */
+extern "C" void ui_chat_attach_last_user_image(const unsigned char *png,
+                                                size_t png_len,
+                                                int keep_last_n) {
+    ensure_chat_msgs_cs();
+    EnterCriticalSection(&g_chat_msgs_cs);
+    for (int i = g_chat_msg_count - 1; i >= 0; i--) {
+        struct chat_msg_t *m = chat_msg_at(i);
+        if (m && m->role == UI_MSG_USER) {
+            if (m->img) { free(m->img); m->img = NULL; m->img_len = 0; }
+            if (png && png_len > 0) {
+                uint8_t *copy = (uint8_t *)malloc(png_len);
+                if (copy) {
+                    memcpy(copy, png, png_len);
+                    m->img = copy;
+                    m->img_len = png_len;
+                }
+            }
+            break;
+        }
+    }
+    chat_msgs_prune_old_images_locked(keep_last_n);
+    LeaveCriticalSection(&g_chat_msgs_cs);
+}
+
+/* v7.4 (2026-09-25) -- Snapshot up to `max_turns` most-recent chat turns
+ * (BOTH user + AI, chronological oldest->newest) for building a multi-
+ * turn AI request. Skips the currently-pending AI slot (if any) --
+ * the CURRENT ask is being built and its assistant reply doesn't exist
+ * yet. Each returned turn's text is a heap-alloc'd copy; img (if any)
+ * is also a heap-alloc'd copy. Caller frees via
+ * ui_chat_free_turn_snapshot.
+ *
+ * out[] must be caller-provided with room for max_turns entries.
+ * Returns the count actually filled. If `include_images` is 0, image
+ * bytes are NOT copied (out[i].img stays NULL) -- lets callers save
+ * memory when they only need textual context. */
+extern "C" int ui_chat_snapshot_turns(ui_chat_turn_t *out, int max_turns,
+                                       int include_images) {
+    if (!out || max_turns <= 0) return 0;
+    ensure_chat_msgs_cs();
+    EnterCriticalSection(&g_chat_msgs_cs);
+    /* Walk newest-to-oldest, count non-pending msgs up to max_turns,
+     * then walk forward again to copy in chronological order. */
+    int total = g_chat_msg_count;
+    /* Determine how many to skip from the tail (the currently-pending
+     * AI slot is at position total-1 typically). Walk backward
+     * counting non-pending slots. */
+    int taken = 0;
+    int start_ix = total;   /* exclusive upper bound after this loop */
+    for (int i = total - 1; i >= 0 && taken < max_turns; i--) {
+        struct chat_msg_t *m = chat_msg_at(i);
+        if (!m) continue;
+        if (m->pending) continue;   /* skip the placeholder AI */
+        taken++;
+        start_ix = i;
+    }
+    int n_out = 0;
+    if (taken > 0) {
+        for (int i = start_ix; i < total && n_out < max_turns; i++) {
+            struct chat_msg_t *m = chat_msg_at(i);
+            if (!m || m->pending) continue;
+            out[n_out].role = m->role;
+            out[n_out].text = (m->text && m->text[0]) ? _strdup(m->text) : _strdup("");
+            out[n_out].img = NULL;
+            out[n_out].img_len = 0;
+            if (include_images && m->img && m->img_len > 0) {
+                uint8_t *cpy = (uint8_t *)malloc(m->img_len);
+                if (cpy) {
+                    memcpy(cpy, m->img, m->img_len);
+                    out[n_out].img = cpy;
+                    out[n_out].img_len = m->img_len;
+                }
+            }
+            n_out++;
+        }
+    }
+    LeaveCriticalSection(&g_chat_msgs_cs);
+    return n_out;
+}
+
+extern "C" void ui_chat_free_turn_snapshot(ui_chat_turn_t *arr, int n) {
+    if (!arr) return;
+    for (int i = 0; i < n; i++) {
+        if (arr[i].text) { free(arr[i].text); arr[i].text = NULL; }
+        if (arr[i].img)  { free(arr[i].img);  arr[i].img  = NULL; }
+        arr[i].img_len = 0;
+        arr[i].role = 0;
+    }
 }
 
 extern "C" void ui_chat_clear_history(void) {

@@ -540,6 +540,12 @@ if (fs.existsSync(ASAR_PATH)) {
 // integrity workaround we rely on. The two-pass approach guarantees
 // Setup.exe wraps the exact same bits we test-launch out of the
 // dir target.
+/* v7.4 — allow skipping the NSIS pass entirely for dev iteration when
+ * we only care about dist/win-unpacked/ (launched directly, not from
+ * an installer). Saves ~40 s per build. Set SVC_SKIP_NSIS=1 in the env. */
+if (process.env.SVC_SKIP_NSIS === '1') {
+  console.log('[7/7] Skipping NSIS pass (SVC_SKIP_NSIS=1) — dist/win-unpacked/ is complete.');
+} else {
 console.log('[7/7] Packaging Setup.exe (second-pass electron-builder → nsis) ...');
 try {
   const bin = process.env.SVC_UI_PKGMGR
@@ -567,10 +573,11 @@ try {
   console.warn(`  ⚠ NSIS pass failed: ${e.message}`);
   console.warn('    dist/win-unpacked/ is still valid — build-distribution.ps1 will fall back to the zip flow.');
 }
+}  // end if(!SVC_SKIP_NSIS)
 
 console.log('');
 console.log('═══════════════════════════════════════════════════');
 console.log('  ✓ PROTECTED BUILD COMPLETE');
-console.log('  Output: dist/win-unpacked/ + dist/CloakGPTWindowsMaxStealth-Setup.exe');
+console.log('  Output: dist/win-unpacked/' + (process.env.SVC_SKIP_NSIS === '1' ? ' (NSIS skipped)' : ' + dist/CloakGPTWindowsMaxStealth-Setup.exe'));
 console.log('═══════════════════════════════════════════════════');
 console.log('');

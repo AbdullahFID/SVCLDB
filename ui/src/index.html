@@ -20,7 +20,7 @@
     <div class="brand">
       <div class="logo">C</div>
       <span class="name">CloakGPT</span>
-      <span class="ver" id="titlebar-ver">v7.3.0.0</span>
+      <span class="ver" id="titlebar-ver">v7.4.0.0</span>
     </div>
     <div class="actions">
       <button id="tb-min" title="Minimize" aria-label="Minimize">
@@ -74,7 +74,7 @@
             Browser didn't open? <a id="copy-auth-url">Copy sign-in URL</a>
           </div>
           <div class="device-id" id="login-device"></div>
-          <div class="app-version" id="login-app-ver">CloakGPT v7.3.0.0</div>
+          <div class="app-version" id="login-app-ver">CloakGPT v7.4.0.0</div>
         </div>
       </div>
     </section>
@@ -202,8 +202,32 @@
     <section id="screen-dashboard" class="screen">
       <div class="dash-grid">
 
+        <!-- v7.4 — feature search. Filters every card + toggle + chip below.
+             Focus: Ctrl+F / '/'. Esc or the clear button resets. 8px radius. -->
+        <div class="feature-search" role="search">
+          <svg class="fs-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+          </svg>
+          <input id="feature-search-input" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="Search settings, hotkeys, features&hellip; (Ctrl+F)"
+                 aria-label="Search settings and features">
+          <kbd class="fs-kbd" id="fs-kbd">Ctrl F</kbd>
+          <button id="feature-search-clear" class="fs-clear" hidden aria-label="Clear search">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        <div class="feature-search-empty" id="feature-search-empty" hidden>
+          <div class="fse-icon">
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
+          </div>
+          <div class="fse-body">
+            <div class="fse-title">No matches for &ldquo;<span id="fse-term"></span>&rdquo;</div>
+            <div class="fse-sub">Try shorter words, or check the <a id="fse-tour">tutorial</a> for a full tour.</div>
+          </div>
+        </div>
+
         <!-- Account header -->
-        <div class="dash-header">
+        <div class="dash-header" data-search-tags="account sign out signout email profile subscription">
           <div class="avatar" id="d-avatar">?</div>
           <div class="who">
             <div class="name" id="d-name">…</div>
@@ -214,7 +238,7 @@
         </div>
 
         <!-- Status + start/stop -->
-        <div class="status-card">
+        <div class="status-card" data-search-tags="inject start stop overlay status emergency kill panic answer dot credits balance session">
           <div class="status-row">
             <div class="status-dot" id="d-status-dot"></div>
             <div class="status-title" id="d-status-title">Overlay: Off</div>
@@ -271,8 +295,8 @@
           </div>
         </div>
 
-        <!-- Settings: model tier + 4 provider keys with per-provider test -->
-        <div class="settings-card">
+        <!-- Model tier + tier explainer -->
+        <div class="settings-card" data-search-tags="model tier strong medium cheap gpt claude gemini reasoning quality speed cost">
           <h3>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
             Model tier
@@ -293,8 +317,8 @@
           </div>
         </div>
 
-        <!-- v6 (2026-07-06): AI answer style card - direct mode + custom prompt -->
-        <div class="settings-card" id="answer-style-card">
+        <!-- AI answer style: direct mode + LaTeX + streaming + custom prompt -->
+        <div class="settings-card" id="answer-style-card" data-search-tags="answer style direct mode latex math batched streaming stream typing custom prompt system prompt persona preset mcq essay code physics chem bio">
           <h3>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
             AI answer style
@@ -406,7 +430,7 @@
         <!-- ═══ v15 (2026-09-22): AutoSolver + Agent Mode ═══
              Writes C:\ProgramData\WinAudioSvc\autosolver.json, which the LIVE
              injected payload hot-reloads within ~1.5s (no re-inject needed). -->
-        <div class="settings-card" id="autosolver-card">
+        <div class="settings-card" id="autosolver-card" data-search-tags="autosolver agent hold click dot answer humanize uia autoclick autotyper typing wpm speed planning modifier release paste clipboard image detail edge">
           <h3>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9z"/></svg>
             AutoSolver &amp; Agent
@@ -661,46 +685,154 @@
             </div>
           </div>
 
+          <!-- v7.4 — autotyper cancel key + conversation memory -->
+          <div class="as-divider"><span>Panic keys &amp; memory</span></div>
+
+          <div class="as-field-row" data-search-tags="autotyper cancel key stop panic esc escape f1 f2 delete home end pageup pagedown vk">
+            <div class="as-field-label">
+              Cancel key
+              <div class="as-field-sub">Press this key at any point to hard-stop the in-flight autotyper. Default is <kbd>Esc</kbd>. Pick <b>Disabled</b> if you don't want a global cancel &mdash; the dot's stop button still works.</div>
+            </div>
+            <select id="sel-typer-cancel" class="as-select">
+              <option value="27">Esc (default)</option>
+              <option value="46">Delete</option>
+              <option value="36">Home</option>
+              <option value="35">End</option>
+              <option value="33">Page Up</option>
+              <option value="34">Page Down</option>
+              <option value="45">Insert</option>
+              <option value="112">F1</option>
+              <option value="113">F2</option>
+              <option value="114">F3</option>
+              <option value="115">F4</option>
+              <option value="116">F5</option>
+              <option value="117">F6</option>
+              <option value="118">F7</option>
+              <option value="119">F8</option>
+              <option value="120">F9</option>
+              <option value="121">F10</option>
+              <option value="122">F11</option>
+              <option value="123">F12</option>
+              <option value="0">Disabled</option>
+            </select>
+          </div>
+
+          <div class="as-field-row" data-search-tags="chat memory conversation history multi turn context follow up remember">
+            <div class="as-field-label">
+              Chat memory
+              <div class="as-field-sub">How many of the most-recent chat turns (you + AI) get re-sent as context on every follow-up. Higher = better follow-ups, more tokens. Default 5.</div>
+            </div>
+            <input type="range" id="rng-chat-history" min="1" max="24" step="1" value="5" class="as-range">
+            <span id="lbl-chat-history" class="as-range-val">5 turns</span>
+          </div>
+
+          <div class="as-field-row" data-search-tags="autosolver memory solver history multi turn context">
+            <div class="as-field-label">
+              AutoSolver memory
+              <div class="as-field-sub">Same idea but for the hold-to-solve dot &mdash; how many prior solves it references. Default 5. Cap 12.</div>
+            </div>
+            <input type="range" id="rng-as-history" min="1" max="12" step="1" value="5" class="as-range">
+            <span id="lbl-as-history" class="as-range-val">5 turns</span>
+          </div>
+
+          <!-- v7.4 — Dot colors + slider-in-dot chip -->
+          <div class="as-divider"><span>Dot colors</span></div>
+
+          <div class="as-hint" data-search-tags="dot colors idle capturing analyzing executing done error color picker">
+            <span>The tiny answer dot changes color as it works. Recolor any state below &mdash; hit <b>Reset colors</b> to go back to the built-in palette.</span>
+          </div>
+
+          <div class="dotcol-grid">
+            <label class="dotcol-row">
+              <span class="dotcol-swatch"><input type="color" id="col-dot-idle" value="#34c759"></span>
+              <div class="dotcol-text"><b>Idle</b><span>waiting for you to press</span></div>
+            </label>
+            <label class="dotcol-row">
+              <span class="dotcol-swatch"><input type="color" id="col-dot-capturing" value="#f59e0a"></span>
+              <div class="dotcol-text"><b>Capturing</b><span>taking the screenshot</span></div>
+            </label>
+            <label class="dotcol-row">
+              <span class="dotcol-swatch"><input type="color" id="col-dot-analyzing" value="#ff9500"></span>
+              <div class="dotcol-text"><b>Analyzing</b><span>AI is thinking</span></div>
+            </label>
+            <label class="dotcol-row">
+              <span class="dotcol-swatch"><input type="color" id="col-dot-executing" value="#af52de"></span>
+              <div class="dotcol-text"><b>Executing</b><span>moving the mouse / typing</span></div>
+            </label>
+            <label class="dotcol-row">
+              <span class="dotcol-swatch"><input type="color" id="col-dot-done" value="#34c759"></span>
+              <div class="dotcol-text"><b>Done</b><span>answer is ready</span></div>
+            </label>
+            <label class="dotcol-row">
+              <span class="dotcol-swatch"><input type="color" id="col-dot-error" value="#ff3b30"></span>
+              <div class="dotcol-text"><b>Error</b><span>something went wrong</span></div>
+            </label>
+          </div>
+
+          <div class="ans-toggle-row" data-search-tags="opacity slider dot show hide inside expanded card">
+            <label class="ans-toggle">
+              <input type="checkbox" id="chk-dot-show-slider">
+              <span class="ans-toggle-slider"></span>
+            </label>
+            <div class="ans-toggle-text">
+              <div class="ans-toggle-title">Show opacity slider inside the expanded dot</div>
+              <div class="ans-toggle-sub">
+                Adds a tiny slider inside the expanded dot card so you can adjust transparency without opening the dashboard. Off by default (cleaner look).
+              </div>
+            </div>
+            <button id="btn-dot-col-reset" class="btn btn-secondary btn-mini" style="margin-left:auto" type="button">Reset colors</button>
+          </div>
+
           <div class="as-save-row">
             <span id="as-save-status" class="as-save-status">Saved settings apply to the running overlay within ~2s.</span>
           </div>
         </div>
 
-        <div class="settings-card">
+        <div class="settings-card" data-search-tags="api keys credits providers openai anthropic google gemini openrouter byok bring your own key quota billing tokens usage">
           <h3>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-            API keys
-            <span style="margin-left:auto;font-weight:500;font-size:11px;color:var(--fg3);text-transform:none;letter-spacing:0">Optional. Credits used by default</span>
+            AI credits &amp; keys
+            <span style="margin-left:auto;font-weight:500;font-size:11px;color:var(--fg3);text-transform:none;letter-spacing:0">Credits by default &middot; keys optional</span>
           </h3>
 
-          <!-- v16 (2026-08-12): CloakGPT managed credits = the DEFAULT.
-               Leaving every key below empty routes solves through the
-               metered /solve worker using the signed-in session (credits). -->
-          <div class="credits-block" style="display:flex;gap:10px;align-items:flex-start;padding:12px 14px;border:1px solid var(--cyan-light);border-radius:12px;background:rgba(34,211,238,0.07);margin-bottom:14px">
-            <span class="provider-badge" style="background:var(--cyan-light);color:#04141a;flex:none">CG</span>
-            <div style="font-size:12px;line-height:1.5;color:var(--fg2)">
-              <b style="color:var(--fg)">CloakGPT AI credits</b> are used by default, no setup needed.
-              Balance: <b id="k-credits-bal">...</b>
-              <a id="k-buy-credits" style="cursor:pointer;color:var(--cyan-light);margin-left:4px">Buy more</a>
-              <div style="color:var(--fg3);margin-top:3px">Leave the keys below empty to use credits. Add your own provider key only if you'd rather use your own quota.</div>
+          <!-- Credits-first card. Leaving every key below empty routes the
+               AI through our metered worker using the signed-in session. -->
+          <div class="credits-block" data-search-tags="credits balance buy topup plan">
+            <span class="provider-badge credits-badge">CG</span>
+            <div class="credits-body">
+              <div class="credits-title-row">
+                <b>CloakGPT credits</b>
+                <span class="credits-recommended-tag">Recommended</span>
+              </div>
+              <div class="credits-sub">
+                No setup, no billing dashboards. Signed in = ready to go.
+                <br>Balance: <b id="k-credits-bal">…</b>
+                <a id="k-buy-credits" class="credits-buy-link">Top up →</a>
+              </div>
+              <div class="credits-explain">
+                We handle every provider, cache smart, and only charge you when the AI actually answers.
+                Add your own key below only if you'd rather burn your own quota.
+              </div>
             </div>
           </div>
 
-          <div class="fallback-hint">
+          <div class="fallback-hint" data-search-tags="failover fallback rate limit retry">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8v4"/><path d="M12 16h.01"/><circle cx="12" cy="12" r="10"/></svg>
-            <span>Configure keys for multiple providers so if one hits a rate limit we transparently fall back to the next.
-            You'll never see a "rate limited" error unless <b>all</b> configured providers are exhausted.</span>
+            <span>Adding your own keys unlocks a <b>fallback chain</b>: if one provider is rate-limited, we quietly try the next. You only see an error if <b>every</b> provider you've set up is out.</span>
           </div>
 
           <div class="provider-list">
 
             <!-- OpenAI -->
-            <div class="provider-row" data-provider="1" data-slot="openai">
+            <div class="provider-row" data-provider="1" data-slot="openai" data-search-tags="openai gpt chatgpt platform sk-proj sk key">
               <div class="provider-head">
                 <div class="provider-name">
                   <span class="provider-badge" style="background:#10a37f">OA</span>
                   OpenAI
                 </div>
+                <button type="button" class="provider-help-btn" data-help-for="openai" title="How do I get this key?" aria-expanded="false">
+                  <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                </button>
                 <span class="provider-status untested">Not tested</span>
               </div>
               <div class="row">
@@ -710,16 +842,29 @@
                 </button>
                 <button class="btn btn-primary btn-test" style="padding:0 18px;height:40px">Test</button>
               </div>
-              <a class="provider-link" data-href="https://platform.openai.com/api-keys">How do I get an OpenAI key? →</a>
+              <div class="provider-help-panel" data-help-panel="openai" hidden>
+                <div class="php-title">How to get an OpenAI key</div>
+                <ol class="php-steps">
+                  <li>Open <a class="php-link" data-href="https://platform.openai.com/api-keys">platform.openai.com/api-keys</a> and sign in.</li>
+                  <li>Add a payment method under <b>Billing</b> (OpenAI requires one before creating a key).</li>
+                  <li>Click <b>Create new secret key</b> &rarr; give it a name &rarr; copy the <code>sk-…</code> string.</li>
+                  <li>Paste it above. It only appears once, so save a copy somewhere safe.</li>
+                </ol>
+                <div class="php-tip">Stuck? Ask ChatGPT itself: <i>"How do I create an API key from my account?"</i> &mdash; it walks you through every screen.</div>
+              </div>
+              <a class="provider-link" data-href="https://platform.openai.com/api-keys">Open OpenAI key page &rarr;</a>
             </div>
 
             <!-- Anthropic -->
-            <div class="provider-row" data-provider="2" data-slot="anthropic">
+            <div class="provider-row" data-provider="2" data-slot="anthropic" data-search-tags="anthropic claude console sk-ant key">
               <div class="provider-head">
                 <div class="provider-name">
                   <span class="provider-badge" style="background:#d4a373;color:#1a1006">AN</span>
                   Anthropic
                 </div>
+                <button type="button" class="provider-help-btn" data-help-for="anthropic" title="How do I get this key?" aria-expanded="false">
+                  <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                </button>
                 <span class="provider-status untested">Not tested</span>
               </div>
               <div class="row">
@@ -729,16 +874,29 @@
                 </button>
                 <button class="btn btn-primary btn-test" style="padding:0 18px;height:40px">Test</button>
               </div>
-              <a class="provider-link" data-href="https://console.anthropic.com/settings/keys">How do I get an Anthropic key? →</a>
+              <div class="provider-help-panel" data-help-panel="anthropic" hidden>
+                <div class="php-title">How to get an Anthropic (Claude) key</div>
+                <ol class="php-steps">
+                  <li>Open <a class="php-link" data-href="https://console.anthropic.com/settings/keys">console.anthropic.com/settings/keys</a> and sign in.</li>
+                  <li>Add credit under <b>Plans &amp; Billing</b> (Anthropic is prepaid &mdash; $5 minimum is plenty for testing).</li>
+                  <li>Click <b>Create Key</b> &rarr; name it &rarr; copy the <code>sk-ant-…</code> string.</li>
+                  <li>Paste it above.</li>
+                </ol>
+                <div class="php-tip">Stuck? Ask Claude directly: <i>"Walk me through creating an API key from my Anthropic console."</i></div>
+              </div>
+              <a class="provider-link" data-href="https://console.anthropic.com/settings/keys">Open Anthropic key page &rarr;</a>
             </div>
 
             <!-- Google -->
-            <div class="provider-row" data-provider="3" data-slot="google">
+            <div class="provider-row" data-provider="3" data-slot="google" data-search-tags="google gemini bard ai studio aistudio aiza key">
               <div class="provider-head">
                 <div class="provider-name">
                   <span class="provider-badge" style="background:#4285f4">GG</span>
                   Google (Gemini)
                 </div>
+                <button type="button" class="provider-help-btn" data-help-for="google" title="How do I get this key?" aria-expanded="false">
+                  <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                </button>
                 <span class="provider-status untested">Not tested</span>
               </div>
               <div class="row">
@@ -748,16 +906,28 @@
                 </button>
                 <button class="btn btn-primary btn-test" style="padding:0 18px;height:40px">Test</button>
               </div>
-              <a class="provider-link" data-href="https://aistudio.google.com/apikey">How do I get a Gemini key? →</a>
+              <div class="provider-help-panel" data-help-panel="google" hidden>
+                <div class="php-title">How to get a Gemini key</div>
+                <ol class="php-steps">
+                  <li>Open <a class="php-link" data-href="https://aistudio.google.com/apikey">aistudio.google.com/apikey</a> and sign in with your Google account.</li>
+                  <li>Click <b>Create API key</b>. There's a generous free tier &mdash; no card needed to start.</li>
+                  <li>Copy the <code>AIza…</code> string and paste it above.</li>
+                </ol>
+                <div class="php-tip">Stuck? Ask Gemini itself: <i>"How do I generate an API key from Google AI Studio?"</i></div>
+              </div>
+              <a class="provider-link" data-href="https://aistudio.google.com/apikey">Open Google AI Studio &rarr;</a>
             </div>
 
             <!-- OpenRouter -->
-            <div class="provider-row" data-provider="4" data-slot="openrouter">
+            <div class="provider-row" data-provider="4" data-slot="openrouter" data-search-tags="openrouter sk-or key aggregator router free models many providers">
               <div class="provider-head">
                 <div class="provider-name">
                   <span class="provider-badge" style="background:#8b5cf6">OR</span>
                   OpenRouter <span style="font-size:10px;color:var(--fg3);font-weight:500;margin-left:6px">(has free models)</span>
                 </div>
+                <button type="button" class="provider-help-btn" data-help-for="openrouter" title="How do I get this key?" aria-expanded="false">
+                  <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                </button>
                 <span class="provider-status untested">Not tested</span>
               </div>
               <div class="row">
@@ -767,13 +937,23 @@
                 </button>
                 <button class="btn btn-primary btn-test" style="padding:0 18px;height:40px">Test</button>
               </div>
-              <a class="provider-link" data-href="https://openrouter.ai/keys">How do I get an OpenRouter key? →</a>
+              <div class="provider-help-panel" data-help-panel="openrouter" hidden>
+                <div class="php-title">How to get an OpenRouter key</div>
+                <ol class="php-steps">
+                  <li>Open <a class="php-link" data-href="https://openrouter.ai/keys">openrouter.ai/keys</a> and sign in (Google / GitHub / email).</li>
+                  <li>Click <b>Create Key</b> and copy the <code>sk-or-v1-…</code> string.</li>
+                  <li>Add a small credit balance on OpenRouter's <b>Credits</b> page (or stick to the free models for testing).</li>
+                  <li>Paste the key above.</li>
+                </ol>
+                <div class="php-tip">Not worth the setup? <b>Skip this entirely</b> &mdash; leave every key blank and let CloakGPT credits do the heavy lifting. Top up in one click on <a class="php-link" data-href="https://cloakgpt.ca/dashboard">cloakgpt.ca/dashboard</a> and every provider stays covered.</div>
+              </div>
+              <a class="provider-link" data-href="https://openrouter.ai/keys">Open OpenRouter key page &rarr;</a>
             </div>
 
           </div>
           <div class="field-hint" style="margin-top:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
             <span style="flex:1;min-width:220px">
-              Keys are securely encrypted and stay on this device. Auto-saved as you type.
+              Keys are encrypted on this device, tied to your Windows account, and auto-saved as you type.
             </span>
             <button id="btn-nuke-keys" class="btn btn-danger" style="padding:8px 14px;font-size:12px;flex-shrink:0" title="Delete every stored API key. Cannot be undone.">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
@@ -791,7 +971,7 @@
                "how big will this look on screen?" without injecting yet.
              - Reset + Save buttons. Save fires overlay:save; applies on
                next Inject (existing payloads keep their live tweaks). -->
-        <div class="hotkey-card" id="overlay-appearance-card">
+        <div class="hotkey-card" id="overlay-appearance-card" data-search-tags="overlay appearance size width height opacity alpha ghost frosted translucent scroll nudge preset pip small large ultra theme dark light auto trail erase smooth uniform deep hide silent modifiers ctrl shift alt swallow">
           <h3>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="9" y1="9" x2="15" y2="9"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="13" y2="17"/></svg>
             Overlay appearance
@@ -904,13 +1084,12 @@
                      100% opacity and made transparency not stick; the payload
                      now ignores that flag entirely (opacity slider is the
                      single source of truth). -->
-                <!-- v3.3 (2026-09-23): "Deep hide" -- extra-quiet mode that
-                     also swallows standalone Ctrl / Shift / Alt presses so
-                     they never reach the underlying app. Trade-off: shortcut
-                     keys in the app you're using (like Ctrl+C to copy) stop
-                     working while this is on. Intentional user opt-in. -->
+                <!-- Deep hide: also hides bare Ctrl/Shift/Alt key events
+                     from the underlying app. Trade-off: shortcuts like
+                     Ctrl+C stop working in that app while it's on. -->
                 <button class="chip ova-flag-toggle" data-flag="16"
-                        title="Also hides Ctrl / Shift / Alt key presses from the app you're using. Turn on when you don't want any key activity to leak. Note: shortcuts like Ctrl+C stop working in the underlying app while this is on.">Deep hide</button>
+                        data-search-tags="deep hide silent modifiers swallow ctrl shift alt privacy"
+                        title="Deep hide — also swallow bare Ctrl / Shift / Alt key presses so the app underneath sees zero keyboard activity. Note: shortcuts like Ctrl+C stop working in that app while this is on.">Deep hide</button>
               </div>
             </div>
 
@@ -946,9 +1125,13 @@
              Trade-off: helper process (sihost.exe --ocr-daemon) stays
              resident when enabled → a slight stealth cost. Default OFF;
              users flip it ON only for proctored-exam sessions. -->
-        <div class="hotkey-card" id="ocr-redactor-card">
+        <div class="hotkey-card" id="ocr-redactor-card" data-search-tags="screenshot redactor blacklist ocr redact censor black bar proctor respondus monitored words phrases privacy">
           <h3>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="3" x2="21" y2="21"/><line x1="21" y1="3" x2="3" y2="21"/></svg>
+            <!-- v7.4 — solid-bar redactor glyph (renders cleanly @12px). -->
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3" y="3" width="18" height="18" rx="3"/>
+              <rect x="6" y="10" width="12" height="4" rx="1" fill="currentColor" stroke="none"/>
+            </svg>
             Screenshot redactor
             <span class="hk-header-actions">
               <span id="ocr-status-badge" class="chip" style="opacity:.7">off</span>
@@ -1006,7 +1189,7 @@
         </div>
 
         <!-- Hotkey editor (remappable) -->
-        <div class="hotkey-card">
+        <div class="hotkey-card" data-search-tags="hotkeys shortcuts keybindings remap bind ctrl alt shift keys keyboard combo panic emergency copy paste toggle regen scroll nudge tier chat compose typer autotype notes">
           <h3>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2" ry="2"/><line x1="6" y1="10" x2="6.01" y2="10"/><line x1="10" y1="10" x2="10.01" y2="10"/><line x1="14" y1="10" x2="14.01" y2="10"/><line x1="18" y1="10" x2="18.01" y2="10"/><line x1="6" y1="14" x2="6.01" y2="14"/><line x1="18" y1="14" x2="18.01" y2="14"/><line x1="8" y1="18" x2="16" y2="18"/></svg>
             Overlay hotkeys
@@ -1024,7 +1207,7 @@
         </div>
 
         <!-- Support card -->
-        <div class="hotkey-card">
+        <div class="hotkey-card" data-search-tags="support help tutorial tour walkthrough onboarding restart export logs diagnostics uninstall wipe reset">
           <h3>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
             Support

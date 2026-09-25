@@ -2650,3 +2650,467 @@ body.bg-paused, body.bg-paused * {
   color: var(--fg2); font-size: 12px; min-width: 60px; text-align: right;
 }
 
+/* ═══ v7.4 — feature search + related UX polish ═════════════════ *
+ * Sticky search bar (8px radius, Apple-style), per-provider help  *
+ * accordions, credits-first block, filter/hidden states, empty    *
+ * search fallback. All GPU-cheap (opacity + subtle box-shadows;   *
+ * no compound blurs stacked on filtered cards) so a low-end       *
+ * integrated GPU stays smooth while typing.                       *
+ * ═════════════════════════════════════════════════════════════════ */
+
+.feature-search {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 14px;
+  margin: -4px 0 4px;
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.82);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(18px) saturate(1.3);
+  -webkit-backdrop-filter: blur(18px) saturate(1.3);
+  box-shadow:
+    0 6px 20px rgba(2, 6, 23, 0.35),
+    inset 0 1px 0 rgba(255, 255, 255, 0.02);
+  transition: border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
+}
+.feature-search:focus-within {
+  border-color: rgba(34, 211, 238, 0.5);
+  background: rgba(15, 23, 42, 0.9);
+  box-shadow:
+    0 8px 26px rgba(6, 182, 212, 0.18),
+    0 0 0 3px rgba(6, 182, 212, 0.12),
+    inset 0 1px 0 rgba(255, 255, 255, 0.03);
+}
+.feature-search .fs-icon {
+  color: var(--fg3);
+  flex-shrink: 0;
+  transition: color 0.18s ease;
+}
+.feature-search:focus-within .fs-icon { color: var(--cyan-light); }
+
+#feature-search-input {
+  flex: 1;
+  min-width: 0;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 13.5px;
+  font-weight: 500;
+  outline: none;
+  letter-spacing: -0.005em;
+  user-select: text;
+  -webkit-user-select: text;
+}
+#feature-search-input::placeholder {
+  color: var(--fg3);
+  font-weight: 400;
+}
+
+.feature-search .fs-kbd {
+  font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  font-size: 10.5px;
+  padding: 3px 7px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border);
+  color: var(--fg3);
+  flex-shrink: 0;
+  transition: opacity 0.18s ease;
+}
+.feature-search.is-active .fs-kbd { display: none; }
+
+.feature-search .fs-clear {
+  width: 24px; height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--fg2);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s ease, color 0.15s ease;
+  flex-shrink: 0;
+}
+.feature-search .fs-clear:hover {
+  background: rgba(239, 68, 68, 0.14);
+  color: #fca5a5;
+}
+
+/* Filter states. `.is-hidden` = card completely removed from layout;
+ * `.is-match` = card visible + persistently glowing amber until search
+ * is cleared, so users see WHERE the match is even when the matched
+ * word only lived in the data-search-tags attribute (e.g. searching
+ * "silent" surfaces the Overlay Appearance card via its tag string
+ * even though the visible chip is labelled "Deep hide"). */
+.dash-grid [data-search-tags].is-hidden { display: none !important; }
+.dash-grid [data-search-tags].is-match {
+  border-color: rgba(251, 191, 36, 0.55) !important;
+  box-shadow:
+    0 0 0 1px rgba(251, 191, 36, 0.35),
+    0 8px 28px rgba(251, 191, 36, 0.12);
+  animation: fsMatchPulse 0.55s cubic-bezier(0.34, 1.4, 0.64, 1) 1;
+}
+@keyframes fsMatchPulse {
+  0%   { box-shadow: 0 0 0 0   rgba(251, 191, 36, 0.0),
+                     0 0 0 0   rgba(251, 191, 36, 0.0); }
+  50%  { box-shadow: 0 0 0 4px rgba(251, 191, 36, 0.35),
+                     0 12px 34px rgba(251, 191, 36, 0.22); }
+  100% { box-shadow: 0 0 0 1px rgba(251, 191, 36, 0.35),
+                     0 8px 28px  rgba(251, 191, 36, 0.12); }
+}
+
+/* Inline term highlight (used by JS wrapping matched words in cards).
+ * v7.4.1 — beefed up. Cyan-on-navy was too subtle at 12px font; users
+ * had to squint. Now: high-contrast amber pill (browser find-in-page
+ * convention) with a thin outline and a soft glow that pulses once
+ * on the first-match card so the eye jumps straight to it. */
+.fs-hit {
+  background: linear-gradient(180deg, #fde68a 0%, #fbbf24 100%);
+  color: #1c1207;
+  border-radius: 4px;
+  padding: 1px 4px;
+  margin: 0 1px;
+  font-weight: 700;
+  box-shadow:
+    0 0 0 1px rgba(251, 191, 36, 0.55),
+    0 2px 8px rgba(251, 191, 36, 0.25);
+}
+/* The current-focus hit — the one we scroll to — gets an even stronger
+ * treatment so it stands out among multiple hits in the same card. */
+.fs-hit.fs-hit-primary {
+  background: linear-gradient(180deg, #fbbf24 0%, #f59e0b 100%);
+  color: #ffffff;
+  box-shadow:
+    0 0 0 2px rgba(251, 191, 36, 0.9),
+    0 4px 14px rgba(245, 158, 11, 0.5);
+  animation: fsHitBounce 0.55s cubic-bezier(0.34, 1.56, 0.64, 1) 1;
+}
+@keyframes fsHitBounce {
+  0%   { transform: scale(1);    }
+  40%  { transform: scale(1.22); }
+  100% { transform: scale(1);    }
+}
+
+/* Empty state when no card matches. `[hidden]` respected explicitly —
+ * `display: flex` below would otherwise override the UA default of
+ * `display: none` and always keep the panel visible. */
+.feature-search-empty[hidden] { display: none !important; }
+.feature-search-empty {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  padding: 20px 22px;
+  border-radius: 14px;
+  background: rgba(15, 23, 42, 0.55);
+  border: 1px dashed var(--border-h);
+  color: var(--fg2);
+}
+.feature-search-empty .fse-icon {
+  width: 40px; height: 40px;
+  border-radius: 12px;
+  background: rgba(34, 211, 238, 0.08);
+  border: 1px solid rgba(34, 211, 238, 0.18);
+  color: var(--cyan-light);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.feature-search-empty .fse-body { flex: 1; min-width: 0; }
+.feature-search-empty .fse-title {
+  font-size: 13.5px; font-weight: 600; color: var(--fg);
+  margin-bottom: 3px;
+}
+.feature-search-empty .fse-title span { color: var(--cyan-light); }
+.feature-search-empty .fse-sub {
+  font-size: 12px; color: var(--fg3);
+}
+.feature-search-empty .fse-sub a {
+  color: var(--cyan-light);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+/* Credits-first block — supersedes the ad-hoc inline styles from v16. */
+.credits-block {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 14px 16px;
+  border: 1px solid rgba(34, 211, 238, 0.32);
+  border-radius: 12px;
+  background:
+    radial-gradient(circle at 12% -20%, rgba(34, 211, 238, 0.14) 0%, transparent 55%),
+    rgba(34, 211, 238, 0.07);
+  margin-bottom: 14px;
+}
+.credits-block .credits-badge {
+  background: var(--cyan-light);
+  color: #04141a;
+  flex: none;
+  font-weight: 800;
+  width: 26px; height: 26px;
+  border-radius: 7px;
+  font-size: 11px;
+  box-shadow: 0 4px 12px rgba(6, 182, 212, 0.28);
+}
+.credits-body { flex: 1; min-width: 0; color: var(--fg2); }
+.credits-title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+.credits-title-row b {
+  color: var(--fg);
+  font-size: 13.5px;
+  font-weight: 700;
+  letter-spacing: -0.005em;
+}
+.credits-recommended-tag {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(34, 211, 238, 0.18);
+  color: var(--cyan-light);
+  border: 1px solid rgba(34, 211, 238, 0.35);
+}
+.credits-sub {
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--fg2);
+}
+.credits-sub b { color: var(--fg); font-weight: 600; }
+.credits-buy-link {
+  cursor: pointer;
+  color: var(--cyan-light);
+  margin-left: 6px;
+  font-weight: 600;
+  border-bottom: 1px dashed rgba(34, 211, 238, 0.35);
+  padding-bottom: 1px;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+.credits-buy-link:hover { color: #67e8f9; border-color: rgba(103, 232, 249, 0.6); }
+.credits-explain {
+  font-size: 11.5px;
+  color: var(--fg3);
+  line-height: 1.55;
+  margin-top: 6px;
+}
+
+/* Per-provider help accordion. */
+.provider-help-btn {
+  width: 22px; height: 22px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--fg3);
+  cursor: pointer;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+.provider-help-btn:hover {
+  background: rgba(34, 211, 238, 0.12);
+  color: var(--cyan-light);
+  border-color: rgba(34, 211, 238, 0.3);
+}
+.provider-help-btn[aria-expanded="true"] {
+  background: rgba(34, 211, 238, 0.16);
+  color: var(--cyan-light);
+  border-color: rgba(34, 211, 238, 0.4);
+}
+
+.provider-help-panel {
+  margin-top: 10px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: rgba(6, 182, 212, 0.06);
+  border: 1px solid rgba(34, 211, 238, 0.22);
+  animation: fsFadeIn 0.18s ease;
+}
+@keyframes fsFadeIn {
+  from { opacity: 0; transform: translateY(-2px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.provider-help-panel .php-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--cyan-light);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 8px;
+}
+.provider-help-panel .php-steps {
+  margin: 0 0 10px 20px;
+  padding: 0;
+  color: var(--fg2);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.provider-help-panel .php-steps li { margin-bottom: 3px; }
+.provider-help-panel .php-steps b { color: var(--fg); font-weight: 600; }
+.provider-help-panel .php-steps code {
+  font-family: 'JetBrains Mono', 'SF Mono', 'Consolas', monospace;
+  font-size: 11px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(6, 182, 212, 0.10);
+  color: var(--cyan-light);
+}
+.provider-help-panel .php-link {
+  color: var(--cyan-light);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.provider-help-panel .php-link:hover { color: #67e8f9; }
+.provider-help-panel .php-tip {
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(59, 130, 246, 0.08);
+  border: 1px solid rgba(59, 130, 246, 0.18);
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--fg2);
+}
+.provider-help-panel .php-tip b { color: var(--fg); font-weight: 600; }
+.provider-help-panel .php-tip i { color: var(--cyan-light); font-style: normal; font-weight: 500; }
+
+/* ═══ v7.4 — low-end / battery / motion-sensitive tuning ═══════ *
+ * Background orbs + gradient shift + all backdrop-filter blurs   *
+ * are expensive on integrated GPUs (Intel HD/Xe, older AMD APUs, *
+ * ChromeOS-tier hardware).  When the OS reports reduced-motion   *
+ * OR reduced-transparency preferences, we quiet everything down. *
+ * Also drops the orb count to zero on those systems.             *
+ * ═════════════════════════════════════════════════════════════════ */
+@media (prefers-reduced-motion: reduce) {
+  .bg-anim { animation: none !important; }
+  .orb     { animation: none !important; opacity: 0.08; }
+  .status-dot.on { animation: none !important; }
+  .feature-search .fs-icon,
+  .feature-search .fs-clear,
+  .credits-block,
+  .provider-help-panel,
+  .provider-help-btn { transition: none !important; animation: none !important; }
+  .dash-grid [data-search-tags].is-match { animation: none !important; }
+}
+@media (prefers-reduced-transparency: reduce) {
+  #titlebar,
+  .settings-card,
+  .hotkey-card,
+  .dash-header,
+  .status-card,
+  .feature-search,
+  .card {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+    background: rgba(15, 23, 42, 0.94) !important;
+  }
+  .orb { display: none; }
+}
+
+/* Runtime low-end detection — set by renderer.js on machines reporting
+ * <=2 CPU cores or <=2 GB memory. Same effect as reduced-transparency. */
+html.is-low-end #titlebar,
+html.is-low-end .settings-card,
+html.is-low-end .hotkey-card,
+html.is-low-end .dash-header,
+html.is-low-end .status-card,
+html.is-low-end .feature-search,
+html.is-low-end .card {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  background: rgba(15, 23, 42, 0.94) !important;
+}
+html.is-low-end .orb    { display: none; }
+html.is-low-end .bg-anim { animation: none !important; background: var(--bg2); }
+html.is-low-end .status-dot.on { animation: none !important; }
+html.is-low-end .dash-grid [data-search-tags].is-match { animation: none !important; }
+
+/* v7.4 — Dot color grid (6 swatches). Native color input styled as a small
+ * pill; label wraps for tap-friendly click targets. Grid collapses to
+ * one column below ~500 px so the AutoSolver card doesn't reflow ugly. */
+.dotcol-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+  margin-bottom: 12px;
+}
+.dotcol-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition: background 0.18s ease, border-color 0.18s ease;
+}
+.dotcol-row:hover {
+  background: var(--surfaceH);
+  border-color: var(--border-h);
+}
+.dotcol-swatch {
+  display: inline-flex;
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--border-h);
+  box-shadow: inset 0 1px 2px rgba(0,0,0,0.35);
+}
+.dotcol-swatch input[type="color"] {
+  border: 0;
+  padding: 0;
+  width: 40px;   /* Chromium renders a small padding around the swatch */
+  height: 40px;
+  margin: -6px;
+  background: transparent;
+  cursor: pointer;
+}
+.dotcol-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.dotcol-text b {
+  font-size: 12.5px;
+  color: var(--fg);
+  font-weight: 600;
+}
+.dotcol-text span {
+  font-size: 11px;
+  color: var(--fg3);
+  line-height: 1.4;
+}
+.as-hint {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(59, 130, 246, 0.05);
+  border: 1px solid rgba(59, 130, 246, 0.14);
+  color: var(--fg2);
+  font-size: 11.5px;
+  line-height: 1.55;
+  margin: 6px 0 10px;
+}
+.as-hint b { color: var(--fg); font-weight: 600; }
+@media (max-width: 620px) {
+  .dotcol-grid { grid-template-columns: 1fr; }
+}
+

@@ -86,6 +86,38 @@ char *ui_chat_last_user_text(void);
  * DESTRUCTIVE -- the messages are gone forever. */
 void ui_chat_clear_history(void);
 
+/* v7.4 (2026-09-25) -- Multi-turn conversation memory support.
+ *
+ * The AI request layer (payload/src/ai/ai_provider.c) now supports
+ * multi-turn conversations with per-turn images. The chat ring is the
+ * source-of-truth for the history a "next ask" should include. To
+ * bound memory the chat ring keeps the newest N PNG copies attached to
+ * their originating USER messages; older USER messages keep their
+ * text but drop the image bytes (text stays for scrollback). */
+typedef struct ui_chat_turn_t {
+    int   role;         /* UI_MSG_USER or UI_MSG_AI */
+    char *text;         /* heap-alloc'd copy; may be "" but never NULL */
+    unsigned char *img; /* optional heap-alloc'd PNG copy (NULL if none) */
+    size_t img_len;
+} ui_chat_turn_t;
+
+/* Copy the PNG for the MOST RECENT USER message. Also prunes older
+ * USER messages' images so at most `keep_last_n` USER turns retain
+ * their bytes (bound on memory). Thread-safe. png/png_len may be
+ * NULL/0 (no attach, prune still runs). */
+void ui_chat_attach_last_user_image(const unsigned char *png,
+                                     size_t png_len,
+                                     int keep_last_n);
+
+/* Snapshot up to `max_turns` most-recent non-pending chat turns in
+ * chronological order. Returns count actually copied. Caller passes
+ * a caller-owned array of ui_chat_turn_t with room for max_turns and
+ * frees with ui_chat_free_turn_snapshot after use. include_images
+ * = 0 skips copying image bytes (text only). */
+int  ui_chat_snapshot_turns(ui_chat_turn_t *out, int max_turns,
+                             int include_images);
+void ui_chat_free_turn_snapshot(ui_chat_turn_t *arr, int n);
+
 /* Force overlay to show the empty "home" cheat-sheet view even if the
  * chat history isn't empty. Non-destructive -- messages stay in memory
  * and are shown again as soon as a new message arrives (or user hits

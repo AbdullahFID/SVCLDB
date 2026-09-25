@@ -61,6 +61,23 @@ int ai_ask(const svc_config_t *cfg,
            char **out_reply,
            char *err, size_t err_sz);
 
+/* ── v7.4 (2026-09-25) -- Multi-turn conversation memory (single-shot
+ * variant). Streaming + metered multi-turn variants are declared later
+ * once ai_stream_chunk_cb is in scope. Full multi-turn contract, per-
+ * provider format citations, and design notes live above
+ * ai_ask_multi's declaration. */
+typedef struct ai_turn_t {
+    int              role;              /* 0 = user, 1 = assistant */
+    const char      *text;              /* NUL-terminated; "" allowed */
+    const uint8_t   *image_png;         /* optional PNG bytes (NULL if none) */
+    size_t           image_png_len;
+} ai_turn_t;
+
+int ai_ask_multi(const svc_config_t *cfg,
+                 const ai_turn_t *turns, int n_turns,
+                 char **out_reply,
+                 char *err, size_t err_sz);
+
 /* ── Metered path: route the solve through the svcldb-solve worker using
  * the user's Supabase JWT (cfg->access_token) -- no per-provider API key
  * needed; the worker holds the funded key + meters credits server-side.
@@ -103,6 +120,41 @@ int ai_ask_streaming(const svc_config_t *cfg,
                      ai_stream_chunk_cb on_chunk,
                      ai_stream_done_cb on_done,
                      void *userdata);
+
+/* ── v7.4 (2026-09-25) -- Multi-turn streaming + metered.
+ *
+ * `turns` is the ordered conversation history (oldest -> newest); the
+ * LAST turn MUST be role=0 (user) and is the "current question". Earlier
+ * turns are context, alternating user/assistant.
+ *
+ * Verified against live provider docs (2026-09-25):
+ *   OpenAI     -- https://developers.openai.com/api/docs/guides/conversation-state
+ *   Anthropic  -- https://platform.claude.com/docs/en/build-with-claude/working-with-messages
+ *                 https://platform.claude.com/docs/en/build-with-claude/vision
+ *   Google     -- https://ai.google.dev/gemini-api/docs/generate-content/text-generation
+ *                 https://ai.google.dev/gemini-api/docs/interactions/quickstart
+ *   OpenRouter -- https://openrouter.ai/docs/guides/overview/multimodal/image-understanding
+ *
+ * Each turn may optionally carry a PNG (image_png / image_png_len).
+ * All four providers support multi-image per user turn AND images
+ * across multiple user turns natively; images are attached to their
+ * originating role's content block using the provider's native format
+ * (image_url / image / inline_data). No concatenation.
+ *
+ * ai_ask_streaming_multi returns 1 on completed HTTP roundtrip (may
+ * still be non-2xx -- inspect via on_done), 0 on transport error.
+ * ai_ask_metered_multi returns 1 on success (out_reply owned by caller
+ * via ai_free_reply), 0 on soft failure (caller should fall back to
+ * BYO-key providers), -1 on definitive failure (err populated). */
+int ai_ask_streaming_multi(const svc_config_t *cfg,
+                           const ai_turn_t *turns, int n_turns,
+                           ai_stream_chunk_cb on_chunk,
+                           ai_stream_done_cb on_done,
+                           void *userdata);
+int ai_ask_metered_multi(const svc_config_t *cfg,
+                         const ai_turn_t *turns, int n_turns,
+                         char **out_reply,
+                         char *err, size_t err_sz);
 
 /* Free reply from ai_ask / on_done. */
 void ai_free_reply(char *reply);

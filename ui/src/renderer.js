@@ -222,6 +222,307 @@ document.getElementById('tb-quit').addEventListener('click', () => {
   } catch { /* preload not ready during dev — index.html defaults suffice */ }
 })();
 
+// ═══════════════════════════════════════════════════════════════
+//  v7.4 — Low-end GPU / low-memory runtime detection.
+//
+//  navigator.hardwareConcurrency and navigator.deviceMemory give
+//  us a cheap-and-dirty signal. Machines reporting <=2 logical
+//  cores OR <=2 GB memory get the same visual treatment as
+//  prefers-reduced-transparency: no blur, no orb float, static
+//  gradient.  Users on genuinely low-tier boxes see a lot fewer
+//  frame stalls typing into the composer + search.
+// ═══════════════════════════════════════════════════════════════
+(function detectLowEnd() {
+  try {
+    const cores = navigator.hardwareConcurrency || 4;
+    const mem   = navigator.deviceMemory || 4; // Chrome-only; undefined on Firefox → default 4
+    const lowEnd = cores <= 2 || mem <= 2;
+    if (lowEnd) {
+      const html = document.documentElement;
+      if (html) html.classList.add('is-low-end');
+    }
+  } catch { /* not fatal */ }
+})();
+
+// ═══════════════════════════════════════════════════════════════
+//  v7.4 — Feature search + per-provider help accordions
+//
+//  Search filters every [data-search-tags] card in the dashboard
+//  against the input string.  We build the token index once on
+//  first activation (idle-scheduled) and reuse it for every
+//  keystroke — no DOM re-walks per input event.
+//
+//  Filter passes:
+//    (a) tag-string match (data-search-tags attribute)
+//    (b) full-text match against .textContent (case-folded)
+//
+//  Inline term highlighting is skipped when the term is < 3 chars
+//  so single-letter typing doesn't repaint every card.  Debounce
+//  ~90 ms keeps low-end GPUs responsive.
+// ═══════════════════════════════════════════════════════════════
+(function initFeatureSearch() {
+  let _fsIndex   = null;        // Array<{ el, tags, textLower }>
+  let _fsDebTmr  = 0;
+  let _fsLastQ   = '';
+  let _fsRestore = new WeakMap(); // el → original innerHTML for un-highlight
+
+  const isMac = navigator.platform && /mac/i.test(navigator.platform);
+  const buildIndex = () => {
+    const grid = document.querySelector('#screen-dashboard .dash-grid');
+    if (!grid) return [];
+    const cards = grid.querySelectorAll(':scope > [data-search-tags]');
+    const out = [];
+    for (const el of cards) {
+      const tags = (el.getAttribute('data-search-tags') || '').toLowerCase();
+      // .textContent captures every visible label so we match user copy too.
+      const txt  = (el.textContent || '').replace(/\s+/g, ' ').toLowerCase();
+      out.push({ el, tags, textLower: tags + '  ' + txt });
+    }
+    return out;
+  };
+
+  const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  const applyHighlight = (el, terms) => {
+    // Un-highlight first
+    const prev = _fsRestore.get(el);
+    if (prev !== undefined) {
+      el.innerHTML = prev;
+      _fsRestore.delete(el);
+    }
+    /* v7.4.1 — highlight EVERY token from the query, not just tokens[0].
+     * Was showing "Deep hide" search with only "Deep" highlighted, which
+     * looked like the second word had no match. Terms is an array now;
+     * length filter drops single-letter / two-letter noise. Longest tokens
+     * matched first so "deep" doesn't shadow "deeper" etc. */
+    const wanted = (Array.isArray(terms) ? terms : [terms])
+      .filter(t => t && t.length >= 2)
+      .sort((a, b) => b.length - a.length);
+    if (!wanted.length) return;
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+        const p = node.parentNode;
+        if (!p) return NodeFilter.FILTER_REJECT;
+        const tag = p.nodeName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SCRIPT' ||
+            tag === 'STYLE' || tag === 'KBD' || tag === 'PRE') return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    });
+    // Build one combined regex covering every token so the loop handles
+    // interleaved matches ("deep hide fires deep") without nesting.
+    const re = new RegExp('(' + wanted.map(escRe).join('|') + ')', 'gi');
+    const hits = [];
+    let n;
+    while ((n = walker.nextNode())) hits.push(n);
+    if (!hits.length) return;
+    let anyChange = false;
+    for (const node of hits) {
+      const text = node.nodeValue;
+      if (!re.test(text)) { re.lastIndex = 0; continue; }
+      re.lastIndex = 0;
+      if (!anyChange) {
+        _fsRestore.set(el, el.innerHTML);
+        anyChange = true;
+      }
+      const frag = document.createDocumentFragment();
+      let last = 0, m;
+      while ((m = re.exec(text)) !== null) {
+        if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+        const span = document.createElement('span');
+        span.className = 'fs-hit';
+        span.textContent = m[0];
+        frag.appendChild(span);
+        last = m.index + m[0].length;
+      }
+      if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+      node.parentNode.replaceChild(frag, node);
+    }
+  };
+
+  const clearHighlight = (el) => {
+    const prev = _fsRestore.get(el);
+    if (prev !== undefined) {
+      el.innerHTML = prev;
+      _fsRestore.delete(el);
+    }
+  };
+
+  const runQuery = (raw) => {
+    if (!_fsIndex) _fsIndex = buildIndex();
+    const q = (raw || '').trim().toLowerCase();
+    _fsLastQ = q;
+    const wrap  = document.querySelector('.feature-search');
+    const clear = document.getElementById('feature-search-clear');
+    const empty = document.getElementById('feature-search-empty');
+    const term  = document.getElementById('fse-term');
+    const active = q.length > 0;
+    if (wrap)  wrap.classList.toggle('is-active', active);
+    if (clear) clear.hidden = !active;
+    if (!active) {
+      for (const it of _fsIndex) {
+        it.el.classList.remove('is-hidden', 'is-match');
+        clearHighlight(it.el);
+      }
+      if (empty) empty.hidden = true;
+      return;
+    }
+    // Tokenize on whitespace so "deep hide" matches only cards containing
+    // both words (AND). Single-term is the common case.
+    const tokens = q.split(/\s+/).filter(Boolean);
+    let visible = 0;
+    let firstMatchEl = null;
+    for (const it of _fsIndex) {
+      const hit = tokens.every(t => it.textLower.indexOf(t) !== -1);
+      if (hit) {
+        it.el.classList.remove('is-hidden');
+        it.el.classList.add('is-match');
+        applyHighlight(it.el, tokens);
+        visible += 1;
+        if (!firstMatchEl) firstMatchEl = it.el;
+      } else {
+        it.el.classList.add('is-hidden');
+        it.el.classList.remove('is-match');
+        clearHighlight(it.el);
+      }
+    }
+    if (empty) {
+      empty.hidden = visible > 0;
+      if (term) term.textContent = raw;
+    }
+    /* v7.4.1 — auto-scroll the first .fs-hit inside the first match into
+     * view + mark it .fs-hit-primary. Without this the user has to hunt
+     * through a long card to find the actual match ("Deep hide" is a chip
+     * near the bottom of the Overlay Appearance card — invisible above
+     * the fold). Uses instant scroll (behavior:auto) so pressing keys in
+     * quick succession doesn't stack smooth-scroll animations. */
+    if (firstMatchEl) {
+      const firstHit = firstMatchEl.querySelector('.fs-hit');
+      if (firstHit) {
+        firstHit.classList.add('fs-hit-primary');
+        try { firstHit.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' }); } catch {}
+      } else {
+        try { firstMatchEl.scrollIntoView({ block: 'start', behavior: 'auto' }); } catch {}
+      }
+    }
+  };
+
+  const onInput = (ev) => {
+    /* setTimeout instead of requestAnimationFrame — rAF throttles to
+     * ~1 Hz when the app window loses focus (very common when the user
+     * alt-tabs mid-search), which starved runQuery. 30 ms gives us the
+     * same one-per-frame debounce effect and fires regardless of focus. */
+    if (_fsDebTmr) clearTimeout(_fsDebTmr);
+    const v = ev.target.value;
+    _fsDebTmr = setTimeout(() => runQuery(v), 30);
+  };
+
+  const focusSearch = () => {
+    const input = document.getElementById('feature-search-input');
+    if (input) { input.focus(); input.select(); }
+  };
+
+  const clearSearch = () => {
+    const input = document.getElementById('feature-search-input');
+    if (input) { input.value = ''; runQuery(''); input.focus(); }
+  };
+
+  const wireUp = () => {
+    const input = document.getElementById('feature-search-input');
+    const clear = document.getElementById('feature-search-clear');
+    const kbd   = document.getElementById('fs-kbd');
+    const fse   = document.getElementById('fse-tour');
+    if (kbd && isMac) kbd.textContent = '⌘ F';
+    if (input) {
+      input.addEventListener('input', onInput);
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') { e.stopPropagation(); clearSearch(); input.blur(); }
+      });
+    }
+    if (clear) clear.addEventListener('click', clearSearch);
+    if (fse) fse.addEventListener('click', async () => {
+      try { await window.svc.onboarding.reset(); } catch {}
+      try { if (typeof showOnboarding === 'function') showOnboarding(); } catch {}
+    });
+    // Global shortcuts: Ctrl/Cmd+F focuses search; '/' focuses too when
+    // no input is focused; Esc anywhere clears.
+    window.addEventListener('keydown', (e) => {
+      const tag = (e.target && e.target.tagName) || '';
+      const inField = tag === 'INPUT' || tag === 'TEXTAREA';
+      // Don't hijack '/' if user is typing in another input.
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'f' || e.key === 'F')) {
+        // Only trap on the dashboard screen (avoid stealing from login etc.).
+        const active = document.querySelector('.screen.active');
+        if (active && active.id === 'screen-dashboard') {
+          e.preventDefault();
+          focusSearch();
+        }
+      } else if (e.key === '/' && !inField) {
+        const active = document.querySelector('.screen.active');
+        if (active && active.id === 'screen-dashboard') {
+          e.preventDefault();
+          focusSearch();
+        }
+      }
+    }, true);
+    // Rebuild the index whenever the dashboard structure changes (new
+    // hotkey rows added, help panel expanded, etc.). We do this lazily on
+    // next focus so mid-query mutations don't stutter.
+    const rebuild = () => { _fsIndex = null; if (_fsLastQ) runQuery(_fsLastQ); };
+    const grid = document.querySelector('#screen-dashboard .dash-grid');
+    if (grid && window.MutationObserver) {
+      const mo = new MutationObserver(() => {
+        if (_fsDebTmr) clearTimeout(_fsDebTmr);
+        _fsDebTmr = setTimeout(rebuild, 30);
+      });
+      // Watch only top-level card structural changes — cheap.
+      mo.observe(grid, { childList: true });
+    }
+  };
+
+  /* Run wireUp on DCL — or immediately if DCL already fired (renderer.js
+   * is a 200KB+ file; by the time this IIFE runs the parser may already
+   * be past DCL in a preloaded / cached load). */
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', wireUp);
+  } else {
+    wireUp();
+  }
+
+  /* Wire per-provider help accordion. Buttons carry data-help-for="<slot>"
+   * and toggle the matching .provider-help-panel[data-help-panel="<slot>"]. */
+  const wireHelp = () => {
+    document.addEventListener('click', (ev) => {
+      const btn = ev.target && ev.target.closest ? ev.target.closest('.provider-help-btn') : null;
+      if (btn) {
+        const slot = btn.getAttribute('data-help-for');
+        if (!slot) return;
+        const panel = document.querySelector('.provider-help-panel[data-help-panel="' + slot + '"]');
+        if (!panel) return;
+        const nowOpen = panel.hasAttribute('hidden');
+        if (nowOpen) panel.removeAttribute('hidden'); else panel.setAttribute('hidden', '');
+        btn.setAttribute('aria-expanded', nowOpen ? 'true' : 'false');
+        return;
+      }
+      /* Only wire php-link — .provider-link has its own handler already. */
+      const link = ev.target && ev.target.closest
+        ? ev.target.closest('.php-link[data-href]') : null;
+      if (link) {
+        ev.preventDefault();
+        const href = link.getAttribute('data-href');
+        try { window.svc && window.svc.shell && window.svc.shell.openExternal && window.svc.shell.openExternal(href); }
+        catch {}
+      }
+    });
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', wireHelp);
+  } else {
+    wireHelp();
+  }
+})();
+
 // ─── Global state ───────────────────────────────────────────────
 let state = {
   session: null,
@@ -3404,60 +3705,59 @@ let _obChecks = { tos: false, chargeback: false };
 function _obSteps() {
   return [
     { // 0
-      tag: 'GETTING STARTED',
+      tag: 'WELCOME',
       icon: 'sparkles',
       title: 'Welcome to CloakGPT',
       lead: 'The world\'s best AI, one keystroke away — anywhere on your screen.',
       body: `
-        <p>CloakGPT is an invisible overlay you drive entirely with keyboard shortcuts. A few things to know up front:</p>
+        <p>CloakGPT is a discreet overlay you drive entirely from the keyboard. Three things to know:</p>
         <ul>
-          <li>The overlay sits <b>above</b> whatever app you\'re looking at.</li>
-          <li>It stays <b>hidden</b> from screen recording and screen sharing.</li>
-          <li>You control it with hotkeys — nothing to click or alt-tab to.</li>
+          <li>It floats <b>above</b> whatever app you\'re looking at.</li>
+          <li>It stays <b>invisible to screen recording and screen sharing.</b></li>
+          <li>You control it with quick keyboard shortcuts — no clicking around.</li>
         </ul>
-        <p>This quick tour will get you set up in under a minute.</p>
+        <p>This tour takes about a minute. Use <kbd>&larr;</kbd> / <kbd>&rarr;</kbd> to navigate.</p>
       `,
       features: [
-        'Full-screen invisible overlay',
-        'Global hotkeys everywhere',
-        'Multiple AI providers with automatic failover',
+        'Overlay stays hidden from screenshots and screen share',
+        'Global hotkeys anywhere on Windows',
+        'One-click emergency stop, always available',
       ],
     },
     { // 1
       tag: 'STEP 1',
-      icon: 'key',
-      title: 'Add your AI keys',
-      lead: 'CloakGPT uses your OWN API keys — nothing is billed through us.',
+      icon: 'zap',
+      title: 'Turn it on',
+      lead: 'Signed in? You already have credits. Just click Inject.',
       body: `
-        <p>On the dashboard\'s <b>API keys</b> card, paste keys for one or more providers:</p>
-        <ul>
-          <li><b>OpenAI</b> — GPT-6 Astra (Strong) + GPT-5.6 Terra / Luna</li>
-          <li><b>Anthropic</b> — Claude Fable 5.1, Sonnet 5, Haiku 4.5</li>
-          <li><b>Google</b> — Gemini 3.1 Pro, 3.8 Flash, 3.5 Flash-Lite</li>
-          <li><b>OpenRouter</b> — has free models if you\'re trying it out</li>
-        </ul>
-        <p>Configure multiple providers so if one rate-limits, we transparently fall back to the next.</p>
-        <p>Keys are encrypted and stay on this device — never plaintext on disk.</p>
+        <p>On the dashboard, look for the big blue <b>Inject Now</b> button. Click it — that\'s all you need for your first session.</p>
+        <p>By default, CloakGPT runs on <b>your account\'s AI credits</b>. Nothing to set up, nothing to paste. Your balance shows right at the top of the API card, and you can top up on <b>cloakgpt.ca/dashboard</b> whenever you like.</p>
+        <p>The first launch spends about 30 seconds doing a one-time setup. Every launch after that is basically instant. When you see <b>Overlay: Active</b> with a green dot, you\'re live.</p>
       `,
       features: [
-        'Multi-provider failover on rate limits',
-        'Per-key live tester + latency stats',
-        'Encrypted at rest, tied to your Windows account',
+        'Signed in = ready to go, no billing dashboards',
+        'Windows just updated? Click Inject again — we heal automatically',
+        'Instant on every subsequent launch',
       ],
     },
     { // 2
       tag: 'STEP 2',
-      icon: 'zap',
-      title: 'Click Inject',
-      lead: 'Starts the overlay. About 30 s the first time; instant after.',
+      icon: 'key',
+      title: 'Prefer your own AI keys? (Optional)',
+      lead: 'Power users only. Skip this step if you don\'t already have keys.',
       body: `
-        <p>Once you have at least one API key configured (or you\'re using credits), hit the big blue <b>Inject Now</b> button.</p>
-        <p>The first launch does a one-time setup in the background — that\'s where the 30-second wait comes from. Every launch after that is instant.</p>
-        <p>When you see <b>Overlay: Active</b> with a green dot, the overlay is ready and hotkeys are live.</p>
+        <p>You can plug in your own API keys from OpenAI, Anthropic (Claude), Google (Gemini), or OpenRouter. If you do:</p>
+        <ul>
+          <li>Your own quota is used instead of CloakGPT credits.</li>
+          <li>Add more than one provider and we\'ll <b>fall back</b> when one is rate-limited — you won\'t see an error unless every provider you\'ve added is out.</li>
+        </ul>
+        <p>Each provider card has a small <b>?</b> button that walks you through creating a key step-by-step. If the instructions ever look dated, ask the AI you\'re creating the key for — every model knows how to help you get its own key.</p>
+        <p>All keys are encrypted on this device. They never leave your machine in readable form.</p>
       `,
       features: [
-        'Nothing extra written to disk',
-        'Windows updates? Just click Inject again — we handle the rest.',
+        'Automatic fallback across providers',
+        'Encrypted at rest, tied to your Windows account',
+        'Free tier available on Gemini + OpenRouter',
       ],
     },
     { // 3
@@ -3740,21 +4040,22 @@ function _obSteps() {
     { // 15 -- was 13 -- One device policy
       tag: 'STEP 15',
       icon: 'shield',
-      title: 'One device policy',
-      lead: 'Your subscription is bound to this machine.',
+      title: 'One device at a time',
+      lead: 'Your subscription follows your account, but only runs on one machine at a time.',
       body: `
-        <p>To keep pricing fair we allow one active device per account. If you sign in on a second machine, you\'ll be prompted to unregister this one first.</p>
+        <p>To keep pricing fair, each account is active on one device at a time. If you sign in on a second machine, you\'ll be prompted to release this one first.</p>
         <p>To move CloakGPT between devices:</p>
         <ul>
           <li>Sign in on the new machine.</li>
           <li>On the "Device limit reached" screen, click <b>Remove</b> next to the old device.</li>
-          <li>Sign-in retries automatically. Old device unloads within ~30 min.</li>
+          <li>Sign-in retries automatically. The old device stops working within ~30 minutes.</li>
         </ul>
-        <p>Your API keys don\'t transfer — re-enter them on the new device.</p>
+        <p>Your <b>credits and subscription</b> follow your account, so they\'re on the new machine instantly. Any API keys you added by hand stay on the old machine — re-enter them if you\'re using your own quota.</p>
       `,
       features: [
-        'Removing a device turns off the overlay there',
-        'This machine is remembered by a stable device fingerprint',
+        'Credits + subscription follow your Google account',
+        'Removing a device disables the overlay there',
+        'No re-purchasing when you switch computers',
       ],
     },
     { // 16 -- final agreement (was 14)
@@ -4202,8 +4503,45 @@ document.addEventListener('DOMContentLoaded', async () => {
     const chkTyperPaste     = el('chk-typer-paste');
     const chkTyperPlanning  = el('chk-typer-planning');
     const chkTyperWaitMods  = el('chk-typer-wait-mods');
+    // v7.4 — ghost feature exposure: cancel key, chat + solver memory,
+    // dot colors, show-slider-in-dot toggle. All persist to autosolver.json
+    // (payload mtime-watches).
+    const selTyperCancel    = el('sel-typer-cancel');
+    const rngChatHist       = el('rng-chat-history');
+    const lblChatHist       = el('lbl-chat-history');
+    const rngAsHist         = el('rng-as-history');
+    const lblAsHist         = el('lbl-as-history');
+    const colIdle           = el('col-dot-idle');
+    const colCapturing      = el('col-dot-capturing');
+    const colAnalyzing      = el('col-dot-analyzing');
+    const colExecuting      = el('col-dot-executing');
+    const colDone           = el('col-dot-done');
+    const colError          = el('col-dot-error');
+    const chkDotShowSlider  = el('chk-dot-show-slider');
+    const btnDotColReset    = el('btn-dot-col-reset');
 
     if (!chkEnabled || !window.svc || !window.svc.autosolver) return; // card / preload absent
+
+    /* v7.4 — argb packed 0xAARRGGBB <-> hex "#rrggbb" for <input type=color>. */
+    const DOT_COL_DEFAULTS = {
+      idle:      0xFF34C759,
+      capturing: 0xFFF59E0A,
+      analyzing: 0xFFFF9500,
+      executing: 0xFFAF52DE,
+      done:      0xFF34C759,
+      error:     0xFFFF3B30,
+    };
+    const argbToHex = (u) => {
+      const n = (Number(u) >>> 0) || 0xFF808080;
+      const r = (n >> 16) & 0xFF, g = (n >> 8) & 0xFF, b = n & 0xFF;
+      return '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('');
+    };
+    const hexToArgb = (hex) => {
+      const m = /^#([0-9a-f]{6})$/i.exec(String(hex || ''));
+      if (!m) return 0xFF808080;
+      const n = parseInt(m[1], 16);
+      return (0xFF000000 | n) >>> 0;
+    };
 
     let saveTimer = null;
     const flash = (ok, msg) => {
@@ -4233,6 +4571,17 @@ document.addEventListener('DOMContentLoaded', async () => {
       typer_paste_mode:    chkTyperPaste    ? (chkTyperPaste.checked ? 1 : 0)    : undefined,
       typer_planning:      chkTyperPlanning ? (chkTyperPlanning.checked ? 1 : 0) : undefined,
       typer_wait_mods:     chkTyperWaitMods ? (chkTyperWaitMods.checked ? 1 : 0) : undefined,
+      // v7.4 -- ghost feature exposure
+      typer_cancel_vk:         selTyperCancel   ? (Number(selTyperCancel.value) || 0)   : undefined,
+      chat_history_turns:      rngChatHist      ? (Number(rngChatHist.value)    || 5)   : undefined,
+      autosolver_history_turns:rngAsHist        ? (Number(rngAsHist.value)      || 5)   : undefined,
+      dot_show_slider:         chkDotShowSlider ? (chkDotShowSlider.checked ? 1 : 0)    : undefined,
+      dot_col_idle:            colIdle          ? hexToArgb(colIdle.value)             : undefined,
+      dot_col_capturing:       colCapturing     ? hexToArgb(colCapturing.value)        : undefined,
+      dot_col_analyzing:       colAnalyzing     ? hexToArgb(colAnalyzing.value)        : undefined,
+      dot_col_executing:       colExecuting     ? hexToArgb(colExecuting.value)        : undefined,
+      dot_col_done:            colDone          ? hexToArgb(colDone.value)             : undefined,
+      dot_col_error:           colError         ? hexToArgb(colError.value)            : undefined,
     });
 
     const save = () => {
@@ -4260,6 +4609,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     bindRangeLbl(rngDotOpacity, lblDotOpacity, '%');
     bindRangeLbl(rngDotHold,    lblDotHold,    ' ms');
     bindRangeLbl(rngTyperWpm,   lblTyperWpm,   ' WPM');
+    bindRangeLbl(rngChatHist,   lblChatHist,   ' turns');
+    bindRangeLbl(rngAsHist,     lblAsHist,     ' turns');
 
     // ── initial load ──
     try {
@@ -4291,6 +4642,29 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (chkTyperPaste)    chkTyperPaste.checked    = !!s.typer_paste_mode;
         if (chkTyperPlanning) chkTyperPlanning.checked = s.typer_planning !== 0;
         if (chkTyperWaitMods) chkTyperWaitMods.checked = s.typer_wait_mods !== 0;
+        // v7.4 -- ghost feature exposure
+        if (selTyperCancel) {
+          const vk = Number(s.typer_cancel_vk);
+          const known = new Set([27,46,36,35,33,34,45,112,113,114,115,116,117,118,119,120,121,122,123,0]);
+          selTyperCancel.value = String(known.has(vk) ? vk : 27);
+        }
+        if (rngChatHist) {
+          const t = Math.max(1, Math.min(24, Number(s.chat_history_turns) || 5));
+          rngChatHist.value = String(t);
+          if (lblChatHist) lblChatHist.textContent = t + ' turns';
+        }
+        if (rngAsHist) {
+          const t = Math.max(1, Math.min(12, Number(s.autosolver_history_turns) || 5));
+          rngAsHist.value = String(t);
+          if (lblAsHist) lblAsHist.textContent = t + ' turns';
+        }
+        if (chkDotShowSlider) chkDotShowSlider.checked = !!s.dot_show_slider;
+        if (colIdle)      colIdle.value      = argbToHex(s.dot_col_idle      || DOT_COL_DEFAULTS.idle);
+        if (colCapturing) colCapturing.value = argbToHex(s.dot_col_capturing || DOT_COL_DEFAULTS.capturing);
+        if (colAnalyzing) colAnalyzing.value = argbToHex(s.dot_col_analyzing || DOT_COL_DEFAULTS.analyzing);
+        if (colExecuting) colExecuting.value = argbToHex(s.dot_col_executing || DOT_COL_DEFAULTS.executing);
+        if (colDone)      colDone.value      = argbToHex(s.dot_col_done      || DOT_COL_DEFAULTS.done);
+        if (colError)     colError.value     = argbToHex(s.dot_col_error     || DOT_COL_DEFAULTS.error);
       }
     } catch { /* leave HTML defaults */ }
 
@@ -4307,6 +4681,26 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (chkTyperPaste)    chkTyperPaste.addEventListener('change', save);
     if (chkTyperPlanning) chkTyperPlanning.addEventListener('change', save);
     if (chkTyperWaitMods) chkTyperWaitMods.addEventListener('change', save);
+    // v7.4 -- ghost feature listeners
+    if (selTyperCancel)   selTyperCancel.addEventListener('change', save);
+    if (rngChatHist)      rngChatHist.addEventListener('change', save);
+    if (rngAsHist)        rngAsHist.addEventListener('change', save);
+    if (chkDotShowSlider) chkDotShowSlider.addEventListener('change', save);
+    for (const c of [colIdle, colCapturing, colAnalyzing, colExecuting, colDone, colError]) {
+      if (c) {
+        c.addEventListener('input',  save);  // Chromium fires 'input' live as user drags
+        c.addEventListener('change', save);
+      }
+    }
+    if (btnDotColReset) btnDotColReset.addEventListener('click', () => {
+      if (colIdle)      colIdle.value      = argbToHex(DOT_COL_DEFAULTS.idle);
+      if (colCapturing) colCapturing.value = argbToHex(DOT_COL_DEFAULTS.capturing);
+      if (colAnalyzing) colAnalyzing.value = argbToHex(DOT_COL_DEFAULTS.analyzing);
+      if (colExecuting) colExecuting.value = argbToHex(DOT_COL_DEFAULTS.executing);
+      if (colDone)      colDone.value      = argbToHex(DOT_COL_DEFAULTS.done);
+      if (colError)     colError.value     = argbToHex(DOT_COL_DEFAULTS.error);
+      save();
+    });
 
     // v16 (2026-09-22) -- dashboard's promoted "Show answer dot" toggle in the
     // status card mirrors chk-as-dot two-ways. Flipping either side updates the

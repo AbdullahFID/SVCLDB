@@ -908,6 +908,98 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
     (void)used;
     if (user_text) { free(user_text); user_text = NULL; }
 
+    /* v7.4 (2026-09-25) -- multi-turn conversation memory.
+     *
+     * Attach the fresh screenshot bytes to the just-appended USER
+     * message (also prunes older USER images beyond `keep_last_n`,
+     * bounding memory) so a later ask can include this image as
+     * prior-turn context. Then snapshot the last N chat turns
+     * (chronological, user + AI, images included) and build an
+     * ai_turn_t[] with the CURRENT question as the final entry
+     * (which supersedes the placeholder we appended above).
+     *
+     * The retention count comes from as_cfg()->chat_history_turns
+     * (user-tunable via autosolver.json; default 5). Bumped from 1
+     * (stateless) to N (multi-turn) so follow-up asks can build on
+     * prior context. */
+    as_cfg_reload_if_changed();
+    const as_settings_t *as = as_cfg();
+    int keep_turns = as ? as->chat_history_turns : 5;
+    if (keep_turns < 1) keep_turns = 1;
+    if (keep_turns > 24) keep_turns = 24;
+    /* keep_last_n USER images == keep_turns (an over-count is fine, the
+     * ring cap of CHAT_MAX_MSGS=64 dominates in worst case). */
+    if (have_image) {
+        ui_chat_attach_last_user_image(png, png_len, keep_turns);
+    } else {
+        ui_chat_attach_last_user_image(NULL, 0, keep_turns);
+    }
+
+    /* Snapshot up to (2 * keep_turns) most-recent non-pending msgs so
+     * we get keep_turns USER + keep_turns AI pairs. Also grab images
+     * (include_images=1). */
+    int snap_cap = keep_turns * 2 + 2;
+    if (snap_cap > 32) snap_cap = 32;
+    ui_chat_turn_t *snap = (ui_chat_turn_t *)calloc((size_t)snap_cap, sizeof(ui_chat_turn_t));
+    int snap_n = 0;
+    if (snap) {
+        snap_n = ui_chat_snapshot_turns(snap, snap_cap, 1 /*include images*/);
+    }
+
+    /* Build ai_turn_t[] out of snap[]. The LAST snap entry SHOULD be
+     * the just-appended USER message (its text is either the user's
+     * typed input OR "[screenshot] Solve the question on screen." for
+     * preset asks). We REPLACE that final entry's text with the fully-
+     * built prompt (notes + wrapper + user text) so the model gets the
+     * expanded context instead of the bare user message. Its image
+     * (if any) survives.
+     *
+     * Cap ai_turns_n at snap_n; ai_turn_t entries borrow strings from
+     * snap[] (both live until ui_chat_free_turn_snapshot at the end
+     * of this function). The final entry's `text` gets pointed at our
+     * `prompt` buffer instead. */
+    ai_turn_t *ai_turns = NULL;
+    int ai_turns_n = 0;
+    if (snap_n > 0) {
+        ai_turns = (ai_turn_t *)calloc((size_t)snap_n, sizeof(ai_turn_t));
+        if (ai_turns) {
+            ai_turns_n = snap_n;
+            for (int i = 0; i < snap_n; i++) {
+                ai_turns[i].role = (snap[i].role == UI_MSG_AI) ? 1 : 0;
+                ai_turns[i].text = snap[i].text ? snap[i].text : "";
+                ai_turns[i].image_png     = snap[i].img;
+                ai_turns[i].image_png_len = snap[i].img_len;
+            }
+            /* Replace the LAST turn's text with the fully-built prompt
+             * so notes + wrapper text reach the model. That turn is
+             * guaranteed to be a USER role (we just appended it). */
+            int last_ix = ai_turns_n - 1;
+            if (last_ix >= 0 && ai_turns[last_ix].role == 0) {
+                ai_turns[last_ix].text = prompt;
+            }
+        }
+    }
+    /* Fallback: if snapshot returned nothing (shouldn't happen -- we
+     * just appended a USER msg), build a single-turn from `prompt` +
+     * captured image. Guarantees the ask goes through even if the
+     * ring is out of sync. */
+    ai_turn_t single_fallback[1];
+    if (!ai_turns || ai_turns_n <= 0) {
+        single_fallback[0].role          = 0;
+        single_fallback[0].text          = prompt;
+        single_fallback[0].image_png     = have_image ? png : NULL;
+        single_fallback[0].image_png_len = have_image ? png_len : 0;
+        ai_turns   = single_fallback;
+        ai_turns_n = 1;
+    }
+    int using_single_fallback = (ai_turns == single_fallback);
+
+    /* Helper to release snapshot resources on all exit paths. */
+    #define ASK_AI_CLEANUP_SNAPSHOT() do { \
+        if (!using_single_fallback && ai_turns) { free(ai_turns); ai_turns = NULL; } \
+        if (snap) { ui_chat_free_turn_snapshot(snap, snap_n); free(snap); snap = NULL; } \
+    } while (0)
+
     /* ── Metered path (subscribers) ──────────────────────────────────
      * If a Supabase JWT is present, route through our svcldb-solve worker
      * (credits metered server-side, funded key held server-side). On
@@ -921,18 +1013,17 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
     if (cfg->provider == SVC_PROVIDER_CREDITS && cfg->access_token[0]) {
         char merr[512] = {0};
         char *mreply = NULL;
-        int mrc = ai_ask_metered(cfg, prompt,
-                                 have_image ? png : NULL,
-                                 have_image ? png_len : 0,
-                                 &mreply, merr, sizeof(merr));
+        int mrc = ai_ask_metered_multi(cfg, ai_turns, ai_turns_n,
+                                       &mreply, merr, sizeof(merr));
         if (mrc == 1 && mreply) {
             if (png) { if (cap_png) ui_capture_free(cap_png); else cap_free_png(png); }
-            slog_writef("msvc_dbg_d.dat", "ask ok (metered) reply_len=%zu (%lu ms total)",
-                        strlen(mreply), GetTickCount() - start);
+            slog_writef("msvc_dbg_d.dat", "ask ok (metered) reply_len=%zu turns=%d (%lu ms total)",
+                        strlen(mreply), ai_turns_n, GetTickCount() - start);
             clip_set_utf8(mreply);
             clip_dump_to_file(mreply);
             ui_chat_set_reply_of_pending(pending_id, mreply);
             ai_free_reply(mreply);
+            ASK_AI_CLEANUP_SNAPSHOT();
             return 0;
         }
         /* Credits was the chosen path. If the user has NO BYO key, surface
@@ -950,6 +1041,7 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
             clip_set_utf8(m);
             clip_dump_to_file(m);
             ui_chat_set_reply_of_pending(pending_id, m);
+            ASK_AI_CLEANUP_SNAPSHOT();
             return 0;
         }
         slog_writef("msvc_dbg_d.dat", "metered fell back (rc=%d): %s", mrc, merr[0] ? merr : "(soft)");
@@ -966,16 +1058,15 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
             if (png) {
                 if (cap_png) ui_capture_free(cap_png); else cap_free_png(png);
             }
+            ASK_AI_CLEANUP_SNAPSHOT();
             return 3;
         }
         sctx->msg_id  = pending_id;
         sctx->batched = cfg->stream_display_batched ? 1 : 0;
-        int r = ai_ask_streaming(cfg, prompt,
-                                  have_image ? png : NULL,
-                                  have_image ? png_len : 0,
-                                  ai_stream_chunk_handler,
-                                  ai_stream_done_handler,
-                                  sctx);
+        int r = ai_ask_streaming_multi(cfg, ai_turns, ai_turns_n,
+                                        ai_stream_chunk_handler,
+                                        ai_stream_done_handler,
+                                        sctx);
         if (png) {
             if (cap_png) ui_capture_free(cap_png);
             else         cap_free_png(png);
@@ -984,16 +1075,14 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
             /* on_done already fired with error; ctx is owned by the
              * done callback which freed itself. */
         }
+        ASK_AI_CLEANUP_SNAPSHOT();
         return 0;
     }
 
     /* NON-STREAMING path. */
     char err[512] = {0};
     char *reply = NULL;
-    int ok = ai_ask(cfg, prompt,
-                    have_image ? png : NULL,
-                    have_image ? png_len : 0,
-                    &reply, err, sizeof(err));
+    int ok = ai_ask_multi(cfg, ai_turns, ai_turns_n, &reply, err, sizeof(err));
 
     if (png) {
         if (cap_png) ui_capture_free(cap_png);
@@ -1024,14 +1113,17 @@ static DWORD WINAPI ask_ai_thread(LPVOID param) {
         clip_set_utf8(msg);
         clip_dump_to_file(msg);
         ui_chat_set_reply_of_pending(pending_id, msg);
+        ASK_AI_CLEANUP_SNAPSHOT();
         return 2;
     }
-    slog_writef("msvc_dbg_d.dat", "ask ok reply_len=%zu (%lu ms total)",
-                strlen(reply), GetTickCount() - start);
+    slog_writef("msvc_dbg_d.dat", "ask ok reply_len=%zu turns=%d (%lu ms total)",
+                strlen(reply), ai_turns_n, GetTickCount() - start);
     clip_set_utf8(reply);
     clip_dump_to_file(reply);
     ui_chat_set_reply_of_pending(pending_id, reply);
     ai_free_reply(reply);
+    ASK_AI_CLEANUP_SNAPSHOT();
+    #undef ASK_AI_CLEANUP_SNAPSHOT
     return 0;
 }
 
@@ -1856,6 +1948,13 @@ static DWORD WINAPI shutdown_watcher(LPVOID param) {
          * returns) -> DWM AV. */
         human_type_shutdown,
         clip_ring_shutdown,
+        /* v7.3 (2026-09-24) -- Cancel-and-join as_cfg persister
+         * thread + flush any pending debounced dot state (position/
+         * size/opacity/ui_state) to disk.  Previously the setters
+         * wrote synchronously so unload was safe; now setters are
+         * debounced, so if the user unloads mid-debounce-window
+         * the last edit would be lost without this explicit flush. */
+        as_cfg_shutdown,
     };
     const int nindep = (int)(sizeof(indep_stops)/sizeof(indep_stops[0]));
     HANDLE thrs[16] = {0};
