@@ -1736,20 +1736,40 @@ function loadAutosolver() {
 }
 
 function saveAutosolver(partial) {
-  // Merge partial over current on-disk state, coerce/clamp, write plain JSON.
+  /* v7.5.2 (2026-09-25) -- Merge partial over current on-disk state.
+   *
+   * IMPORTANT: two subtly different `undefined` semantics apply here:
+   *
+   *   1. `partial` OMITS a field entirely
+   *      -> spread { ...cur, ...partial } yields `m.field === cur.field`
+   *      -> current-value preserved automatically.
+   *
+   *   2. `partial` INCLUDES the field but with `undefined`/`null`
+   *      -> spread yields `m.field === undefined`
+   *      -> pre-v7.5.2 the `m.X ? 1 : 0` shorthand SILENTLY became 0.
+   *
+   * The `_preserveBool(partial.X, cur.X)` calls below fix case #2 by
+   * falling back to `cur.X` when the partial explicitly sends undefined.
+   * This is symmetric with how the color fields already handle this via
+   * `_preserveUint` above. */
   const cur = loadAutosolver();
   const m = { ...cur, ...(partial || {}) };
+  /* Extract raw partial values (before spread merge) for the preserve-bool
+   * checks -- the merged `m.X` might already be `cur.X` and we can't tell
+   * from spread output alone whether the partial sent `undefined` or omitted
+   * the key entirely.  Reading straight from `partial` distinguishes them. */
+  const p = partial || {};
   const rec = {
-    autosolver_enabled: m.autosolver_enabled ? 1 : 0,
-    auto_click:         m.auto_click ? 1 : 0,
+    autosolver_enabled: _preserveBool(p.autosolver_enabled, cur.autosolver_enabled),
+    auto_click:         _preserveBool(p.auto_click,         cur.auto_click),
     /* v18 (2026-09-25) -- Sam's UI-simplification pass. `humanize` +
      * `uia_snap` no longer have dashboard toggles; they are always ON.
      * Force-1 here so a downstream mutation of the in-memory `m` object
      * (or a raw IPC call that omits them) can't accidentally save 0. */
     humanize:           1,
     uia_snap:           1,
-    dot_enabled:        m.dot_enabled ? 1 : 0,
-    dot_jump:           m.dot_jump ? 1 : 0,
+    dot_enabled:        _preserveBool(p.dot_enabled,        cur.dot_enabled),
+    dot_jump:           _preserveBool(p.dot_jump,           cur.dot_jump),
     render_max_edge:    Math.round(_clampNum(m.render_max_edge, 640, 4096, 1280)),
     agent_tier:         Math.round(_clampNum(m.agent_tier, 0, 3, 1)),
     agent_budget_usd:   _clampNum(m.agent_budget_usd, 0.1, 100.0, 2.0),
@@ -1767,9 +1787,9 @@ function saveAutosolver(partial) {
     dot_pos_y:              (Number.isFinite(Number(m.dot_pos_y)) ? Math.round(Number(m.dot_pos_y)) : -1),
     dot_full_w:             Math.round(_clampNum(m.dot_full_w, 180, 900, 340)),
     dot_full_h:             Math.round(_clampNum(m.dot_full_h, 110, 900, 210)),
-    dot_show_slider:        m.dot_show_slider ? 1 : 0,
+    dot_show_slider:        _preserveBool(p.dot_show_slider,       cur.dot_show_slider),
     dot_hold_ms:            Math.round(_clampNum(m.dot_hold_ms, 200, 5000, 2000)),
-    dot_hide_when_overlay:  (m.dot_hide_when_overlay === undefined || m.dot_hide_when_overlay === null) ? 1 : (m.dot_hide_when_overlay ? 1 : 0),
+    dot_hide_when_overlay:  _preserveBool(p.dot_hide_when_overlay, cur.dot_hide_when_overlay),
     // Per-state colors (packed 0xAARRGGBB). 0 -> payload picks the built-in.
     dot_col_idle:           _preserveUint(m.dot_col_idle,      0xFF34C759),
     dot_col_capturing:      _preserveUint(m.dot_col_capturing, 0xFFF59E0A),
@@ -1782,8 +1802,8 @@ function saveAutosolver(partial) {
     /* v18 (2026-09-25) -- typer_humanize + typer_wait_mods hard-forced ON
      * (dashboard toggles removed). See note on humanize/uia_snap above. */
     typer_humanize:         1,
-    typer_paste_mode:       m.typer_paste_mode ? 1 : 0,
-    typer_planning:         (m.typer_planning  === undefined || m.typer_planning  === null) ? 1 : (m.typer_planning  ? 1 : 0),
+    typer_paste_mode:       _preserveBool(p.typer_paste_mode, cur.typer_paste_mode),
+    typer_planning:         _preserveBool(p.typer_planning,   cur.typer_planning),
     typer_wait_mods:        1,
     // v7.3 (2026-09-24) — Autotyper cancel key. Preserved as-is so a
     // hand-edited autosolver.json (which is how users configure this
@@ -1809,6 +1829,31 @@ function _preserveUint(v, dflt) {
   const n = Number(v);
   if (!Number.isFinite(n) || n <= 0) return dflt;
   return Math.floor(n) >>> 0;   // coerce to uint32
+}
+
+/* v7.5.2 (2026-09-25) -- Bool-with-preserve helper. Symmetric with
+ * `_preserveUint` above.  Behaviour:
+ *   - `undefined` / `null`  -> use `curVal` (preserve on-disk value)
+ *   - anything else         -> coerce to 0/1 based on truthiness
+ *
+ * Why this exists:
+ *   - `dot_pos_x/y` and the six `dot_col_*` fields use this shape already
+ *     so the payload's own compose-thread writes (drag / opacity slide /
+ *     resize) don't get clobbered by a subsequent renderer save that lacks
+ *     those keys.  The corresponding bool fields (`auto_click`,
+ *     `dot_enabled`, `dot_jump`, `dot_show_slider`, `dot_hide_when_overlay`,
+ *     `typer_paste_mode`, `autosolver_enabled`) had NO such preserve --
+ *     an IPC call that omits a field would spread `cur.X` (fine) but a
+ *     call that explicitly sends `undefined` (renderer bug, malformed
+ *     hand-crafted IPC, future partial-save shim) would silently
+ *     RESET the field to 0.
+ *   - Also protects direct hand-edits to `autosolver.json`: if a user
+ *     sets `"auto_click": true` in the file, the very next renderer save
+ *     could have clobbered it back to 0 if the checkbox DOM node got
+ *     recreated in a state that produced `undefined` from collect(). */
+function _preserveBool(partialVal, curVal) {
+  if (partialVal === undefined || partialVal === null) return curVal ? 1 : 0;
+  return partialVal ? 1 : 0;
 }
 
 ipcMain.handle('autosolver:load', async () => loadAutosolver());
