@@ -391,6 +391,27 @@ static void hook_diag(const char *fmt, ...);
 static volatile LONG g_compose_degraded = 0;
 int hooks_compose_degraded(void) { return g_compose_degraded ? 1 : 0; }
 
+/* v7.3.0 (2026-09-25) -- external SAFE-MODE trip, callable from ANY
+ * subsystem that detects a fatal incompatibility with the live dwmcore
+ * layout. Currently invoked by imgui_layer.cpp's get_backbuffer_texture
+ * when the dynamic vtable-slot scan (including the multi-inheritance
+ * walk) gives up on locating GetPhysicalBackBuffer / GetD3D11Resource /
+ * accessor. Before v7.3.0, that path fell back to hardcoded slot
+ * indices which on user dharpan2010@gmail.com's box crashed DWM (his
+ * pLayer subclass has the target functions on a secondary base subobject
+ * vftable, not the primary). Idempotent + cheap: single atomic exchange
+ * + one log line the first time it flips. */
+void hooks_force_compose_degraded(void) {
+    if (InterlockedExchange(&g_compose_degraded, 1) == 0) {
+        slog_write("msvc_dbg_a.dat",
+            "hooks_force_compose_degraded: SAFE-MODE tripped externally "
+            "(likely: dynamic vtable scan give-up in get_backbuffer_texture). "
+            "Overlay quiesced. Payload alive for rawinput/hotkey use. "
+            "DWM stays alive (avoided calling hardcoded vtable slot that "
+            "would AV on this pLayer subclass).");
+    }
+}
+
 /* Hook integrity monitor. Every 10s, walk the registry and verify the
  * first byte at each target is `0xE9` (MinHook's JMP rel32 trampoline
  * head). If any hook shows a non-`0xE9` first byte, an anti-cheat has

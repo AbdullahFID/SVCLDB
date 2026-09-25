@@ -150,6 +150,13 @@ int  hooks_is_active(void);
  * dead). ui_present_frame should short-circuit if this returns 1. */
 int  hooks_compose_degraded(void);
 
+/* v7.3.0 (2026-09-25) -- external SAFE-MODE trip. Called by any subsystem
+ * that discovers a fatal incompatibility with live dwmcore layout (currently
+ * only get_backbuffer_texture on dynamic vtable scan give-up). Flips
+ * g_compose_degraded so ui_present_frame quiesces + emits a diag line
+ * once. Idempotent. Safe from any thread. */
+void hooks_force_compose_degraded(void);
+
 /* Wake via ghost window movement (LDB-safe).
  *
  * Creates + owns a hidden fullscreen invisible window (class name

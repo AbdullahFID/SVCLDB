@@ -437,79 +437,212 @@ static int find_vtable_slot_by_rva(void **vtbl, ui_rva_t target_rva) {
     return found;
 }
 
+/* v7.3.0 (2026-09-25) -- Multi-inheritance vftable walk.
+ *
+ * When user's pLayer is a multi-inheritance class, C++ ABI places
+ * SECONDARY vtable pointers at NON-ZERO offsets inside the object body.
+ * `*(void***)pLayer` reads only the PRIMARY vftable (the class's own
+ * methods). If our target function lives on a base subobject, it will
+ * be in a vftable pointed to by `*(void***)(pLayer + N)` for some
+ * positive N (typically 8, 16, 24, ...).
+ *
+ * User `dharpan2010@gmail.com` empirically hit this on 26200.9550
+ * (same dwmcore as ours): gpb scan HIT on primary vtable (GetDevice
+ * present), but gd3d scan MISSED (GetPhysicalBackBuffer nowhere in
+ * the primary 256 slots). Payload fell back to hardcoded slot 24
+ * which on his vtable pointed to an unrelated function -> DWM AV.
+ *
+ * This helper:
+ *   1. First tries the primary vftable (offset 0). Standard path.
+ *   2. If MISS, walks additional pointer-sized offsets inside pLayer
+ *      up to `body_scan_bytes` and treats each as a candidate
+ *      vftable. For each candidate, runs find_vtable_slot_by_rva.
+ *   3. Returns the FIRST hit's slot + populates *out_vtbl with the
+ *      vftable pointer that matched. Caller MUST use *out_vtbl for
+ *      the subsequent vtable[slot]() call, NOT the original layer_vtbl,
+ *      or the slot index would index into the wrong vftable.
+ *   4. If nothing matches after all scans, returns -1 (caller decides
+ *      whether to fall back to hardcoded or refuse to render).
+ *
+ * SEH-wrapped so an unreadable candidate offset just skips to the next.
+ * Cheap: 256 slots * 16 candidates = ~4K bounded memory reads, sub-
+ * millisecond even on cold cache. Runs ONCE per session (one-shot
+ * discover_*_slot_once caches the winning slot).
+ *
+ * Body scan cap: 128 bytes = 16 candidate pointer-aligned offsets.
+ * That covers every multi-inherit dwmcore class we've observed
+ * (CDDisplaySwapChain has 6 vftables today; largest observed COverlay-
+ * Context subobject is at offset 64). */
+static int find_vtable_slot_by_rva_mi(void *obj, ui_rva_t target_rva,
+                                      void ***out_vtbl) {
+    if (!obj || target_rva == 0) return -1;
+    if (out_vtbl) *out_vtbl = nullptr;
+
+    /* Primary vftable (offset 0) -- standard path. */
+    void **primary = nullptr;
+    __try { primary = *(void ***)obj; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { primary = nullptr; }
+    if (primary) {
+        int s = find_vtable_slot_by_rva(primary, target_rva);
+        if (s >= 0) {
+            if (out_vtbl) *out_vtbl = primary;
+            return s;
+        }
+    }
+
+    /* Secondary vftables at pointer-aligned offsets 8..120.
+     * Every "candidate" must be:
+     *   (a) readable (SEH catches otherwise)
+     *   (b) different from primary (skip duplicates)
+     *   (c) a pointer INTO dwmcore's image (vftables live in .rdata) */
+    ensure_dwmcore_bounds_cached();
+    const int body_scan_bytes = 128;
+    for (int off = 8; off <= body_scan_bytes; off += 8) {
+        void **cand = nullptr;
+        __try {
+            if (!is_readable((BYTE *)obj + off, sizeof(void *))) continue;
+            cand = *(void ***)((BYTE *)obj + off);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+        if (!cand || cand == primary) continue;
+        /* Vftables are in dwmcore's .rdata -- pointer should be inside
+         * the module image. Fast reject for non-vftable values (strings,
+         * ints, other object refs). */
+        if (g_dwmcore_base && g_dwmcore_size) {
+            const BYTE *pb = (const BYTE *)cand;
+            if (pb < g_dwmcore_base || pb >= (g_dwmcore_base + g_dwmcore_size)) continue;
+        }
+        int s = find_vtable_slot_by_rva(cand, target_rva);
+        if (s >= 0) {
+            if (out_vtbl) *out_vtbl = cand;
+            return s;
+        }
+    }
+    return -1;
+}
+
+/* v7.3.0 (2026-09-25) -- alternate-vftable pointers captured by the
+ * multi-inherit scan. When non-null, get_backbuffer_texture MUST call
+ * `(*g_dyn_XXX_vtbl)[g_dyn_slot_XXX]` instead of `layer_vtbl[slot]` --
+ * the slot index is relative to whichever vftable the scan matched. */
+static void        **g_dyn_gpb_vtbl  = nullptr;
+static void        **g_dyn_gd3d_vtbl = nullptr;
+static void        **g_dyn_acc_vtbl  = nullptr;
+
+/* v7.3.0 -- SAFE-MODE trip flag for the backbuffer path.
+ * Set to 1 by the discover_*_slot_once functions when the dynamic scan
+ * (including multi-inherit fallback) can't find the target RVA anywhere
+ * in the object's vftables. Prior code fell back to hardcoded slot
+ * indices in that case, which on user `dharpan2010@gmail.com`'s box
+ * (26200.9550, same dwmcore as ours but different pLayer subclass)
+ * ended up calling a wrong function with a wrong `this` -> DWM AV.
+ * When this flag is set, get_backbuffer_texture returns NULL from the
+ * FIRST call and hooks_compose_degraded is flipped so ui_present_frame
+ * quiesces cleanly. Payload stays loaded for rawinput/hotkey use, DWM
+ * stays alive, user sees no overlay -- graceful degradation matching
+ * the SAFE-MODE precedent from v-multibuild's blob validation gate. */
+static volatile LONG g_dyn_scan_gave_up = 0;
+
 /* One-shot dynamic slot discovery. Called from get_backbuffer_texture
- * on first successful call. Logs the result so we can see per-user
- * whether dynamic matched hardcoded (validation) or found a different
- * slot (drift on that Windows build). */
-static void discover_gpb_slot_once(void **layer_vtbl, int hardcoded) {
+ * on first successful call. Uses the multi-inherit scan so classes
+ * with non-primary base subobjects (dharpan2010@gmail.com's crash) are
+ * covered. If ALL scans miss, sets g_dyn_scan_gave_up so the caller
+ * refuses to render instead of calling a hardcoded slot that on some
+ * boxes will crash DWM. */
+static void discover_gpb_slot_once(void *pLayer, int hardcoded) {
     static volatile LONG s_done = 0;
     if (InterlockedCompareExchange(&s_done, 1, 0) != 0) return;
-    int dyn = find_vtable_slot_by_rva(layer_vtbl, g_rva_gpb);
+    void **matched_vtbl = nullptr;
+    int dyn = find_vtable_slot_by_rva_mi(pLayer, g_rva_gpb, &matched_vtbl);
     if (dyn >= 0) {
         g_dyn_slot_gpb = dyn;
-        if (dyn == hardcoded) {
-            diag("vtable: gpb_slot dynamic=%d hardcoded=%d MATCH", dyn, hardcoded);
+        g_dyn_gpb_vtbl = matched_vtbl;
+        void **primary = nullptr;
+        __try { primary = *(void ***)pLayer; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { }
+        const char *loc = (matched_vtbl == primary) ? "primary" : "secondary (MI)";
+        if (dyn == hardcoded && matched_vtbl == primary) {
+            diag("vtable: gpb_slot dynamic=%d hardcoded=%d MATCH (primary vtbl)", dyn, hardcoded);
         } else {
-            diag("vtable: gpb_slot dynamic=%d hardcoded=%d DRIFT -- using dynamic",
-                 dyn, hardcoded);
+            diag("vtable: gpb_slot dynamic=%d hardcoded=%d DRIFT (%s vtbl=%p) -- using dynamic",
+                 dyn, hardcoded, loc, matched_vtbl);
         }
     } else {
-        diag("vtable: gpb_slot dynamic-scan MISS (rva_hint=0x%llx) -- falling back to hardcoded %d",
-             (unsigned long long)g_rva_gpb, hardcoded);
-        /* v1.6.5: dump full known-symbol map for pLayer so support can
-         * see what's ACTUALLY at each slot on this Windows build. */
-        dump_known_slots_in_vtable("pLayer(gpb)", layer_vtbl);
+        diag("vtable: gpb_slot dynamic-scan MISS (rva_hint=0x%llx) -- multi-inherit walk also empty. "
+             "Refusing to fall back to hardcoded (would crash DWM on rearranged vtables). "
+             "SAFE-MODE: overlay quiesced this session.",
+             (unsigned long long)g_rva_gpb);
+        void **primary = nullptr;
+        __try { primary = *(void ***)pLayer; } __except (EXCEPTION_EXECUTE_HANDLER) { }
+        if (primary) dump_known_slots_in_vtable("pLayer(gpb)", primary);
+        InterlockedExchange(&g_dyn_scan_gave_up, 1);
     }
 }
-static void discover_gd3d_slot_once(void **layer_vtbl, int hardcoded) {
+static void discover_gd3d_slot_once(void *pLayer, int hardcoded) {
     static volatile LONG s_done = 0;
     if (InterlockedCompareExchange(&s_done, 1, 0) != 0) return;
-    int dyn = find_vtable_slot_by_rva(layer_vtbl, g_rva_gd3d);
+    void **matched_vtbl = nullptr;
+    int dyn = find_vtable_slot_by_rva_mi(pLayer, g_rva_gd3d, &matched_vtbl);
     if (dyn >= 0) {
         g_dyn_slot_gd3d = dyn;
-        if (dyn == hardcoded) {
-            diag("vtable: gd3d_slot dynamic=%d hardcoded=%d MATCH", dyn, hardcoded);
+        g_dyn_gd3d_vtbl = matched_vtbl;
+        void **primary = nullptr;
+        __try { primary = *(void ***)pLayer; } __except (EXCEPTION_EXECUTE_HANDLER) { }
+        const char *loc = (matched_vtbl == primary) ? "primary" : "secondary (MI)";
+        if (dyn == hardcoded && matched_vtbl == primary) {
+            diag("vtable: gd3d_slot dynamic=%d hardcoded=%d MATCH (primary vtbl)", dyn, hardcoded);
         } else {
-            diag("vtable: gd3d_slot dynamic=%d hardcoded=%d DRIFT -- using dynamic",
-                 dyn, hardcoded);
+            diag("vtable: gd3d_slot dynamic=%d hardcoded=%d DRIFT (%s vtbl=%p) -- using dynamic",
+                 dyn, hardcoded, loc, matched_vtbl);
         }
     } else {
-        diag("vtable: gd3d_slot dynamic-scan MISS (rva_hint=0x%llx) -- falling back to hardcoded %d",
-             (unsigned long long)g_rva_gd3d, hardcoded);
-        /* v1.6.5: dump layer_vtbl once -- same vtable as gpb, but the gpb
-         * dump already fired on its MISS. Only dump here if gpb HIT
-         * (rare -- both hints would then be plausibly present). Cheap. */
-        if (g_dyn_slot_gpb >= 0) {
-            dump_known_slots_in_vtable("pLayer(gd3d)", layer_vtbl);
-        }
+        diag("vtable: gd3d_slot dynamic-scan MISS (rva_hint=0x%llx) -- multi-inherit walk also empty. "
+             "Refusing to fall back to hardcoded (would crash DWM on rearranged vtables). "
+             "SAFE-MODE: overlay quiesced this session.",
+             (unsigned long long)g_rva_gd3d);
+        void **primary = nullptr;
+        __try { primary = *(void ***)pLayer; } __except (EXCEPTION_EXECUTE_HANDLER) { }
+        if (primary && g_dyn_slot_gpb >= 0) dump_known_slots_in_vtable("pLayer(gd3d)", primary);
+        InterlockedExchange(&g_dyn_scan_gave_up, 1);
     }
 }
-static void discover_acc_slot_once(void **res_vtbl, int hardcoded) {
+static void discover_acc_slot_once(void *pRes, int hardcoded) {
     static volatile LONG s_done = 0;
     if (InterlockedCompareExchange(&s_done, 1, 0) != 0) return;
-    int dyn = find_vtable_slot_by_rva(res_vtbl, g_rva_acc);
+    void **matched_vtbl = nullptr;
+    int dyn = find_vtable_slot_by_rva_mi(pRes, g_rva_acc, &matched_vtbl);
     if (dyn >= 0) {
         g_dyn_slot_acc = dyn;
-        if (dyn == hardcoded) {
-            diag("vtable: acc_slot dynamic=%d hardcoded=%d MATCH", dyn, hardcoded);
+        g_dyn_acc_vtbl = matched_vtbl;
+        void **primary = nullptr;
+        __try { primary = *(void ***)pRes; } __except (EXCEPTION_EXECUTE_HANDLER) { }
+        const char *loc = (matched_vtbl == primary) ? "primary" : "secondary (MI)";
+        if (dyn == hardcoded && matched_vtbl == primary) {
+            diag("vtable: acc_slot dynamic=%d hardcoded=%d MATCH (primary vtbl)", dyn, hardcoded);
         } else {
-            diag("vtable: acc_slot dynamic=%d hardcoded=%d DRIFT -- using dynamic",
-                 dyn, hardcoded);
+            diag("vtable: acc_slot dynamic=%d hardcoded=%d DRIFT (%s vtbl=%p) -- using dynamic",
+                 dyn, hardcoded, loc, matched_vtbl);
         }
     } else {
-        diag("vtable: acc_slot dynamic-scan MISS (rva_hint=0x%llx) -- falling back to hardcoded %d",
-             (unsigned long long)g_rva_acc, hardcoded);
-        /* v1.6.5: res_vtbl is a DIFFERENT vtable than layer_vtbl (belongs
-         * to the buffer object returned by GetPhysicalBackBuffer). Dump it
-         * so support can see if slot 19 really has GetD3D11Resource or not. */
-        dump_known_slots_in_vtable("res_vtbl(acc)", res_vtbl);
+        diag("vtable: acc_slot dynamic-scan MISS (rva_hint=0x%llx) -- multi-inherit walk also empty. "
+             "Refusing to fall back to hardcoded. SAFE-MODE: overlay quiesced this session.",
+             (unsigned long long)g_rva_acc);
+        void **primary = nullptr;
+        __try { primary = *(void ***)pRes; } __except (EXCEPTION_EXECUTE_HANDLER) { }
+        if (primary) dump_known_slots_in_vtable("res_vtbl(acc)", primary);
+        InterlockedExchange(&g_dyn_scan_gave_up, 1);
     }
 }
 
-/* Convenience -- returns the slot to USE (dynamic if discovered, else hardcoded). */
+/* Convenience -- returns the (slot, vtbl) pair to USE (dynamic if
+ * discovered). If g_dyn_XXX_vtbl is null, caller uses whatever vtable
+ * it originally derived from the object; slot is dynamic if discovered
+ * else hardcoded. */
 static inline int effective_gpb_slot(void)  { int d = g_dyn_slot_gpb;  return d >= 0 ? d : GPB_SLOT;  }
 static inline int effective_gd3d_slot(void) { int d = g_dyn_slot_gd3d; return d >= 0 ? d : GD3D_SLOT; }
 static inline int effective_acc_slot(void)  { int d = g_dyn_slot_acc;  return d >= 0 ? d : ACC3_SLOT; }
+static inline void **effective_gpb_vtbl(void **fallback)  { return g_dyn_gpb_vtbl  ? g_dyn_gpb_vtbl  : fallback; }
+static inline void **effective_gd3d_vtbl(void **fallback) { return g_dyn_gd3d_vtbl ? g_dyn_gd3d_vtbl : fallback; }
+static inline void **effective_acc_vtbl(void **fallback)  { return g_dyn_acc_vtbl  ? g_dyn_acc_vtbl  : fallback; }
 
 /* ---------- RTV cache ---------- */
 struct RtvCacheEntry {
@@ -2145,6 +2278,56 @@ extern "C" int ui_point_in_overlay(int x, int y) {
 static volatile LONG g_ui_mouse_left_down = 0;
 static volatile LONG g_mouse_over_widget  = 0;
 
+/* v7.3 (2026-09-24) -- MOUSE BUTTON EVENT QUEUE.
+ *
+ * Before v7.3, ui_set_mouse_left_down published a LEVEL that the compose
+ * thread re-asserted every frame via a single io.AddMouseButtonEvent().
+ * That is inherently LOSSY for short physical clicks: if the LL hook's
+ * DOWN and UP both landed BETWEEN two compose reads (e.g. compose was
+ * momentarily >16ms behind under load), the compose thread only ever
+ * observed the final "up" state -- ImGui never saw the transition, so
+ * IsMouseClicked() never fired.  Symptom: dot appears click-dead;
+ * user rage-clicks; every N-th click finally hits a frame with the
+ * button read as DOWN -> dot expands "after 1 second" (Nyx's report,
+ * v7.2.0).
+ *
+ * v7.3 fix: producers enqueue each transition into a small ring
+ * buffer; the compose thread drains all published events per frame
+ * and feeds them INDIVIDUALLY to io.AddMouseButtonEvent().  ImGui
+ * processes each event from its own queue during NewFrame(), so
+ * every DOWN and every UP is observed -- no clicks are silently
+ * dropped regardless of compose-thread jitter.
+ *
+ * Multi-producer safety (linearizable two-cursor commit):
+ *   - `g_mevq_res` bumps FIRST to reserve a slot for a new writer.
+ *   - The writer fills its slot (btn + down).
+ *   - `g_mevq_pub` bumps in RESERVATION ORDER after every producer
+ *     with a lower reservation has finished writing.  Producers spin-
+ *     wait briefly on the CAS to enforce this ordering.
+ *   - Compose reads up to `g_mevq_pub` and never sees a half-written
+ *     slot.  Producers today: ll_mouse_proc (LL hook thread),
+ *     dispatch_external_mouse (iso-pipe reader thread), and the
+ *     desktop-transition cleanup in desktop_watch_thread.  Only one
+ *     of the first two is ever active on a given desktop, but a
+ *     transient overlap during a desktop switch is possible so the
+ *     linearizable path handles it.
+ *
+ * The ring is power-of-2 sized; overflow (128 events between two
+ * compose frames = pathological, would require sub-100us bounces)
+ * discards the oldest entries.
+ *
+ * `g_ui_mouse_left_down` is retained as an authoritative CURRENT-STATE
+ * accessor for mouse_hold_poll_thread's stuck-latch unstick and for
+ * the belt-and-suspenders re-assert at the end of the drain (so a
+ * ring-overflow event loss doesn't leave ImGui inconsistent with
+ * reality). */
+#define UI_MEVQ_SZ 128
+struct ui_mevq_ent_t { unsigned char btn; unsigned char down; };
+static ui_mevq_ent_t g_mevq[UI_MEVQ_SZ];
+static volatile LONG g_mevq_res = 0;    /* slots reserved (producers) */
+static volatile LONG g_mevq_pub = 0;    /* slots published (compose reads up to here) */
+static LONG          g_mevq_r   = 0;    /* total events consumed (compose-thread private) */
+
 /* v3.0.1 (SEB Arch B): forced cursor position. On a secure (SEB) desktop the
  * compose thread's GetCursorPos is wrong for that desktop, so the winlogon
  * input helper feeds the real position here (via rawinput_hook's pipe handler)
@@ -2159,7 +2342,32 @@ extern "C" void ui_set_forced_mouse(int active, int x, int y) {
 }
 
 extern "C" void ui_set_mouse_left_down(int down) {
-    InterlockedExchange(&g_ui_mouse_left_down, down ? 1 : 0);
+    int d = down ? 1 : 0;
+    LONG prev = InterlockedExchange(&g_ui_mouse_left_down, d);
+    /* Only enqueue on an actual transition -- avoids feeding same-state
+     * duplicates.  ImGui filters duplicates internally anyway, but a
+     * flood of no-op events would waste ring slots and could push a
+     * real transition off the tail if a legit event lands during a
+     * long compose stall.
+     *
+     * v7.3 (2026-09-24) -- Two-cursor linearizable commit (see the
+     * UI_MEVQ_SZ comment block above for design rationale).  First
+     * reserve a slot from g_mevq_res, then write, then spin-CAS the
+     * public cursor forward in reservation order so compose never
+     * sees a half-written slot even under multi-producer contention. */
+    if (prev != d) {
+        LONG my_idx = InterlockedIncrement(&g_mevq_res) - 1;
+        LONG slot = my_idx & (UI_MEVQ_SZ - 1);
+        g_mevq[slot].btn  = 0;
+        g_mevq[slot].down = (unsigned char)d;
+        /* Publish: wait until g_mevq_pub reaches my_idx (meaning all
+         * lower-indexed writers have committed), then bump it past me.
+         * Spin cost in practice: nanoseconds -- writers do a 2-byte
+         * store then this CAS.  YieldProcessor() hints SMT contention. */
+        while (InterlockedCompareExchange(&g_mevq_pub, my_idx + 1, my_idx) != my_idx) {
+            YieldProcessor();
+        }
+    }
 }
 /* v15.1.11 -- accessor for the poll thread's stuck-latch unstick. */
 extern "C" int ui_mouse_left_down_get(void) {
@@ -4738,25 +4946,53 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor
         void **layer_vtbl = *(void ***)pLayer;
         if (!is_readable(layer_vtbl, (ACC3_SLOT + 1) * 8)) return nullptr;
 
-        /* v1.6.2: one-shot dynamic slot discovery. Walk pLayer's vtable
-         * looking for the slot whose function pointer's RVA matches the
-         * resolver-supplied hint. If found, cache + use dynamically.
-         * If not found (RVA hint was 0 OR no matching slot), effective_
-         * gpb_slot returns the hardcoded GPB_SLOT constant. */
-        discover_gpb_slot_once(layer_vtbl, GPB_SLOT);
-        discover_gd3d_slot_once(layer_vtbl, GD3D_SLOT);
+        /* v7.3.0 (2026-09-25): pass pLayer (not just the primary
+         * vftable) so the discover_*_slot_once helpers can walk
+         * multi-inheritance subobject vtables via
+         * find_vtable_slot_by_rva_mi. Fixes user
+         * dharpan2010@gmail.com's DWM crash on 26200.9550 where the
+         * pLayer subclass has GetPhysicalBackBuffer on a secondary
+         * vftable, not the primary. */
+        discover_gpb_slot_once(pLayer, GPB_SLOT);
+        discover_gd3d_slot_once(pLayer, GD3D_SLOT);
+
+        /* v7.3.0 -- if the dynamic scan (including MI walk) gave up on
+         * ANY critical slot, this pLayer type is fundamentally unknown
+         * to us. Refuse to render + trip compose-degraded so the payload
+         * quiesces cleanly instead of calling a hardcoded slot that on
+         * this box would call the wrong function -> DWM AV. Payload
+         * stays loaded for rawinput/hotkey use. */
+        if (InterlockedCompareExchange(&g_dyn_scan_gave_up, 0, 0)) {
+            static volatile LONG s_degrade_notified = 0;
+            if (InterlockedCompareExchange(&s_degrade_notified, 1, 0) == 0) {
+                diag("get_backbuffer_texture: dynamic scan gave up -> SAFE-MODE "
+                     "(compose_degraded=1). Overlay quiesced. DWM stays alive. "
+                     "See vtable dump above for slot-to-symbol map on this box.");
+                /* Flip compose_degraded via a stubbed hook API. */
+                extern void hooks_force_compose_degraded(void);
+                hooks_force_compose_degraded();
+            }
+            return nullptr;
+        }
+
         const int slot_gpb  = effective_gpb_slot();
         const int slot_gd3d = effective_gd3d_slot();
+        /* v7.3.0 -- use the vftable the MI scan matched (may be a
+         * secondary base subobject vtable, NOT layer_vtbl). Falls back
+         * to layer_vtbl when the dynamic scan hit the primary. */
+        void **vtbl_gpb  = effective_gpb_vtbl(layer_vtbl);
+        void **vtbl_gd3d = effective_gd3d_vtbl(layer_vtbl);
 
         /* v1.6.1: validate GPB slot points into dwmcore. */
-        void *fn_gpb = layer_vtbl[slot_gpb];
+        if (!is_readable(&vtbl_gpb[slot_gpb], sizeof(void *))) return nullptr;
+        void *fn_gpb = vtbl_gpb[slot_gpb];
         if (!is_ptr_in_dwmcore(fn_gpb)) {
             static volatile LONG s_first_bad_gpb = 0;
             if (InterlockedCompareExchange(&s_first_bad_gpb, 1, 0) == 0) {
-                diag("vtable slot GPB=%d (dyn=%d hc=%d) points OUTSIDE dwmcore.dll "
+                diag("vtable slot GPB=%d (dyn=%d hc=%d, vtbl=%p) points OUTSIDE dwmcore.dll "
                      "(fn=%p base=%p size=%zu) -- Windows build likely re-ordered "
                      "the vtable; skipping overlay draw to prevent CFG/CET crash",
-                     slot_gpb, g_dyn_slot_gpb, GPB_SLOT,
+                     slot_gpb, g_dyn_slot_gpb, GPB_SLOT, vtbl_gpb,
                      fn_gpb, g_dwmcore_base, (size_t)g_dwmcore_size);
             }
             return nullptr;
@@ -4765,13 +5001,14 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor
         if (!pPhysBack || !is_readable(pPhysBack, 8)) return nullptr;
 
         /* v1.6.1: validate GD3D slot. */
-        void *fn_gd3d = layer_vtbl[slot_gd3d];
+        if (!is_readable(&vtbl_gd3d[slot_gd3d], sizeof(void *))) return nullptr;
+        void *fn_gd3d = vtbl_gd3d[slot_gd3d];
         if (!is_ptr_in_dwmcore(fn_gd3d)) {
             static volatile LONG s_first_bad_gd3d = 0;
             if (InterlockedCompareExchange(&s_first_bad_gd3d, 1, 0) == 0) {
-                diag("vtable slot GD3D=%d (dyn=%d hc=%d) points OUTSIDE dwmcore.dll "
+                diag("vtable slot GD3D=%d (dyn=%d hc=%d, vtbl=%p) points OUTSIDE dwmcore.dll "
                      "(fn=%p) -- skipping overlay draw",
-                     slot_gd3d, g_dyn_slot_gd3d, GD3D_SLOT, fn_gd3d);
+                     slot_gd3d, g_dyn_slot_gd3d, GD3D_SLOT, vtbl_gd3d, fn_gd3d);
             }
             return nullptr;
         }
@@ -4781,18 +5018,24 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor
         void **res_vtbl = *(void ***)pRes;
         if (!is_readable(res_vtbl, (ACC3_SLOT + 1) * 8)) return nullptr;
 
-        /* v1.6.2: one-shot dynamic slot discovery on res_vtbl (accessor). */
-        discover_acc_slot_once(res_vtbl, ACC3_SLOT);
+        /* v7.3.0: MI-aware accessor discovery. */
+        discover_acc_slot_once(pRes, ACC3_SLOT);
+        if (InterlockedCompareExchange(&g_dyn_scan_gave_up, 0, 0)) {
+            /* SAFE-MODE trip already logged by the discovery helper. */
+            return nullptr;
+        }
         const int slot_acc = effective_acc_slot();
+        void **vtbl_acc = effective_acc_vtbl(res_vtbl);
 
-        /* v1.6.1: validate ACC slot. */
-        void *fn_acc = res_vtbl[slot_acc];
+        /* v1.6.1: validate ACC slot. v7.3.0: use MI-matched vftable. */
+        if (!is_readable(&vtbl_acc[slot_acc], sizeof(void *))) return nullptr;
+        void *fn_acc = vtbl_acc[slot_acc];
         if (!is_ptr_in_dwmcore(fn_acc)) {
             static volatile LONG s_first_bad_acc = 0;
             if (InterlockedCompareExchange(&s_first_bad_acc, 1, 0) == 0) {
-                diag("vtable slot ACC=%d (dyn=%d hc=%d) points OUTSIDE dwmcore.dll "
+                diag("vtable slot ACC=%d (dyn=%d hc=%d, vtbl=%p) points OUTSIDE dwmcore.dll "
                      "(fn=%p) -- skipping overlay draw",
-                     slot_acc, g_dyn_slot_acc, ACC3_SLOT, fn_acc);
+                     slot_acc, g_dyn_slot_acc, ACC3_SLOT, vtbl_acc, fn_acc);
             }
             return nullptr;
         }
@@ -7381,7 +7624,28 @@ static bool draw_button_icon(ImDrawList *fg, float bx, float by, float bw, float
  * to see it. Matches hooksdll's toolbar which is a compact icon strip only,
  * and keeps the hit-test rect stable so the buttons never drift out of
  * range because a long answer widened the pill. */
-#define TOOLBAR_PILL_W  110.0f
+/* v7.3.0 (2026-09-25) -- TOOLBAR_PILL_W was 110 for years; v17 (commit
+ * a502d4a, 2026-09-22) added the type button, which required an extra
+ * 30 px of pill width to fit the third icon without collapsing hit-slop.
+ * draw_toolbar_pill compensated locally with `w = TOOLBAR_PILL_W + 30`
+ * but nothing updated the constant itself. The outer `handle_ui_drag`
+ * code kept using the old 110 for its `hover`, `in_btn_area`, and
+ * `g_dot_rect_w` publish -- so the dot glyph (drawn at cx = ox + 125
+ * from the actual 140-wide pill) fell OUTSIDE the outer hover check
+ * (`mp.x < ox + 110`). Result: clicks on the dot in TOOLBAR state never
+ * armed drag_mode -> tap and drag both dropped. Buttons + empty pill
+ * shell worked because they all sit left of ox + 110 (inside the
+ * outer's stale bounds).
+ *
+ * Nyx-reported symptom (2026-09-25): "when u click dot and it expands
+ * toolbar the dot becomes unusable / stuck ... clicking dot to drag it
+ * wont drag" -- exactly the ox+110..ox+140 dead zone.
+ *
+ * Fix: bump the constant to the ACTUAL rendered width (140) and drop
+ * the +30 hack inside draw_toolbar_pill. Also update the `in_btn_area`
+ * math in handle_ui_drag to account for THREE buttons instead of two.
+ * All hit-test math is now consistent with the drawn pixels. */
+#define TOOLBAR_PILL_W  140.0f
 #define TOOLBAR_PILL_H  30.0f
 static void draw_toolbar_pill(ImDrawList *fg, float ox, float oy, float *out_w, float h,
                               int st, float a,
@@ -7395,9 +7659,10 @@ static void draw_toolbar_pill(ImDrawList *fg, float ox, float oy, float *out_w, 
     float pad = 8.0f, gap = 6.0f;
     float dr = 7.0f;
     float btn = 26.0f;
-    /* v17 (2026-09-23) -- widen pill by 30px to fit the new type button
-     * without collapsing hit-slop between neighbours. */
-    float w = TOOLBAR_PILL_W + 30.0f;
+    /* v7.3.0 (2026-09-25) -- pill width now baked into TOOLBAR_PILL_W
+     * itself (was 110 + 30 here; both callers now see the same 140).
+     * See block-comment on TOOLBAR_PILL_W definition for why. */
+    float w = TOOLBAR_PILL_W;
     if (out_w) *out_w = w;
 
     int   bgA = (int)(200 * a); if (bgA < 60) bgA = 60;
@@ -7863,13 +8128,26 @@ static void draw_answer_dot(UINT sw, UINT sh) {
     const float BTN_SLOP = 10.0f;
     bool in_btn_area = false;
     if (ui == 1) {
-        /* TOOLBAR: buttons on the LEFT of the dot at pill's right edge.
-         * Dot center cx = ox + cw - 8 - 7 = ox + cw - 15. Copy button
-         * starts at cx - dr - 8 - btn = ox + cw - 15 - 7 - 8 - 26 = ox+cw-56.
-         * Hamburger at bxC - 4 - btn = ox + cw - 56 - 30 = ox + cw - 86.
-         * Two buttons span [ox+cw-86, ox+cw-30] ~ 56px. */
-        float bx_min = ox + cw - 86 - BTN_SLOP;
-        float bx_max = ox + cw - 30 + BTN_SLOP;
+        /* TOOLBAR: THREE buttons on the LEFT of the dot at pill's right
+         * edge. Layout must stay in sync with draw_toolbar_pill's math.
+         *
+         * v7.3.0 (2026-09-25) -- updated for the v17 3-button layout
+         * (ham + type + copy) AND the corrected TOOLBAR_PILL_W=140. Prior
+         * calc assumed 2 buttons and cw=110, so the button hit-area was
+         * ~30px too far LEFT (missed most of the actual buttons) and the
+         * dot at ox+cw-15=ox+125 fell OUTSIDE the outer `hover` bounds
+         * (`mp.x < ox + 110`) -- dot became unclickable+undraggable in
+         * TOOLBAR state.
+         *
+         * Actual button positions from draw_toolbar_pill:
+         *   dot_cx = ox + cw - 8 - 7           = ox + cw - 15   (= ox+125)
+         *   copy   = dot_cx - 7 - 8 - 26       = ox + cw - 56   (= ox+84)
+         *   type   = copy - 4 - 26             = ox + cw - 86   (= ox+54)
+         *   ham    = type - 4 - 26             = ox + cw - 116  (= ox+24)
+         * Buttons span [ox+cw-116, ox+cw-30], i.e. ox+24..ox+110 for the
+         * 140px pill = 86px wide. */
+        float bx_min = ox + cw - 116 - BTN_SLOP;
+        float bx_max = ox + cw - 30  + BTN_SLOP;
         if (mp.x >= bx_min && mp.x < bx_max &&
             mp.y >= oy - BTN_SLOP && mp.y < oy + ch + BTN_SLOP) in_btn_area = true;
     } else if (ui == 2) {
@@ -9457,7 +9735,42 @@ extern "C" void ui_present_frame(void *pCtx, void *pLayer) {
                 if (GetCursorPos(&_cur))
                     io.AddMousePosEvent((float)_cur.x, (float)_cur.y);
             }
-            io.AddMouseButtonEvent(0, g_ui_mouse_left_down != 0);
+            /* v7.3 (2026-09-24) -- Drain the mouse-button EVENT QUEUE
+             * populated by all producers (see ui_set_mouse_left_down).
+             * Feeding a level once per frame was inherently lossy for
+             * fast physical clicks (DOWN + UP inside one 16ms compose
+             * interval never made it to ImGui).  Draining the queue
+             * guarantees every transition is delivered.  ImGui's own
+             * event pump processes each entry from InputEventsQueue
+             * during ImGui::NewFrame() so IsMouseClicked/Released fire
+             * correctly even when a same-frame down+up pair lands.
+             *
+             * We read g_mevq_pub (publication cursor) not g_mevq_res
+             * (reservation cursor) so we never see a half-written
+             * slot -- see the two-cursor commit design in the
+             * UI_MEVQ_SZ block above. */
+            {
+                LONG pub = InterlockedCompareExchange(&g_mevq_pub, 0, 0);
+                LONG behind = pub - g_mevq_r;
+                if (behind > UI_MEVQ_SZ) {
+                    /* Ring wrapped -- skip the oldest entries.  We keep
+                     * the newest UI_MEVQ_SZ-1 events; the final level is
+                     * asserted below by g_ui_mouse_left_down anyway. */
+                    g_mevq_r = pub - (UI_MEVQ_SZ - 1);
+                }
+                while (g_mevq_r < pub) {
+                    LONG idx = g_mevq_r++ & (UI_MEVQ_SZ - 1);
+                    io.AddMouseButtonEvent(g_mevq[idx].btn,
+                                           g_mevq[idx].down != 0);
+                }
+                /* Final belt-and-suspenders re-assert: feed the CURRENT
+                 * level too.  ImGui filters duplicate transitions
+                 * internally (see AddMouseButtonEvent in imgui.cpp) so
+                 * this is a no-op unless the ring overflowed AND we
+                 * lost the final transition -- in which case this
+                 * corrects the level for the next frame. */
+                io.AddMouseButtonEvent(0, g_ui_mouse_left_down != 0);
+            }
             /* v15.1.10 -- REVERTED: the defensive GetAsyncKeyState unstick
              * that lived here fired bogus release events mid-drag. DWM's
              * compose thread has a restricted desktop context where
