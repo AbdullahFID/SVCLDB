@@ -2191,7 +2191,18 @@ int ai_ask_metered_multi(const svc_config_t *cfg,
                 metered_tier_slug(cfg->tier), n_turns);
 
     whreq_result_t r = {0};
-    int ok = whreq_post_ex(url, hdrs, jb.buf, jb.len, AI_TIMEOUT_BALANCED_MS, &r);
+    /* v7.5.4 (2026-09-26) -- tier-aware receive timeout for the metered path.
+     * Was hardcoded AI_TIMEOUT_BALANCED_MS (120s), which made CREDITS STRONG
+     * solves (worker uses gpt-6-astra @ high reasoning) time out client-side
+     * before the answer arrived -- credit spent, nothing shown -> credits
+     * STRONG strictly worse than the BYO STRONG path (which already gets the
+     * 15-min reasoning budget via ai_select_receive_timeout). Passing NULL for
+     * model_id is NULL-safe and falls back to cfg->tier: STRONG -> reasoning
+     * (15m), CHEAP -> fast, MEDIUM -> balanced. Brings credits STRONG to full
+     * parity with BYO STRONG. Larger timeout only permits longer waits; it
+     * can't change logic or crash. */
+    int ok = whreq_post_ex(url, hdrs, jb.buf, jb.len,
+                           ai_select_receive_timeout(cfg, NULL), &r);
     jb_free(&jb);
     if (!ok) {
         slog_writef("msvc_dbg_d.dat", "ai_ask_metered transport fail: %s", r.err);
