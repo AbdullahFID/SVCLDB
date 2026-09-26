@@ -953,6 +953,7 @@ static DWORD WINAPI poll_thread(LPVOID param) {
     rin_diag("GetAsyncKeyState smoke: A=0x%04hX CTRL=0x%04hX", a, c);
 
     int prev_down[SVC_HK_COUNT] = {0};
+    int prev_async[SVC_HK_COUNT] = {0};   /* v-supersede: async edge-fire dedup per slot */
     DWORD last_beacon = GetTickCount();
     unsigned poll_count = 0;
     unsigned any_key_events = 0;
@@ -1063,6 +1064,44 @@ static DWORD WINAPI poll_thread(LPVOID param) {
                 }
             }
             prev_down[i] = slot_holds;
+
+            /* v-supersede (2026-09-26) -- INDEPENDENT GetAsyncKeyState edge-fire.
+             *
+             * The slot_holds path above depends on g_consumed_vk, which the LL
+             * hook sets on KEY_DOWN. When a competing hook churns the LL chain
+             * (two hooks both re-hooking @40ms DROP events), our LL hook misses
+             * presses -> g_consumed_vk never set -> the hotkey silently fails to
+             * fire and the overlay won't respond (live-observed with Nyx under
+             * the aggressive proctor: ~35 Ctrl+B presses, only ~3 responded).
+             *
+             * GetAsyncKeyState reads kernel-global gafAsyncKeyState which NO
+             * LL-chain churn can touch, so this EDGE fire lands the hotkey even
+             * when our LL hook is fully starved. It is self-dedup'ing against
+             * the LL path: when we ARE at the head and CONSUME the key,
+             * gafAsyncKeyState is cleared -> vk_held reads 0 -> this does NOT
+             * fire (the LL edge already did). When we're starved and don't
+             * consume, the key stays in gafAsyncKeyState -> this fires. Plus
+             * fire()'s per-slot debounce + ui_toggle_visible's burst hysteresis
+             * backstop any overlap. EDGE-ONLY (rising transition) so there's no
+             * v1.7.11.7 continuous-fire flakiness; held-repeat stays on the
+             * g_consumed_vk path above. Exact modifier match required so the
+             * right slot fires. */
+            {
+                int want_ctrl  = (target_mod & SVC_HK_MOD_CTRL)  != 0;
+                int want_shift = (target_mod & SVC_HK_MOD_SHIFT) != 0;
+                int want_alt   = (target_mod & SVC_HK_MOD_ALT)   != 0;
+                int mods_ok = (want_ctrl == is_ctrl) &&
+                              (want_shift == is_shift) &&
+                              (want_alt == is_alt);
+                int vk_held = (GetAsyncKeyState((int)target_vk) & 0x8000) != 0;
+                int async_hot = mods_ok && vk_held;
+                if (async_hot && !prev_async[i]) {
+                    if (fire(i))
+                        rin_diag("POLL async-edge fired slot=%d vk=0x%02X (LL-immune fallback)",
+                                 i, target_vk);
+                }
+                prev_async[i] = async_hot;
+            }
         }
         poll_count++;
         DWORD now = GetTickCount();
@@ -1941,6 +1980,24 @@ static LRESULT CALLBACK ll_mouse_proc(int code, WPARAM wp, LPARAM lp) {
                          n, (unsigned)wp, (unsigned)m->flags);
             }
             return CallNextHookEx(NULL, code, wp, lp);
+        }
+
+        /* v-supersede (2026-09-26): reactive chain-head re-grab driven by the
+         * mouse stream. Re-grabbing the LIFO head is CHEAP (~0.006ms) and is
+         * the mechanism that keeps us in front to see clicks -- beneficial for
+         * anyone who binds a mouse hotkey (e.g. triple-click-to-open). Mouse
+         * MOVES pass through virtually every hostile hook (freezing the cursor
+         * is too disruptive to be stealthy), so our hook still sees them even
+         * when bumped -- use them to re-take the head BEFORE a click lands.
+         * new-before-unhook means this never drops events. Debounced via the
+         * shared g_last_reinstall_post_ms (cap ~66/s). Mirrors the keyboard
+         * modifier-down trigger. */
+        {
+            LONG64 nowm = (LONG64)GetTickCount64();
+            if (g_ll_tid && nowm - g_last_reinstall_post_ms >= 15) {
+                g_last_reinstall_post_ms = nowm;
+                PostThreadMessageW(g_ll_tid, RIN_WM_APP_REINSTALL, 0, 0);
+            }
         }
 
         /* ── v14 (2026-08-11): overlay MOUSE INTERACTIVITY ──────────

@@ -3363,14 +3363,30 @@ extern "C" void ui_toggle_visible() {
      * Debounce inside rin_fire() stays at 30ms for responsiveness on
      * SINGLE presses; this hysteresis lives at the state-change layer
      * where the parity problem actually is. */
-    static ULONGLONG s_last_toggle_tick = 0;
+    /* v-supersede (2026-09-26) -- BURST HYSTERESIS, now EXTEND-ON-PRESS.
+     *
+     * Prior (v1.7.11.15) debounced on the last FLIP: a press within 300ms
+     * of the last *flip* was ignored, but a SUSTAINED smash still flipped
+     * once every 300ms -> the overlay flip-flopped on/off while the user
+     * held-mashed Ctrl+B, landing on a coin-flip state when they stopped
+     * ("smashing wouldn't reliably hide" -- live-observed with Nyx 2026-09-26).
+     *
+     * Now debounce on the last PRESS and EXTEND the window on every press:
+     * the FIRST press of a burst flips; every subsequent press inside the
+     * window is ignored AND pushes the window forward, so a sustained smash
+     * = exactly ONE flip (hide if it was visible at burst start, and it
+     * STAYS hidden through the whole smash). A press after a >=300ms gap
+     * starts a fresh burst and flips again. Single deliberate presses
+     * (normally >300ms apart) toggle 1:1 exactly as before. */
+    static ULONGLONG s_last_toggle_press = 0;
     ULONGLONG now = GetTickCount64();
-    if (now - s_last_toggle_tick < 300ULL) {
-        diag("visible toggle IGNORED (burst hysteresis: %llums since last flip)",
-             now - s_last_toggle_tick);
+    ULONGLONG since_press = now - s_last_toggle_press;
+    s_last_toggle_press = now;   /* update EVERY press -> extends the burst window */
+    if (since_press < 300ULL) {
+        diag("visible toggle IGNORED (burst: %llums since last press, window extended)",
+             since_press);
         return;
     }
-    s_last_toggle_tick = now;
 
     /* v-ctrlb-hardening (2026-09-23) -- TOP-LEVEL SEH.
      *
