@@ -2276,9 +2276,22 @@ void hooks_uninstall(void) {
      * This is what solves "overlay stays on screen after killing the
      * payload" -- WITHOUT this sleep, MH_DisableHook cuts off hooks
      * MID-FRAME and the last drawn overlay pixels persist. */
-    hook_diag("hooks_uninstall: sleeping 200ms for clean-frame drain "
-              "(PN still returns TRUE to force compose)");
-    Sleep(200);
+    /* v-audit-hardening (2026-09-26) -- P2-3 (opus-4.7 Audit A): this drain
+     * does DOUBLE duty. (1) clean-frame drain: PN still returns TRUE so DWM
+     * keeps compositing and orig-Present overwrites our last overlay pixels
+     * before we cut the hooks. (2) in-flight-detour drain: MinHook's
+     * MH_Uninitialize (below) FREES the trampoline; if a dwmcore compose
+     * thread is still inside g_orig_present when that happens, it returns
+     * into freed memory -> AV in DWM on unload/upgrade/uninstall. 200ms was
+     * a heuristic that a GPU stall / TDR / VRR-synced long Present can exceed.
+     * Widened 200 -> 500ms: the overlay is already hidden (draw skipped), so
+     * the only cost is +300ms on the (rare) unload path -- imperceptible for
+     * --unload / installer upgrade / uninstall, and it materially shrinks the
+     * in-flight-detour crash window. Not a hard barrier (a refcount would be),
+     * but a strict, zero-risk improvement. */
+    hook_diag("hooks_uninstall: sleeping 500ms for clean-frame + in-flight "
+              "detour drain (PN still returns TRUE to force compose)");
+    Sleep(500);
 
     /* Step 3: now clear g_active. From this point PN will return
      * orig (see Detour_DisplayPresentNeeded: `if (!g_active) return
