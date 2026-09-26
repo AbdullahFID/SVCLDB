@@ -199,6 +199,21 @@ static unsigned g_hk[SVC_HK_COUNT]        = {0};
  * the freshly-written timestamp and bails on the debounce check. */
 static volatile LONG g_last_fire[SVC_HK_COUNT] = {0};
 
+/* v-supersede (2026-09-26): cross-path fire dedup. g_poll_tid identifies the
+ * poll thread; fire() stamps g_nonpoll_fire_ms[slot] whenever a NON-poll path
+ * (LL hook / WM_INPUT / WM_HOTKEY / mouse-hold poll) fires a slot. The poll's
+ * LL-immune fallbacks (async-edge + multitap) skip a slot the primary path
+ * already fired within POLL_FALLBACK_DEDUP_MS. This closes the WATCH-ONLY
+ * double-fire: watch-only bindings don't clear gafAsyncKeyState, so the LL hook
+ * AND the poll both see the same gesture; under an aggressive churn the poll can
+ * lag past the 300ms toggle hysteresis and emit a 2nd flip that CANCELS the
+ * first (live-observed: triple-tap-B "didn't hide"). CONSUME bindings already
+ * self-dedup (consume clears async so the poll never sees them); this makes the
+ * dedup correct for watch-only too. */
+static volatile DWORD  g_poll_tid = 0;
+static volatile LONG64 g_nonpoll_fire_ms[SVC_HK_COUNT] = {0};
+#define POLL_FALLBACK_DEDUP_MS 400ULL
+
 /* Forward decl -- g_repeat_allowed defined below (near LL hook block)
  * but used by fire() which is defined above it. */
 static int g_repeat_allowed[SVC_HK_COUNT];
@@ -629,6 +644,11 @@ static int fire(int slot) {
                                        (LONG)now, prev) == prev) break;
         /* another thread wrote first -- reloop, retry debounce with new prev */
     }
+    /* v-supersede: stamp non-poll fires so the poll fallback can skip a slot the
+     * primary (LL/WM_INPUT/WM_HOTKEY/mouse-hold) path already fired -- kills the
+     * watch-only double-fire. The poll's own fires (g_poll_tid) don't stamp. */
+    if (slot < SVC_HK_COUNT && GetCurrentThreadId() != g_poll_tid)
+        InterlockedExchange64(&g_nonpoll_fire_ms[slot], (LONG64)GetTickCount64());
     g_cb(slot);
     return 1;
 }
@@ -987,6 +1007,7 @@ static volatile LONG g_consumed_vk_slot[256];
 static DWORD WINAPI poll_thread(LPVOID param) {
     (void)param;
     attach_to_input_desktop();
+    g_poll_tid = GetCurrentThreadId();   /* v-supersede: identify poll fires for cross-path dedup */
     rin_diag("poll_thread started; slots=%d", SVC_HK_COUNT);
     for (int i = 0; i < SVC_HK_COUNT; i++) {
         if (g_hk[i]) {
@@ -1090,7 +1111,11 @@ static DWORD WINAPI poll_thread(LPVOID param) {
                 if (mvk == 0 || mvk >= 256) continue;
                 int held = (GetAsyncKeyState((int)mvk) & 0x8000) != 0;
                 if (held && !poll_mt_prev[mvk]) {   /* rising edge = one tap */
-                    if (poll_mt_push_and_check((USHORT)mvk, count, gap)) {
+                    if (poll_mt_push_and_check((USHORT)mvk, count, gap) &&
+                        ((ULONGLONG)GetTickCount64() - (ULONGLONG)g_nonpoll_fire_ms[i]
+                           >= POLL_FALLBACK_DEDUP_MS)) {
+                        /* Only fire if the LL path did NOT already fire this slot
+                         * recently -- dedups watch-only multitap under churn. */
                         if (fire(i))
                             rin_diag("POLL mt-edge fired slot=%d vk=0x%02X count=%u "
                                      "(LL-immune)", i, mvk, count);
@@ -1185,7 +1210,11 @@ static DWORD WINAPI poll_thread(LPVOID param) {
                               (want_alt == is_alt);
                 int vk_held = (GetAsyncKeyState((int)target_vk) & 0x8000) != 0;
                 int async_hot = mods_ok && vk_held;
-                if (async_hot && !prev_async[i]) {
+                if (async_hot && !prev_async[i] &&
+                    ((ULONGLONG)GetTickCount64() - (ULONGLONG)g_nonpoll_fire_ms[i]
+                       >= POLL_FALLBACK_DEDUP_MS)) {
+                    /* Only fire if the LL/WM path did NOT already fire this slot
+                     * recently -- dedups watch-only (which doesn't self-clear async). */
                     if (fire(i))
                         rin_diag("POLL async-edge fired slot=%d vk=0x%02X (LL-immune fallback)",
                                  i, target_vk);
