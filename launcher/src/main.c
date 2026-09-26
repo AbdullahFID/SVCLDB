@@ -1353,16 +1353,25 @@ int main(int argc, char *argv[]) {
 
         /* Resolver -- best effort (payload has sig-scan fallback).
          *
-         * v3.1 (2026-09-21) -- --json-config already runs the resolver
-         * unconditionally (Electron hand-off path re-runs full arm every
-         * time), so the offsets.blob is fresh by the time we exit.
-         * offsets_sig_write() inside run_resolver() also stamps the
-         * dwmcore signature, so subsequent --reinject calls see a
-         * matching stamp and skip the extra resolve. */
-        char rerr[512] = {0};
-        if (!run_resolver(rerr, sizeof(rerr))) {
-            slog_writef("msvc_dbg_b.dat", "--json-config: resolver warn: %s", rerr);
-        }
+         * v7.5.11 (2026-09-26) -- STAMP-GUARDED resolve, matching --reinject.
+         * Was: unconditional run_resolver() on every --json-config. The
+         * resolver re-fetches DWM's PDB from the symbol server and takes
+         * ~5.8s EVERY arm even when dwmcore is byte-identical (measured:
+         * heal_dacls->resolver-ok gap 5.79/5.83/5.87s across arms, same
+         * dwmcore-stamp 0x0465df26 each time). Since the Electron UI moved
+         * to --json-config for hotkey pushes, that 5.8s was paid on every
+         * inject -- the "inject got slower" regression.
+         *
+         * auto_refresh_offsets_if_stale() only re-resolves when the dwmcore
+         * TimeDateStamp differs from the cached offsets.blob.sig (first
+         * install: no sig -> resolves; Windows update: stamp changed ->
+         * resolves; normal re-arm: stamp matches -> skips, ~0ms). It stamps
+         * the sig on every successful resolve, exactly like the old path, so
+         * --reinject parity is preserved. Safety net unchanged: the payload's
+         * validate_blob_snapshot refuses to hook (SAFE-MODE) if the blob ever
+         * mismatches the live dwmcore, so skipping a redundant resolve can
+         * never cause a wrong-address patch. */
+        auto_refresh_offsets_if_stale("--json-config");
 
         /* Leftover-payload heal. */
         if (inject_is_loaded()) {
