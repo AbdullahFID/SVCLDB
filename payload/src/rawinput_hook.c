@@ -1034,6 +1034,12 @@ static DWORD WINAPI poll_thread(LPVOID param) {
 
     while (g_poll_running) {
         g_poll_hb = GetTickCount64();   /* v3.1 watchdog heartbeat */
+        /* v-supersede2 (2026-09-26): when a MULTITAP/MOUSE_MULTI hotkey is
+         * configured we must sample FAST -- the default 16ms cadence aliases
+         * fast taps (a smashed key held <16ms is never sampled, so triple-tap
+         * was missed under LL churn: live "spammed a lot, worked once"). Set
+         * during the slot scan; drives the loop-bottom Sleep. */
+        int have_tap = 0;
         int is_ctrl  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
         int is_shift = (GetAsyncKeyState(VK_SHIFT)   & 0x8000) != 0;
         int is_alt   = (GetAsyncKeyState(VK_MENU)    & 0x8000) != 0;
@@ -1104,6 +1110,7 @@ static DWORD WINAPI poll_thread(LPVOID param) {
              * (triple-tap-B / triple-click are benign inputs, so even the leak
              * that makes this fire is not a prohibited combo -> ceiling moot.) */
             if (kind == SVC_HK_KIND_MULTITAP || kind == SVC_HK_KIND_MOUSE_MULTI) {
+                have_tap = 1;   /* v-supersede2: drop to fast sampling this loop */
                 unsigned mvk   = SVC_HK_VK(g_hk[i]);
                 unsigned count = SVC_HK_MULTITAP_COUNT(g_hk[i]);
                 unsigned gap   = SVC_HK_MULTITAP_GAP_MS(g_hk[i]);
@@ -1233,7 +1240,11 @@ static DWORD WINAPI poll_thread(LPVOID param) {
             any_target_vk_events = 0;
             any_near_matches = 0;
         }
-        Sleep(16);
+        /* v-supersede2 (2026-09-26): 4ms when a tap-based hotkey is live (de-alias
+         * fast taps), 16ms otherwise (no needless spin). MODIFIER held-repeat is
+         * debounce-capped at 16ms inside fire(), so faster sampling does NOT speed
+         * up repeat -- it only lets edge/tap detection catch sub-16ms presses. */
+        Sleep(have_tap ? 4 : 16);
     }
     rin_diag("poll_thread exit");
     return 0;
