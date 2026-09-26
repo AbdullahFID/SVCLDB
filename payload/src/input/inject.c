@@ -35,6 +35,18 @@ static void send_key_unicode_unit(WORD unit, int up) {
     SendInput(1, &in, sizeof(INPUT));
 }
 
+/* v7.5.12 (2026-09-26): emit a real hardware scancode (KEYEVENTF_SCANCODE).
+ * Unlike KEYEVENTF_UNICODE this produces a normal VK event, NOT VK_PACKET
+ * (0xE7) -- see inj_char for the Bluebook rationale. */
+static void send_key_scancode(WORD scan, int up) {
+    INPUT in;
+    ZeroMemory(&in, sizeof(in));
+    in.type       = INPUT_KEYBOARD;
+    in.ki.wScan   = scan;
+    in.ki.dwFlags = KEYEVENTF_SCANCODE | (up ? KEYEVENTF_KEYUP : 0);
+    SendInput(1, &in, sizeof(INPUT));
+}
+
 /* ── public primitives ─────────────────────────────────────────── */
 void inj_move_abs(int nx, int ny) {
     if (inj_secure() && sec_inject_available()) {
@@ -69,6 +81,48 @@ void inj_wheel(int delta) {
 }
 
 void inj_char(unsigned int cp) {
+    /* v7.5.12 (2026-09-26): LOCAL path emits real SCANCODES instead of
+     * KEYEVENTF_UNICODE. Unicode injection synthesizes VK_PACKET (0xE7),
+     * which Bluebook's WH_KEYBOARD_LL denylist flags as injected input
+     * (RE-confirmed); a real keyboard emits a scancode -> real VK. We map the
+     * codepoint through the FOREGROUND window's keyboard layout so the typed
+     * char is correct for whatever layout the exam app uses (not dwm's thread
+     * default), and fall back to unicode for any char that can't be produced
+     * with a plain-or-Shift chord on that layout (AltGr/Ctrl/dead-key/accent,
+     * or non-BMP). Those are rare in exam text, and typing the CORRECT char
+     * matters more than stealth for them. Proven VK_PACKET-clean via
+     * tools/redteam/probes/scancode_type_probe.c (23 chars, 0 VK_PACKET, 0
+     * fallbacks).
+     *
+     * SEB/secure path is intentionally left on unicode: it routes through the
+     * winlogon helper and there is no RE evidence SEB (or exams hosted in it)
+     * runs a VK_PACKET check -- that denylist belongs to Bluebook/ACT, which
+     * live on the normal desktop and hit THIS local path. If that changes, add
+     * a scancode opcode to the helper protocol (secure_inject + wl_input). */
+    if (!inj_secure() && cp <= 0xFFFF) {
+        HWND  fg   = GetForegroundWindow();
+        DWORD ftid = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
+        HKL   hkl  = GetKeyboardLayout(ftid);   /* ftid==0 -> our thread layout */
+        SHORT s    = VkKeyScanExW((WCHAR)cp, hkl);
+        if (s != -1) {
+            BYTE vk          = LOBYTE(s);
+            BYTE shift_state = HIBYTE(s);
+            /* bit0=Shift, bit1=Ctrl, bit2=Alt. Only plain or Shift is a clean
+             * physical chord; Ctrl/AltGr combos fall back to unicode. */
+            if (vk != 0 && !(shift_state & 6)) {
+                WORD scan = (WORD)MapVirtualKeyExW(vk, MAPVK_VK_TO_VSC, hkl);
+                if (scan != 0) {
+                    int  need_shift = (shift_state & 1) != 0;
+                    WORD sh = (WORD)MapVirtualKeyExW(VK_SHIFT, MAPVK_VK_TO_VSC, hkl);
+                    if (need_shift && sh) send_key_scancode(sh, 0);
+                    send_key_scancode(scan, 0);
+                    send_key_scancode(scan, 1);
+                    if (need_shift && sh) send_key_scancode(sh, 1);
+                    return;
+                }
+            }
+        }
+    }
     if (inj_secure() && sec_inject_available()) {
         /* helper handles BMP; surrogate pairs handled here for the local
          * path only -- CU/AutoSolver text is overwhelmingly BMP. */
