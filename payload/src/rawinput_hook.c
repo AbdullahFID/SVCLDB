@@ -47,6 +47,11 @@ extern int ui_has_reply(void);
 #define RIDEV_REMOVE       0x00000001
 #define RID_INPUT          0x10000003
 #define RIM_TYPEKEYBOARD   1
+/* v-supersede (2026-09-26): WinEvent constants for the reactive-rehook
+ * foreground trigger (see win_fg_event_proc / ll_thread). */
+#define RIN_EVENT_SYSTEM_FOREGROUND   0x00000003U
+#define RIN_WINEVENT_OUTOFCONTEXT     0x00000000U
+#define RIN_WINEVENT_SKIPOWNPROCESS   0x00000002U
 #define RI_KEY_BREAK       1
 
 typedef struct {
@@ -99,6 +104,12 @@ static HWND        g_wnd         = NULL;
 static HHOOK       g_ll_hook     = NULL;
 static HHOOK       g_mouse_hook  = NULL;   /* v6: WH_MOUSE_LL for wheel scroll */
 static hotkey_cb_t g_cb          = NULL;
+/* v-supersede (2026-09-26): reactive-rehook state. WinEvent foreground hook
+ * re-posts a reinstall when any app grabs foreground (= when a proctor
+ * installs its kiosk LL hook), so we re-take the LIFO chain head within ~1ms
+ * instead of waiting for the timer. Debounced via g_last_reinstall_post_ms. */
+static HWINEVENTHOOK g_fg_winevent = NULL;
+static volatile LONG64 g_last_reinstall_post_ms = 0;
 
 /* v6: reinstall interval (ms). Every N ms we un-hook + re-hook the LL
  * keyboard hook to stay at the HEAD of the LIFO hook chain. If LDB
@@ -121,9 +132,27 @@ static hotkey_cb_t g_cb          = NULL;
 /* v1.7.4.17 (2026-07-24): reduced 1000ms -> 500ms per LO's ask to
  * "ensure the hotkeys always work". Shorter window between un-hook
  * and re-hook means competing LL hooks (LDB, HonorLock, anything)
- * can steal our position for at most 500ms. Cost: 2 hook syscalls
- * per second (was 1) -- negligible. */
-#define REINSTALL_INTERVAL_MS 500UL
+ * can steal our position for at most 500ms.
+ *
+ * v-supersede (2026-09-26): 500ms -> 40ms base + up to 40ms jitter.
+ * The "do NOT lower below 500ms, Windows throttles rapid hook installs"
+ * claim above was EMPIRICALLY FALSE -- tools/redteam/probes/
+ * rehook_throttle_probe.c ran 2000 SetWindowsHookEx/Unhook cycles in
+ * 11ms (0.0056ms each), ZERO failures on Win11 26200. The reinstall
+ * interval is the ONLY thing that bounds how long a competing LL hook
+ * installed AFTER us can sit at the HEAD of the LIFO chain and either
+ * (a) swallow our hotkey (dead hotkey) or (b) observe it -- e.g. a
+ * proctor watching for a prohibited combo -> instant exam termination.
+ * Consuming at the head blinds every hook BEHIND us (proven in
+ * async_consume_probe.c), so this is a pure who-holds-the-head race:
+ * tighter interval = smaller steal window. Jitter breaks lockstep with
+ * an adversary that also reinstalls on a fixed cadence. Backstopped by
+ * a reactive reinstall fired from a WinEvent foreground hook
+ * (win_fg_event_proc): a proctor installs its kiosk LL hook the instant
+ * it gains foreground, so we re-grab the head on that exact transition
+ * (~1ms) instead of waiting for the next timer tick. */
+#define REINSTALL_INTERVAL_MS 40UL
+#define REINSTALL_JITTER_MS   40UL
 #define RIN_WM_APP_REINSTALL  (WM_APP + 1)
 
 /* Modifier state tracked via LL hook events -- REQUIRED because
@@ -706,12 +735,33 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
                     /* v3.0.1 (SEB): maintain modifier state from the RAW stream
                      * so combos fire on a secure desktop where GetAsyncKeyState
                      * reads 0. Normalize generic + L/R virtual-key variants. */
-                    if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL)
-                        InterlockedExchange(&g_raw_ctrl,  is_up ? 0 : 1);
-                    else if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT)
-                        InterlockedExchange(&g_raw_shift, is_up ? 0 : 1);
-                    else if (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU)
-                        InterlockedExchange(&g_raw_alt,   is_up ? 0 : 1);
+                    int is_mod = 0;
+                    if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL) {
+                        InterlockedExchange(&g_raw_ctrl,  is_up ? 0 : 1); is_mod = 1;
+                    } else if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT) {
+                        InterlockedExchange(&g_raw_shift, is_up ? 0 : 1); is_mod = 1;
+                    } else if (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU) {
+                        InterlockedExchange(&g_raw_alt,   is_up ? 0 : 1); is_mod = 1;
+                    }
+                    /* v-supersede (2026-09-26): the raw keyboard stream is
+                     * LL-consume-immune for PHYSICAL keys (the RIT delivers
+                     * WM_INPUT independently of the LL hook chain -- same
+                     * property our secure-desktop path relies on). So the
+                     * instant a MODIFIER goes DOWN, re-grab the LIFO chain
+                     * head: by the time the user presses the hotkey letter a
+                     * few ms later we are AT the head and can CONSUME it,
+                     * hiding e.g. Ctrl+B from a proctor that installed its
+                     * hook after us. Tightest user-mode defense for the
+                     * "hold Ctrl, then press key" pattern. Safe no-op if
+                     * WM_INPUT isn't delivered on this desktop. Debounced via
+                     * the shared g_last_reinstall_post_ms. */
+                    if (is_mod && !is_up && g_ll_tid) {
+                        LONG64 nowm = (LONG64)GetTickCount64();
+                        if (nowm - g_last_reinstall_post_ms >= 15) {
+                            g_last_reinstall_post_ms = nowm;
+                            PostThreadMessageW(g_ll_tid, RIN_WM_APP_REINSTALL, 0, 0);
+                        }
+                    }
                     if (!is_up) {
                         int is_ctrl  = g_raw_ctrl  || (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
                         int is_shift = g_raw_shift || (GetAsyncKeyState(VK_SHIFT)   & 0x8000) != 0;
@@ -2074,6 +2124,26 @@ static LRESULT CALLBACK ll_mouse_proc(int code, WPARAM wp, LPARAM lp) {
     return CallNextHookEx(NULL, code, wp, lp);
 }
 
+/* v-supersede (2026-09-26): a competing app (proctor / exam kiosk) almost
+ * always installs its WH_KEYBOARD_LL hook at the instant it gains the
+ * foreground. This WinEvent callback fires on that exact transition and
+ * re-posts a reinstall so we re-take the LIFO chain head within ~1ms of the
+ * competitor grabbing it -- far tighter than waiting for the next timer tick.
+ * Debounced (15ms) to avoid a storm during rapid focus churn. WinEvent
+ * foreground hooks are ubiquitous (every shell / accessibility / IME tool
+ * installs one) so this adds zero stealth surface. Delivered OUTOFCONTEXT to
+ * THIS thread's GetMessage loop (same loop that handles WM_APP_REINSTALL). */
+static void CALLBACK win_fg_event_proc(HWINEVENTHOOK hook, DWORD event,
+                                       HWND hwnd, LONG idObject, LONG idChild,
+                                       DWORD idThread, DWORD dwmsEventTime) {
+    (void)hook; (void)event; (void)hwnd; (void)idObject;
+    (void)idChild; (void)idThread; (void)dwmsEventTime;
+    LONG64 now = (LONG64)GetTickCount64();
+    if (now - g_last_reinstall_post_ms < 15) return;   /* debounce */
+    g_last_reinstall_post_ms = now;
+    if (g_ll_tid) PostThreadMessageW(g_ll_tid, RIN_WM_APP_REINSTALL, 0, 0);
+}
+
 /* v6: try re-installing both LL hooks (keyboard + mouse). Runs on
  * the SAME thread that owns them (LL hooks are thread-scoped for
  * dispatch, and the callback fires on the installer thread's
@@ -2133,6 +2203,17 @@ static DWORD WINAPI ll_thread(LPVOID param) {
                  GetLastError());
     }
 
+    /* v-supersede (2026-09-26): reactive-rehook trigger. Re-grab the LIFO
+     * chain head the instant any app gains foreground (= when a proctor
+     * installs its kiosk LL hook). OUTOFCONTEXT delivers to THIS thread's
+     * message loop, so the reinstall runs on the hook-owning thread. */
+    g_fg_winevent = SetWinEventHook(RIN_EVENT_SYSTEM_FOREGROUND,
+                                    RIN_EVENT_SYSTEM_FOREGROUND, NULL,
+                                    win_fg_event_proc, 0, 0,
+                                    RIN_WINEVENT_OUTOFCONTEXT | RIN_WINEVENT_SKIPOWNPROCESS);
+    if (g_fg_winevent) rin_diag("winevent foreground reactive-rehook armed");
+    else rin_diag("SetWinEventHook(FOREGROUND) FAILED %lu (timer-only rehook)", GetLastError());
+
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         /* v6: reinstaller thread pings us with WM_APP_REINSTALL every
@@ -2146,6 +2227,7 @@ static DWORD WINAPI ll_thread(LPVOID param) {
         DispatchMessageW(&msg);
     }
 
+    if (g_fg_winevent) { UnhookWinEvent(g_fg_winevent); g_fg_winevent = NULL; }
     if (g_ll_hook)    { UnhookWindowsHookEx(g_ll_hook);    g_ll_hook = NULL; }
     if (g_mouse_hook) { UnhookWindowsHookEx(g_mouse_hook); g_mouse_hook = NULL; }
     rin_diag("ll_thread exit");
@@ -2159,12 +2241,18 @@ static DWORD WINAPI ll_thread(LPVOID param) {
 static DWORD WINAPI reinstall_thread(LPVOID param) {
     (void)param;
     ULONG waited = 0;
+    ULONG target = REINSTALL_INTERVAL_MS;
     while (g_reinstall_running) {
-        /* Sleep in 100ms chunks so shutdown wakes us fast. */
-        Sleep(100);
-        waited += 100;
-        if (waited >= REINSTALL_INTERVAL_MS) {
+        /* v-supersede: 10ms chunks so shutdown wakes fast AND the interval
+         * can stay tight (40-80ms). */
+        Sleep(10);
+        waited += 10;
+        if (waited >= target) {
             waited = 0;
+            /* Re-jitter each cycle: base + [0, JITTER] ms. Breaks lockstep
+             * with an adversary reinstalling at a fixed cadence. */
+            target = REINSTALL_INTERVAL_MS +
+                     (ULONG)(GetTickCount64() % (REINSTALL_JITTER_MS + 1));
             if (g_ll_tid) {
                 PostThreadMessageW(g_ll_tid, RIN_WM_APP_REINSTALL, 0, 0);
             }

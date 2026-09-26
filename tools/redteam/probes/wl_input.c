@@ -1306,11 +1306,14 @@ static void run_reader(const char *deskname) {
      * / hk-table-refresh / periodic-LL-rehook all run promptly under
      * key-storm. */
     SetTimer(hwnd, 1, 100, NULL);
-    /* v3.3 (2026-09-23) -- periodic LL rehook cadence (500ms) so we
-     * stay at the HEAD of the LIFO chain even if a proctor kiosk installs
-     * its own LL after us. Same defense as the payload's REINSTALL_INTERVAL_MS
-     * (rawinput_hook.c) and the emergency_reinstall_thread. Timer id 2. */
-    SetTimer(hwnd, 2, 500, NULL);
+    /* v3.3 (2026-09-23) -- periodic LL rehook so we stay at the HEAD of the
+     * LIFO chain even if a proctor kiosk installs its own LL after us.
+     * v-supersede (2026-09-26) -- 500ms -> 50ms. Rehook is ~0.006ms
+     * (rehook_throttle_probe.c: 2000 cycles in 11ms, no throttle), so a
+     * tight cadence just shrinks the window a competing hook can sit ahead
+     * of us on the secure desktop. Mirrors the payload's REINSTALL_INTERVAL_MS
+     * drop. Timer id 2. */
+    SetTimer(hwnd, 2, 50, NULL);
     /* v3.3 (2026-09-23) -- hk-table refresh cadence (500ms). Cheap
      * mtime-gate; only actually re-reads the file when the payload wrote
      * a new one. Timer id 3. */
@@ -1398,10 +1401,10 @@ static void run_reader(const char *deskname) {
                 if (g_chat_ev) lg("reader: chat_ev opened (was pending)");
             }
             /* v3.3 (2026-09-23) -- timer id 2: periodic LL rehook to stay
-             * at HEAD of LIFO chain. Fires only on the 500ms timer, not
-             * the 100ms one, so key-storm doesn't cause rehook spam. Old
-             * hook uninstalled AFTER new one is up so we're never
-             * hookless. */
+             * at HEAD of LIFO chain. v-supersede (2026-09-26): 50ms cadence
+             * (was 500ms). Old hook uninstalled AFTER new one is up so we're
+             * never hookless. Rehook cost is negligible so the tighter
+             * cadence is free insurance against a same-desktop competitor. */
             if (m.wParam == 2) {
                 HHOOK nh = SetWindowsHookExW(13, wl_ll_kbd, NULL, 0);
                 if (nh) {

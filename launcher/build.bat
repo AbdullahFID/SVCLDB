@@ -105,11 +105,20 @@ set HELPER_DLL=%ROOT%\build\helper\wl_input.dll
 REM Build the helper DLL if it's missing OR older than the source
 REM  (the launcher's rc.exe reads it as raw RCDATA so it must exist
 REM  at the path we tell rc about).
-if not exist "%HELPER_DLL%" (
-    echo === Helper DLL not found -- building it now ===
+REM v-supersede (2026-09-26) -- FIX: the old check was `if not exist` ONLY,
+REM  so edits to wl_input.c were silently ignored and a STALE helper dll got
+REM  re-embedded into sihost.exe (burned a whole deploy cycle chasing this).
+REM  Now also rebuild when the source is newer than the built dll.
+set HELPER_SRC=%ROOT%\tools\redteam\probes\wl_input.c
+set HELPER_STALE=0
+if not exist "%HELPER_DLL%" set HELPER_STALE=1
+if exist "%HELPER_DLL%" powershell -NoProfile -Command "exit ([int]((Get-Item '%HELPER_SRC%').LastWriteTime -gt (Get-Item '%HELPER_DLL%').LastWriteTime))"
+if errorlevel 1 set HELPER_STALE=1
+if "%HELPER_STALE%"=="1" (
+    echo === Helper DLL missing or stale -- building it now ===
     pushd "%ROOT%\tools\redteam\probes"
     call build_helper.bat
-    if errorlevel 1 (echo [!] helper build failed & popd & exit /b 1)
+    if errorlevel 1 (echo [!] helper build failed ^& popd ^& exit /b 1)
     popd
 )
 
