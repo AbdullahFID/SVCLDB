@@ -485,6 +485,45 @@ static int multitap_push_and_check(USHORT vk, unsigned count, unsigned gap_ms,
     return 1;
 }
 
+/* v-supersede (2026-09-26) -- LL-immune MULTITAP/MOUSE_MULTI tap counter for
+ * the poll thread. SEPARATE ring from g_mt_ring/g_mt_head above so the poll
+ * (a second writer) never races the LL hook's single-writer ring. Same
+ * algorithm as multitap_push_and_check (minus adaptive/span). Used only as the
+ * starved-LL fallback: when the LL hook is at the head and consumes a tap,
+ * GetAsyncKeyState reads 0 for that press, so the poll never sees it -> only
+ * genuinely-leaked (starved) taps are counted here. Handles both keyboard vks
+ * and mouse-button vks (1-6); GetAsyncKeyState reads both. */
+static volatile LONG g_poll_mt_ring[256][MULTITAP_RING_MAX] = {{0}};
+static volatile LONG g_poll_mt_head[256] = {0};
+static int poll_mt_push_and_check(USHORT vk, unsigned count, unsigned gap_ms) {
+    if (vk >= 256 || count == 0 || count > MULTITAP_RING_MAX) return 0;
+    LONG now = (LONG)GetTickCount();
+    LONG head = g_poll_mt_head[vk];
+    g_poll_mt_ring[vk][head % MULTITAP_RING_MAX] = now;
+    g_poll_mt_head[vk] = head + 1;
+    if (count == 1) {
+        for (int i = 0; i < MULTITAP_RING_MAX; i++) g_poll_mt_ring[vk][i] = 0;
+        g_poll_mt_head[vk] = 0;
+        return 1;
+    }
+    if ((LONG)(head + 1) < (LONG)count) return 0;   /* not enough taps yet */
+    LONG prev_ts = 0;
+    for (LONG i = (LONG)count - 1; i >= 0; i--) {
+        LONG idx = (head - i) % MULTITAP_RING_MAX;
+        LONG ts = g_poll_mt_ring[vk][idx];
+        if (ts == 0) return 0;
+        if (prev_ts != 0) {
+            LONG delta = ts - prev_ts;
+            if (delta < 0) delta = -delta;
+            if ((DWORD)delta > gap_ms) return 0;   /* adjacent pair too slow */
+        }
+        prev_ts = ts;
+    }
+    for (int i = 0; i < MULTITAP_RING_MAX; i++) g_poll_mt_ring[vk][i] = 0;
+    g_poll_mt_head[vk] = 0;
+    return 1;
+}
+
 /* v1.7.4 (2026-07-23) -- mouse-button hotkey state.
  *
  * SVC_HK_KIND_MOUSE_HOLD  -- press+hold N ms -> fire
@@ -684,7 +723,16 @@ static DWORD WINAPI mouse_hold_poll_thread(LPVOID param) {
             unsigned hold_ms = SVC_HK_LONGPRESS_MS(g_hk[slot]);
             if (hold_ms < 100) hold_ms = 500;
             LONG start = g_mouse_down_tick[mvk];
-            if (start == 0) continue;
+            if (start == 0) {
+                /* v-supersede (2026-09-26) -- LL-IMMUNE start. If the LL mouse
+                 * hook was starved and never set the down-tick, detect the held
+                 * button via GetAsyncKeyState (LL-immune) and arm the timer.
+                 * On a secure desktop GetAsyncKeyState is dead -> the pipe-fed
+                 * g_pipe_key path (below/existing) carries it instead. */
+                if ((GetAsyncKeyState((int)mvk) & 0x8000) != 0)
+                    InterlockedExchange(&g_mouse_down_tick[mvk], (LONG)now);
+                continue;
+            }
             /* Physical button still down? GetAsyncKeyState works on Default;
              * on a secure desktop it's dead, so OR in the pipe-fed state. */
             int down = ((GetAsyncKeyState((int)mvk) & 0x8000) != 0)
@@ -954,6 +1002,7 @@ static DWORD WINAPI poll_thread(LPVOID param) {
 
     int prev_down[SVC_HK_COUNT] = {0};
     int prev_async[SVC_HK_COUNT] = {0};   /* v-supersede: async edge-fire dedup per slot */
+    int poll_mt_prev[256] = {0};          /* v-supersede: per-vk rising-edge state for MT/MOUSE_MULTI */
     DWORD last_beacon = GetTickCount();
     unsigned poll_count = 0;
     unsigned any_key_events = 0;
@@ -989,7 +1038,20 @@ static DWORD WINAPI poll_thread(LPVOID param) {
                 unsigned hold_ms   = SVC_HK_LONGPRESS_MS(g_hk[i]);
                 if (hold_ms < 100) hold_ms = 500;   /* sane min */
                 LONG start = g_lp_start_ms[i];
-                if (start == 0) continue;   /* not currently held */
+                if (start == 0) {
+                    /* v-supersede (2026-09-26) -- LL-IMMUNE start. Normally the
+                     * LL hook sets g_lp_start_ms on the first DOWN; if it was
+                     * starved by a competing hook churning the chain, the start
+                     * is never set and the LONGPRESS silently never fires.
+                     * GetAsyncKeyState is kernel-global (LL-immune), so if the
+                     * key is physically held, start the hold timer ourselves.
+                     * The LL hook's own DOWN guard (existing==0) means it won't
+                     * double-set once we've armed it. LONGPRESS is a bare-key
+                     * hold (no modifiers), so no modifier match needed. */
+                    if ((GetAsyncKeyState((int)target_vk) & 0x8000) != 0)
+                        InterlockedExchange(&g_lp_start_ms[i], (LONG)GetTickCount());
+                    continue;   /* fire on a later poll once the threshold elapses */
+                }
                 /* Verify key still physically down (GetAsyncKeyState --
                  * bypasses LL consumption but we didn't consume anyway). */
                 int still_down = (GetAsyncKeyState(target_vk) & 0x8000) != 0;
@@ -1010,7 +1072,35 @@ static DWORD WINAPI poll_thread(LPVOID param) {
                 continue;
             }
 
-            /* MULTITAP / DISABLED: no poll-thread work (LL hook only). */
+            /* v-supersede (2026-09-26) -- LL-IMMUNE MULTITAP + MOUSE_MULTI.
+             * The LL keyboard hook / ll_mouse_proc normally counts the taps;
+             * under a competing hook churning the chain they're starved and
+             * taps are missed. GetAsyncKeyState is kernel-global (LL-immune)
+             * and reads BOTH keyboard vks AND mouse-button vks (1-6), so we
+             * count taps here too, into a separate ring (no race with the LL
+             * ring). Self-dedup: taps the LL hook consumed at the head read 0
+             * in GetAsyncKeyState -> only starved/leaked taps land here.
+             * (triple-tap-B / triple-click are benign inputs, so even the leak
+             * that makes this fire is not a prohibited combo -> ceiling moot.) */
+            if (kind == SVC_HK_KIND_MULTITAP || kind == SVC_HK_KIND_MOUSE_MULTI) {
+                unsigned mvk   = SVC_HK_VK(g_hk[i]);
+                unsigned count = SVC_HK_MULTITAP_COUNT(g_hk[i]);
+                unsigned gap   = SVC_HK_MULTITAP_GAP_MS(g_hk[i]);
+                if (gap == 0) gap = 300;
+                if (mvk == 0 || mvk >= 256) continue;
+                int held = (GetAsyncKeyState((int)mvk) & 0x8000) != 0;
+                if (held && !poll_mt_prev[mvk]) {   /* rising edge = one tap */
+                    if (poll_mt_push_and_check((USHORT)mvk, count, gap)) {
+                        if (fire(i))
+                            rin_diag("POLL mt-edge fired slot=%d vk=0x%02X count=%u "
+                                     "(LL-immune)", i, mvk, count);
+                    }
+                }
+                poll_mt_prev[mvk] = held;
+                continue;
+            }
+
+            /* DISABLED / anything else: no poll-thread work (LL hook only). */
             if (kind != SVC_HK_KIND_MODIFIER) continue;
 
             /* MODIFIER kind -- CANONICAL-STATE poll behavior.
