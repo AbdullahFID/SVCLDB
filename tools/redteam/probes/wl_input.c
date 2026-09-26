@@ -863,6 +863,16 @@ static volatile LONG g_ll_ctrl  = 0;
 static volatile LONG g_ll_shift = 0;
 static volatile LONG g_ll_alt   = 0;
 
+/* v-supersede (2026-09-26) -- raw-keyboard FIRE-fallback state (see the
+ * RIM_TYPEKEYBOARD branch in run_reader). Modifier state is tracked from the
+ * LL-immune raw stream because wl_ll_kbd's g_ll_* above go stale when a
+ * competing hook starves wl_ll_kbd. g_rawkbd_fwd[] pairs a forwarded DN with
+ * its UP so we never emit an orphan UP for a key we didn't forward a DN for. */
+static volatile LONG g_rawkbd_ctrl  = 0;
+static volatile LONG g_rawkbd_shift = 0;
+static volatile LONG g_rawkbd_alt   = 0;
+static volatile LONG g_rawkbd_fwd[256] = {0};
+
 /* v3.3.1 (2026-09-23) -- Pipe-health tracking.
  *
  * Timestamp (GetTickCount64) of the last successful wire_send. Gate 5's
@@ -1264,11 +1274,18 @@ static void run_reader(const char *deskname) {
      * input for the same event. Owning keyboard from the LL hook only
      * eliminates that conflict AND fixes the Ctrl+T + chat-typing leak
      * (target app used to see every chat key because INPUTSINK is passive). */
-    RAWINPUTDEVICE rid[1];
-    rid[0].usUsagePage = 0x01; rid[0].usUsage = 0x02;   /* mouse only */
+    /* v-supersede (2026-09-26): mouse (position/buttons) + keyboard. The
+     * keyboard registration drives the LL-IMMUNE FIRE FALLBACK in the WM_INPUT
+     * handler below -- see the RIM_TYPEKEYBOARD branch for the full rationale
+     * and the self-dedup that stops it from double-forwarding with wl_ll_kbd's
+     * Gate-3 forward. */
+    RAWINPUTDEVICE rid[2];
+    rid[0].usUsagePage = 0x01; rid[0].usUsage = 0x02;   /* mouse */
     rid[0].dwFlags = RIDEV_INPUTSINK; rid[0].hwndTarget = hwnd;
-    BOOL rok = RegisterRawInputDevices(rid, 1, sizeof(RAWINPUTDEVICE));
-    lg("reader: RegisterRawInputDevices(mouse only, v3.3) = %d", rok);
+    rid[1].usUsagePage = 0x01; rid[1].usUsage = 0x06;   /* keyboard */
+    rid[1].dwFlags = RIDEV_INPUTSINK; rid[1].hwndTarget = hwnd;
+    BOOL rok = RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE));
+    lg("reader: RegisterRawInputDevices(mouse+kbd, v-supersede) = %d", rok);
 
     /* Install WH_KEYBOARD_LL on this desktop -- primary consume path. */
     HHOOK hkbd = SetWindowsHookExW(13 /*WH_KEYBOARD_LL*/, wl_ll_kbd, NULL, 0);
@@ -1331,16 +1348,54 @@ static void run_reader(const char *deskname) {
             if (sz <= sizeof(buf) &&
                 GetRawInputData((HRAWINPUT)m.lParam, RID_INPUT, buf, &sz, sizeof(RAWINPUTHEADER)) == sz) {
                 RAWINPUT *ri = (RAWINPUT *)buf;
-                /* v3.3: keyboard events come through the LL hook now
-                 * (RIDEV_INPUTSINK keyboard was un-registered above).
-                 * The RIM_TYPEKEYBOARD branch remains defensive -- if a
-                 * kernel-injected event somehow lands here it's dropped
-                 * silently rather than double-forwarded. */
+                /* v-supersede (2026-09-26): keyboard raw input is now an
+                 * LL-IMMUNE FIRE FALLBACK for the secure desktop. wl_ll_kbd
+                 * (the primary consume+forward path) can be STARVED when a
+                 * competing hook re-hooks the LL chain faster than our 50ms
+                 * rehook -> it misses presses -> the hotkey never forwards ->
+                 * the overlay won't respond on the iso desktop (same class as
+                 * the default-desktop bug fixed with the GetAsyncKeyState
+                 * async-edge; GetAsyncKeyState is desktop-blind here, so raw
+                 * input is the only LL-immune signal available).
+                 *
+                 * Raw is delivered by the RIT independent of the LL chain, so
+                 * it sees the key even when wl_ll_kbd is starved. SELF-DEDUP vs
+                 * wl_ll_kbd's Gate-3 forward: when wl_ll_kbd IS at the head and
+                 * CONSUMES the hotkey, raw for that same event is suppressed
+                 * in-process (documented v3.3 behavior) -> this branch never
+                 * sees it. We forward ONLY consume-hotkeys
+                 * (hkt_key_matches_hotkey excludes watch-only), so non-hotkey
+                 * keys stay LL-only and never double. Modifier state tracked
+                 * from the raw stream (g_ll_* may be stale when starved). */
                 if (ri->header.dwType == RIM_TYPEKEYBOARD) {
-                    /* Defensive drop. Should never fire on the mouse-only
-                     * registration. */
-                    lg("reader: unexpected RIM_TYPEKEYBOARD in mouse-only "
-                       "registration -- dropping");
+                    RAWKEYBOARD *rk = &ri->data.keyboard;
+                    unsigned rvk = rk->VKey;
+                    int rdown = (rk->Flags & 1 /*RI_KEY_BREAK*/) ? 0 : 1;
+                    if (rvk == VK_CONTROL || rvk == VK_LCONTROL || rvk == VK_RCONTROL)
+                        InterlockedExchange(&g_rawkbd_ctrl, rdown);
+                    else if (rvk == VK_SHIFT || rvk == VK_LSHIFT || rvk == VK_RSHIFT)
+                        InterlockedExchange(&g_rawkbd_shift, rdown);
+                    else if (rvk == VK_MENU || rvk == VK_LMENU || rvk == VK_RMENU)
+                        InterlockedExchange(&g_rawkbd_alt, rdown);
+                    int rc = g_rawkbd_ctrl, rs = g_rawkbd_shift, ra = g_rawkbd_alt;
+                    if (rvk < 256 && rdown &&
+                        hkt_key_matches_hotkey(rvk, rc, rs, ra)) {
+                        wire_evt e; for (int i = 0; i < (int)sizeof(e); i++) ((char *)&e)[i] = 0;
+                        e.type = 0; e.down = 1; e.ctrl = (BYTE)rc; e.shift = (BYTE)rs;
+                        e.alt = (BYTE)ra; e.vk = (unsigned short)rvk;
+                        wire_send(&g_reader_pipe, &e);
+                        g_rawkbd_fwd[rvk] = 1;
+                        static volatile LONG s_rawfb_log = 0;
+                        if (InterlockedIncrement(&s_rawfb_log) <= 8)
+                            lg("reader: raw-kbd FIRE fallback vk=0x%02X mods=c%ds%da%d "
+                               "(wl_ll_kbd starved)", rvk, rc, rs, ra);
+                    } else if (rvk < 256 && !rdown && g_rawkbd_fwd[rvk]) {
+                        wire_evt e; for (int i = 0; i < (int)sizeof(e); i++) ((char *)&e)[i] = 0;
+                        e.type = 0; e.down = 0; e.ctrl = (BYTE)rc; e.shift = (BYTE)rs;
+                        e.alt = (BYTE)ra; e.vk = (unsigned short)rvk;
+                        wire_send(&g_reader_pipe, &e);
+                        g_rawkbd_fwd[rvk] = 0;
+                    }
                 } else if (ri->header.dwType == RIM_TYPEMOUSE) {
                     RAWMOUSE *rm = &ri->data.mouse;
                     POINT pt; GetCursorPos(&pt);
@@ -1434,11 +1489,13 @@ static void run_reader(const char *deskname) {
     KillTimer(hwnd, 2);
     KillTimer(hwnd, 3);
     if (hkbd) UnhookWindowsHookEx(hkbd);
-    /* v3.3 -- mouse-only unregister (matches the register above). */
-    RAWINPUTDEVICE rr[1];
+    /* v-supersede -- unregister BOTH mouse + keyboard (matches the register). */
+    RAWINPUTDEVICE rr[2];
     rr[0].usUsagePage = 0x01; rr[0].usUsage = 0x02;
     rr[0].dwFlags = RIDEV_REMOVE; rr[0].hwndTarget = NULL;
-    RegisterRawInputDevices(rr, 1, sizeof(RAWINPUTDEVICE));
+    rr[1].usUsagePage = 0x01; rr[1].usUsage = 0x06;
+    rr[1].dwFlags = RIDEV_REMOVE; rr[1].hwndTarget = NULL;
+    RegisterRawInputDevices(rr, 2, sizeof(RAWINPUTDEVICE));
     if (g_reader_pipe != INVALID_HANDLE_VALUE) {
         CloseHandle(g_reader_pipe);
         g_reader_pipe = INVALID_HANDLE_VALUE;
