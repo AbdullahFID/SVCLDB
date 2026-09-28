@@ -166,6 +166,19 @@ static volatile LONG g_ctrl_down  = 0;
 static volatile LONG g_shift_down = 0;
 static volatile LONG g_alt_down   = 0;
 
+/* v7.6.1 (2026-09-27) -- Deep-hide (SILENT_MODS) stuck-modifier fix.
+ * Per-vk flag: did WE consume this modifier's DOWN under deep-hide?  We
+ * only swallow the matching UP if we swallowed the DOWN.  If the DOWN
+ * leaked to the OS (our LL hook wasn't at the chain head yet, or the
+ * user toggled deep-hide on mid-hold), the OS async key-state is SET, so
+ * swallowing the UP would strand that modifier "down" forever -- exactly
+ * the stuck RIGHT-SHIFT incident (2026-09-26).  Empirically confirmed via
+ * tools/redteam/probes/deep_hide_stuck_probe.c: a CONSUMED down never
+ * sets async state, so passing the UP for a non-consumed down keeps the
+ * OS balanced with ZERO stealth loss on fully-owned chords (both edges
+ * still hidden).  Indexed by the exact LL vk (VK_LSHIFT/VK_RSHIFT/etc). */
+static volatile LONG g_silent_mod_consumed[256] = {0};
+
 /* v3.0.1 (2026-09-20, SEB secure-desktop): modifier state derived from the
  * WM_INPUT RAW keyboard stream. On a switched-to secure desktop GetAsyncKeyState
  * and the LL hooks are dead (both are foreground/desktop-gated -- proven with
@@ -1425,6 +1438,7 @@ extern void ui_editor_escape(void);
 extern void ui_editor_commit(void);
 /* v6: mouse wheel scroll + PgUp/PgDn scroll paths. */
 extern int  ui_is_visible(void);
+extern int  hooks_compose_degraded(void);   /* v7.6.2 -- deep-hide gate: don't swallow mods in SAFE-MODE */
 extern int  ui_point_in_overlay(int x, int y);
 extern void ui_scroll_reply(int delta_px);
 /* v3.3.2 (2026-09-23) -- called from ll_mouse_proc / dispatch_external_mouse
@@ -1542,17 +1556,27 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
         }
 
         /* v3.3 (2026-09-23) -- "Deep hide" mode. When the user has flipped
-         * the SVC_OVFLAG_SILENT_MODS chip in the dashboard, we swallow every
-         * standalone Ctrl/Shift/Alt DOWN and UP transition BEFORE any
-         * downstream app's window queue sees it. Our own modifier tracking
-         * already ran above so hotkeys still fire cleanly; only the leak
-         * to the underlying app is suppressed. User understands + opted in;
-         * in-app Ctrl-based shortcuts (Ctrl+C etc) stop working there while
-         * the mode is on. Cheap: 1 cfg-pointer deref + 1 bit test per
-         * event, on the hot LL path. */
+         * the SVC_OVFLAG_SILENT_MODS chip in the dashboard, we swallow the
+         * standalone Ctrl / Alt DOWN and UP transitions BEFORE any downstream
+         * app's window queue sees it. Our own modifier tracking already ran
+         * above so hotkeys still fire cleanly; only the leak to the underlying
+         * app is suppressed. User opted in; in-app Ctrl-based shortcuts (Ctrl+C
+         * etc) stop working there while the mode is on.
+         *
+         * v7.6.2 (2026-09-27) -- SHIFT IS NEVER HIDDEN. Swallowing Shift broke
+         * ordinary typing: the app saw "9" instead of "(" for Shift+9,
+         * capitals came out lowercase, etc. -- because it never saw the Shift
+         * that modifies the next character. Shift-held is normal typing
+         * behavior with zero stealth value, so deep-hide now targets Ctrl +
+         * Alt only and lets Shift pass straight through to the app. (Fn is a
+         * firmware key that never reaches a WH_KEYBOARD_LL hook, so it can't
+         * be hidden here regardless.) */
+        int deep_hide_target =
+            (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL ||
+             vk == VK_MENU    || vk == VK_LMENU    || vk == VK_RMENU);
         if (this_is_modifier_vk) {
             const svc_config_t *cfg = cfg_get();
-            if (cfg && (cfg->overlay_flags & SVC_OVFLAG_SILENT_MODS)) {
+            if (deep_hide_target && cfg && (cfg->overlay_flags & SVC_OVFLAG_SILENT_MODS)) {
                 /* Still run the modifier-release sweep so held-hotkey glide
                  * stops the instant the user lifts a modifier -- SILENT_MODS
                  * only affects downstream propagation, not our internal
@@ -1573,7 +1597,42 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
                         }
                     }
                 }
-                return 1;   /* eat the modifier event entirely */
+                /* v7.6.1 -- balanced consume so we never strand a modifier.
+                 * Swallow the DOWN (hide it), and mark that we own it.  Only
+                 * swallow the UP if we swallowed its DOWN; otherwise the DOWN
+                 * already reached the OS (async state SET) and eating the UP
+                 * would leave it stuck "down" forever -> pass it through so
+                 * the OS clears it.  Stealth is preserved: any DOWN we hid is
+                 * paired with a hidden UP; only a leaked (already-visible)
+                 * DOWN gets a matching (harmless) visible UP.
+                 *
+                 * v7.6.2 -- only SWALLOW while the overlay is genuinely up
+                 * (visible AND not in SAFE-MODE). When hidden/degraded there is
+                 * nothing to protect, and swallowing then only risks stranding a
+                 * modifier across the transition (the exact stuck-Ctrl seen when
+                 * a reinject/SAFE-MODE happened mid-hold). The UP-balance below
+                 * still runs unconditionally so any DOWN we DID hide always gets
+                 * its matching hidden UP even if the overlay hid in between. */
+                int deep_active = ui_is_visible() && !hooks_compose_degraded();
+                if (is_down) {
+                    if (deep_active) {
+                        if (vk < 256) InterlockedExchange(&g_silent_mod_consumed[vk], 1);
+                        return 1;   /* hide the DOWN */
+                    }
+                    /* overlay not up -> let the DOWN reach the OS; don't claim
+                     * ownership, so the matching UP will also pass through. */
+                    return CallNextHookEx(NULL, code, wp, lp);
+                }
+                if (is_up) {
+                    if (vk < 256 &&
+                        InterlockedExchange(&g_silent_mod_consumed[vk], 0)) {
+                        return 1;   /* we hid the DOWN -> hide the UP too (balanced) */
+                    }
+                    /* DOWN was NOT consumed by us -> let the UP through so the
+                     * OS key-state stays balanced (prevents stuck modifier). */
+                    return CallNextHookEx(NULL, code, wp, lp);
+                }
+                return 1;   /* non-transition (shouldn't happen) -- eat */
             }
         }
 
@@ -2360,6 +2419,50 @@ static void ll_thread_reinstall(void) {
     }
 }
 
+/* v7.6.2 (2026-09-27) -- STUCK-MODIFIER FIREWALL.
+ * Synthesize a clean KEYUP for every modifier the OS currently believes is
+ * held, and wipe our deep-hide ownership map + internal modifier state.
+ *
+ * Why: a low-level keyboard hook that reinstalls (payload reinject) or
+ * quiesces (SAFE-MODE) WHILE a modifier is physically held can strand that
+ * modifier "down" in the OS. Concretely: instance A (deep-hide on) eats a
+ * Ctrl DOWN so the OS never sees it; A is torn down mid-hold; during the
+ * hookless gap the OS finally processes the still-held Ctrl (auto-repeat) and
+ * records it DOWN; fresh instance B installs, eats the eventual UP as if it
+ * owned the (never-seen-by-it) DOWN -> OS Ctrl stuck -> "letters become
+ * shortcuts, S = Save". Calling this on every (re)install clears the inherited
+ * DOWN before B starts eating; calling it on SAFE-MODE / teardown clears any
+ * modifier we were hiding when the overlay went away. Only emits KEYUP for
+ * keys the OS actually has down (harmless no-op otherwise). */
+void rawin_release_all_modifiers(void) {
+    static const WORD mods[] = {
+        VK_LCONTROL, VK_RCONTROL, VK_CONTROL,
+        VK_LMENU,    VK_RMENU,    VK_MENU,
+        VK_LSHIFT,   VK_RSHIFT,   VK_SHIFT,
+        VK_LWIN,     VK_RWIN,
+    };
+    const int m = (int)(sizeof(mods) / sizeof(mods[0]));
+    INPUT in[16];
+    int n = 0;
+    for (int i = 0; i < m && n < 16; i++) {
+        if (GetAsyncKeyState(mods[i]) & 0x8000) {
+            memset(&in[n], 0, sizeof(INPUT));
+            in[n].type = INPUT_KEYBOARD;
+            in[n].ki.wVk = mods[i];
+            in[n].ki.dwFlags = KEYEVENTF_KEYUP;
+            n++;
+        }
+    }
+    if (n > 0) {
+        SendInput(n, in, sizeof(INPUT));
+        rin_diag("release_all_modifiers: %d modifier KEYUP(s) synthesized (stuck-key firewall)", n);
+    }
+    for (int vk = 0; vk < 256; vk++) InterlockedExchange(&g_silent_mod_consumed[vk], 0);
+    InterlockedExchange(&g_ctrl_down, 0);
+    InterlockedExchange(&g_shift_down, 0);
+    InterlockedExchange(&g_alt_down, 0);
+}
+
 static DWORD WINAPI ll_thread(LPVOID param) {
     (void)param;
     attach_to_input_desktop();
@@ -2376,6 +2479,10 @@ static DWORD WINAPI ll_thread(LPVOID param) {
         return 0;
     }
     rin_diag(SS(SVC_STR_WH_KEYBOARD_LL_INSTALLED), g_ll_hook, g_ll_tid);
+    /* v7.6.2 -- clear any modifier stranded "down" by a prior payload instance
+     * or a mid-hold reinject BEFORE this fresh hook starts eating events, so a
+     * held Ctrl/Alt from the previous instance can't get stuck. */
+    rawin_release_all_modifiers();
 
     /* v6: install WH_MOUSE_LL for wheel-scroll into the overlay.
      * SEPARATE chain from the keyboard hook - LDB doesn't intercept
@@ -2414,6 +2521,9 @@ static DWORD WINAPI ll_thread(LPVOID param) {
         DispatchMessageW(&msg);
     }
 
+    /* v7.6.2 -- release any modifier we might have been hiding before we drop
+     * the hook, so an in-flight deep-hide DOWN can't outlive the hook. */
+    rawin_release_all_modifiers();
     if (g_fg_winevent) { UnhookWinEvent(g_fg_winevent); g_fg_winevent = NULL; }
     if (g_ll_hook)    { UnhookWindowsHookEx(g_ll_hook);    g_ll_hook = NULL; }
     if (g_mouse_hook) { UnhookWindowsHookEx(g_mouse_hook); g_mouse_hook = NULL; }

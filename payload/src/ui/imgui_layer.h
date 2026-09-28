@@ -228,7 +228,7 @@ void ui_reset_geometry(void);        /* back to defaults */
  * being 0 means "no PDB hint -- use hardcoded slot" for that entry.
  * Thread-safe (single-writer at init before any Present detour). */
 typedef unsigned long long ui_rva_t;
-void ui_set_vtable_slot_hints(ui_rva_t gpb_rva, ui_rva_t gd3d_rva, ui_rva_t acc_rva);
+void ui_set_vtable_slot_hints(ui_rva_t gpb_rva, ui_rva_t gd3d_rva, ui_rva_t acc_rva, ui_rva_t tex2d_rva);
 
 /* v1.6.3 (2026-07-15): populate an RVA-to-name lookup table so the
  * first-success diagnostic in get_backbuffer_texture can identify

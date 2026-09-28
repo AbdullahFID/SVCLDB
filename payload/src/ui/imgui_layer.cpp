@@ -111,6 +111,23 @@ void as_cfg_set_dot_enabled(int on);
 #define GD3D_SLOT    24   /* really: CDDisplaySwapChain::GetPhysicalBackBuffer */
 #define ACC3_SLOT    19   /* really: CDDisplaySwapChainBuffer::GetD3D11Resource */
 #define VTBL_QI      0    /* IUnknown::QueryInterface      */
+/* v7.6.2-legacy (2026-09-27) -- GetBackBuffer slot on the legacy composition
+ * path. dwmcore's own CLegacyRenderTarget::Render does
+ *   deviceTarget = pLayer->vtbl[0x68]()  (0x68 / 8 == slot 13)
+ * to fetch the logical composition surface (the physical overlay-plane
+ * backbuffer array is empty on legacy/WARP/Basic-Display boxes, so
+ * GetPhysicalBackBuffer NULLs -- see get_backbuffer_texture legacy branch).
+ * Fixed vtable offset used by dwmcore itself; validated + SEH-guarded before
+ * call so a future build that moves it degrades to SAFE-MODE, never crashes. */
+#define GBB_SLOT     13   /* pLayer->vtbl[0x68]: CLegacySwapChain::GetBackBuffer */
+/* v7.6.2-legacy DEV VALIDATION -- when 1, force the legacy GetBackBuffer path
+ * even on the display path (real GPU) by treating GetPhysicalBackBuffer as if
+ * it NULLed. Lets us confirm GetBackBuffer->GetTexture2D yields a fullscreen
+ * renderable surface on real hardware (WARP's surface is degenerate 32x32).
+ * MUST be 0 for any shipped/normal build. */
+#ifndef SVCLDB_TEST_FORCE_LEGACY
+#define SVCLDB_TEST_FORCE_LEGACY 0
+#endif
 #define VTBL_RELEASE 2    /* IUnknown::Release             */
 
 static const GUID IID_ID3D11Texture2D_LOCAL = {
@@ -318,6 +335,15 @@ static bool is_ptr_in_loaded_module_code(const void *p) {
 static volatile ui_rva_t g_rva_gpb  = 0;   /* GetPhysicalBackBuffer RVA hint */
 static volatile ui_rva_t g_rva_gd3d = 0;   /* GetD3D11Resource RVA hint      */
 static volatile ui_rva_t g_rva_acc  = 0;   /* accessor RVA hint              */
+/* v7.6.2-legacy -- CDeviceTextureTarget::GetTexture2D RVA (blob accessorRva,
+ * 0x865D0 on 26100.9549). The accessor on the legacy GetBackBuffer device
+ * target; discovered on pRes in place of GetD3D11Resource when g_legacy_mode. */
+static volatile ui_rva_t g_rva_tex2d = 0;
+/* v7.6.2-legacy -- set to 1 the first frame the physical chain NULLs and the
+ * GetBackBuffer legacy acquisition takes over. Flips accessor discovery from
+ * GetD3D11Resource (display) to GetTexture2D (legacy). Never set on Display/
+ * MPO boxes (their physical chain succeeds, legacy branch never runs). */
+static volatile LONG g_legacy_mode = 0;
 
 /* Discovered slot indices (cached across calls). -1 = not yet resolved
  * or dynamic scan failed -> falls back to hardcoded constant. */
@@ -325,10 +351,11 @@ static volatile int g_dyn_slot_gpb  = -1;
 static volatile int g_dyn_slot_gd3d = -1;
 static volatile int g_dyn_slot_acc  = -1;
 
-extern "C" void ui_set_vtable_slot_hints(ui_rva_t gpb_rva, ui_rva_t gd3d_rva, ui_rva_t acc_rva) {
-    g_rva_gpb  = gpb_rva;
-    g_rva_gd3d = gd3d_rva;
-    g_rva_acc  = acc_rva;
+extern "C" void ui_set_vtable_slot_hints(ui_rva_t gpb_rva, ui_rva_t gd3d_rva, ui_rva_t acc_rva, ui_rva_t tex2d_rva) {
+    g_rva_gpb   = gpb_rva;
+    g_rva_gd3d  = gd3d_rva;
+    g_rva_acc   = acc_rva;
+    g_rva_tex2d = tex2d_rva;   /* v7.6.2-legacy: GetTexture2D (blob accessorRva) */
     /* Note: don't log here -- this runs before slog is fully set up in
      * some code paths. Discovery attempts log their own diagnostics. */
 }
@@ -459,9 +486,17 @@ static int find_vtable_slot_by_rva(void **vtbl, ui_rva_t target_rva) {
  *      up to `body_scan_bytes` and treats each as a candidate
  *      vftable. For each candidate, runs find_vtable_slot_by_rva.
  *   3. Returns the FIRST hit's slot + populates *out_vtbl with the
- *      vftable pointer that matched. Caller MUST use *out_vtbl for
- *      the subsequent vtable[slot]() call, NOT the original layer_vtbl,
- *      or the slot index would index into the wrong vftable.
+ *      vftable pointer that matched AND *out_this_adj with the body
+ *      offset of that vptr (0 for primary). Caller MUST:
+ *        (a) dispatch via *out_vtbl[slot], NOT layer_vtbl[slot]
+ *        (b) pass `this = obj + *out_this_adj`, NOT the primary obj
+ *      MSVC C++ MI ABI: a method on a secondary vftable expects
+ *      `this` to be the subobject start (the address of THAT vptr),
+ *      not the most-derived object. v7.3.0 did (a) and forgot (b).
+ *      Empirically on dharpan2010@gmail.com 2026-09-26: scan found
+ *      GetPhysicalBackBuffer at slot 28 on a secondary vtbl, then
+ *      called it with unadjusted pLayer -> NULL / DWM AV. Slot 28
+ *      matches the known CDDisplaySwapChain vftable[5/6] layout.
  *   4. If nothing matches after all scans, returns -1 (caller decides
  *      whether to fall back to hardcoded or refuse to render).
  *
@@ -475,9 +510,10 @@ static int find_vtable_slot_by_rva(void **vtbl, ui_rva_t target_rva) {
  * (CDDisplaySwapChain has 6 vftables today; largest observed COverlay-
  * Context subobject is at offset 64). */
 static int find_vtable_slot_by_rva_mi(void *obj, ui_rva_t target_rva,
-                                      void ***out_vtbl) {
+                                      void ***out_vtbl, int *out_this_adj) {
     if (!obj || target_rva == 0) return -1;
     if (out_vtbl) *out_vtbl = nullptr;
+    if (out_this_adj) *out_this_adj = 0;
 
     /* Primary vftable (offset 0) -- standard path. */
     void **primary = nullptr;
@@ -487,6 +523,7 @@ static int find_vtable_slot_by_rva_mi(void *obj, ui_rva_t target_rva,
         int s = find_vtable_slot_by_rva(primary, target_rva);
         if (s >= 0) {
             if (out_vtbl) *out_vtbl = primary;
+            if (out_this_adj) *out_this_adj = 0;
             return s;
         }
     }
@@ -497,7 +534,12 @@ static int find_vtable_slot_by_rva_mi(void *obj, ui_rva_t target_rva,
      *   (b) different from primary (skip duplicates)
      *   (c) a pointer INTO dwmcore's image (vftables live in .rdata) */
     ensure_dwmcore_bounds_cached();
-    const int body_scan_bytes = 128;
+    /* v7.6.2 -- widened 128 -> 384. dharpan2010's real-GPU legacy device
+     * target places its texture accessor on an MI subobject past the old
+     * 128-byte window (WARP's sat at +120, right at the edge); 384 covers
+     * deeper multi-inherit layouts. Each candidate is still validated to
+     * actually contain target_rva, so the wider window can't false-match. */
+    const int body_scan_bytes = 384;
     for (int off = 8; off <= body_scan_bytes; off += 8) {
         void **cand = nullptr;
         __try {
@@ -515,6 +557,9 @@ static int find_vtable_slot_by_rva_mi(void *obj, ui_rva_t target_rva,
         int s = find_vtable_slot_by_rva(cand, target_rva);
         if (s >= 0) {
             if (out_vtbl) *out_vtbl = cand;
+            /* v7.6.0 -- this-adjust is the body offset of this vptr.
+             * Secondary-subobject methods expect `this` == obj+off. */
+            if (out_this_adj) *out_this_adj = off;
             return s;
         }
     }
@@ -524,113 +569,154 @@ static int find_vtable_slot_by_rva_mi(void *obj, ui_rva_t target_rva,
 /* v7.3.0 (2026-09-25) -- alternate-vftable pointers captured by the
  * multi-inherit scan. When non-null, get_backbuffer_texture MUST call
  * `(*g_dyn_XXX_vtbl)[g_dyn_slot_XXX]` instead of `layer_vtbl[slot]` --
- * the slot index is relative to whichever vftable the scan matched. */
+ * the slot index is relative to whichever vftable the scan matched.
+ * v7.6.0 (2026-09-26) -- also the this-adjust (body offset of that
+ * vptr). Secondary-subobject methods need `this = obj + adj`. */
 static void        **g_dyn_gpb_vtbl  = nullptr;
 static void        **g_dyn_gd3d_vtbl = nullptr;
 static void        **g_dyn_acc_vtbl  = nullptr;
+static int           g_dyn_gpb_this_adj  = 0;
+static int           g_dyn_gd3d_this_adj = 0;
+static int           g_dyn_acc_this_adj  = 0;
 
-/* v7.3.0 -- SAFE-MODE trip flag for the backbuffer path.
- * Set to 1 by the discover_*_slot_once functions when the dynamic scan
- * (including multi-inherit fallback) can't find the target RVA anywhere
- * in the object's vftables. Prior code fell back to hardcoded slot
- * indices in that case, which on user `dharpan2010@gmail.com`'s box
- * (26200.9550, same dwmcore as ours but different pLayer subclass)
- * ended up calling a wrong function with a wrong `this` -> DWM AV.
- * When this flag is set, get_backbuffer_texture returns NULL from the
- * FIRST call and hooks_compose_degraded is flipped so ui_present_frame
- * quiesces cleanly. Payload stays loaded for rawinput/hotkey use, DWM
- * stays alive, user sees no overlay -- graceful degradation matching
- * the SAFE-MODE precedent from v-multibuild's blob validation gate. */
-static volatile LONG g_dyn_scan_gave_up = 0;
+/* v7.6.1 (2026-09-27) -- retry-until-success discovery.
+ * ROOT CAUSE of dharpan2010's "overlay runs but never draws": DWM presents
+ * MULTIPLE distinct COverlayContext/swapchain objects, and the backbuffer
+ * getter (GetPhysicalBackBuffer) lives in the PRIMARY vtable on the
+ * renderable ("good") object but only in a SECONDARY (MI) vtable on another
+ * ("bad") object.  The old one-shot discovery locked onto whichever object
+ * hit Present FIRST.  Our box won that race (locked the good object -> slot
+ * 24 primary -> works); dharpan's box lost it (locked the bad object ->
+ * slot 28 secondary this_adj+8 -> GetPhysicalBackBuffer returns NULL every
+ * frame -> no texture -> overlay never renders, while Present keeps firing).
+ * PROVEN via gbt_dump_layout_once on our own box: the dumped object carries
+ * the getter ONLY in secondaries, yet the locked/working object uses the
+ * primary -- so >=2 distinct objects definitely exist.
+ *
+ * Fix: do NOT lock on the first object.  Re-run discovery each frame and
+ * ATTEMPT the full chain; only when the chain yields a VALID texture do we
+ * LOCK the (slot,vtbl,this_adj) tuple.  Bad objects return NULL cleanly
+ * (empirically non-crashing on dharpan's box, which already calls the wrong
+ * slot every frame today without crashing) so we just try the next frame's
+ * object.  Bounded: after GBT_MAX_ATTEMPTS frames with no success we trip
+ * SAFE-MODE (overlay quiesced, DWM alive) exactly as before -- a box that
+ * only ever presents "bad" objects is no worse off than today. */
+static volatile LONG g_gbt_locked   = 0;   /* 1 once a full chain succeeded */
+static volatile LONG g_gbt_attempts = 0;   /* frames tried before lock      */
+#define GBT_MAX_ATTEMPTS 600               /* ~10s @ 60fps before SAFE-MODE  */
 
-/* One-shot dynamic slot discovery. Called from get_backbuffer_texture
- * on first successful call. Uses the multi-inherit scan so classes
- * with non-primary base subobjects (dharpan2010@gmail.com's crash) are
- * covered. If ALL scans miss, sets g_dyn_scan_gave_up so the caller
- * refuses to render instead of calling a hardcoded slot that on some
- * boxes will crash DWM. */
+/* Dynamic slot discovery. Re-runs every frame until the chain locks
+ * (g_gbt_locked). Uses the multi-inherit scan so classes with non-primary
+ * base subobjects are covered. On a per-object MISS it marks the slot
+ * unusable (-1) WITHOUT tripping SAFE-MODE -- the caller skips that object
+ * and retries the next frame; SAFE-MODE is decided by the caller only
+ * after GBT_MAX_ATTEMPTS. Logging is throttled to tuple-changes so the
+ * retry window doesn't spam the diag log. */
 static void discover_gpb_slot_once(void *pLayer, int hardcoded) {
-    static volatile LONG s_done = 0;
-    if (InterlockedCompareExchange(&s_done, 1, 0) != 0) return;
+    if (InterlockedCompareExchange(&g_gbt_locked, 0, 0)) return;  /* frozen after success */
     void **matched_vtbl = nullptr;
-    int dyn = find_vtable_slot_by_rva_mi(pLayer, g_rva_gpb, &matched_vtbl);
+    int this_adj = 0;
+    int dyn = find_vtable_slot_by_rva_mi(pLayer, g_rva_gpb, &matched_vtbl, &this_adj);
     if (dyn >= 0) {
         g_dyn_slot_gpb = dyn;
         g_dyn_gpb_vtbl = matched_vtbl;
-        void **primary = nullptr;
-        __try { primary = *(void ***)pLayer; }
-        __except (EXCEPTION_EXECUTE_HANDLER) { }
-        const char *loc = (matched_vtbl == primary) ? "primary" : "secondary (MI)";
-        if (dyn == hardcoded && matched_vtbl == primary) {
-            diag("vtable: gpb_slot dynamic=%d hardcoded=%d MATCH (primary vtbl)", dyn, hardcoded);
-        } else {
-            diag("vtable: gpb_slot dynamic=%d hardcoded=%d DRIFT (%s vtbl=%p) -- using dynamic",
-                 dyn, hardcoded, loc, matched_vtbl);
+        g_dyn_gpb_this_adj = this_adj;
+        static void *s_lv = (void *)-1; static int s_ls = -2, s_la = -2;
+        if (matched_vtbl != s_lv || dyn != s_ls || this_adj != s_la) {
+            s_lv = matched_vtbl; s_ls = dyn; s_la = this_adj;
+            void **primary = nullptr;
+            __try { primary = *(void ***)pLayer; } __except (EXCEPTION_EXECUTE_HANDLER) { }
+            const char *loc = (matched_vtbl == primary) ? "primary" : "secondary (MI)";
+            if (dyn == hardcoded && matched_vtbl == primary)
+                diag("vtable: gpb_slot dynamic=%d hardcoded=%d MATCH (primary vtbl)", dyn, hardcoded);
+            else
+                diag("vtable: gpb_slot dynamic=%d hardcoded=%d DRIFT (%s vtbl=%p this_adj=+%d) -- using dynamic",
+                     dyn, hardcoded, loc, matched_vtbl, this_adj);
         }
     } else {
-        diag("vtable: gpb_slot dynamic-scan MISS (rva_hint=0x%llx) -- multi-inherit walk also empty. "
-             "Refusing to fall back to hardcoded (would crash DWM on rearranged vtables). "
-             "SAFE-MODE: overlay quiesced this session.",
-             (unsigned long long)g_rva_gpb);
-        void **primary = nullptr;
-        __try { primary = *(void ***)pLayer; } __except (EXCEPTION_EXECUTE_HANDLER) { }
-        if (primary) dump_known_slots_in_vtable("pLayer(gpb)", primary);
-        InterlockedExchange(&g_dyn_scan_gave_up, 1);
+        g_dyn_slot_gpb = -1; g_dyn_gpb_vtbl = nullptr; g_dyn_gpb_this_adj = 0;
     }
 }
 static void discover_gd3d_slot_once(void *pLayer, int hardcoded) {
-    static volatile LONG s_done = 0;
-    if (InterlockedCompareExchange(&s_done, 1, 0) != 0) return;
+    if (InterlockedCompareExchange(&g_gbt_locked, 0, 0)) return;
     void **matched_vtbl = nullptr;
-    int dyn = find_vtable_slot_by_rva_mi(pLayer, g_rva_gd3d, &matched_vtbl);
+    int this_adj = 0;
+    int dyn = find_vtable_slot_by_rva_mi(pLayer, g_rva_gd3d, &matched_vtbl, &this_adj);
     if (dyn >= 0) {
         g_dyn_slot_gd3d = dyn;
         g_dyn_gd3d_vtbl = matched_vtbl;
-        void **primary = nullptr;
-        __try { primary = *(void ***)pLayer; } __except (EXCEPTION_EXECUTE_HANDLER) { }
-        const char *loc = (matched_vtbl == primary) ? "primary" : "secondary (MI)";
-        if (dyn == hardcoded && matched_vtbl == primary) {
-            diag("vtable: gd3d_slot dynamic=%d hardcoded=%d MATCH (primary vtbl)", dyn, hardcoded);
-        } else {
-            diag("vtable: gd3d_slot dynamic=%d hardcoded=%d DRIFT (%s vtbl=%p) -- using dynamic",
-                 dyn, hardcoded, loc, matched_vtbl);
+        g_dyn_gd3d_this_adj = this_adj;
+        static void *s_lv = (void *)-1; static int s_ls = -2, s_la = -2;
+        if (matched_vtbl != s_lv || dyn != s_ls || this_adj != s_la) {
+            s_lv = matched_vtbl; s_ls = dyn; s_la = this_adj;
+            void **primary = nullptr;
+            __try { primary = *(void ***)pLayer; } __except (EXCEPTION_EXECUTE_HANDLER) { }
+            const char *loc = (matched_vtbl == primary) ? "primary" : "secondary (MI)";
+            if (dyn == hardcoded && matched_vtbl == primary)
+                diag("vtable: gd3d_slot dynamic=%d hardcoded=%d MATCH (primary vtbl)", dyn, hardcoded);
+            else
+                diag("vtable: gd3d_slot dynamic=%d hardcoded=%d DRIFT (%s vtbl=%p this_adj=+%d) -- using dynamic",
+                     dyn, hardcoded, loc, matched_vtbl, this_adj);
         }
     } else {
-        diag("vtable: gd3d_slot dynamic-scan MISS (rva_hint=0x%llx) -- multi-inherit walk also empty. "
-             "Refusing to fall back to hardcoded (would crash DWM on rearranged vtables). "
-             "SAFE-MODE: overlay quiesced this session.",
-             (unsigned long long)g_rva_gd3d);
-        void **primary = nullptr;
-        __try { primary = *(void ***)pLayer; } __except (EXCEPTION_EXECUTE_HANDLER) { }
-        if (primary && g_dyn_slot_gpb >= 0) dump_known_slots_in_vtable("pLayer(gd3d)", primary);
-        InterlockedExchange(&g_dyn_scan_gave_up, 1);
+        g_dyn_slot_gd3d = -1; g_dyn_gd3d_vtbl = nullptr; g_dyn_gd3d_this_adj = 0;
     }
 }
 static void discover_acc_slot_once(void *pRes, int hardcoded) {
-    static volatile LONG s_done = 0;
-    if (InterlockedCompareExchange(&s_done, 1, 0) != 0) return;
+    if (InterlockedCompareExchange(&g_gbt_locked, 0, 0)) return;
     void **matched_vtbl = nullptr;
-    int dyn = find_vtable_slot_by_rva_mi(pRes, g_rva_acc, &matched_vtbl);
+    int this_adj = 0;
+    /* v7.6.2-legacy: on the legacy GetBackBuffer device target the texture
+     * accessor varies by the CONCRETE IDeviceTarget class the swapchain
+     * allocated, which depends on GPU backing:
+     *   - software/WARP  -> CDeviceTextureTarget::GetTexture2D   (g_rva_tex2d)
+     *   - hardware       -> CD3DSurface::GetDXGIResource, a swapchain buffer's
+     *                       GetDXGIResource, or CD2DBitmap::GetTexture2D
+     * dharpan2010's real-GPU box hit NEITHER GetTexture2D nor GetD3D11Resource
+     * (chain died at the accessor step -> SAFE-MODE), so try the full set of
+     * texture getters RE'd from dwmcore 26100.9549. Whatever the accessor
+     * returns (ID3D11Texture2D / ID3D11Resource / IDXGIResource) is normalized
+     * by the QueryInterface(ID3D11Texture2D) step downstream. Each candidate is
+     * validated to actually exist in pRes's vtable before use, so a
+     * non-matching RVA is a safe no-op (never a bad call). The hardcoded RVAs
+     * are 9549-specific; a wrong-build RVA simply won't match. Display path
+     * (g_legacy_mode==0) is unchanged: GetD3D11Resource only. */
+    int dyn = -1;
+    if (InterlockedCompareExchange(&g_legacy_mode, 0, 0)) {
+        const ui_rva_t cands[] = {
+            g_rva_tex2d,       /* CDeviceTextureTarget::GetTexture2D  (0x865D0, WARP) */
+            g_rva_acc,         /* CDDisplaySwapChainBuffer::GetD3D11Resource (0x1F6F50) */
+            (ui_rva_t)0x2ca86c,/* CD3DSurface::GetDXGIResource        (hardware target) */
+            (ui_rva_t)0x189590,/* CLegacySwapChainBuffer::GetDXGIResource */
+            (ui_rva_t)0x1fc640,/* CD2DBitmap::GetTexture2D */
+            (ui_rva_t)0x2cfac0,/* CDeviceTextureTarget::GetTexture2D (adjustor thunk) */
+        };
+        for (int i = 0; i < (int)(sizeof(cands) / sizeof(cands[0])); i++) {
+            if (!cands[i]) continue;
+            dyn = find_vtable_slot_by_rva_mi(pRes, cands[i], &matched_vtbl, &this_adj);
+            if (dyn >= 0) break;
+        }
+    } else {
+        dyn = find_vtable_slot_by_rva_mi(pRes, g_rva_acc, &matched_vtbl, &this_adj);
+    }
     if (dyn >= 0) {
         g_dyn_slot_acc = dyn;
         g_dyn_acc_vtbl = matched_vtbl;
-        void **primary = nullptr;
-        __try { primary = *(void ***)pRes; } __except (EXCEPTION_EXECUTE_HANDLER) { }
-        const char *loc = (matched_vtbl == primary) ? "primary" : "secondary (MI)";
-        if (dyn == hardcoded && matched_vtbl == primary) {
-            diag("vtable: acc_slot dynamic=%d hardcoded=%d MATCH (primary vtbl)", dyn, hardcoded);
-        } else {
-            diag("vtable: acc_slot dynamic=%d hardcoded=%d DRIFT (%s vtbl=%p) -- using dynamic",
-                 dyn, hardcoded, loc, matched_vtbl);
+        g_dyn_acc_this_adj = this_adj;
+        static void *s_lv = (void *)-1; static int s_ls = -2, s_la = -2;
+        if (matched_vtbl != s_lv || dyn != s_ls || this_adj != s_la) {
+            s_lv = matched_vtbl; s_ls = dyn; s_la = this_adj;
+            void **primary = nullptr;
+            __try { primary = *(void ***)pRes; } __except (EXCEPTION_EXECUTE_HANDLER) { }
+            const char *loc = (matched_vtbl == primary) ? "primary" : "secondary (MI)";
+            if (dyn == hardcoded && matched_vtbl == primary)
+                diag("vtable: acc_slot dynamic=%d hardcoded=%d MATCH (primary vtbl)", dyn, hardcoded);
+            else
+                diag("vtable: acc_slot dynamic=%d hardcoded=%d DRIFT (%s vtbl=%p this_adj=+%d) -- using dynamic",
+                     dyn, hardcoded, loc, matched_vtbl, this_adj);
         }
     } else {
-        diag("vtable: acc_slot dynamic-scan MISS (rva_hint=0x%llx) -- multi-inherit walk also empty. "
-             "Refusing to fall back to hardcoded. SAFE-MODE: overlay quiesced this session.",
-             (unsigned long long)g_rva_acc);
-        void **primary = nullptr;
-        __try { primary = *(void ***)pRes; } __except (EXCEPTION_EXECUTE_HANDLER) { }
-        if (primary) dump_known_slots_in_vtable("res_vtbl(acc)", primary);
-        InterlockedExchange(&g_dyn_scan_gave_up, 1);
+        g_dyn_slot_acc = -1; g_dyn_acc_vtbl = nullptr; g_dyn_acc_this_adj = 0;
     }
 }
 
@@ -644,6 +730,12 @@ static inline int effective_acc_slot(void)  { int d = g_dyn_slot_acc;  return d 
 static inline void **effective_gpb_vtbl(void **fallback)  { return g_dyn_gpb_vtbl  ? g_dyn_gpb_vtbl  : fallback; }
 static inline void **effective_gd3d_vtbl(void **fallback) { return g_dyn_gd3d_vtbl ? g_dyn_gd3d_vtbl : fallback; }
 static inline void **effective_acc_vtbl(void **fallback)  { return g_dyn_acc_vtbl  ? g_dyn_acc_vtbl  : fallback; }
+/* v7.6.0 -- MI this-adjust. 0 on the primary (our box). Non-zero when
+ * the scan hit a secondary subobject vptr (dharpan2010's box). */
+static inline void *adjust_this(void *obj, int adj) {
+    if (!obj || adj <= 0) return obj;
+    return (BYTE *)obj + adj;
+}
 
 /* ---------- RTV cache ---------- */
 struct RtvCacheEntry {
@@ -5094,6 +5186,237 @@ extern "C" char *ui_chat_take_and_clear() {
  * out_accessor: caller-owned void** that receives pAcc (borrowed ref,
  * do NOT Release -- same lifetime as our existing pAcc use inside the
  * function). NULL means "caller doesn't need it" (e.g. capture path). */
+/* v7.6.1 (2026-09-27) -- One-shot object-layout dump for the "overlay
+ * runs but never draws" class of box-specific bugs (dharpan2010, hardware
+ * MPO / COverlaySwapChain path 2026-09-27).  Read-only: walks pLayer's
+ * primary vtable AND every secondary (MI) subobject vtable, printing the
+ * slot -> RVA -> blob-symbol-name for every entry that resolves to a
+ * KNOWN dwmcore symbol.  That tells support EXACTLY where GetPhysicalBack-
+ * Buffer / GetD3D11Resource / GetDevice actually live on THAT box's
+ * object -- WITHOUT calling anything (no CFG/CET __fastfail risk).  Fires
+ * once per process on the first get_backbuffer_texture entry. */
+static void gbt_dump_layout_once(void *pLayer) {
+    static volatile LONG s_done = 0;
+    if (InterlockedCompareExchange(&s_done, 1, 0) != 0) return;
+    __try {
+        if (!pLayer || !is_readable(pLayer, 8)) { diag("gbt-dump: pLayer unreadable"); return; }
+        void **vt = *(void ***)pLayer;
+        diag("gbt-dump: pLayer=%p primary_vtbl=%p dwmcore_base=%p size=%zu",
+             pLayer, vt, g_dwmcore_base, (size_t)g_dwmcore_size);
+        if (is_readable(vt, sizeof(void *))) {
+            for (int s = 0; s < 220; s++) {
+                if (!is_readable(&vt[s], sizeof(void *))) break;
+                void *fn = vt[s];
+                if (!fn || !is_ptr_in_dwmcore(fn)) continue;
+                ui_rva_t rva = (ui_rva_t)((BYTE *)fn - g_dwmcore_base);
+                const char *nm = lookup_rva_name(rva);
+                if (nm && nm[0] != '?')   /* only KNOWN dwmcore symbols */
+                    diag("gbt-dump: primary[%d] rva=0x%llx == %s", s,
+                         (unsigned long long)rva, nm);
+            }
+        }
+        for (int off = 8; off <= 256; off += 8) {
+            if (!is_readable((BYTE *)pLayer + off, sizeof(void *))) continue;
+            void **cand = *(void ***)((BYTE *)pLayer + off);
+            if (!cand || cand == vt) continue;
+            if (!g_dwmcore_base || (BYTE *)cand < g_dwmcore_base ||
+                (BYTE *)cand >= g_dwmcore_base + g_dwmcore_size) continue;
+            int named = 0;
+            for (int s = 0; s < 220; s++) {
+                if (!is_readable(&cand[s], sizeof(void *))) break;
+                void *fn = cand[s];
+                if (!fn || !is_ptr_in_dwmcore(fn)) continue;
+                ui_rva_t rva = (ui_rva_t)((BYTE *)fn - g_dwmcore_base);
+                const char *nm = lookup_rva_name(rva);
+                if (nm && nm[0] != '?') {   /* only KNOWN dwmcore symbols */
+                    if (!named) { diag("gbt-dump: secondary_vtbl @ pLayer+%d = %p", off, cand); named = 1; }
+                    diag("gbt-dump:   sec[+%d][%d] rva=0x%llx == %s", off, s,
+                         (unsigned long long)rva, nm);
+                }
+            }
+        }
+        diag("gbt-dump: end");
+    } __except (EXCEPTION_EXECUTE_HANDLER) { diag("gbt-dump: SEH during dump"); }
+}
+
+/* v7.6.2-legacy (2026-09-27) -- EMPIRICAL legacy-path acquisition probe.
+ * Fires once when GetPhysicalBackBuffer NULLs (dharpan2010 / any WARP /
+ * Basic-Display / legacy-composition box: PN2 CLegacyRenderTarget only,
+ * physical overlay-plane array empty). Reproduces dwmcore's OWN legacy
+ * acquisition: CLegacyRenderTarget::Render does
+ *   deviceTarget = pLayer->vtbl[0x68/8 = slot 13]()   // GetBackBuffer
+ * then composits the desktop into it. We walk the same path and log
+ * exactly which getter yields a renderable ID3D11Texture2D so the real
+ * fallback (below) uses proven values, not guesses. Read + call only,
+ * one-shot, SEH-guarded. RVAs from Ghidra RE of dwmcore 26100.9549
+ * (TDS 0x0465DF26): GetBackBuffer(legacy)=0x187EE0, GetTexture2D=0x865D0,
+ * GetD3D11Resource=g_rva_acc(0x1F6F50). */
+static void legacy_acquire_probe_once(void *pLayer) {
+    static volatile LONG s_done = 0;
+    if (InterlockedCompareExchange(&s_done, 1, 0) != 0) return;
+    __try {
+        diag("legacy-probe: BEGIN pLayer=%p (physical chain NULLed -- trying legacy GetBackBuffer path)", pLayer);
+        if (!pLayer || !is_readable(pLayer, 8)) { diag("legacy-probe: pLayer unreadable"); return; }
+        void **vt = *(void ***)pLayer;
+        if (!is_readable(vt, 14 * sizeof(void *))) { diag("legacy-probe: primary vtbl too short for slot 13"); return; }
+        /* dwmcore convention: CLegacyRenderTarget::Render calls the device-target
+         * getter via pLayer->vtbl[0x68] (slot 13) with this=pLayer (adj 0). */
+        void *fn13 = vt[13];
+        ui_rva_t rva13 = g_dwmcore_base ? (ui_rva_t)((BYTE *)fn13 - g_dwmcore_base) : 0;
+        diag("legacy-probe: pLayer.vtbl[13] (off 0x68) = %p rva=0x%llx (%s) inDwm=%d",
+             fn13, (unsigned long long)rva13, lookup_rva_name(rva13), is_ptr_in_dwmcore(fn13));
+        if (!is_ptr_in_dwmcore(fn13)) { diag("legacy-probe: slot13 fn not in dwmcore -- abort"); return; }
+        void *pDT = ((pfnVGet)fn13)(pLayer);
+        diag("legacy-probe: GetBackBuffer(pLayer) -> %p", pDT);
+        if (!pDT || !is_readable(pDT, 8)) { diag("legacy-probe: device target null/unreadable -- abort"); return; }
+        void **dtvt = *(void ***)pDT;
+        ui_rva_t dtvtrva = (g_dwmcore_base && (BYTE *)dtvt >= g_dwmcore_base) ? (ui_rva_t)((BYTE *)dtvt - g_dwmcore_base) : 0;
+        diag("legacy-probe: device-target vtbl=%p rva=0x%llx", dtvt, (unsigned long long)dtvtrva);
+        if (is_readable(dtvt, sizeof(void *))) {
+            for (int s = 0; s < 80; s++) {
+                if (!is_readable(&dtvt[s], sizeof(void *))) break;
+                void *f = dtvt[s];
+                if (!f || !is_ptr_in_dwmcore(f)) continue;
+                ui_rva_t r = (ui_rva_t)((BYTE *)f - g_dwmcore_base);
+                const char *nm = lookup_rva_name(r);
+                if (nm && nm[0] != '?')
+                    diag("legacy-probe:   devTarget[%d] rva=0x%llx == %s", s, (unsigned long long)r, nm);
+            }
+        }
+        /* Strategy 1 -- CDeviceTextureTarget::GetTexture2D (0x865D0) on the device target. */
+        {
+            void **mv = nullptr; int adj = 0;
+            int sl = find_vtable_slot_by_rva_mi(pDT, (ui_rva_t)0x865D0, &mv, &adj);
+            diag("legacy-probe: [S1] GetTexture2D(0x865d0) slot=%d adj=+%d", sl, adj);
+            if (sl >= 0 && mv) {
+                void *fn = mv[sl];
+                if (is_ptr_in_dwmcore(fn)) {
+                    void *ret = ((pfnVGet)fn)((BYTE *)pDT + adj);
+                    diag("legacy-probe: [S1]   GetTexture2D -> %p", ret);
+                    if (ret && is_readable(ret, 8)) {
+                        void **rvt = *(void ***)ret;
+                        if (is_readable(rvt, sizeof(void *)) && is_ptr_in_loaded_module_code(rvt[0])) {
+                            ID3D11Texture2D *t2 = nullptr;
+                            HRESULT hr = ((pfnQI)rvt[0])(ret, &IID_ID3D11Texture2D_LOCAL, (void **)&t2);
+                            diag("legacy-probe: [S1]   QI(ID3D11Texture2D) hr=0x%08lx tex=%p %s",
+                                 hr, t2, t2 ? "<-- WINNER" : "");
+                            if (t2) t2->Release();
+                        }
+                    }
+                }
+            }
+        }
+        /* Strategy 2 -- GetD3D11Resource (g_rva_acc) on the device target, then QI. */
+        {
+            void **mv = nullptr; int adj = 0;
+            int sl = find_vtable_slot_by_rva_mi(pDT, g_rva_acc, &mv, &adj);
+            diag("legacy-probe: [S2] GetD3D11Resource(0x%llx) slot=%d adj=+%d", (unsigned long long)g_rva_acc, sl, adj);
+            if (sl >= 0 && mv) {
+                void *fn = mv[sl];
+                if (is_ptr_in_dwmcore(fn)) {
+                    void *pAcc = ((pfnVGet)fn)((BYTE *)pDT + adj);
+                    diag("legacy-probe: [S2]   GetD3D11Resource -> %p", pAcc);
+                    if (pAcc && is_readable(pAcc, 8)) {
+                        void **avt = *(void ***)pAcc;
+                        if (is_readable(avt, sizeof(void *)) && is_ptr_in_loaded_module_code(avt[0])) {
+                            ID3D11Texture2D *t2 = nullptr;
+                            HRESULT hr = ((pfnQI)avt[0])(pAcc, &IID_ID3D11Texture2D_LOCAL, (void **)&t2);
+                            diag("legacy-probe: [S2]   QI(ID3D11Texture2D) hr=0x%08lx tex=%p %s",
+                                 hr, t2, t2 ? "<-- WINNER" : "");
+                            if (t2) t2->Release();
+                        }
+                    }
+                }
+            }
+        }
+        /* Strategy 3 -- device target itself QI'd straight to ID3D11Texture2D. */
+        {
+            void **dv = *(void ***)pDT;
+            if (is_readable(dv, sizeof(void *)) && is_ptr_in_loaded_module_code(dv[0])) {
+                ID3D11Texture2D *t2 = nullptr;
+                HRESULT hr = ((pfnQI)dv[0])(pDT, &IID_ID3D11Texture2D_LOCAL, (void **)&t2);
+                diag("legacy-probe: [S3] QI(deviceTarget) hr=0x%08lx tex=%p %s",
+                     hr, t2, t2 ? "<-- WINNER" : "");
+                if (t2) t2->Release();
+            }
+        }
+        diag("legacy-probe: END");
+    } __except (EXCEPTION_EXECUTE_HANDLER) { diag("legacy-probe: SEH exception"); }
+}
+
+/* v7.6.2-legacy -- fetch the legacy composition device target the exact way
+ * dwmcore does inside CLegacyRenderTarget::Render:
+ *   deviceTarget = pLayer->vtbl[0x68]()   (0x68 / 8 == GBB_SLOT == 13)
+ * On legacy/WARP/Basic-Display boxes GetPhysicalBackBuffer returns NULL
+ * (empty physical overlay-plane array); this returns the CDeviceTextureTarget
+ * DWM actually draws the desktop into. Validated + SEH-guarded: any anomaly
+ * yields NULL so the caller degrades to SAFE-MODE instead of crashing DWM. */
+static void *legacy_get_device_target(void *pLayer) {
+    __try {
+        if (!pLayer || !is_readable(pLayer, 8)) return nullptr;
+        void **vt = *(void ***)pLayer;
+        if (!is_readable(vt, (GBB_SLOT + 1) * sizeof(void *))) return nullptr;
+        void *fn = vt[GBB_SLOT];
+        if (!is_ptr_in_dwmcore(fn)) return nullptr;
+        return ((pfnVGet)fn)(pLayer);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+
+/* v7.6.2 -- one-shot comprehensive dump of the legacy device target. Fires
+ * when the legacy path arms so dharpan2010's log reveals EXACTLY which accessor
+ * his real-GPU device target exposes + at what MI offset/slot (his box's chain
+ * dies at the accessor step -- neither GetTexture2D nor GetD3D11Resource was
+ * found in the old 128-byte window). Logs raw RVAs (named where a known dwmcore
+ * symbol matches) for the primary vtable and every MI subobject vtable, and
+ * explicitly flags GetTexture2D (0x865D0) / GetD3D11Resource (0x1F6F50) /
+ * GetDXGIResource (0x189590) wherever they appear. Read-only, SEH-guarded. */
+static void legacy_devtarget_dump_once(void *pDT) {
+    static volatile LONG s_done = 0;
+    if (InterlockedCompareExchange(&s_done, 1, 0) != 0) return;
+    __try {
+        if (!pDT || !is_readable(pDT, 8)) { diag("legacy-dt: pDT unreadable"); return; }
+        void **vt = *(void ***)pDT;
+        ui_rva_t vtrva = (g_dwmcore_base && (BYTE *)vt >= g_dwmcore_base)
+                             ? (ui_rva_t)((BYTE *)vt - g_dwmcore_base) : 0;
+        diag("legacy-dt: pDT=%p primary_vtbl=%p rva=0x%llx base=%p size=%zu",
+             pDT, vt, (unsigned long long)vtrva, g_dwmcore_base, (size_t)g_dwmcore_size);
+        for (int off = 0; off <= 384; off += 8) {
+            void **cand;
+            if (off == 0) {
+                cand = vt;
+            } else {
+                if (!is_readable((BYTE *)pDT + off, sizeof(void *))) continue;
+                cand = *(void ***)((BYTE *)pDT + off);
+            }
+            if (!cand) continue;
+            if (off != 0 && cand == vt) continue;
+            if (!g_dwmcore_base || (BYTE *)cand < g_dwmcore_base ||
+                (BYTE *)cand >= g_dwmcore_base + g_dwmcore_size) continue;
+            int header = 0;
+            for (int s = 0; s < 48; s++) {
+                if (!is_readable(&cand[s], sizeof(void *))) break;
+                void *fn = cand[s];
+                if (!fn || !is_ptr_in_dwmcore(fn)) continue;
+                ui_rva_t r = (ui_rva_t)((BYTE *)fn - g_dwmcore_base);
+                const char *nm = lookup_rva_name(r);
+                int known = (nm && nm[0] != '?');
+                int flag  = (r == 0x865d0ULL || r == 0x1f6f50ULL || r == 0x189590ULL);
+                if (!known && !flag) continue;   /* keep it concise: named or accessor-of-interest */
+                if (!header) { diag("legacy-dt: vtbl @ pDT+%d = %p", off, cand); header = 1; }
+                if (flag)
+                    diag("legacy-dt:   [+%d][%d] rva=0x%llx *** ACCESSOR (%s) ***", off, s,
+                         (unsigned long long)r,
+                         r == 0x865d0ULL ? "GetTexture2D" :
+                         r == 0x1f6f50ULL ? "GetD3D11Resource" : "GetDXGIResource");
+                else
+                    diag("legacy-dt:   [+%d][%d] rva=0x%llx == %s", off, s, (unsigned long long)r, nm);
+            }
+        }
+        diag("legacy-dt: end (if no ACCESSOR line above, this device target uses a "
+             "different texture getter -- RVAs above identify it)");
+    } __except (EXCEPTION_EXECUTE_HANDLER) { diag("legacy-dt: SEH during dump"); }
+}
+
 static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor) {
     ID3D11Texture2D *out_tex = nullptr;
     if (out_accessor) *out_accessor = nullptr;
@@ -5116,23 +5439,43 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor
         discover_gpb_slot_once(pLayer, GPB_SLOT);
         discover_gd3d_slot_once(pLayer, GD3D_SLOT);
 
-        /* v7.3.0 -- if the dynamic scan (including MI walk) gave up on
-         * ANY critical slot, this pLayer type is fundamentally unknown
-         * to us. Refuse to render + trip compose-degraded so the payload
-         * quiesces cleanly instead of calling a hardcoded slot that on
-         * this box would call the wrong function -> DWM AV. Payload
-         * stays loaded for rawinput/hotkey use. */
-        if (InterlockedCompareExchange(&g_dyn_scan_gave_up, 0, 0)) {
-            static volatile LONG s_degrade_notified = 0;
-            if (InterlockedCompareExchange(&s_degrade_notified, 1, 0) == 0) {
-                diag("get_backbuffer_texture: dynamic scan gave up -> SAFE-MODE "
-                     "(compose_degraded=1). Overlay quiesced. DWM stays alive. "
-                     "See vtable dump above for slot-to-symbol map on this box.");
-                /* Flip compose_degraded via a stubbed hook API. */
-                extern void hooks_force_compose_degraded(void);
-                hooks_force_compose_degraded();
+        /* v7.6.1 -- one-shot full object-layout dump (read-only) so a box
+         * where the overlay "runs but never draws" (MPO/COverlaySwapChain)
+         * hands support the exact slot->symbol map to build the right chain. */
+        gbt_dump_layout_once(pLayer);
+
+        /* v7.6.1 -- retry-until-success gate. Until we've LOCKED a working
+         * chain, count attempts and skip any object whose primary/MI scan
+         * didn't carry BOTH getters (dyn slot == -1). Skipping = return NULL
+         * now, retry next frame's object. Only after GBT_MAX_ATTEMPTS frames
+         * with no working object do we trip SAFE-MODE (compose quiesced, DWM
+         * alive) -- matching the old behavior for genuinely-unknown boxes.
+         * Once locked, this whole block is a cheap flag check. */
+        if (!InterlockedCompareExchange(&g_gbt_locked, 0, 0)) {
+            LONG att = InterlockedIncrement(&g_gbt_attempts);
+            /* Exhaustion is checked EVERY pre-lock frame -- covers BOTH the
+             * "getter not found at all" (missing) case AND dharpan's case
+             * where the getter IS found on a secondary but the chain NULLs
+             * every frame (so `missing` stays false). Without this, that
+             * case would retry forever with no SAFE-MODE fallback. */
+            if (att >= GBT_MAX_ATTEMPTS) {
+                static volatile LONG s_degrade_notified = 0;
+                if (InterlockedCompareExchange(&s_degrade_notified, 1, 0) == 0) {
+                    diag("get_backbuffer_texture: no renderable object after %ld frames "
+                         "(gpb=%d gd3d=%d) -> SAFE-MODE (compose_degraded=1). Overlay "
+                         "quiesced, DWM stays alive. See gbt-dump above for this box's "
+                         "slot->symbol map.", att, g_dyn_slot_gpb, g_dyn_slot_gd3d);
+                    void **primary = nullptr;
+                    __try { primary = *(void ***)pLayer; } __except (EXCEPTION_EXECUTE_HANDLER) { }
+                    if (primary) dump_known_slots_in_vtable("pLayer(exhausted)", primary);
+                    extern void hooks_force_compose_degraded(void);
+                    hooks_force_compose_degraded();
+                }
+                return nullptr;
             }
-            return nullptr;
+            /* Skip any object whose scan didn't carry BOTH getters. */
+            if ((g_dyn_slot_gpb < 0) || (g_dyn_slot_gd3d < 0))
+                return nullptr;   /* retry next frame's object */
         }
 
         const int slot_gpb  = effective_gpb_slot();
@@ -5157,8 +5500,18 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor
             }
             return nullptr;
         }
-        void *pPhysBack = ((pfnVGet)fn_gpb)(pLayer);
-        if (!pPhysBack || !is_readable(pPhysBack, 8)) return nullptr;
+        /* v7.6.0 -- this-adjust: primary adj=0 (no-op on our box).
+         * Secondary MI subobjects need obj+offset, not the most-derived
+         * pointer. dharpan2010 2026-09-26: slot 28 on secondary vtbl
+         * called with unadjusted pLayer -> NULL / DWM AV. */
+        void *pPhysBack = ((pfnVGet)fn_gpb)(adjust_this(pLayer, g_dyn_gpb_this_adj));
+        if (!pPhysBack || !is_readable(pPhysBack, 8)) {
+            static volatile LONG s_f = 0;
+            if (InterlockedCompareExchange(&s_f, 1, 0) == 0)
+                diag("gbt: NULL at GPB call (slot=%d adj=+%d ret=%p) -- see gbt-dump above",
+                     slot_gpb, g_dyn_gpb_this_adj, pPhysBack);
+            return nullptr;
+        }
 
         /* v1.6.1: validate GD3D slot. */
         if (!is_readable(&vtbl_gd3d[slot_gd3d], sizeof(void *))) return nullptr;
@@ -5172,18 +5525,54 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor
             }
             return nullptr;
         }
-        void *pRes = ((pfnVGet)fn_gd3d)(pLayer);
-        if (!pRes || !is_readable(pRes, 8)) return nullptr;
+        void *pRes = ((pfnVGet)fn_gd3d)(adjust_this(pLayer, g_dyn_gd3d_this_adj));
+#if SVCLDB_TEST_FORCE_LEGACY
+        pRes = nullptr;   /* DEV VALIDATION: force legacy GetBackBuffer path on real GPU */
+#endif
+        if (!pRes || !is_readable(pRes, 8)) {
+            /* v7.6.2-legacy -- physical overlay-plane backbuffer array is empty
+             * (legacy / WARP / Basic-Display composition; dharpan2010's box:
+             * PN2 CLegacyRenderTarget only, no MPO plane). dwmcore itself
+             * composits via CLegacyRenderTarget::Render ->
+             *   deviceTarget = pLayer->vtbl[0x68]()   (GetBackBuffer)
+             * then CDeviceTextureTarget::GetTexture2D on that target. Mirror it:
+             * swap pRes to the GetBackBuffer device target and flip accessor
+             * discovery to GetTexture2D (g_legacy_mode). Everything downstream
+             * (accessor -> QI -> RTV) is shared with the display path. Proven
+             * live via legacy_acquire_probe_once on a reproduced WARP DWM. */
+            static volatile LONG s_f = 0;
+            if (InterlockedCompareExchange(&s_f, 1, 0) == 0)
+                diag("gbt: GetPhysicalBackBuffer NULL (slot=%d adj=+%d) -- physical "
+                     "plane empty; falling through to legacy GetBackBuffer path",
+                     slot_gd3d, g_dyn_gd3d_this_adj);
+            void *pDevTarget = legacy_get_device_target(pLayer);
+            if (!pDevTarget || !is_readable(pDevTarget, 8)) {
+                static volatile LONG s_lf = 0;
+                if (InterlockedCompareExchange(&s_lf, 1, 0) == 0) {
+                    diag("gbt: legacy GetBackBuffer also failed (ret=%p) -- probing", pDevTarget);
+                    legacy_acquire_probe_once(pLayer);
+                }
+                return nullptr;   /* retry next frame; SAFE-MODE after GBT_MAX_ATTEMPTS */
+            }
+            if (InterlockedCompareExchange(&g_legacy_mode, 1, 0) == 0)
+                diag("gbt: LEGACY acquisition armed -- deviceTarget=%p via "
+                     "pLayer->vtbl[0x68] (GetBackBuffer); accessor -> GetTexture2D(0x%llx)",
+                     pDevTarget, (unsigned long long)g_rva_tex2d);
+            /* v7.6.2 -- dump the device target's vtable shape once so we can see
+             * which accessor it exposes if discovery fails (dharpan's box). */
+            legacy_devtarget_dump_once(pDevTarget);
+            pRes = pDevTarget;   /* continue the shared accessor chain on the device target */
+        }
 
         void **res_vtbl = *(void ***)pRes;
         if (!is_readable(res_vtbl, (ACC3_SLOT + 1) * 8)) return nullptr;
 
-        /* v7.3.0: MI-aware accessor discovery. */
+        /* v7.3.0: MI-aware accessor discovery. v7.6.1: skip-and-retry if the
+         * accessor getter isn't on this pRes (bounded by the gpb/gd3d gate
+         * above, which already counts attempts + trips SAFE-MODE on exhaust). */
         discover_acc_slot_once(pRes, ACC3_SLOT);
-        if (InterlockedCompareExchange(&g_dyn_scan_gave_up, 0, 0)) {
-            /* SAFE-MODE trip already logged by the discovery helper. */
-            return nullptr;
-        }
+        if (!InterlockedCompareExchange(&g_gbt_locked, 0, 0) && g_dyn_slot_acc < 0)
+            return nullptr;   /* accessor not on this object; retry next frame */
         const int slot_acc = effective_acc_slot();
         void **vtbl_acc = effective_acc_vtbl(res_vtbl);
 
@@ -5199,8 +5588,14 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor
             }
             return nullptr;
         }
-        void *pAcc = ((pfnVGet)fn_acc)(pRes);
-        if (!pAcc || !is_readable(pAcc, 8)) return nullptr;
+        void *pAcc = ((pfnVGet)fn_acc)(adjust_this(pRes, g_dyn_acc_this_adj));
+        if (!pAcc || !is_readable(pAcc, 8)) {
+            static volatile LONG s_f = 0;
+            if (InterlockedCompareExchange(&s_f, 1, 0) == 0)
+                diag("gbt: NULL at ACC call (slot=%d adj=+%d ret=%p) -- see gbt-dump above",
+                     slot_acc, g_dyn_acc_this_adj, pAcc);
+            return nullptr;
+        }
 
         void **acc_vtbl = *(void ***)pAcc;
         if (!is_readable(acc_vtbl, (VTBL_QI + 1) * 8)) return nullptr;
@@ -5233,6 +5628,49 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor
          * to CreateRenderTargetView (BP-parity -- see docstring above). */
         if (out_accessor) *out_accessor = pAcc;
 
+        /* v7.6.2-legacy -- SIZE GATE before locking (legacy path only).
+         * On the legacy/WARP/Basic-Display path COverlayContext::Present is
+         * invoked for MULTIPLE swapchains per frame -- small sub-surfaces AND
+         * the fullscreen desktop. GetBackBuffer returns a valid texture for
+         * ALL of them (unlike the display path's GetPhysicalBackBuffer, which
+         * NULLs on non-fullscreen swapchains, so the display path self-selects
+         * the desktop). Without a size gate we lock onto whichever swapchain
+         * is presented FIRST -- empirically a 32x32 sub-surface on the repro
+         * box -- and the overlay never draws. So: don't lock on a
+         * sub-fullscreen target; release it and retry subsequent Present
+         * calls until the desktop swapchain appears. Threshold matches
+         * get_or_create_rtv's minimum (800x600). Display path is untouched
+         * (g_legacy_mode stays 0 there). */
+        if (out_tex && InterlockedCompareExchange(&g_legacy_mode, 0, 0)) {
+            D3D11_TEXTURE2D_DESC ld = {};
+            out_tex->GetDesc(&ld);
+            if (ld.Width < 800 || ld.Height < 600) {
+                static volatile LONG s_lastsmall = 0;
+                LONG dim = (LONG)(((LONG)ld.Width << 16) | ((LONG)ld.Height & 0xFFFF));
+                if (dim != InterlockedCompareExchange(&s_lastsmall, dim, s_lastsmall))
+                    diag("gbt legacy: skip sub-fullscreen target %ux%u (pLayer=%p) -- "
+                         "retrying other Present swapchains for the desktop surface",
+                         ld.Width, ld.Height, pLayer);
+                out_tex->Release();
+                out_tex = nullptr;
+                if (out_accessor) *out_accessor = nullptr;
+                return nullptr;   /* NO lock -- retry next Present (different swapchain) */
+            }
+        }
+
+        /* v7.6.1 -- FULL CHAIN SUCCEEDED. Lock the discovered tuple so we
+         * stop re-scanning + never switch off this (proven-renderable)
+         * object. This is what makes dharpan-class boxes converge: we keep
+         * skipping "bad" objects (getter only in a non-working secondary)
+         * until a "good" one renders, then freeze on it. */
+        if (!InterlockedCompareExchange(&g_gbt_locked, 1, 0)) {
+            diag("get_backbuffer_texture: LOCKED renderable object after %ld attempt(s) "
+                 "(gpb_slot=%d adj=+%d gd3d_slot=%d adj=+%d acc_slot=%d adj=+%d)",
+                 InterlockedCompareExchange(&g_gbt_attempts, 0, 0),
+                 slot_gpb, g_dyn_gpb_this_adj, slot_gd3d, g_dyn_gd3d_this_adj,
+                 slot_acc, g_dyn_acc_this_adj);
+        }
+
         /* First successful call -- log the pointer values AND their
          * dwmcore RVAs so support has definitive per-Windows-build data
          * on what class::method each slot resolves to.
@@ -5250,12 +5688,12 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor
             ui_rva_t rva_gd3d = g_dwmcore_base ? (ui_rva_t)((BYTE *)fn_gd3d - g_dwmcore_base) : 0;
             ui_rva_t rva_acc  = g_dwmcore_base ? (ui_rva_t)((BYTE *)fn_acc  - g_dwmcore_base) : 0;
             diag("get_backbuffer_texture: OK on first call "
-                 "(gpb_slot=%d rva=0x%llx (== %s)  "
-                 "gd3d_slot=%d rva=0x%llx (== %s)  "
-                 "acc_slot=%d rva=0x%llx (== %s)  qi=%p  tex=%p)",
-                 slot_gpb,  (unsigned long long)rva_gpb,  lookup_rva_name(rva_gpb),
-                 slot_gd3d, (unsigned long long)rva_gd3d, lookup_rva_name(rva_gd3d),
-                 slot_acc,  (unsigned long long)rva_acc,  lookup_rva_name(rva_acc),
+                 "(gpb_slot=%d adj=+%d rva=0x%llx (== %s)  "
+                 "gd3d_slot=%d adj=+%d rva=0x%llx (== %s)  "
+                 "acc_slot=%d adj=+%d rva=0x%llx (== %s)  qi=%p  tex=%p)",
+                 slot_gpb,  g_dyn_gpb_this_adj,  (unsigned long long)rva_gpb,  lookup_rva_name(rva_gpb),
+                 slot_gd3d, g_dyn_gd3d_this_adj, (unsigned long long)rva_gd3d, lookup_rva_name(rva_gd3d),
+                 slot_acc,  g_dyn_acc_this_adj,  (unsigned long long)rva_acc,  lookup_rva_name(rva_acc),
                  fn_qi, out_tex);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -5299,6 +5737,18 @@ static ID3D11RenderTargetView *get_or_create_rtv(ID3D11Device *dev,
     }
     D3D11_TEXTURE2D_DESC desc = {};
     tex->GetDesc(&desc);
+
+    /* v7.6.2-legacy -- log the legacy GetBackBuffer->GetTexture2D surface
+     * dims whenever they CHANGE, so we can see if a 32x32 placeholder grows
+     * to fullscreen across frames (swapchain buffer rotation / lazy realloc). */
+    if (InterlockedCompareExchange(&g_legacy_mode, 0, 0)) {
+        static volatile LONG s_lastdim = 0;
+        LONG dim = (LONG)((desc.Width << 16) | (desc.Height & 0xFFFF));
+        if (dim != InterlockedCompareExchange(&s_lastdim, dim, s_lastdim))
+            diag("legacy-rtv: tex desc CHANGED %ux%u fmt=%u bind=0x%x tex=%p target=%p",
+                 desc.Width, desc.Height, (unsigned)desc.Format, (unsigned)desc.BindFlags,
+                 (void *)tex, (void *)pRes_for_rtv);
+    }
 
     /* Reject small layers (cursor 32x32, tooltip ~100x30). */
     if (desc.Width < 800 || desc.Height < 600) return nullptr;

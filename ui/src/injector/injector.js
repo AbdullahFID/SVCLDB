@@ -880,7 +880,17 @@ async function inject(opts) {
        * Promise executor without ever reaching finish(), leaking the
        * plaintext access_token + 4 api_keys in %TEMP%. */
       try { fs.unlinkSync(tmp); } catch {}
-      resolve({ ok: code === 0, exitCode: code, err });
+      /* v7.6.2 (2026-09-27): launcher exit 14 = "old payload stuck in dwm.exe,
+       * new inject would silently no-op against the double-init guard." Bubble
+       * a needsReboot flag so the renderer can show a reboot modal instead of
+       * a plain toast (only a real Windows restart clears dwm.exe of the old
+       * DLL image on boxes where TerminateProcess(dwm.exe) is denied). */
+      const result = { ok: code === 0, exitCode: code, err };
+      if (code === 14) {
+        result.needsReboot = true;
+        result.err = 'An older version of the overlay is still loaded in Windows and cannot be replaced without a restart.';
+      }
+      resolve(result);
     };
 
     let child;

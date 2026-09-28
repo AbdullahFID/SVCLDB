@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>v7.6.0 deep-hide click harness</title>
+<style>
+  body { font: 14px/1.4 system-ui; max-width: 720px; margin: 24px auto; }
+  .card { border: 1px solid #ccc; padding: 16px; }
+  .chip { padding: 6px 12px; margin-right: 8px; cursor: pointer; }
+  .chip.is-active { background: #111; color: #fff; }
+  .fs-hit { background: #fbbf24; font-weight: 700; }
+  #log { white-space: pre-wrap; background: #111; color: #eee; padding: 12px; min-height: 80px; }
+</style>
+</head>
+<body>
+  <h1>Deep hide click after search-highlight</h1>
+  <p>James_17338: clicking Deep hide did nothing after searching for it.</p>
+  <div class="card" id="overlay-appearance-card" data-search-tags="deep hide">
+    <span>Behavior:</span>
+    <button class="chip ova-flag-toggle" data-flag="4" id="uniform">Uniform alpha</button>
+    <button class="chip ova-flag-toggle" data-flag="16" id="deephide">Deep hide</button>
+  </div>
+  <p>
+    <button id="btn-old">1. Simulate OLD innerHTML highlight</button>
+    <button id="btn-new">2. Simulate NEW unwrap highlight</button>
+    <button id="btn-click">3. Click Deep hide</button>
+  </p>
+  <div id="log"></div>
+<script>
+  let flags = 0x4;
+  let clicks = 0;
+  const card = document.getElementById('overlay-appearance-card');
+  const log = (s) => { document.getElementById('log').textContent += s + '\n'; };
+
+  function refresh() {
+    card.querySelectorAll('.ova-flag-toggle').forEach((c) => {
+      c.classList.toggle('is-active', !!(flags & +c.dataset.flag));
+    });
+  }
+  refresh();
+
+  card.addEventListener('click', (ev) => {
+    const flag = ev.target.closest('.ova-flag-toggle');
+    if (!flag) return;
+    clicks += 1;
+    flags ^= +flag.dataset.flag;
+    refresh();
+    log('DELEGATED click on "' + flag.textContent.trim() + '" flags=0x' + flags.toString(16));
+  });
+
+  function applyOldInnerHTML() {
+    const prev = card.innerHTML;
+    card.innerHTML = prev.replace(/Deep hide/g, '<span class="fs-hit">Deep hide</span>');
+    log('OLD: replaced card.innerHTML (listeners on children are dead if they were per-node)');
+  }
+
+  function unwrapHighlights(el) {
+    el.querySelectorAll('span.fs-hit').forEach((span) => {
+      const p = span.parentNode;
+      p.replaceChild(document.createTextNode(span.textContent), span);
+      p.normalize();
+    });
+  }
+  function applyNewHighlight() {
+    unwrapHighlights(card);
+    const btn = document.getElementById('deephide');
+    const walker = document.createTreeWalker(btn, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    let n; while ((n = walker.nextNode())) nodes.push(n);
+    for (const node of nodes) {
+      if (!/Deep hide/.test(node.nodeValue)) continue;
+      const span = document.createElement('span');
+      span.className = 'fs-hit';
+      span.textContent = 'Deep hide';
+      node.parentNode.replaceChild(span, node);
+    }
+    log('NEW: wrapped text in .fs-hit without replacing the <button> node');
+  }
+
+  document.getElementById('btn-old').onclick = applyOldInnerHTML;
+  document.getElementById('btn-new').onclick = applyNewHighlight;
+  document.getElementById('btn-click').onclick = () => {
+    const btn = document.getElementById('deephide');
+    if (!btn) { log('FAIL: Deep hide button missing'); return; }
+    btn.click();
+    const on = !!(flags & 16);
+    const cls = btn.classList.contains('is-active');
+    if (on === cls && clicks > 0) log('PASS: Deep hide selected=' + on);
+    else log('FAIL: flags bit=' + on + ' is-active=' + cls + ' clicks=' + clicks);
+  };
+</script>
+</body>
+</html>

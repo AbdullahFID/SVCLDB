@@ -1,0 +1,17 @@
+{
+  "exported_at": "2026-09-27T23:40:46.558Z",
+  "app_version": "7.6.2",
+  "productName": "svchelper",
+  "user_email": "dharpan2010@gmail.com",
+  "subscription": {
+    "active": true,
+    "plan": "lifetime",
+    "status": "active",
+    "is_lifetime": true
+  },
+  "hwid_short": "b07fca57...aeea",
+  "os": "win32 x64",
+  "electron": "34.5.8",
+  "node": "20.19.1",
+  "copied_files": 10
+}

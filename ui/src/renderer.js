@@ -264,7 +264,11 @@ document.getElementById('tb-quit').addEventListener('click', () => {
   let _fsIndex   = null;        // Array<{ el, tags, textLower }>
   let _fsDebTmr  = 0;
   let _fsLastQ   = '';
-  let _fsRestore = new WeakMap(); // el → original innerHTML for un-highlight
+  /* v7.6.0 -- do NOT stash card.innerHTML. Restoring innerHTML
+   * destroyed every child node and dropped click listeners on
+   * Deep hide / Uniform alpha / theme chips (James_17338 2026-09-26:
+   * "clicking Deep hide but it's not selecting"). Unwrap .fs-hit
+   * spans in place so the original button elements stay alive. */
 
   const isMac = navigator.platform && /mac/i.test(navigator.platform);
   const buildIndex = () => {
@@ -283,13 +287,18 @@ document.getElementById('tb-quit').addEventListener('click', () => {
 
   const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-  const applyHighlight = (el, terms) => {
-    // Un-highlight first
-    const prev = _fsRestore.get(el);
-    if (prev !== undefined) {
-      el.innerHTML = prev;
-      _fsRestore.delete(el);
+  const unwrapHighlights = (el) => {
+    const hits = el.querySelectorAll('span.fs-hit');
+    for (const span of hits) {
+      const parent = span.parentNode;
+      if (!parent) continue;
+      parent.replaceChild(document.createTextNode(span.textContent), span);
+      parent.normalize();
     }
+  };
+
+  const applyHighlight = (el, terms) => {
+    unwrapHighlights(el);
     /* v7.4.1 — highlight EVERY token from the query, not just tokens[0].
      * Was showing "Deep hide" search with only "Deep" highlighted, which
      * looked like the second word had no match. Terms is an array now;
@@ -305,8 +314,16 @@ document.getElementById('tb-quit').addEventListener('click', () => {
         const p = node.parentNode;
         if (!p) return NodeFilter.FILTER_REJECT;
         const tag = p.nodeName;
+        /* v7.6.0 -- also skip interactive controls. Wrapping a chip
+         * label is fine for visuals, but INPUT/BUTTON/SELECT rebuild
+         * via innerHTML (the old path) killed listeners. We no longer
+         * replace innerHTML; still skip form controls so typed query
+         * text inside inputs isn't painted amber. Buttons ARE
+         * highlighted (that's how users find "Deep hide") -- unwrap
+         * keeps the same <button> node, so clicks still fire. */
         if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SCRIPT' ||
-            tag === 'STYLE' || tag === 'KBD' || tag === 'PRE') return NodeFilter.FILTER_REJECT;
+            tag === 'STYLE' || tag === 'KBD' || tag === 'PRE' ||
+            tag === 'SELECT') return NodeFilter.FILTER_REJECT;
         return NodeFilter.FILTER_ACCEPT;
       },
     });
@@ -317,15 +334,10 @@ document.getElementById('tb-quit').addEventListener('click', () => {
     let n;
     while ((n = walker.nextNode())) hits.push(n);
     if (!hits.length) return;
-    let anyChange = false;
     for (const node of hits) {
       const text = node.nodeValue;
       if (!re.test(text)) { re.lastIndex = 0; continue; }
       re.lastIndex = 0;
-      if (!anyChange) {
-        _fsRestore.set(el, el.innerHTML);
-        anyChange = true;
-      }
       const frag = document.createDocumentFragment();
       let last = 0, m;
       while ((m = re.exec(text)) !== null) {
@@ -341,13 +353,7 @@ document.getElementById('tb-quit').addEventListener('click', () => {
     }
   };
 
-  const clearHighlight = (el) => {
-    const prev = _fsRestore.get(el);
-    if (prev !== undefined) {
-      el.innerHTML = prev;
-      _fsRestore.delete(el);
-    }
-  };
+  const clearHighlight = unwrapHighlights;
 
   const runQuery = (raw) => {
     if (!_fsIndex) _fsIndex = buildIndex();
@@ -2184,42 +2190,41 @@ async function _initOverlayCard() {
     }
   };
 
-  document.querySelectorAll('#overlay-appearance-card .ova-alpha-preset').forEach((chip) => {
-    chip.addEventListener('click', () => {
-      _ovaState.alpha = +chip.dataset.alpha;
-      _ovaRefreshAll();
-      _autoSaveAndReinject(`Opacity ${Math.round(_ovaState.alpha*100)}%`);
+  /* v7.6.0 -- event delegation on the card. Feature-search used to
+   * replace card.innerHTML (killing per-chip listeners). Unwrap-in-place
+   * is the primary fix; delegation is the belt so a future highlight
+   * tweak cannot silently deaden Deep hide / theme / opacity chips. */
+  const ovaCard = document.getElementById('overlay-appearance-card');
+  if (ovaCard && !ovaCard.dataset.ovaDelegated) {
+    ovaCard.dataset.ovaDelegated = '1';
+    ovaCard.addEventListener('click', (ev) => {
+      const flag = ev.target.closest('.ova-flag-toggle');
+      if (flag && ovaCard.contains(flag)) {
+        const bit = +flag.dataset.flag;
+        _ovaState.overlay_flags ^= bit;
+        _ovaState.overlay_flags |= OVFLAG_ALWAYS_ON;
+        _ovaRefreshAll();
+        const label = flag.textContent.trim();
+        const onOff = (_ovaState.overlay_flags & bit) ? 'ON' : 'OFF';
+        _autoSaveAndReinject(`${label}: ${onOff}`);
+        return;
+      }
+      const theme = ev.target.closest('.ova-theme-preset');
+      if (theme && ovaCard.contains(theme)) {
+        _ovaState.theme = +theme.dataset.theme;
+        _ovaRefreshAll();
+        const names = { 0: 'Dark', 1: 'Light', 2: 'Auto' };
+        _autoSaveAndReinject(`Theme: ${names[_ovaState.theme] || 'Auto'}`);
+        return;
+      }
+      const alpha = ev.target.closest('.ova-alpha-preset');
+      if (alpha && ovaCard.contains(alpha)) {
+        _ovaState.alpha = +alpha.dataset.alpha;
+        _ovaRefreshAll();
+        _autoSaveAndReinject(`Opacity ${Math.round(_ovaState.alpha*100)}%`);
+      }
     });
-  });
-
-  document.querySelectorAll('#overlay-appearance-card .ova-theme-preset').forEach((chip) => {
-    chip.addEventListener('click', () => {
-      _ovaState.theme = +chip.dataset.theme;
-      _ovaRefreshAll();
-      const names = { 0: 'Dark', 1: 'Light', 2: 'Auto' };
-      _autoSaveAndReinject(`Theme: ${names[_ovaState.theme] || 'Auto'}`);
-    });
-  });
-
-  document.querySelectorAll('#overlay-appearance-card .ova-flag-toggle').forEach((chip) => {
-    chip.addEventListener('click', () => {
-      const bit = +chip.dataset.flag;
-      /* v13 (2026-08-10): plain bit toggle. The old OPAQUE_LOCK auto-alpha
-       * special-case is gone (that chip was removed; the flag is deprecated
-       * and the payload ignores it). Opacity is slider-driven only. */
-      _ovaState.overlay_flags ^= bit;
-      /* v18 (2026-09-25) -- Sam's UI-simplification pass.
-       * TRAIL_ERASE + SMOOTH_NUDGE are always-on now.  There are no
-       * chips for them in v18+ HTML, but if a v17 chip somehow sneaks
-       * back in (dev checkout mid-migration, cached DOM, etc.), refuse
-       * to clear the bit -- the payload force-ORs it back anyway. */
-      _ovaState.overlay_flags |= OVFLAG_ALWAYS_ON;
-      _ovaRefreshAll();
-      const label = chip.textContent.trim();
-      const onOff = (_ovaState.overlay_flags & bit) ? 'ON' : 'OFF';
-      _autoSaveAndReinject(`${label}: ${onOff}`);
-    });
-  });
+  }
 
   /* v18 (2026-09-25) -- Sam's UI-simplification pass.
    * The explicit `btn-ova-save` handler was removed together with the
@@ -2329,6 +2334,32 @@ document.getElementById('btn-inject').addEventListener('click', async () => {
       /* v2.0.2: soft recovery instead of a dead red toast — the app is still
        * fully open; only this Inject action needs the engine restored. */
       await _handleLauncherMissing(bag, configured);
+    } else if (r.needsReboot) {
+      /* v7.6.2 (2026-09-27): launcher exit 14 = an older version of the
+       * overlay is still loaded in dwm.exe and refused to unload within the
+       * 5 s grace, so a fresh inject on top would silently no-op against the
+       * payload's double-init guard. Only a real Windows restart evicts the
+       * stale DLL image (on boxes where TerminateProcess(dwm.exe) is denied
+       * by the OS). Give the user a clear message + a one-click restart. */
+      const yes = confirm(
+        "The app can't be loaded — an older version of the overlay is still stuck in Windows and can't be replaced without a restart.\n\n" +
+        "Click OK to restart your PC now (5-second delay; run `shutdown /a` in cmd to cancel).\n" +
+        "Click Cancel to restart manually later."
+      );
+      if (yes) {
+        try {
+          const r2 = await window.svc.system.restartPc();
+          if (r2 && r2.ok) {
+            toast('Restarting in 5 seconds… run `shutdown /a` in cmd if you need to cancel.', 'ok');
+          } else {
+            toast(`Restart failed: ${(r2 && r2.err) || 'unknown'}. Please restart manually.`, 'err');
+          }
+        } catch (e) {
+          toast(`Restart failed: ${e && e.message ? e.message : e}. Please restart manually.`, 'err');
+        }
+      } else {
+        toast('Please restart your PC and then click Inject again.', 'err');
+      }
     } else {
       const msg = _explainInjectExit(r.exitCode, r.err);
       toast(`Inject failed: ${msg}`, 'err');
@@ -2442,6 +2473,11 @@ function _explainInjectExit(code, err) {
     case 11: return 'Setup file invalid (version mismatch).';
     case 12: return 'Could not write to install folder (check permissions).';
     case 13: return 'Overlay failed to start. Try again, or use Emergency stop and retry.';
+    /* v7.6.2 (2026-09-27): "old payload stuck in dwm.exe, needs Windows restart."
+     * Explicit inject flows above handle this with the reboot modal; this string
+     * is the fallback for auto-reinject paths (preset changes etc.) that toast
+     * instead of dialoguing. */
+    case 14: return 'An older overlay version is still loaded in Windows. Restart your PC and try Inject again.';
     case  2: return 'Not running as administrator.';
     case  3: return 'API key missing.';
     default: return `exit ${code}`;

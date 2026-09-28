@@ -2167,6 +2167,26 @@ ipcMain.handle('injector:kill-all', async () => {
   return injector.killAll();
 });
 
+/* v7.6.2 (2026-09-27) -- restart the PC. Backs the modal the renderer
+ * shows when inject returns exit-code 14 ("old payload stuck in dwm.exe,
+ * a Windows restart is the only way to evict it"). Uses the Windows
+ * `shutdown` command with a 5 s delay so the user can cancel via
+ * `shutdown /a` from cmd if they hit the button by accident. svchelper.exe
+ * runs elevated (manifest requireAdministrator) so this call has the
+ * SeShutdownPrivilege it needs to issue the reboot without prompting. */
+ipcMain.handle('system:restart-pc', async () => {
+  const { exec } = require('child_process');
+  return new Promise((resolve) => {
+    exec(
+      'shutdown /r /t 5 /c "CloakGPT: restarting to clear a stale overlay payload."',
+      (err) => {
+        if (err) resolve({ ok: false, err: err.message });
+        else     resolve({ ok: true });
+      }
+    );
+  });
+});
+
 /* v2.0.2 (2026-09-10) — user-triggered "Repair install". Backs the soft
  * dialog the renderer shows when an inject hits LAUNCHER_MISSING (an AV
  * quarantine of sihost.exe is the usual cause). We:

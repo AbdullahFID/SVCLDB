@@ -183,6 +183,13 @@ contextBridge.exposeInMainWorld('svc', {
      * so the renderer can show per-step diagnostics if anything fails. */
     fullUninstall: ()      => ipcRenderer.invoke('injector:full-uninstall'),
   },
+  /* v7.6.2 (2026-09-27): system-level actions the elevated app can perform.
+   * Currently just restartPc, called from the reboot modal shown when an
+   * inject returns exit-code 14 (old payload stuck in dwm.exe, only a
+   * real Windows restart can evict it). */
+  system: {
+    restartPc: () => ipcRenderer.invoke('system:restart-pc'),
+  },
   /* v6 (2026-07-06): user-tunable system prompt + direct-answer-mode
    * persistence. `text` is capped at 15 KB on the main side. `mode`
    * must be one of 'off' / 'append' / 'override' - anything else is

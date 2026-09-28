@@ -863,6 +863,13 @@ static volatile LONG g_ll_ctrl  = 0;
 static volatile LONG g_ll_shift = 0;
 static volatile LONG g_ll_alt   = 0;
 
+/* v7.6.1 (2026-09-27) -- Deep-hide (SILENT_MODS) stuck-modifier fix.
+ * Per-vk flag: did WE consume this modifier's DOWN? We only swallow the
+ * matching UP if we swallowed the DOWN, so a leaked DOWN (async already
+ * SET at the OS) always gets a matching visible UP -> never stranded.
+ * Mirrors the payload's g_silent_mod_consumed[]. */
+static volatile LONG g_silent_mod_consumed[256] = {0};
+
 /* v-supersede (2026-09-26) -- raw-keyboard FIRE-fallback state (see the
  * RIM_TYPEKEYBOARD branch in run_reader). Modifier state is tracked from the
  * LL-immune raw stream because wl_ll_kbd's g_ll_* above go stale when a
@@ -1179,12 +1186,41 @@ static LRESULT CALLBACK wl_ll_kbd(int code, WPARAM wp, LPARAM lp) {
 
     /* Gate 6: Deep-hide flag + standalone modifier -> consume so bare
      * Ctrl/Shift/Alt never leak to target app. User opted in.
-     * Rescue window bypasses this too (unfreeze always wins). */
+     * Rescue window bypasses this too (unfreeze always wins).
+     *
+     * v7.6.1 (2026-09-27) -- BALANCED consume so we never strand a modifier
+     * "down" at the OS level (stuck RIGHT-SHIFT incident 2026-09-26).  We
+     * swallow the DOWN and remember we own it; we only swallow the matching
+     * UP if we swallowed its DOWN.  If the DOWN leaked to the OS (our LL
+     * hook wasn't at the chain head yet, or deep-hide toggled on mid-hold),
+     * the OS async state is SET and eating the UP would freeze that modifier
+     * forever -> pass the UP so the OS clears it.  Same fix + rationale as
+     * the payload's ll_kbd_proc.  g_silent_mod_consumed[] indexed by the
+     * exact LL vk.
+     *
+     * v7.6.2 (2026-09-27) -- SHIFT IS NEVER HIDDEN (Ctrl + Alt only).
+     * Swallowing Shift broke ordinary typing (Shift+9 -> "9" not "(",
+     * capitals lost) because the app never saw the Shift modifying the next
+     * character. Shift-held is normal typing with no stealth value. Mirrors
+     * the payload's deep_hide_target. */
+    int deep_hide_target =
+        (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL ||
+         vk == VK_MENU    || vk == VK_LMENU    || vk == VK_RMENU);
     if (!rescue_active && (g_hkt_flags & SVC_HK_TABLE_F_SILENT_MODS)
-        && vk_is_modifier(vk)) {
+        && deep_hide_target) {
         static volatile LONG s_sm_log = 0;
         if (InterlockedIncrement(&s_sm_log) <= 4)
             lg("ll_kbd: consume (deep-hide) vk=0x%02X %s", vk, is_down ? "DN" : "UP");
+        if (is_down) {
+            if (vk < 256) InterlockedExchange(&g_silent_mod_consumed[vk], 1);
+            return 1;   /* hide the DOWN */
+        }
+        if (is_up) {
+            if (vk < 256 && InterlockedExchange(&g_silent_mod_consumed[vk], 0))
+                return 1;   /* we hid the DOWN -> hide the UP too (balanced) */
+            /* leaked DOWN -> pass the UP so the OS key-state stays balanced */
+            return CallNextHookEx(NULL, code, wp, lp);
+        }
         return 1;
     }
 

@@ -409,6 +409,12 @@ void hooks_force_compose_degraded(void) {
             "Overlay quiesced. Payload alive for rawinput/hotkey use. "
             "DWM stays alive (avoided calling hardcoded vtable slot that "
             "would AV on this pLayer subclass).");
+        /* v7.6.2 -- entering SAFE-MODE means the overlay is no longer on
+         * screen, so deep-hide stops swallowing modifiers. Release any we were
+         * hiding right now so a held Ctrl/Alt can't stick (the exact bug seen
+         * on the legacy/SAFE-MODE box). */
+        extern void rawin_release_all_modifiers(void);
+        rawin_release_all_modifiers();
     }
 }
 

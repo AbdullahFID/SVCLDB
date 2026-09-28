@@ -2493,7 +2493,8 @@ static DWORD WINAPI init_thread(LPVOID param) {
      * v1.6.5 MAX_VTABLE_SCAN_SLOTS=256 window). */
     ui_set_vtable_slot_hints(off.getDevice,                 /* slot 5 -> GetDevice */
                              off.getPhysicalBackBufferRva,  /* slot 24 -> GetPhysicalBackBuffer */
-                             off.getD3D11ResourceRva);      /* slot 19 -> GetD3D11Resource */
+                             off.getD3D11ResourceRva,       /* slot 19 -> GetD3D11Resource */
+                             off.accessorRva);              /* v7.6.2-legacy: GetTexture2D (legacy accessor) */
 
     /* v1.6.3: populate the known-RVA lookup table so the first-success
      * diag in get_backbuffer_texture can NAME which dwmcore method each

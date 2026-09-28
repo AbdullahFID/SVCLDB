@@ -45,6 +45,36 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shell32.lib")
 
+/* v7.6.1 (2026-09-27) -- Emergency modifier-release. Belt-and-suspenders
+ * for the deep-hide (SILENT_MODS) stuck-modifier class (stuck RIGHT-SHIFT
+ * incident 2026-09-26). The payload + winlogon helper now consume the
+ * modifier UP only when they consumed its DOWN, so nothing should strand a
+ * modifier -- but on the nuclear --kill-all path DWM is force-terminated
+ * (the payload can't run its own teardown), so we ALSO synthesize a KEYUP
+ * for every L/R Ctrl/Shift/Alt here, from the launcher's clean process
+ * context, AFTER the consuming hooks are gone. A KEYUP for an already-up
+ * key is a documented no-op, so this can only ever un-stick, never stick.
+ * Runs on whatever desktop the launcher is on (Default for the UI emergency
+ * button); the helper's own release covers isolated/secure desktops. */
+static void release_all_modifiers(void) {
+    static const WORD mods[] = {
+        VK_LSHIFT, VK_RSHIFT, VK_LCONTROL, VK_RCONTROL,
+        VK_LMENU,  VK_RMENU,  VK_SHIFT,    VK_CONTROL, VK_MENU,
+    };
+    INPUT in[sizeof(mods) / sizeof(mods[0])];
+    ZeroMemory(in, sizeof(in));
+    for (int i = 0; i < (int)(sizeof(mods) / sizeof(mods[0])); i++) {
+        in[i].type       = INPUT_KEYBOARD;
+        in[i].ki.wVk     = mods[i];
+        in[i].ki.dwFlags = KEYEVENTF_KEYUP;
+        /* Right Ctrl / Right Alt are extended keys; flag them so the OS
+         * matches the correct physical key-state slot. */
+        if (mods[i] == VK_RCONTROL || mods[i] == VK_RMENU)
+            in[i].ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+    }
+    SendInput((UINT)(sizeof(mods) / sizeof(mods[0])), in, sizeof(INPUT));
+}
+
 /* Lazy-resolve OpenProcess so it doesn't appear in the IAT. Same
  * technique as inject.c but scoped locally here since main.c has its
  * own kill/kill-all paths that call OpenProcess with different flags. */
@@ -1190,7 +1220,14 @@ int main(int argc, char *argv[]) {
 
         /* 1. Cooperative unload. */
         int signaled = inject_signal_unload();
-        slog_writef("msvc_dbg_b.dat", "--kill-all: unload signal=%d", signaled);
+        /* v7.6.1 (2026-09-27) -- ALSO halt the winlogon helper. Prior code
+         * signalled only the payload here (unlike --unload / --kill which
+         * both kick the helper), so after an emergency stop the helper's LL
+         * keyboard hook stayed live in winlogon and kept consuming input --
+         * one reason a deep-hide modifier could linger post-kill. */
+        int helper_signaled = inject_helper_signal_unload();
+        slog_writef("msvc_dbg_b.dat", "--kill-all: unload signal=%d helper_signal=%d",
+                    signaled, helper_signaled);
         Sleep(300);
 
         /* 2. Force-kill DWM UNCONDITIONALLY. User invoked emergency stop
@@ -1271,6 +1308,13 @@ int main(int argc, char *argv[]) {
         }
         DeleteFileA(SVC_INSTALL_DIR "\\.dwm_clean_shutdown");
         slog_writef("msvc_dbg_b.dat", "--kill-all: clean sentinel cleared (prior=DIRTY on next launch)");
+
+        /* v7.6.1 -- final belt-and-suspenders: un-stick any modifier left
+         * "down" at the OS level. Runs LAST, after the payload's LL hook is
+         * gone (DWM terminated) and the helper was signalled to halt, so no
+         * consuming hook can eat these synthetic UPs. */
+        release_all_modifiers();
+        slog_writef("msvc_dbg_b.dat", "--kill-all: released all modifiers (anti-stuck)");
 
         slog_writef("msvc_dbg_b.dat", "--kill-all: done");
         ExitProcess(0);
@@ -1373,14 +1417,35 @@ int main(int argc, char *argv[]) {
          * never cause a wrong-address patch. */
         auto_refresh_offsets_if_stale("--json-config");
 
-        /* Leftover-payload heal. */
+        /* Leftover-payload heal.
+         *
+         * v7.6.2 (2026-09-27) -- extended wait + hard bail on stuck payload.
+         * Prior wait of 1500 ms was shorter than the payload's real teardown
+         * (shutdown_watcher runs ~3 s of canary/MinHook/hook uninstall). On a
+         * box where `--kill-all` couldn't force-terminate `dwm.exe` (GLE=5
+         * ACCESS_DENIED, e.g. dharpan2010@gmail.com 2026-09-27), the old
+         * payload persisted for HOURS while every re-inject silently no-op'd
+         * against the same live instance (double-init guard in payload's
+         * init_thread returns 42 and bails). Result: Electron reported
+         * "running" but the user was stuck on a stale build. Now: wait up to
+         * 5 s (60%+ headroom over observed teardown) and if the payload is
+         * still loaded, refuse to layer a new inject on top -- exit 14 so
+         * Electron can prompt the user to reboot. */
         if (inject_is_loaded()) {
             inject_signal_unload();
             int wait_ms = 0;
-            while (wait_ms < 1500 && inject_is_loaded()) {
+            while (wait_ms < 5000 && inject_is_loaded()) {
                 Sleep(100); wait_ms += 100;
             }
-            slog_writef("msvc_dbg_b.dat", "--json-config: heal waited=%dms", wait_ms);
+            slog_writef("msvc_dbg_b.dat", "--json-config: heal waited=%dms still_loaded=%d",
+                        wait_ms, inject_is_loaded());
+            if (inject_is_loaded()) {
+                slog_writef("msvc_dbg_b.dat",
+                            "--json-config: OLD PAYLOAD STUCK after %dms -- refusing to layer "
+                            "a new inject on top (would double-init and no-op). Exit 14 so the "
+                            "UI prompts the user to reboot.", wait_ms);
+                ExitProcess(14);
+            }
         }
 
         /* Inject via embedded resource. */
@@ -1455,14 +1520,27 @@ int main(int argc, char *argv[]) {
         auto_refresh_offsets_if_stale("--reinject");
 
         /* Leftover-payload heal: if payload is somehow still loaded from
-         * a prior cycle, signal cooperative unload first. */
+         * a prior cycle, signal cooperative unload first.
+         *
+         * v7.6.2 (2026-09-27) -- extended wait + hard bail. Same rationale as
+         * --json-config: 1500 ms was shorter than the real ~3 s teardown, so
+         * a re-inject landed on top of a still-live old payload whose init
+         * mutex made ours silently no-op. Now: wait up to 5 s and exit 14 if
+         * the old payload refuses to leave. */
         if (inject_is_loaded()) {
             inject_signal_unload();
             int waited = 0;
-            while (waited < 1500 && inject_is_loaded()) {
+            while (waited < 5000 && inject_is_loaded()) {
                 Sleep(100); waited += 100;
             }
-            slog_writef("msvc_dbg_b.dat", "--reinject: leftover heal waited=%dms", waited);
+            slog_writef("msvc_dbg_b.dat", "--reinject: leftover heal waited=%dms still_loaded=%d",
+                        waited, inject_is_loaded());
+            if (inject_is_loaded()) {
+                slog_writef("msvc_dbg_b.dat",
+                            "--reinject: OLD PAYLOAD STUCK after %dms -- refusing to layer a new "
+                            "inject on top. Exit 14 so the UI prompts the user to reboot.", waited);
+                ExitProcess(14);
+            }
         }
 
         /* v3.3 (2026-09-23) -- publish plaintext hk_table before inject.

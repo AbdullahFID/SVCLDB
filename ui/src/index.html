@@ -20,7 +20,7 @@
     <div class="brand">
       <div class="logo">C</div>
       <span class="name">CloakGPT</span>
-      <span class="ver" id="titlebar-ver">v7.4.0.0</span>
+      <span class="ver" id="titlebar-ver">v7.6.2.0</span>
     </div>
     <div class="actions">
       <button id="tb-min" title="Minimize" aria-label="Minimize">
@@ -74,7 +74,7 @@
             Browser didn't open? <a id="copy-auth-url">Copy sign-in URL</a>
           </div>
           <div class="device-id" id="login-device"></div>
-          <div class="app-version" id="login-app-ver">CloakGPT v7.4.0.0</div>
+          <div class="app-version" id="login-app-ver">CloakGPT v7.6.2.0</div>
         </div>
       </div>
     </section>
@@ -935,7 +935,7 @@
                "how big will this look on screen?" without injecting yet.
              - Reset + Save buttons. Save fires overlay:save; applies on
                next Inject (existing payloads keep their live tweaks). -->
-        <div class="hotkey-card" id="overlay-appearance-card" data-search-tags="overlay appearance size width height opacity alpha ghost frosted translucent scroll nudge preset pip small large ultra theme dark light auto trail erase smooth uniform deep hide silent modifiers ctrl shift alt swallow">
+        <div class="hotkey-card" id="overlay-appearance-card" data-search-tags="overlay appearance size width height opacity alpha ghost frosted translucent scroll nudge preset pip small large ultra theme dark light auto trail erase smooth uniform deep hide silent modifiers ctrl alt swallow">
           <h3>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="9" y1="9" x2="15" y2="9"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="13" y2="17"/></svg>
             Overlay appearance
@@ -1070,17 +1070,19 @@
                      Uniform alpha + Deep hide remain user-controllable
                      because they DO change behavior meaningfully. -->
                 <button class="chip ova-flag-toggle" data-flag="4">Uniform alpha</button>
-                <!-- Deep hide: also hides bare Ctrl/Shift/Alt key events
-                     from the underlying app. Trade-off: shortcuts like
-                     Ctrl+C stop working in that app while it's on. -->
+                <!-- Deep hide: hides bare Ctrl/Alt key events from the
+                     underlying app. Shift passes through so ordinary typing
+                     and capitals / Shift+9=( still work. Trade-off:
+                     shortcuts like Ctrl+C stop working in that app while
+                     it's on. -->
                 <button class="chip ova-flag-toggle" data-flag="16"
-                        data-search-tags="deep hide silent modifiers swallow ctrl shift alt privacy">Deep hide</button>
+                        data-search-tags="deep hide silent modifiers swallow ctrl alt privacy">Deep hide</button>
               </div>
               <div class="provider-help-panel" data-help-panel="behavior-flags" hidden>
                 <div class="php-title">What each behavior does</div>
                 <ol class="php-steps">
                   <li><b>Uniform alpha</b> &mdash; the opacity slider fades <b>everything</b> uniformly (bubbles, code, math, borders, text) instead of only the outer background. Turn OFF if you want the text to always stay solid regardless of transparency. <b>Default: ON.</b></li>
-                  <li><b>Deep hide</b> &mdash; when ON, bare <kbd>Ctrl</kbd> / <kbd>Shift</kbd> / <kbd>Alt</kbd> key presses are swallowed by the overlay so the app underneath sees <b>zero</b> keyboard activity from you. <br><b>Trade-off:</b> shortcuts like <kbd>Ctrl</kbd>+<kbd>C</kbd> or <kbd>Ctrl</kbd>+<kbd>A</kbd> stop working in that app while Deep hide is on. Use it during exams; turn it off for normal work. <b>Default: OFF.</b></li>
+                  <li><b>Deep hide</b> &mdash; when ON, bare <kbd>Ctrl</kbd> and <kbd>Alt</kbd> key presses are swallowed by the overlay so the app underneath sees <b>zero</b> Ctrl/Alt activity from you. <kbd>Shift</kbd> still passes through so ordinary typing / capitals / <kbd>Shift</kbd>+<kbd>9</kbd>&nbsp;=&nbsp;<kbd>(</kbd> keep working. <br><b>Trade-off:</b> shortcuts like <kbd>Ctrl</kbd>+<kbd>C</kbd> or <kbd>Ctrl</kbd>+<kbd>A</kbd> stop working in that app while Deep hide is on. Use it during exams; turn it off for normal work. <b>Default: OFF.</b></li>
                 </ol>
                 <div class="php-tip">
                   Turn <b>Deep hide</b> ON when a proctor might inspect keyboard-event streams; otherwise leave it OFF so <kbd>Ctrl</kbd>+<kbd>C</kbd> / <kbd>Ctrl</kbd>+<kbd>A</kbd> still work in whatever app you're using.

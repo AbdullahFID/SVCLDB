@@ -34,6 +34,12 @@ int  rawin_start(const unsigned *hotkeys, hotkey_cb_t cb);
 
 void rawin_stop(void);
 
+/* v7.6.2 -- stuck-modifier firewall. Synthesize KEYUP for any modifier the OS
+ * currently has down + clear our deep-hide ownership map. Called on every LL
+ * hook (re)install, on SAFE-MODE entry, and on teardown so a held Ctrl/Alt can
+ * never be stranded across a reinject / DWM crash / quiesce. */
+void rawin_release_all_modifiers(void);
+
 /* v3.2 (P0: overlay/mouse die on explorer restart). Stop + restart the input
  * subsystem so the poll thread, WM_INPUT worker, and low-level keyboard/mouse
  * hooks re-attach to the CURRENT input desktop. Called by the shell-restart
