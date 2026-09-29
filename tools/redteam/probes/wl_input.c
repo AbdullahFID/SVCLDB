@@ -1184,45 +1184,21 @@ static LRESULT CALLBACK wl_ll_kbd(int code, WPARAM wp, LPARAM lp) {
                (unsigned long long)(now_ms - g_wire_last_ok_ms));
     }
 
-    /* Gate 6: Deep-hide flag + standalone modifier -> consume so bare
-     * Ctrl/Shift/Alt never leak to target app. User opted in.
-     * Rescue window bypasses this too (unfreeze always wins).
+    /* Gate 6: Deep-hide -- REMOVED v7.8.0 (2026-09-28), mirroring the payload.
+     * It used to swallow bare Ctrl/Alt here so the proctored app never saw them,
+     * but that blinded the OS to the modifier AND -- because this winlogon hook
+     * sits AHEAD of the payload's hook in the LL chain -- eating the Ctrl DOWN
+     * here meant the PAYLOAD never saw it, so EVERY overlay hotkey silently died
+     * whenever the SILENT_MODS flag was set (Ctrl+U just typed "u", nothing could
+     * nudge/toggle). That's the exact regression this removal fixes.
      *
-     * v7.6.1 (2026-09-27) -- BALANCED consume so we never strand a modifier
-     * "down" at the OS level (stuck RIGHT-SHIFT incident 2026-09-26).  We
-     * swallow the DOWN and remember we own it; we only swallow the matching
-     * UP if we swallowed its DOWN.  If the DOWN leaked to the OS (our LL
-     * hook wasn't at the chain head yet, or deep-hide toggled on mid-hold),
-     * the OS async state is SET and eating the UP would freeze that modifier
-     * forever -> pass the UP so the OS clears it.  Same fix + rationale as
-     * the payload's ll_kbd_proc.  g_silent_mod_consumed[] indexed by the
-     * exact LL vk.
-     *
-     * v7.6.2 (2026-09-27) -- SHIFT IS NEVER HIDDEN (Ctrl + Alt only).
-     * Swallowing Shift broke ordinary typing (Shift+9 -> "9" not "(",
-     * capitals lost) because the app never saw the Shift modifying the next
-     * character. Shift-held is normal typing with no stealth value. Mirrors
-     * the payload's deep_hide_target. */
-    int deep_hide_target =
-        (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL ||
-         vk == VK_MENU    || vk == VK_LMENU    || vk == VK_RMENU);
-    if (!rescue_active && (g_hkt_flags & SVC_HK_TABLE_F_SILENT_MODS)
-        && deep_hide_target) {
-        static volatile LONG s_sm_log = 0;
-        if (InterlockedIncrement(&s_sm_log) <= 4)
-            lg("ll_kbd: consume (deep-hide) vk=0x%02X %s", vk, is_down ? "DN" : "UP");
-        if (is_down) {
-            if (vk < 256) InterlockedExchange(&g_silent_mod_consumed[vk], 1);
-            return 1;   /* hide the DOWN */
-        }
-        if (is_up) {
-            if (vk < 256 && InterlockedExchange(&g_silent_mod_consumed[vk], 0))
-                return 1;   /* we hid the DOWN -> hide the UP too (balanced) */
-            /* leaked DOWN -> pass the UP so the OS key-state stays balanced */
-            return CallNextHookEx(NULL, code, wp, lp);
-        }
-        return 1;
-    }
+     * No SEB / isolated-desktop exception: the same blinding + modifier-stranding
+     * happens there, input already routes through the pipe, and a keyboard-hiding
+     * trick adds fragility with no real stealth win. The stealth replacement is
+     * the same as the payload's -- set the overlay toggle to a triple-left-click
+     * and drive it with the on-screen buttons (mouse-only, no keyboard pattern
+     * for a proctor to spot). SVC_HK_TABLE_F_SILENT_MODS is now vestigial;
+     * g_silent_mod_consumed[] is retained only for the teardown-release helper. */
 
     /* Gate 7: registered hotkey -> consume so target never sees it.
      * Rescue window bypasses (user needs raw keyboard back). */

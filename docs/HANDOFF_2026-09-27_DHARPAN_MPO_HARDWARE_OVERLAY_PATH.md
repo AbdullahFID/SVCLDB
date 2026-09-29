@@ -1466,3 +1466,67 @@ render, or `refusing hardcoded slot ... skip` -> SAFE-MODE).
   crash) but won't RENDER her; if she needs render, RE her exact pLayer type from a
   v7.7.1 gbt-dump log.
 
+### ROUND 6 -- v7.8.0 DEEP-HIDE REMOVAL + v7.8.1 HELPER/HOTKEY FIX + WINDOWS-BUILD TRIGGER (2026-09-29 ~2:25 AM)
+
+**v7.8.0 -- DEEP HIDE REMOVED (per He's explicit call).** Deep hide (SVC_OVFLAG_SILENT_MODS)
+swallowed bare Ctrl/Alt at the LL hook, which blinded the OS to the modifier and stranded
+it "held forever" (bare `u` fired Ctrl+U, bare `s` saved, quit chord eaten). Fundamentally
+unwinnable (hiding the key from the app hides it from the OS too -> no ground-truth). Removed
+from `payload/src/rawinput_hook.c` (swallow block) + `payload/src/ui/imgui_layer.cpp`
+(overlay toggle button) + `ui/src/index.html` (Electron chip -> replaced with a triple-left-
+click-toggle recommendation) + read-only Emergency section documenting the fixed
+Ctrl+Shift+Alt+Q/R winlogon chords (`index.html` + `styles.css`). Also this round: GPT-6
+Sol/Luna + Opus 5.5 model bump (worker + ai_provider), pushed to main as `62a2598`.
+
+**v7.8.0 REGRESSION (found live) -- ALL HOTKEYS DEAD when injected.** Symptom: uninjected =
+Ctrl+A/C/V fine; injected = no overlay hotkey works, "Ctrl+U just types u". ROOT CAUSE: I
+removed deep-hide from the PAYLOAD but NOT from the WINLOGON HELPER (`tools/redteam/probes/
+wl_input.c` Gate 6). The helper's LL hook sits AHEAD of the payload's in the chain, so with
+the user's config still carrying SILENT_MODS it swallowed Ctrl DOWN (return 1) before the
+payload ever saw it -> g_ctrl_down never set -> zero hotkey matches. Confirmed from the
+payload log: the LL hook saw Ctrl only as an UP (0xA2/wp=0x101), never a DOWN.
+
+**v7.8.1 -- THE FIX (verified live).** (1) Removed Gate 6 deep-hide swallow from wl_input.c
+(no SEB exception -- same blinding/stranding there). (2) `ui/src/license/storage.js` now
+strips the SILENT_MODS bit (`flg &= ~0x10`) on load/save so stale configs self-heal; flag is
+vestigial everywhere now. Rebuilt (launcher auto-rebuilds the helper DLL when wl_input.c is
+newer) + re-armed -> log showed `hk: 6` + `ui: nudge ... [glide]` + `POLL fired slot=6` =
+Ctrl+Arrow nudge FIRING. HOTKEYS WORK. Version bumped 7.8.0.0 -> 7.8.1.0. Setup.exe (80.1MB)
++ zip (124.8MB) on He's Desktop, ready to upload.
+
+**WARP crash-safety spot-check (2026-09-29):** disabled BOTH GPUs (-> Microsoft Basic
+Display Adapter / WARP software). 3rd inject attempt landed on the WARP DWM: payload pulled a
+FULL-SCREEN 2880x1800 RTV (`target size grew 0x0 -> 2880x1800`, `RTV cached 2880x1800`) with
+ZERO DWM crash. (First 2 attempts just missed the inject during DWM's restart.) Heavy flicker
+/ black desktop / stutter during WARP = software-rendering the whole desktop on CPU, NOT a
+bug + NOT what real-GPU users see. Restored GPUs (`C:\ghidra_dl\restore_gpu.ps1`; NVIDIA
+10DE:2D59 + AMD 1002:150E). NOTE: injection onto a freshly-restarted DWM is timing-sensitive
+-- settle ~18s before `--reinject`.
+
+**>>> ROOT-CAUSE NOW PINNED TO A WINDOWS BUILD FLIP <<<** Affected user reports: overlay
+WORKS on Windows 26200.**9457**, FAILS on 26200.**9550** -- SAME hardware, SAME app. dharpan
+same. THIS dev box is ALSO 26200.9550 (dwmcore 26100.9278) and the overlay WORKS here ->
+so 9550 does NOT universally break; a Windows cumulative update (9457->9550) flips CERTAIN
+hardware from the DISPLAY composition path to the LEGACY (CLegacyRenderTarget) path, which is
+the no-render/crash class this whole doc chased. My hardware stays on display at 9550; theirs
+flips to legacy -> I STILL cannot reproduce their legacy path locally (display on my GPU even
+GPU-off-WARP is degenerate). **Key positive:** the legacy getters DO resolve on the 9550
+dwmcore (blob: legacy_gpb=0x900A0, legacy_acc=0x90230), and the resolver finds them BY NAME
+per-build, so v7.8.1's legacy fix SHOULD auto-adapt on the affected users' 9550 boxes -- but
+it is UNVALIDATED on a real 9550-legacy box (they only ever tested the old broken version).
+
+**DEFINITIVE NEXT STEP (do this before any "roll back Windows" advice):** upload v7.8.1 ->
+have ONE 9550-legacy user (the 9457-works/9550-breaks reporter, or dharpan) install it + send
+`msvc_dbg_a.dat`. Read the render path: `PN2: captured CLegacyRenderTarget` + `gd3d_slot
+LEGACY getter (CLegacySwapChain::GetPhysicalBackBuffer) primary slot=` + `acc_slot LEGACY
+accessor` + `get_backbuffer_texture: OK` + `ImGui READY` == FIXED. If instead `refusing
+hardcoded slot ... skip` -> SAFE-MODE, the legacy getter isn't at a callable slot on their
+pLayer -> RE their 9550 dwmcore (Ghidra at `C:\ghidra_dl\`, dwmcore_pdb_analysis.log already
+has the CLegacySwapChain symbols) to find the real slot/chain. "Roll back Windows" is a weak
+last-resort stopgap only (updates re-apply, ~10-day uninstall window, unpatched, doesn't
+scale) -- validate v7.8.1 FIRST.
+
+**FRESH-CHAT NOTE:** this chat is huge (compacted once). If v7.8.1 fails on a 9550-legacy
+box, continue the dwmcore-diff RE in a FRESH chat loaded from this handoff -- do NOT try to
+RE in the exhausted original chat.
+

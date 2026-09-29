@@ -367,11 +367,17 @@ function _clampOverlayInput(o) {
   else if (o.theme === 2 || o.theme === '2' || o.theme === 'auto')  theme = 2;
   // overlay_flags: bitfield, sanitize to known bits only.
   let flg = Number.isFinite(+o.overlay_flags) ? (+o.overlay_flags | 0) : OVFLAG_DEFAULTS;
-  flg &= (OVFLAG_TRAIL_ERASE | OVFLAG_SMOOTH_NUDGE | OVFLAG_UNIFORM_ALPHA | OVFLAG_OPAQUE_LOCK | 0x10 /* SILENT_MODS */);
+  flg &= (OVFLAG_TRAIL_ERASE | OVFLAG_SMOOTH_NUDGE | OVFLAG_UNIFORM_ALPHA | OVFLAG_OPAQUE_LOCK | 0x10 /* SILENT_MODS (deep hide) */);
   // v13 (2026-08-10): strip OPAQUE_LOCK — it's deprecated (the payload ignores
   // it) and leaving a stale bit set in an old overlay.json is confusing. This
   // clears it on the next load/save so opacity is purely slider-driven.
   flg &= ~OVFLAG_OPAQUE_LOCK;
+  // v7.8.0 (2026-09-28): strip SILENT_MODS (Deep hide) — feature REMOVED from
+  // payload + winlogon helper. A stale bit set here is what made the helper
+  // swallow Ctrl/Alt ahead of the payload and kill every hotkey (Ctrl+U typed
+  // "u"). Clear it on next load/save so old configs self-heal; it's ignored
+  // everywhere now regardless.
+  flg &= ~0x10;
   // v18 (2026-09-25) — Sam's UI-simplification pass. Force TRAIL_ERASE +
   // SMOOTH_NUDGE ON regardless of persisted value.  A hand-edited or old
   // overlay.json with either bit cleared silently migrates up here.
