@@ -30,6 +30,7 @@
 #include "../../../shared/str_enc.h"
 #include "../../../shared/supabase_config.h"
 #include "../config_read.h"   /* v2.0.1: cfg_copy_access_token prototype */
+#include "../token_refresh_client.h"  /* v7.8.3: refresh_now for AI 401 retry */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -2208,8 +2209,32 @@ int ai_ask_metered_multi(const svc_config_t *cfg,
      * (15m), CHEAP -> fast, MEDIUM -> balanced. Brings credits STRONG to full
      * parity with BYO STRONG. Larger timeout only permits longer waits; it
      * can't change logic or crash. */
-    int ok = whreq_post_ex(url, hdrs, jb.buf, jb.len,
+    /* v7.8.3 (2026-09-29) -- on-demand JWT refresh + retry ONCE on 401.
+     * Fixes the "session expired mid-exam" class: the periodic
+     * token_refresh_client tick missed a beat (laptop suspend, transient
+     * Supabase 5xx, race with Electron's pipe push) and THIS POST is the
+     * first to hit the now-stale access_token. On the first 401 we
+     * synchronously refresh the JWT in-place and re-POST the SAME body once,
+     * so the user never sees the error. A second 401 with a fresh JWT means
+     * something structural (revoked user / worker gate change) -- fall
+     * through to the friendly error below. Only non-200 codes reach the retry
+     * check; non-401s and transport failures behave exactly as before. jb
+     * stays alive across the retry (freed after the loop). */
+    int ok = 0;
+    for (int attempt = 0; ; attempt++) {
+        ok = whreq_post_ex(url, hdrs, jb.buf, jb.len,
                            ai_select_receive_timeout(cfg, NULL), &r);
+        if (!ok || r.status != 401 || attempt >= 1) break;
+        slog_writef("msvc_dbg_d.dat", "ai_ask_metered 401 -> refresh_now + retry");
+        if (token_refresh_client_refresh_now() != 1) break;  /* refresh failed -> keep the 401 */
+        char at2[4200];
+        if (cfg_copy_access_token(at2, sizeof(at2)) == 0) break;
+        /* Rebuild the auth header in place; hdrs[] still points at auth_hdr. */
+        _snprintf(auth_hdr, sizeof(auth_hdr) - 1, "Authorization: Bearer %s", at2);
+        auth_hdr[sizeof(auth_hdr) - 1] = 0;
+        whreq_free_result(&r);
+        memset(&r, 0, sizeof(r));    /* clean slate for the retry POST */
+    }
     jb_free(&jb);
     if (!ok) {
         slog_writef("msvc_dbg_d.dat", "ai_ask_metered transport fail: %s", r.err);

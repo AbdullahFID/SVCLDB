@@ -479,3 +479,14 @@ void token_refresh_client_stop(void) {
         g_trc_wake_ev = NULL;
     }
 }
+
+/* Public on-demand refresh -- thin wrapper over the same trc_do_refresh the
+ * periodic tick calls, so the retry-on-401 path in ai_provider.c exercises
+ * the exact same rotation / cfg_persist / lock semantics as the background
+ * thread. Any future change to trc_do_refresh (backoff, log shape, persist
+ * retries) automatically applies here too. Thread-safe: trc_do_refresh takes
+ * the config CS internally and holds it only across the in-memory rotation,
+ * not across the HTTPS call. */
+int token_refresh_client_refresh_now(void) {
+    return trc_do_refresh();
+}

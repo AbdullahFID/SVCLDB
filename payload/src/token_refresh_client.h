@@ -75,6 +75,16 @@ void token_refresh_client_start(void);
  * whole auth stack coherently. */
 void token_refresh_client_stop(void);
 
+/* Synchronous on-demand refresh. Thread-safe (delegates to the same
+ * trc_do_refresh the periodic tick uses, which takes the config CS
+ * internally). Intended for the AI-request path: on a 401, call this,
+ * and if it returns 1 the caller re-reads cfg->access_token (now rotated)
+ * and retries the request ONCE. Return codes mirror the periodic tick:
+ *   1 = success (cfg->access_token is fresh),
+ *   0 = transient failure (network / 5xx / config unavailable),
+ *  -1 = permanent failure (refresh_token dead / 400 invalid_grant). */
+int token_refresh_client_refresh_now(void);
+
 #ifdef __cplusplus
 }
 #endif
