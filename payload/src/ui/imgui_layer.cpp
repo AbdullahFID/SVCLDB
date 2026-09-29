@@ -128,6 +128,16 @@ void as_cfg_set_dot_enabled(int on);
 #ifndef SVCLDB_TEST_FORCE_LEGACY
 #define SVCLDB_TEST_FORCE_LEGACY 0
 #endif
+/* v7.8.2 -- dummy-class (empty-swapchain legacy) acquisition anchor. When the
+ * Present-supplied pLayers never yield a fullscreen lock within this many
+ * frames, switch acquisition to the CLegacyRenderTarget's OWN fullscreen
+ * swapchain (via g_legacy_rt). Populated-legacy boxes (WARP/dharpan) lock on
+ * frame 1 so this never triggers for them. Dev flag forces it immediately for
+ * WARP bring-up. MUST be 0 for shipped builds. */
+#ifndef SVCLDB_TEST_RT_ANCHOR
+#define SVCLDB_TEST_RT_ANCHOR 0
+#endif
+#define LEGACY_RT_ANCHOR_AFTER 90   /* ~1.5s @ 60fps of no fullscreen lock */
 #define VTBL_RELEASE 2    /* IUnknown::Release             */
 
 static const GUID IID_ID3D11Texture2D_LOCAL = {
@@ -5508,6 +5518,145 @@ static void legacy_devtarget_dump_once(void *pDT) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { diag("legacy-dt: SEH during dump"); }
 }
 
+/* v7.8.2 (2026-09-29) -- READ-ONLY legacy fullscreen surface-hunter.
+ * On the dummy/empty-swapchain legacy case (userB/yqyeyyqye), COverlayContext::
+ * Present only ever hands us sub-surface swapchains, so the pLayer chain never
+ * finds the fullscreen desktop. dwmcore composites the desktop via
+ * CLegacyRenderTarget::Render into GetBackBuffer(swapchain+0x18) where
+ * swapchain = *(rt+0xc8) (RE'd on 9549). We already capture rt
+ * (CLegacyRenderTarget) via PN2 (hooks_get_legacy_rt). This walks rt ->
+ * swapchain -> that surface and reports its DIMENSIONS + which getter yields a
+ * renderable texture, so the first real dummy-class log pinpoints the
+ * fullscreen surface WITHOUT guessing. Pure read + GetDesc + Release,
+ * SEH-guarded, one-shot. Fires on ANY legacy box (incl. WARP) so the anchor
+ * plumbing is validated locally before any render fallback is wired. */
+extern "C" void *hooks_get_legacy_rt(void);
+
+static void hunt_probe_layer(void *pLayer, int off) {
+    __try {
+        if (!pLayer || !is_readable(pLayer, 8)) return;
+        void **vt = *(void ***)pLayer;
+        if (!vt || (BYTE *)vt < g_dwmcore_base ||
+            (BYTE *)vt >= g_dwmcore_base + g_dwmcore_size || !is_readable(vt, 14 * 8)) return;
+        void *fn13 = vt[13];
+        if (!is_ptr_in_dwmcore(fn13)) return;
+        ui_rva_t r13 = (ui_rva_t)((BYTE *)fn13 - g_dwmcore_base);
+        diag("legacy-hunt: rt+0x%x -> pLayer=%p vtbl_rva=0x%llx slot13=0x%llx(%s)",
+             off, pLayer, (unsigned long long)((BYTE *)vt - g_dwmcore_base),
+             (unsigned long long)r13, lookup_rva_name(r13));
+
+        /* (A) legacy GetPhysicalBackBuffer -> its buffer -> legacy accessor -> QI. */
+        if (g_rva_legacy_gd3d) {
+            void **mv = nullptr; int adj = 0;
+            int sl = find_vtable_slot_by_rva_mi(pLayer, g_rva_legacy_gd3d, &mv, &adj);
+            if (sl >= 0 && mv && is_ptr_in_dwmcore(mv[sl])) {
+                void *buf = ((pfnVGet)mv[sl])((BYTE *)pLayer + adj);
+                diag("legacy-hunt:   GPB(slot=%d adj=%d) -> %p", sl, adj, buf);
+                if (buf && is_readable(buf, 8) && g_rva_legacy_acc) {
+                    void **bmv = nullptr; int badj = 0;
+                    int bsl = find_vtable_slot_by_rva_mi(buf, g_rva_legacy_acc, &bmv, &badj);
+                    if (bsl >= 0 && bmv && is_ptr_in_dwmcore(bmv[bsl])) {
+                        void *res = ((pfnVGet)bmv[bsl])((BYTE *)buf + badj);
+                        if (res && is_readable(res, 8)) {
+                            void **rvt = *(void ***)res;
+                            if (is_readable(rvt, 8) && is_ptr_in_loaded_module_code(rvt[0])) {
+                                ID3D11Texture2D *t = nullptr;
+                                if (SUCCEEDED(((pfnQI)rvt[0])(res, &IID_ID3D11Texture2D_LOCAL, (void **)&t)) && t) {
+                                    D3D11_TEXTURE2D_DESC d = {}; t->GetDesc(&d);
+                                    diag("legacy-hunt:   [GPB->acc->tex] %ux%u fmt=%u <== SURFACE",
+                                         d.Width, d.Height, (unsigned)d.Format);
+                                    t->Release();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        /* (B) GetBackBuffer (slot 13) device target -> full texture-getter set. */
+        {
+            void *pDT = ((pfnVGet)fn13)(pLayer);
+            diag("legacy-hunt:   GetBackBuffer(slot13) -> devTarget=%p", pDT);
+            if (pDT && is_readable(pDT, 8)) {
+                const ui_rva_t getters[3] = { g_rva_tex2d, g_rva_acc, (ui_rva_t)0x865D0 };
+                for (int gi = 0; gi < 3; gi++) {
+                    if (!getters[gi]) continue;
+                    void **mv = nullptr; int adj = 0;
+                    int sl = find_vtable_slot_by_rva_mi(pDT, getters[gi], &mv, &adj);
+                    if (sl < 0 || !mv || !is_ptr_in_dwmcore(mv[sl])) continue;
+                    void *res = ((pfnVGet)mv[sl])((BYTE *)pDT + adj);
+                    if (!res || !is_readable(res, 8)) continue;
+                    void **rvt = *(void ***)res;
+                    if (!is_readable(rvt, 8) || !is_ptr_in_loaded_module_code(rvt[0])) continue;
+                    ID3D11Texture2D *t = nullptr;
+                    if (SUCCEEDED(((pfnQI)rvt[0])(res, &IID_ID3D11Texture2D_LOCAL, (void **)&t)) && t) {
+                        D3D11_TEXTURE2D_DESC d = {}; t->GetDesc(&d);
+                        diag("legacy-hunt:   [GBB->getter0x%llx->tex] %ux%u fmt=%u <== SURFACE",
+                             (unsigned long long)getters[gi], d.Width, d.Height, (unsigned)d.Format);
+                        t->Release();
+                    }
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { diag("legacy-hunt: SEH on rt+0x%x", off); }
+}
+
+static void legacy_rt_surface_hunt_once(void) {
+    static volatile LONG s_done = 0;
+    if (InterlockedCompareExchange(&s_done, 1, 0) != 0) return;
+    __try {
+        int scrW = GetSystemMetrics(SM_CXSCREEN), scrH = GetSystemMetrics(SM_CYSCREEN);
+        void *rt = hooks_get_legacy_rt();
+        diag("legacy-hunt: BEGIN g_legacy_rt=%p primaryRes=%dx%d", rt, scrW, scrH);
+        if (!rt || !is_readable(rt, 0x200)) { diag("legacy-hunt: no/short g_legacy_rt -- abort"); return; }
+        /* RE'd swapchain offset on 9549 = rt+0xc8; try it explicitly first. */
+        {
+            void *P = *(void **)((BYTE *)rt + 0xc8);
+            if (P && is_readable(P, 0x20)) hunt_probe_layer((BYTE *)P + 0x18, 0xc8);
+        }
+        /* Then scan rt for any other swapchain-shaped pointer (build-robust). */
+        for (int off = 0x20; off <= 0x1F8; off += 8) {
+            if (off == 0xc8) continue;
+            if (!is_readable((BYTE *)rt + off, 8)) continue;
+            void *P = *(void **)((BYTE *)rt + off);
+            if (!P || !is_readable(P, 0x20)) continue;
+            void *pLayer = (BYTE *)P + 0x18;
+            if (!is_readable(pLayer, 8)) continue;
+            void **vt = *(void ***)pLayer;
+            if (!vt || (BYTE *)vt < g_dwmcore_base || (BYTE *)vt >= g_dwmcore_base + g_dwmcore_size) continue;
+            if (!is_readable(vt, 14 * 8) || !is_ptr_in_dwmcore(vt[13])) continue;
+            hunt_probe_layer(pLayer, off);
+        }
+        diag("legacy-hunt: END (SURFACE lines above = reachable D3D surfaces + dims; "
+             "the one matching primaryRes is the fullscreen desktop)");
+    } __except (EXCEPTION_EXECUTE_HANDLER) { diag("legacy-hunt: SEH"); }
+}
+
+/* v7.8.2 -- return the CLegacyRenderTarget's OWN fullscreen swapchain pLayer
+ * (rt -> *(rt+0xc8) -> +0x18), validated (dwmcore vtbl + slot13 GetBackBuffer in
+ * dwmcore). This is the swapchain dwmcore composites the desktop into on the
+ * legacy path (CLegacyRenderTarget::Render). Used as the acquisition anchor for
+ * the dummy class, where COverlayContext::Present only ever hands us sub-surface
+ * swapchains. WARP-validated: this pLayer's legacy GPB+accessor chain yields the
+ * true fullscreen (2880x1800) texture. NULL if unavailable/invalid (degrades to
+ * SAFE-MODE, never crashes). The 0xc8 swapchain offset is RE'd on 9278/9549;
+ * validated before use so a build that moves it just yields NULL here. */
+static void *legacy_rt_fullscreen_pLayer(void) {
+    __try {
+        void *rt = hooks_get_legacy_rt();
+        if (!rt || !is_readable(rt, 0xd0)) return nullptr;
+        void *P = *(void **)((BYTE *)rt + 0xc8);
+        if (!P || !is_readable(P, 0x20)) return nullptr;
+        void *pLayer = (BYTE *)P + 0x18;
+        if (!is_readable(pLayer, 8)) return nullptr;
+        void **vt = *(void ***)pLayer;
+        if (!vt || (BYTE *)vt < g_dwmcore_base ||
+            (BYTE *)vt >= g_dwmcore_base + g_dwmcore_size) return nullptr;
+        if (!is_readable(vt, 14 * 8) || !is_ptr_in_dwmcore(vt[13])) return nullptr;
+        return pLayer;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+
 static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor) {
     ID3D11Texture2D *out_tex = nullptr;
     if (out_accessor) *out_accessor = nullptr;
@@ -5517,6 +5666,36 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor
 
     __try {
         if (!pLayer || !is_readable(pLayer, 8)) return nullptr;
+
+        /* v7.8.2 -- DUMMY-CLASS ACQUISITION ANCHOR.
+         * On empty-swapchain legacy boxes (userB/yqyeyyqye) COverlayContext::
+         * Present only ever hands us sub-surface swapchains, so no fullscreen
+         * lock ever happens on the Present-supplied pLayer. After
+         * LEGACY_RT_ANCHOR_AFTER frames with no lock, switch acquisition to the
+         * CLegacyRenderTarget's OWN fullscreen swapchain (g_legacy_rt -> rt+0xc8
+         * -> +0x18) -- the surface dwmcore composites the desktop into. WARP
+         * proved this yields the true fullscreen texture via the legacy
+         * GPB+accessor chain. Populated-legacy + display boxes lock on frame 1
+         * (or aren't legacy), so this never fires for them -> zero regression.
+         * All validated + SEH-guarded downstream; worst case is SAFE-MODE. */
+        if (!InterlockedCompareExchange(&g_gbt_locked, 0, 0) && hooks_get_legacy_rt()) {
+            int anchor_now = SVCLDB_TEST_RT_ANCHOR;
+            if (!anchor_now &&
+                InterlockedCompareExchange(&g_gbt_attempts, 0, 0) >= LEGACY_RT_ANCHOR_AFTER)
+                anchor_now = 1;
+            if (anchor_now) {
+                void *anchor = legacy_rt_fullscreen_pLayer();
+                if (anchor && anchor != pLayer) {
+                    static volatile LONG s_sw = 0;
+                    if (InterlockedCompareExchange(&s_sw, 1, 0) == 0)
+                        diag("gbt: dummy-class anchor -- no fullscreen lock on Present "
+                             "pLayers; switching acquisition to g_legacy_rt fullscreen "
+                             "swapchain pLayer=%p", anchor);
+                    pLayer = anchor;
+                }
+            }
+        }
+
         void **layer_vtbl = *(void ***)pLayer;
         if (!is_readable(layer_vtbl, (ACC3_SLOT + 1) * 8)) return nullptr;
 
@@ -5534,6 +5713,13 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor
          * where the overlay "runs but never draws" (MPO/COverlaySwapChain)
          * hands support the exact slot->symbol map to build the right chain. */
         gbt_dump_layout_once(pLayer);
+
+        /* v7.8.2 -- on legacy boxes, one-shot READ-ONLY hunt for the fullscreen
+         * desktop surface via g_legacy_rt (CLegacyRenderTarget -> swapchain ->
+         * device target). Pinpoints where the desktop composites on the dummy
+         * class (userB) without guessing; harmless on display boxes (g_legacy_rt
+         * is NULL there so this is skipped). Fires on WARP too -> anchor validated. */
+        if (hooks_get_legacy_rt()) legacy_rt_surface_hunt_once();
 
         /* v7.6.1 -- retry-until-success gate. Until we've LOCKED a working
          * chain, count attempts and skip any object whose primary/MI scan

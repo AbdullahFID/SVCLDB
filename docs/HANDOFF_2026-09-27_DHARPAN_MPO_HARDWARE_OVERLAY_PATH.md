@@ -1530,3 +1530,120 @@ scale) -- validate v7.8.1 FIRST.
 box, continue the dwmcore-diff RE in a FRESH chat loaded from this handoff -- do NOT try to
 RE in the exhausted original chat.
 
+---
+
+## ROUND 7 -- GHIDRA RE CLOSES THE LOOP + WARP VALIDATES v7.8.1 + DUMMY-CLASS ANCHOR (2026-09-29 ~3:25 AM, autonomous overnight)
+
+Fresh chat, box fully handed over (admin, kept awake via powercfg + caffeine pid; GPU
+dead-man's switch `SvcldbGPUDeadman` armed for WARP tests). Ghidra assets on `dwmcore_9549`
+(project_legacy) + new script `C:\ghidra_dl\scripts\LegacyRE.java` (decomps + slot-by-slot
+vtable dumps; raw output `C:\ghidra_dl\legacyRE*.out`).
+
+### THE RE FINDING (definitive -- resolves the whole fork)
+On dharpan/girlC's exact build (9549), the `pLayer` that `COverlayContext::Present` hands us
+points at `CLegacySwapChain::vftable{for IDeviceResource}` (RVA **0x30c500** -- byte-for-byte
+matches dharpan's round-3 runtime `primary_vtbl=...C500`). In THAT primary vtable:
+- **slot 24 (off 0xc0) = `CLegacySwapChain::GetPhysicalBackBuffer` (0x900a0)** -- reads its
+  OWN buffer array at `this+0x160` -> returns a real buffer on a populated legacy swapchain.
+  (The display getter `CDDisplaySwapChain::GetPhysicalBackBuffer` 0x1e34c0 reads `this+0x1B8`,
+  EMPTY on legacy -> that was the NULL.) v7.8.1 resolves 0x900a0 BY NAME and searches the
+  primary vtable for it -> finds it at slot 24, `this_adj==0` -> uses it. **Correct.**
+- **buffer's slot 19 = `CLegacySwapChainBuffer::GetD3D11Resource` (0x90230)** = v7.8.1's paired
+  legacy accessor. The DISPLAY accessor `CDDisplaySwapChainBuffer::GetD3D11Resource` (0x1f6f50)
+  sits at **secondary slot 76** -- calling THAT on a legacy buffer = girlC's type-confusion
+  crash. v7.8.1 never calls it (pairs the legacy accessor when the legacy getter matched).
+- HDR/wide-gamut boxes get `CConversionSwapChain` (EnsureSwapChain: `*(rt+0x88) >= 2`), which
+  **inherits** 0x900a0 (does not override) -> v7.8.1 covers them too.
+
+**Why it was never validated:** NO affected user ever ran a build with the fix. The legacy-
+getter search first shipped in v7.7.1; dharpan's last log was v7.6.2, userB/geko were v7.7.0.
+Every "still broken" log predates the code that fixes it.
+
+### WARP VALIDATION (local, end-to-end) -- v7.8.1 legacy chain RENDERS
+Tonight's WARP sessions (GPUs disabled -> Basic Display -> legacy composition, real dwmcore
+9278) ran the CURRENT build and produced the exact predicted chain:
+`PN2 captured CLegacyRenderTarget` -> `gd3d_slot LEGACY getter primary slot=24` ->
+`acc_slot LEGACY accessor slot=19` -> `LOCKED after 1 attempt` -> fullscreen 2880x1800 RTV ->
+`ImGui READY`, zero DWM crash. So the handoff's "unvalidated" is now **validated for the
+populated-legacy class** (dharpan/girlC/geko's class). The RTV thrash seen on WARP
+(2880x1800 <-> 800x600 every frame) is a WARP **multi-D3D-device artifact** (`device changed
+-> RTV cache cleared` fires every frame; two software devices) -- NOT a real-box bug; a real
+single-GPU legacy box has one device so `g_target` holds fullscreen + the 95% gate rejects
+sub-surfaces. No code change warranted for it.
+
+### TWO LEGACY SUB-CLASSES (both now understood)
+1. **Populated-legacy** (geko confirmed on old build; dharpan/girlC predicted; WARP): the
+   swapchain's physical-buffer array is non-empty -> `CLegacySwapChain::GetPhysicalBackBuffer`
+   returns a real buffer -> **v7.8.1 renders.**
+2. **Empty/dummy-legacy** (userB/yqyeyyqye): array empty -> legacy getter NULLs on the
+   Present-supplied `pLayer` too. ROUND 4 concluded "16x16/32x32 dummy" and gave up.
+   **Tonight's surface-hunter shows WHY that was a red herring** (below).
+
+### NEW: READ-ONLY SURFACE-HUNTER (shipped in v7.8.2, WARP-validated)
+`imgui_layer.cpp::legacy_rt_surface_hunt_once()` fires once on ANY legacy box (g_legacy_rt
+non-NULL). It walks `g_legacy_rt` (the `CLegacyRenderTarget` we already capture via PN2) ->
+swapchain at `rt+0xc8` -> `pLayer+0x18`, and probes every getter, reporting each reachable
+D3D surface's DIMENSIONS. On WARP it produced the decisive map:
+```
+legacy-hunt: rt+0xc8 -> pLayer=... vtbl_rva=0x30c500 slot13=0x187ee0
+legacy-hunt:   [GPB->acc->tex]        2880x1800 <== the FULLSCREEN desktop
+legacy-hunt:   [GBB->getter0x865d0]   32x32     <== the "dummy" GetBackBuffer device target
+```
+**The fullscreen desktop IS reachable via `g_legacy_rt` -> swapchain -> GetPhysicalBackBuffer
++ legacy accessor. The 32x32 "dummy" that made userB look unfixable is the GetBackBuffer
+DEVICE-TARGET path -- the wrong surface.** Read-only + SEH-guarded + one-shot; dormant on
+display boxes. `hooks_get_legacy_rt()` accessor added to dwm_hooks.c/.h.
+
+### NEW: DUMMY-CLASS ACQUISITION ANCHOR (shipped in v7.8.2, gated + WARP-plumbing-validated)
+`imgui_layer.cpp::get_backbuffer_texture` + `legacy_rt_fullscreen_pLayer()`: when a legacy box
+never locks a fullscreen surface on the Present-supplied pLayers within `LEGACY_RT_ANCHOR_AFTER`
+(90) frames, switch acquisition to the CLegacyRenderTarget's OWN fullscreen swapchain
+(`g_legacy_rt -> rt+0xc8 -> +0x18`) and run the same legacy GPB+accessor chain there.
+- Gated: populated-legacy + display boxes lock on frame 1 (or aren't legacy) -> anchor NEVER
+  fires for them -> **zero regression** (verified on display + WARP populated-legacy).
+- `rt+0xc8` validated before use (dwmcore vtbl + slot13 in dwmcore); wrong offset on another
+  build -> NULL -> degrades to SAFE-MODE, never crashes.
+- Dev flag `SVCLDB_TEST_RT_ANCHOR` (default 0) forces it immediately; used tonight on WARP to
+  confirm the anchor resolves to a valid, renderable pLayer + renders fullscreen + no crash.
+- **Still needs a real userB-class box to confirm his rt-swapchain array is populated** (WARP
+  is populated-legacy, so the divergent switch case isn't reproducible locally). If populated
+  -> renders; if empty everywhere -> SAFE-MODE (no worse than v7.8.1), and the `legacy-hunt`
+  SURFACE lines in his log will show where the desktop actually is.
+
+### ROOT CAUSE OF THE 9457->9550 FLIP (his DLL-diff idea)
+`COverlayContext::LegacyPresentRequired` / `CLegacyRenderTarget::UseLegacyPresent` (= reads
+`this[0x82f1]`) / `UpdateMPOCaps` / `CheckDirectFlipSupport` (calls DWM_CHECK_MULTIPLANE_
+OVERLAY_SUPPORT via the driver) -- the display-vs-legacy fork is gated on **driver-reported
+MPO/DirectFlip capability**, which these functions READ (they don't compute it). My box runs
+the SAME dwmcore builds (8457/9278/9549 all in WinSxS) and stays on the DISPLAY path on my GPU
+while affected users flip to legacy -> **environmental (driver/GPU/output caps changed by the
+9550 cumulative update), not a dwmcore code regression.** So the fix is fix-forward (render on
+legacy), not a revert and not a dwmcore patch. 8457 dwmcore copied to `C:\ghidra_dl` for a
+full byte-diff if ever wanted (low value; conclusion already firm).
+
+### SHIP STATE (v7.8.2)
+- Code committed to `main` locally (NOT pushed -- distribution stays your call).
+- PROD Setup.exe + zip on your Desktop (v7.8.2.0), ready to send to a 9550-legacy user.
+- Local box left CLEAN (payload unloaded); clean dev build deployed under WinAudioSvc, so
+  `sihost.exe --reinject` re-arms the overlay for local testing anytime.
+- **What to look for in a real 9550-legacy user's v7.8.2 `msvc_dbg_a.dat`:**
+  - Populated-legacy (expected win): `gd3d_slot LEGACY getter ... primary slot=24` +
+    `acc_slot LEGACY accessor slot=19` + `LOCKED` + `ImGui READY` = FIXED, overlay renders.
+  - Dummy-legacy: `legacy-hunt` lines report a `... <== SURFACE 2880x1800` (or their res) via
+    `[GPB->acc->tex]` -> then `gbt: dummy-class anchor -- switching ...` -> `LOCKED` +
+    `ImGui READY` = FIXED via the anchor. If instead the only SURFACE is a small one, the
+    desktop scans out via a non-D3D path and we pivot to force-display guidance.
+- Files touched this round: `payload/src/dwm_hooks.c` (+`hooks_get_legacy_rt`),
+  `payload/src/dwm_hooks.h`, `payload/src/ui/imgui_layer.cpp` (surface-hunter + anchor +
+  defines), `ui/package.json` + `ui/src/license/config.js` + `ui/src/index.html` (7.8.1->7.8.2).
+  RE tooling: `C:\ghidra_dl\scripts\LegacyRE.java`, `C:\ghidra_dl\legacyRE*.out`,
+  `C:\ghidra_dl\warp_test.ps1`, `C:\ghidra_dl\caffeine.ps1`.
+
+### BIGGEST TAKEAWAY
+v7.8.1 (already on your Desktop before tonight) very likely ALREADY fixes most affected users
+-- the RE proves it and WARP renders it. The reason it "seemed unfixed" is that no user ever
+installed a build containing the fix. **Get ONE 9550-legacy user onto v7.8.2 and read the log
+-- I expect `ImGui READY`.** v7.8.2 adds the dummy-class anchor + surface-hunter on top so even
+the empty-swapchain case either renders or self-diagnoses.
+
+

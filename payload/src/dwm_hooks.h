@@ -224,6 +224,11 @@ void hooks_bump_compose_grace(unsigned ms);
  * volatile read, no lock. */
 int hooks_uninstall_in_progress(void);
 
+/* v7.8.2 (2026-09-29) -- PN2-captured CLegacyRenderTarget base pointer, or
+ * NULL on display-path boxes. Read-only; used by the UI layer's legacy
+ * surface-hunter to reach the fullscreen composition device target. */
+void *hooks_get_legacy_rt(void);
+
 #ifdef __cplusplus
 }
 #endif

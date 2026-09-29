@@ -489,6 +489,14 @@ static present_cb_t         g_present_cb      = NULL;
 static volatile void *g_display_rt = NULL;
 static volatile void *g_legacy_rt  = NULL;
 
+/* v7.8.2 (2026-09-29) -- expose the PN2-captured CLegacyRenderTarget base
+ * pointer so the UI layer can, on the dummy/empty-swapchain legacy case,
+ * walk rt -> swapchain (rt+0xc8 on 9549) -> fullscreen device target -- the
+ * surface dwmcore composites the desktop into via CLegacyRenderTarget::Render
+ * -- when COverlayContext::Present only ever hands us sub-surface swapchains.
+ * Returns NULL on display-path boxes (PN2 never fires). Read-only use. */
+void *hooks_get_legacy_rt(void) { return (void *)g_legacy_rt; }
+
 /* ── Master switches (Bypassify pattern) ──
  *
  * Two-flag state machine because we have two DIFFERENT shutdown
