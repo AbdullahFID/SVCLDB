@@ -66,7 +66,11 @@ typedef struct {
     uint8_t  prologue_present[32];
     uint8_t  prologue_iop[32];
     uint8_t  ffd_bytes[16];
-    uint8_t  reserved[16];
+    /* v7.7.1 -- legacy-path getters (repurposed from reserved[16], same size).
+     * CLegacyRenderTarget/no-overlay-plane boxes need these instead of the
+     * display getters (which NULL or crash there). */
+    uint64_t legacyGetPhysicalBackBufferRva; /* CLegacySwapChain::GetPhysicalBackBuffer  */
+    uint64_t legacyGetD3D11ResourceRva;      /* CLegacySwapChainBuffer::GetD3D11Resource */
 } OffsetsBlobExt;
 
 typedef struct {
@@ -407,6 +411,20 @@ int main(void) {
     ext.magic = BLOB_EXT_MAGIC;
     ext.resolver_flags = 0;
     int ext_ok = 0;
+
+    /* v7.7.1 -- LEGACY getters (parallel of the display getters, used on the
+     * CLegacyRenderTarget / no-overlay-plane path). On legacy boxes the display
+     * GetPhysicalBackBuffer NULLs and the display GetD3D11Resource crashes when
+     * called on a legacy buffer; these legacy-class methods render. Named
+     * symbols -> resolved to the correct per-build RVA on each user's machine.
+     * Confirmed live: geko9777mellado (legacy box) renders via slot24=
+     * CLegacySwapChain::GetPhysicalBackBuffer + slot19=CLegacySwapChainBuffer::
+     * GetD3D11Resource. */
+    ext.legacyGetPhysicalBackBufferRva = resolve("dwmcore!CLegacySwapChain::GetPhysicalBackBuffer");
+    ext.legacyGetD3D11ResourceRva      = resolve("dwmcore!CLegacySwapChainBuffer::GetD3D11Resource");
+    log_line("Legacy-getter RVA hints: legacy_gpb=0x%llX legacy_acc=0x%llX",
+             (unsigned long long)ext.legacyGetPhysicalBackBufferRva,
+             (unsigned long long)ext.legacyGetD3D11ResourceRva);
     {
         HANDLE hf_dc = CreateFileA(DWMCORE_PATH, GENERIC_READ,
                                    FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
@@ -481,6 +499,9 @@ int main(void) {
             CloseHandle(hf_dc);
         }
     }
+    /* v7.7.1 -- write the ext block even if the PE snapshot failed, so the
+     * legacy-getter RVAs still reach the payload. */
+    if (ext.legacyGetPhysicalBackBufferRva || ext.legacyGetD3D11ResourceRva) ext_ok = 1;
     if (ext_ok) {
         log_line("blob-ext: dwmcore TDS=0x%08X size=%lu "
                  "present=%02X %02X %02X %02X ... iop=%02X %02X %02X %02X ... ffd=%02X",

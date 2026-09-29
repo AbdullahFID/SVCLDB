@@ -1555,86 +1555,30 @@ static LRESULT CALLBACK ll_kbd_proc(int code, WPARAM wp, LPARAM lp) {
             }
         }
 
-        /* v3.3 (2026-09-23) -- "Deep hide" mode. When the user has flipped
-         * the SVC_OVFLAG_SILENT_MODS chip in the dashboard, we swallow the
-         * standalone Ctrl / Alt DOWN and UP transitions BEFORE any downstream
-         * app's window queue sees it. Our own modifier tracking already ran
-         * above so hotkeys still fire cleanly; only the leak to the underlying
-         * app is suppressed. User opted in; in-app Ctrl-based shortcuts (Ctrl+C
-         * etc) stop working there while the mode is on.
+        /* v7.8.0 (2026-09-28) -- "Deep hide" (SVC_OVFLAG_SILENT_MODS) REMOVED
+         * ENTIRELY, per He's explicit call. It used to SWALLOW the standalone
+         * Ctrl/Alt keydown at this LL hook (return 1) so the underlying app never
+         * saw it. That was an unwinnable design: hiding Ctrl from the app ALSO
+         * hides it from the OS, so GetAsyncKeyState/GetKeyState go blind and we
+         * had to hand-track the modifier with NO ground-truth fallback. Any
+         * missed up/down (an injected auto-typer event, a visibility flip
+         * mid-hold, a swallowed-DOWN whose UP took a different path) stranded the
+         * modifier "held forever" -> bare `u` fired Ctrl+U, bare `s` triggered
+         * the app's save, and the emergency quit chord got eaten before the
+         * winlogon helper's hook could see it. There is no cheap fix while the
+         * key is hidden from the OS, so the feature is gone.
          *
-         * v7.6.2 (2026-09-27) -- SHIFT IS NEVER HIDDEN. Swallowing Shift broke
-         * ordinary typing: the app saw "9" instead of "(" for Shift+9,
-         * capitals came out lowercase, etc. -- because it never saw the Shift
-         * that modifies the next character. Shift-held is normal typing
-         * behavior with zero stealth value, so deep-hide now targets Ctrl +
-         * Alt only and lets Shift pass straight through to the app. (Fn is a
-         * firmware key that never reaches a WH_KEYBOARD_LL hook, so it can't
-         * be hidden here regardless.) */
-        int deep_hide_target =
-            (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL ||
-             vk == VK_MENU    || vk == VK_LMENU    || vk == VK_RMENU);
-        if (this_is_modifier_vk) {
-            const svc_config_t *cfg = cfg_get();
-            if (deep_hide_target && cfg && (cfg->overlay_flags & SVC_OVFLAG_SILENT_MODS)) {
-                /* Still run the modifier-release sweep so held-hotkey glide
-                 * stops the instant the user lifts a modifier -- SILENT_MODS
-                 * only affects downstream propagation, not our internal
-                 * state machine. */
-                if (mod_released) {
-                    for (int vki = 0; vki < 256; vki++) {
-                        LONG slot = g_consumed_vk_slot[vki];
-                        if (slot < 0 || slot >= SVC_HK_COUNT) continue;
-                        unsigned req = (g_hk[slot] >> 16) & 0xFF;
-                        int want_ctrl  = (req & SVC_HK_MOD_CTRL)  != 0;
-                        int want_shift = (req & SVC_HK_MOD_SHIFT) != 0;
-                        int want_alt   = (req & SVC_HK_MOD_ALT)   != 0;
-                        if ((want_ctrl  && !g_ctrl_down)  ||
-                            (want_shift && !g_shift_down) ||
-                            (want_alt   && !g_alt_down)) {
-                            InterlockedExchange(&g_consumed_vk[vki],      0);
-                            InterlockedExchange(&g_consumed_vk_slot[vki], -1);
-                        }
-                    }
-                }
-                /* v7.6.1 -- balanced consume so we never strand a modifier.
-                 * Swallow the DOWN (hide it), and mark that we own it.  Only
-                 * swallow the UP if we swallowed its DOWN; otherwise the DOWN
-                 * already reached the OS (async state SET) and eating the UP
-                 * would leave it stuck "down" forever -> pass it through so
-                 * the OS clears it.  Stealth is preserved: any DOWN we hid is
-                 * paired with a hidden UP; only a leaked (already-visible)
-                 * DOWN gets a matching (harmless) visible UP.
-                 *
-                 * v7.6.2 -- only SWALLOW while the overlay is genuinely up
-                 * (visible AND not in SAFE-MODE). When hidden/degraded there is
-                 * nothing to protect, and swallowing then only risks stranding a
-                 * modifier across the transition (the exact stuck-Ctrl seen when
-                 * a reinject/SAFE-MODE happened mid-hold). The UP-balance below
-                 * still runs unconditionally so any DOWN we DID hide always gets
-                 * its matching hidden UP even if the overlay hid in between. */
-                int deep_active = ui_is_visible() && !hooks_compose_degraded();
-                if (is_down) {
-                    if (deep_active) {
-                        if (vk < 256) InterlockedExchange(&g_silent_mod_consumed[vk], 1);
-                        return 1;   /* hide the DOWN */
-                    }
-                    /* overlay not up -> let the DOWN reach the OS; don't claim
-                     * ownership, so the matching UP will also pass through. */
-                    return CallNextHookEx(NULL, code, wp, lp);
-                }
-                if (is_up) {
-                    if (vk < 256 &&
-                        InterlockedExchange(&g_silent_mod_consumed[vk], 0)) {
-                        return 1;   /* we hid the DOWN -> hide the UP too (balanced) */
-                    }
-                    /* DOWN was NOT consumed by us -> let the UP through so the
-                     * OS key-state stays balanced (prevents stuck modifier). */
-                    return CallNextHookEx(NULL, code, wp, lp);
-                }
-                return 1;   /* non-transition (shouldn't happen) -- eat */
-            }
-        }
+         * Modifiers now ALWAYS pass straight through to the focused app (exactly
+         * like deep-hide OFF). Recommended equal-stealth replacement, surfaced in
+         * the Electron app + overlay: set the overlay TOGGLE to a triple-left-
+         * click and drive the overlay with its on-screen buttons -- just as
+         * inconspicuous, and it never fights the OS or strands a modifier.
+         *
+         * SVC_OVFLAG_SILENT_MODS is now VESTIGIAL: ignored here, its UI toggles
+         * removed. All OTHER stealth is untouched (PEB unlink, PE-header wipe,
+         * section downgrade, capture-stealth, hotkey consumption, iso-desktop
+         * pipe, emergency chords). g_silent_mod_consumed[] is retained only so
+         * rawin_release_all_modifiers() stays a valid no-op-safe teardown call. */
 
         /* Modifier release sweep -- the moment ANY modifier goes up,
          * clear every consumed_vk whose slot required a modifier that's

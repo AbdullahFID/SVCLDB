@@ -108,3 +108,9 @@ tools/redteam/runtime/
 # v17 (2026-09-22) -- cloned reference repos live here, never committed
 _ref/
 
+
+# Plaintext decrypted logs / analysis dumps + raw user log bundles -- NEVER
+# commit. These folders contain user PII (emails + HWIDs in meta.json) and
+# raw/encrypted user logs (*.dat, *.log). The whole bundle stays local.
+*.decrypted.txt
+_incoming_logs_*/

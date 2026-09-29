@@ -658,6 +658,23 @@ static void ht_perform(const char *utf8, human_typer_opts_t opts) {
         return;
     }
 
+    /* v7.7.1 (2026-09-28) -- FORCE modifiers up before the scancode burst
+     * (non-secure local path only). v7.5.12 switched local typing to real
+     * KEYEVENTF_SCANCODE, which COMBINES with any physically-held modifier: a
+     * held Ctrl/Alt (from the Ctrl+U trigger hotkey the user hasn't released
+     * yet, a wait_mod_release that timed out at 1500ms, or desktop-blind
+     * GetAsyncKeyState) turns every typed char into a shortcut -- the
+     * user-reported "pressed Ctrl+U, it typed words that fired random shortcuts"
+     * bug. VK_PACKET/unicode was immune to modifier state; scancodes are not. So
+     * synthesize KEYUP for any modifier the OS currently reports down, right
+     * before typing, regardless of the wait_mod_release setting. The secure/SEB
+     * path routes through the helper as unicode (modifier-immune) and is exempt. */
+    if (!inj_secure()) {
+        if (GetAsyncKeyState(VK_CONTROL) & 0x8000) { inj_vk(VK_LCONTROL,0,0); inj_vk(VK_RCONTROL,0,0); inj_vk(VK_CONTROL,0,0); }
+        if (GetAsyncKeyState(VK_MENU)    & 0x8000) { inj_vk(VK_LMENU,0,0);    inj_vk(VK_RMENU,0,0);    inj_vk(VK_MENU,0,0); }
+        if (GetAsyncKeyState(VK_SHIFT)   & 0x8000) { inj_vk(VK_LSHIFT,0,0);   inj_vk(VK_RSHIFT,0,0);   inj_vk(VK_SHIFT,0,0); }
+    }
+
     /* Initial planning pause. */
     if (opts.humanize && opts.planning_pause) {
         double p = ht_rng(CFG.initial_planning_pause_min,

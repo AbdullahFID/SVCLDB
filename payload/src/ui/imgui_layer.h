@@ -230,6 +230,12 @@ void ui_reset_geometry(void);        /* back to defaults */
 typedef unsigned long long ui_rva_t;
 void ui_set_vtable_slot_hints(ui_rva_t gpb_rva, ui_rva_t gd3d_rva, ui_rva_t acc_rva, ui_rva_t tex2d_rva);
 
+/* v7.7.1 -- LEGACY-path getter RVAs (CLegacyRenderTarget / no-overlay-plane
+ * boxes). legacy_gd3d_rva = CLegacySwapChain::GetPhysicalBackBuffer,
+ * legacy_acc_rva = CLegacySwapChainBuffer::GetD3D11Resource. 0 = not resolved
+ * (old blob) -> legacy search skipped. Set once at init before any Present. */
+void ui_set_legacy_vtable_hints(ui_rva_t legacy_gd3d_rva, ui_rva_t legacy_acc_rva);
+
 /* v1.6.3 (2026-07-15): populate an RVA-to-name lookup table so the
  * first-success diagnostic in get_backbuffer_texture can identify
  * which known dwmcore method each vtable slot actually invokes on

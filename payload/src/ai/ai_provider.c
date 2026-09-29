@@ -86,17 +86,21 @@ static const char *ai_google_stable_fallback(const char *model_id) {
 
 /* v-bump 2026-09-08 -- Anthropic STRONG fallback. STRONG Anthropic is now
  * Fable 5.1; if it's unavailable to the user's key (HTTP 404/400) or
- * overloaded/rate-limited (429/500/503/529), we retry ONCE on Opus 5 --
- * the prior STRONG, still a frontier reasoner and served on the SAME
- * Anthropic key -- at the same xHigh effort before hopping to another
- * provider (which the user may not even have a key for). This is the
- * "a brand-new slug 404s for un-provisioned accounts" guard: without a
- * concrete fallback here, a user whose key can't see Fable 5.1 yet would
- * get a hard failure. Returns a static model_id, or NULL if no fallback. */
+ * overloaded/rate-limited (429/500/503/529), we retry ONCE on Opus 5.5 --
+ * a frontier reasoner served on the SAME Anthropic key -- at the same xHigh
+ * effort before hopping to another provider (which the user may not even have
+ * a key for). This is the "a brand-new slug 404s for un-provisioned accounts"
+ * guard: without a concrete fallback here, a user whose key can't see Fable
+ * 5.1 yet would get a hard failure.
+ *
+ * v-bump 2026-09-28 -- fallback target Opus 5 -> Opus 5.5 (`claude-opus-5-5`,
+ * released 2026-09-22, replaces Opus 5; Claude API id uses dashes not dots).
+ * Adaptive thinking is always-on on 5.5 (thinking can't be disabled) which our
+ * xHigh-effort path already assumes. Returns a static model_id, or NULL. */
 static const char *ai_anthropic_stable_fallback(const char *model_id) {
     if (!model_id) return NULL;
     if (strstr(model_id, "fable") || strstr(model_id, "mythos"))
-        return "claude-opus-5";
+        return "claude-opus-5-5";
     return NULL;
 }
 
@@ -630,12 +634,15 @@ static const char SVCLDB_DEFAULT_SYSTEM_PROMPT[] =
  * `reasoning_effort` accepts {low, medium, high} on all three; the
  * `minimal` value was rejected in tests.
  *
- * Final mapping (v-bump 2026-09-08 -- STRONG bumped to GPT-6 Astra,
- * OpenAI's new flagship released 2026-09-04; Terra/Luna stay on the
- * cost-balanced GPT-5.6 line for MEDIUM/CHEAP):
- *   STRONG -> gpt-6-astra   + reasoning_effort=high    (flagship, 2026-09-04)
- *   MEDIUM -> gpt-5.6-terra + reasoning_effort=medium  (balanced)
- *   CHEAP  -> gpt-5.6-luna  + reasoning_effort=low     (efficiency)
+ * Final mapping (v-bump 2026-09-28 -- OpenAI shipped GPT-6 Sol + GPT-6 Luna
+ * on 2026-09-22, 50% cheaper than the GPT-5.6 line and built on Astra, so
+ * MEDIUM/CHEAP move off GPT-5.6 onto them. STRONG stays GPT-6 Astra, still
+ * the flagship. GPT-6 Sol/Luna accept the same effort ladder as Astra
+ * {none,low,medium,high,xhigh,max}; the `gpt-6` prefix check already routes
+ * them as reasoning models):
+ *   STRONG -> gpt-6-astra + reasoning_effort=high    (flagship, 2026-09-04)
+ *   MEDIUM -> gpt-6-sol   + reasoning_effort=medium  (balanced GPT-6, 2026-09-22)
+ *   CHEAP  -> gpt-6-luna  + reasoning_effort=low     (most efficient GPT-6, 2026-09-22)
  *
  * The default reasoning_effort comes from cfg->reasoning_effort which
  * user sets in the dashboard (default 4=high). The map here reflects
@@ -643,8 +650,8 @@ static const char SVCLDB_DEFAULT_SYSTEM_PROMPT[] =
  * (gpt-6-astra also accepts xhigh/max; high is our balanced default.) */
 static const svc_model_tier_t OPENAI_TIERS[SVC_TIER_COUNT] = {
     { "gpt-6-astra",   "STRONG (GPT-6 Astra)",   "Flagship end-to-end reasoning + agentic, released 2026-09-04, 400K ctx", 1, 1, 32768 },
-    { "gpt-5.6-terra", "MEDIUM (GPT-5.6 Terra)", "Balanced daily driver, $2.50/$15, GPT-5.5-class at 1/2 cost",      1, 1, 16384 },
-    { "gpt-5.6-luna",  "CHEAP  (GPT-5.6 Luna)",  "Fast + cheap, $1/$6, 1/5 Sol cost (short-context only)",           1, 1,  8192 },
+    { "gpt-6-sol",     "MEDIUM (GPT-6 Sol)",     "Balanced GPT-6, interactive + agentic coding, 50% cheaper than GPT-5.6, 1.05M ctx (2026-09-22)", 1, 1, 16384 },
+    { "gpt-6-luna",    "CHEAP  (GPT-6 Luna)",    "Most efficient GPT-6, focused high-volume tasks, cheapest GPT-6 family, 1.05M ctx (2026-09-22)", 1, 1,  8192 },
     { NULL,            "CUSTOM",                 "user-specified model",                                              0, 0,  8192 },
 };
 
@@ -652,15 +659,15 @@ static const svc_model_tier_t OPENAI_TIERS[SVC_TIER_COUNT] = {
  * v-bump 2026-09-08 -- STRONG bumped Opus 5 -> Fable 5.1 (Anthropic's new
  * frontier coding/knowledge model, released 2026-09-01, $10/$50, 1M ctx,
  * adaptive thinking always-on). Fable 5.1 is FORCED to xHigh effort in
- * build_anthropic_body, and Opus 5 stays as its automatic fallback target
- * (ai_anthropic_stable_fallback): if Fable 5.1 is unavailable to the
- * user's key (404/400) or overloaded, the request retries on Opus 5 --
- * also at xHigh -- before hopping providers. Direct Claude API slug is
+ * build_anthropic_body, and Opus 5.5 (v-bump 2026-09-28, was Opus 5) is its
+ * automatic fallback target (ai_anthropic_stable_fallback): if Fable 5.1 is
+ * unavailable to the user's key (404/400) or overloaded, the request retries
+ * on Opus 5.5 -- also at xHigh -- before hopping providers. Direct Claude API slug is
  * `claude-fable-5-1` (dashes, NOT dots; the dotted `claude-fable-5.1` is
  * the OpenRouter slug used by the solver worker, not this direct path).
  * All tiers verified against platform.claude.com/docs/models/overview. */
 static const svc_model_tier_t ANTHROPIC_TIERS[SVC_TIER_COUNT] = {
-    { "claude-fable-5-1",  "STRONG (Fable 5.1)", "Frontier coding + knowledge @ xHigh, $10/$50, 1M ctx (falls back to Opus 5)", 1, 1, 12288 },
+    { "claude-fable-5-1",  "STRONG (Fable 5.1)", "Frontier coding + knowledge @ xHigh, $10/$50, 1M ctx (falls back to Opus 5.5)", 1, 1, 12288 },
     { "claude-sonnet-5",   "MEDIUM (Sonnet 5)",  "Balanced workhorse, $3/$15, 1M ctx, adaptive thinking",       1, 1,  8192 },
     { "claude-haiku-4-5",  "CHEAP  (Haiku 4.5)", "Fast + affordable, $1/$5, 200K ctx, extended thinking",       1, 1,  6144 },
     { NULL,                "CUSTOM",             "user-specified model",                                          0, 0,  6144 },
@@ -700,7 +707,7 @@ static const svc_model_tier_t GOOGLE_TIERS[SVC_TIER_COUNT] = {
  * slugs (documented per OpenRouter's model catalog). */
 static const svc_model_tier_t OPENROUTER_TIER = {
     "openrouter/auto", "OpenRouter (user-picked)",
-    "Auto-router picks best-available; user can override with any specific slug (e.g. anthropic/claude-opus-5, or a :free-suffixed one for zero cost)",
+    "Auto-router picks best-available; user can override with any specific slug (e.g. anthropic/claude-opus-5.5, or a :free-suffixed one for zero cost)",
     1, 1, 8192
 };
 

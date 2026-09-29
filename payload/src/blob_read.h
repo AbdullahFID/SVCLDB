@@ -115,7 +115,12 @@ typedef struct {
     uint8_t  prologue_present[32];     /* first 32 bytes of Present    */
     uint8_t  prologue_iop[32];         /* first 32 bytes of IsOverlay* */
     uint8_t  ffd_bytes[16];            /* 16 bytes at ForceFullDirty   */
-    uint8_t  reserved[16];             /* padding for future growth    */
+    /* v7.7.1 -- legacy-path getters (repurposed from reserved[16], same size).
+     * Zero on old blobs -> payload skips the legacy-getter search (current
+     * behavior). CLegacyRenderTarget/no-overlay-plane boxes use these instead
+     * of the display getters. Keep in sync with resolver OffsetsBlobExt. */
+    uint64_t legacyGetPhysicalBackBufferRva; /* CLegacySwapChain::GetPhysicalBackBuffer  */
+    uint64_t legacyGetD3D11ResourceRva;      /* CLegacySwapChainBuffer::GetD3D11Resource */
 } pl_offsets_ext_t;
 
 /* Magic marker used to distinguish v2 blobs from raw padding zeros. */

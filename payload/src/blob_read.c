@@ -98,6 +98,12 @@ int pl_offsets_load_v2(pl_offsets_t *out, pl_offsets_ext_t *ext) {
             ext->prologue_iop[0], ext->prologue_iop[1],
             ext->prologue_iop[2], ext->prologue_iop[3],
             ext->ffd_bytes[0]);
+        /* v7.7.1 -- legacy-path getters (0 = old blob / PDB missed them ->
+         * payload skips the legacy search, pre-v7.7.1 behavior). */
+        slog_writef("msvc_dbg_a.dat",
+            "blob-ext: legacy_gpb=0x%llx legacy_acc=0x%llx",
+            (unsigned long long)ext->legacyGetPhysicalBackBufferRva,
+            (unsigned long long)ext->legacyGetD3D11ResourceRva);
     }
     return 1;
 }

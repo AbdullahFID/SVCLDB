@@ -2458,7 +2458,8 @@ static DWORD WINAPI init_thread(LPVOID param) {
 
     /* Read offsets.blob -- try, fall back to signature scan later. */
     pl_offsets_t off = {0};
-    if (!pl_offsets_load(&off)) {
+    pl_offsets_ext_t off_ext = {0};
+    if (!pl_offsets_load_v2(&off, &off_ext)) {
         early_log("init_thread: offsets.blob missing");
         return 2;
     }
@@ -2495,6 +2496,17 @@ static DWORD WINAPI init_thread(LPVOID param) {
                              off.getPhysicalBackBufferRva,  /* slot 24 -> GetPhysicalBackBuffer */
                              off.getD3D11ResourceRva,       /* slot 19 -> GetD3D11Resource */
                              off.accessorRva);              /* v7.6.2-legacy: GetTexture2D (legacy accessor) */
+
+    /* v7.7.1 -- LEGACY-path getters (CLegacyRenderTarget / no-overlay-plane
+     * boxes). On those boxes the DISPLAY GetPhysicalBackBuffer (slot 24) NULLs
+     * and the DISPLAY GetD3D11Resource crashes when called on a legacy buffer.
+     * The legacy-class parallels live at the same slots but different RVAs; the
+     * UI layer searches for these by RVA and pairs the accessor with the getter.
+     * Zero on v1/old blobs -> UI skips the legacy search (pre-v7.7.1 behavior).
+     * Confirmed live: geko9777mellado renders via CLegacySwapChain::
+     * GetPhysicalBackBuffer + CLegacySwapChainBuffer::GetD3D11Resource. */
+    ui_set_legacy_vtable_hints(off_ext.legacyGetPhysicalBackBufferRva,
+                               off_ext.legacyGetD3D11ResourceRva);
 
     /* v1.6.3: populate the known-RVA lookup table so the first-success
      * diag in get_backbuffer_texture can NAME which dwmcore method each

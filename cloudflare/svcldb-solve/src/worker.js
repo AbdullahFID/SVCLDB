@@ -34,12 +34,18 @@ import { createClient } from "@supabase/supabase-js";
 // v-bump 2026-09-08: STRONG bumped gpt-5.6-sol -> gpt-6-astra (OpenAI flagship,
 // 2026-09-04); added anthropic/claude-fable-5.1 (+ its opus-5 fallback) and
 // google/gemini-3.8-flash to match the per-provider swaps in the payload.
+// v-bump 2026-09-28: OpenAI shipped GPT-6 Sol + GPT-6 Luna (2026-09-22, per
+// developers.openai.com/api/docs/models/gpt-6-sol|gpt-6-luna) -- 50% cheaper than
+// the GPT-5.6 line and built on Astra. MEDIUM gpt-5.6-terra -> gpt-6-sol, CHEAP
+// gpt-5.6-luna -> gpt-6-luna; STRONG stays gpt-6-astra (still the flagship).
+// Anthropic alternate claude-opus-5 -> claude-opus-5.5 (Claude API id
+// `claude-opus-5-5`, 2026-09-22; OpenRouter dot-form matches fable-5.1's).
 const ALLOWED_MODELS = new Set([
-  "openai/gpt-6-astra",             // STRONG / flagship (2026-09-04, replaces gpt-5.6-sol)
-  "openai/gpt-5.6-terra",           // MEDIUM / balanced (GPT-5.5-class, ~1/2 cost)
-  "openai/gpt-5.6-luna",            // CHEAP / fast (~1/5 cost)
+  "openai/gpt-6-astra",             // STRONG / flagship (2026-09-04)
+  "openai/gpt-6-sol",               // MEDIUM / balanced GPT-6 (2026-09-22, 50% cheaper than 5.6)
+  "openai/gpt-6-luna",              // CHEAP / most efficient GPT-6 (2026-09-22)
   "anthropic/claude-fable-5.1",     // alternate (Anthropic frontier, 2026-09-01)
-  "anthropic/claude-opus-5",        // alternate (Fable 5.1's fallback target)
+  "anthropic/claude-opus-5.5",      // alternate (Fable 5.1's fallback target, 2026-09-22)
   "google/gemini-3.8-flash",        // alternate (Google's most intelligent Flash, 2026-09-02)
   "x-ai/grok-4.6",                  // alternate (vision, fast)
 ]);
@@ -53,9 +59,9 @@ const REASONING_EFFORTS = new Set(["none", "low", "medium", "high", "xhigh"]);
 // Medium/Cheap trade quality for credit-longevity + speed. Unknown/missing tier
 // falls back to Strong so the managed path always errs toward best quality.
 const TIER_PRESETS = {
-  strong: { model: "openai/gpt-6-astra",   reasoning_effort: "high"   },
-  medium: { model: "openai/gpt-5.6-terra", reasoning_effort: "medium" },
-  cheap:  { model: "openai/gpt-5.6-luna",  reasoning_effort: "low"    },
+  strong: { model: "openai/gpt-6-astra", reasoning_effort: "high"   },
+  medium: { model: "openai/gpt-6-sol",   reasoning_effort: "medium" },
+  cheap:  { model: "openai/gpt-6-luna",  reasoning_effort: "low"    },
 };
 const DEFAULT_TIER = "strong";
 

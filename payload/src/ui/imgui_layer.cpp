@@ -339,6 +339,17 @@ static volatile ui_rva_t g_rva_acc  = 0;   /* accessor RVA hint              */
  * 0x865D0 on 26100.9549). The accessor on the legacy GetBackBuffer device
  * target; discovered on pRes in place of GetD3D11Resource when g_legacy_mode. */
 static volatile ui_rva_t g_rva_tex2d = 0;
+/* v7.7.1 -- LEGACY-path getter RVAs (CLegacyRenderTarget / no-overlay-plane).
+ * legacy_gd3d = CLegacySwapChain::GetPhysicalBackBuffer (the slot-24 getter that
+ * RENDERS on legacy boxes; the DISPLAY getter at the same slot NULLs there).
+ * legacy_acc  = CLegacySwapChainBuffer::GetD3D11Resource (paired accessor on the
+ * buffer the legacy getter returns). 0 = not resolved (old blob) -> skip. */
+static volatile ui_rva_t g_rva_legacy_gd3d = 0;
+static volatile ui_rva_t g_rva_legacy_acc  = 0;
+/* v7.7.1 -- set when the gd3d slot matched the LEGACY getter RVA (not the
+ * display one). Tells accessor discovery to pair with the LEGACY accessor
+ * (prevents calling the display accessor on a legacy buffer = girlC's crash). */
+static volatile LONG g_using_legacy_getter = 0;
 /* v7.6.2-legacy -- set to 1 the first frame the physical chain NULLs and the
  * GetBackBuffer legacy acquisition takes over. Flips accessor discovery from
  * GetD3D11Resource (display) to GetTexture2D (legacy). Never set on Display/
@@ -358,6 +369,11 @@ extern "C" void ui_set_vtable_slot_hints(ui_rva_t gpb_rva, ui_rva_t gd3d_rva, ui
     g_rva_tex2d = tex2d_rva;   /* v7.6.2-legacy: GetTexture2D (blob accessorRva) */
     /* Note: don't log here -- this runs before slog is fully set up in
      * some code paths. Discovery attempts log their own diagnostics. */
+}
+
+extern "C" void ui_set_legacy_vtable_hints(ui_rva_t legacy_gd3d_rva, ui_rva_t legacy_acc_rva) {
+    g_rva_legacy_gd3d = legacy_gd3d_rva;
+    g_rva_legacy_acc  = legacy_acc_rva;
 }
 
 /* v1.6.3: known-RVA lookup table. Populated once at init by
@@ -617,23 +633,28 @@ static void discover_gpb_slot_once(void *pLayer, int hardcoded) {
     void **matched_vtbl = nullptr;
     int this_adj = 0;
     int dyn = find_vtable_slot_by_rva_mi(pLayer, g_rva_gpb, &matched_vtbl, &this_adj);
-    if (dyn >= 0) {
+    if (dyn >= 0 && this_adj == 0) {
         g_dyn_slot_gpb = dyn;
         g_dyn_gpb_vtbl = matched_vtbl;
         g_dyn_gpb_this_adj = this_adj;
-        static void *s_lv = (void *)-1; static int s_ls = -2, s_la = -2;
-        if (matched_vtbl != s_lv || dyn != s_ls || this_adj != s_la) {
-            s_lv = matched_vtbl; s_ls = dyn; s_la = this_adj;
-            void **primary = nullptr;
-            __try { primary = *(void ***)pLayer; } __except (EXCEPTION_EXECUTE_HANDLER) { }
-            const char *loc = (matched_vtbl == primary) ? "primary" : "secondary (MI)";
-            if (dyn == hardcoded && matched_vtbl == primary)
+        static int s_ls = -2;
+        if (dyn != s_ls) {
+            s_ls = dyn;
+            if (dyn == hardcoded)
                 diag("vtable: gpb_slot dynamic=%d hardcoded=%d MATCH (primary vtbl)", dyn, hardcoded);
             else
-                diag("vtable: gpb_slot dynamic=%d hardcoded=%d DRIFT (%s vtbl=%p this_adj=+%d) -- using dynamic",
-                     dyn, hardcoded, loc, matched_vtbl, this_adj);
+                diag("vtable: gpb_slot dynamic=%d hardcoded=%d DRIFT (primary vtbl) -- using dynamic",
+                     dyn, hardcoded);
         }
     } else {
+        /* v7.6.2 REGRESSION FIX -- reject secondary (base-class) matches; use
+         * the hardcoded primary interface slot (the correct virtual override). */
+        if (dyn >= 0) {
+            static volatile LONG s_rej = 0;
+            if (InterlockedCompareExchange(&s_rej, 1, 0) == 0)
+                diag("vtable: gpb_slot RVA found only on secondary (adj=+%d, base-class "
+                     "version) -- using primary slot %d override instead (v7.6.2)", this_adj, hardcoded);
+        }
         g_dyn_slot_gpb = -1; g_dyn_gpb_vtbl = nullptr; g_dyn_gpb_this_adj = 0;
     }
 }
@@ -641,31 +662,86 @@ static void discover_gd3d_slot_once(void *pLayer, int hardcoded) {
     if (InterlockedCompareExchange(&g_gbt_locked, 0, 0)) return;
     void **matched_vtbl = nullptr;
     int this_adj = 0;
+    /* (1) DISPLAY getter (CDDisplaySwapChain::GetPhysicalBackBuffer) on the
+     * PRIMARY vtable -- display / MPO boxes. */
     int dyn = find_vtable_slot_by_rva_mi(pLayer, g_rva_gd3d, &matched_vtbl, &this_adj);
-    if (dyn >= 0) {
+    if (dyn >= 0 && this_adj == 0) {
         g_dyn_slot_gd3d = dyn;
         g_dyn_gd3d_vtbl = matched_vtbl;
-        g_dyn_gd3d_this_adj = this_adj;
-        static void *s_lv = (void *)-1; static int s_ls = -2, s_la = -2;
-        if (matched_vtbl != s_lv || dyn != s_ls || this_adj != s_la) {
-            s_lv = matched_vtbl; s_ls = dyn; s_la = this_adj;
-            void **primary = nullptr;
-            __try { primary = *(void ***)pLayer; } __except (EXCEPTION_EXECUTE_HANDLER) { }
-            const char *loc = (matched_vtbl == primary) ? "primary" : "secondary (MI)";
-            if (dyn == hardcoded && matched_vtbl == primary)
-                diag("vtable: gd3d_slot dynamic=%d hardcoded=%d MATCH (primary vtbl)", dyn, hardcoded);
-            else
-                diag("vtable: gd3d_slot dynamic=%d hardcoded=%d DRIFT (%s vtbl=%p this_adj=+%d) -- using dynamic",
-                     dyn, hardcoded, loc, matched_vtbl, this_adj);
+        g_dyn_gd3d_this_adj = 0;
+        InterlockedExchange(&g_using_legacy_getter, 0);
+        static int s_ls = -2;
+        if (dyn != s_ls) {
+            s_ls = dyn;
+            diag("vtable: gd3d_slot dynamic=%d hardcoded=%d %s (primary vtbl, display getter)",
+                 dyn, hardcoded, dyn == hardcoded ? "MATCH" : "DRIFT -- using dynamic");
         }
-    } else {
-        g_dyn_slot_gd3d = -1; g_dyn_gd3d_vtbl = nullptr; g_dyn_gd3d_this_adj = 0;
+        return;
     }
+    /* (2) v7.7.1 -- DISPLAY getter not on the primary. On legacy
+     * (CLegacyRenderTarget / no-overlay-plane) boxes the display getter exists
+     * only on a secondary subobject and NULLs there (it reads the empty overlay-
+     * plane array). The getter that actually returns a buffer is the LEGACY
+     * class method CLegacySwapChain::GetPhysicalBackBuffer, which sits at the
+     * classic hardcoded slot (24) but is a DIFFERENT function (different RVA per
+     * build). Search for it BY RVA on the primary. CONFIRMED live:
+     * geko9777mellado renders through this path. RVA-verified -> if it isn't
+     * there we skip (SAFE-MODE) rather than blind-calling slot 24 (which is the
+     * dharpan2010 / mariigjd DWM crash). */
+    if (g_rva_legacy_gd3d) {
+        void **lv = nullptr; int la = 0;
+        int ld = find_vtable_slot_by_rva_mi(pLayer, g_rva_legacy_gd3d, &lv, &la);
+        if (ld >= 0 && la == 0) {
+            g_dyn_slot_gd3d = ld;
+            g_dyn_gd3d_vtbl = lv;
+            g_dyn_gd3d_this_adj = 0;
+            InterlockedExchange(&g_using_legacy_getter, 1);
+            static volatile LONG s_lg = 0;
+            if (InterlockedCompareExchange(&s_lg, 1, 0) == 0)
+                diag("vtable: gd3d_slot LEGACY getter (CLegacySwapChain::GetPhysicalBackBuffer) "
+                     "primary slot=%d -- legacy composition box; pairing legacy accessor", ld);
+            return;
+        }
+    }
+    /* (3) Neither display-primary nor legacy-primary getter is present. Do NOT
+     * call any hardcoded slot -- a blind call to the wrong function is exactly
+     * the DWM crash. Mark unusable; the caller skips this object and trips
+     * SAFE-MODE after GBT_MAX_ATTEMPTS. */
+    InterlockedExchange(&g_using_legacy_getter, 0);
+    if (dyn >= 0) {
+        static volatile LONG s_rej = 0;
+        if (InterlockedCompareExchange(&s_rej, 1, 0) == 0)
+            diag("vtable: gd3d_slot -- display getter only on secondary (adj=+%d) and no "
+                 "legacy getter on primary -- refusing hardcoded slot (crash-safe) -> skip object",
+                 this_adj);
+    }
+    g_dyn_slot_gd3d = -1; g_dyn_gd3d_vtbl = nullptr; g_dyn_gd3d_this_adj = 0;
 }
 static void discover_acc_slot_once(void *pRes, int hardcoded) {
     if (InterlockedCompareExchange(&g_gbt_locked, 0, 0)) return;
     void **matched_vtbl = nullptr;
     int this_adj = 0;
+    /* v7.7.1 -- LEGACY GetPhysicalBackBuffer path (g_using_legacy_getter): pRes is
+     * a CLegacySwapChainBuffer; its accessor is CLegacySwapChainBuffer::
+     * GetD3D11Resource. Pair it explicitly. Do NOT fall through to the display
+     * accessor -- calling the display GetD3D11Resource on a legacy buffer is a
+     * right-function/wrong-object type-confusion that crashes DWM (mariigjd/girlC).
+     * RVA-verified; if the legacy accessor isn't on pRes we skip -> SAFE-MODE. */
+    if (InterlockedCompareExchange(&g_using_legacy_getter, 0, 0) && g_rva_legacy_acc) {
+        int ld = find_vtable_slot_by_rva_mi(pRes, g_rva_legacy_acc, &matched_vtbl, &this_adj);
+        if (ld >= 0) {
+            g_dyn_slot_acc = ld;
+            g_dyn_acc_vtbl = matched_vtbl;
+            g_dyn_acc_this_adj = this_adj;
+            static volatile LONG s_la = 0;
+            if (InterlockedCompareExchange(&s_la, 1, 0) == 0)
+                diag("vtable: acc_slot LEGACY accessor (CLegacySwapChainBuffer::GetD3D11Resource) "
+                     "slot=%d adj=+%d -- paired with legacy getter", ld, this_adj);
+        } else {
+            g_dyn_slot_acc = -1; g_dyn_acc_vtbl = nullptr; g_dyn_acc_this_adj = 0;
+        }
+        return;
+    }
     /* v7.6.2-legacy: on the legacy GetBackBuffer device target the texture
      * accessor varies by the CONCRETE IDeviceTarget class the swapchain
      * allocated, which depends on GPU backing:
@@ -681,8 +757,9 @@ static void discover_acc_slot_once(void *pRes, int hardcoded) {
      * non-matching RVA is a safe no-op (never a bad call). The hardcoded RVAs
      * are 9549-specific; a wrong-build RVA simply won't match. Display path
      * (g_legacy_mode==0) is unchanged: GetD3D11Resource only. */
+    int legacy = (int)InterlockedCompareExchange(&g_legacy_mode, 0, 0);
     int dyn = -1;
-    if (InterlockedCompareExchange(&g_legacy_mode, 0, 0)) {
+    if (legacy) {
         const ui_rva_t cands[] = {
             g_rva_tex2d,       /* CDeviceTextureTarget::GetTexture2D  (0x865D0, WARP) */
             g_rva_acc,         /* CDDisplaySwapChainBuffer::GetD3D11Resource (0x1F6F50) */
@@ -699,7 +776,15 @@ static void discover_acc_slot_once(void *pRes, int hardcoded) {
     } else {
         dyn = find_vtable_slot_by_rva_mi(pRes, g_rva_acc, &matched_vtbl, &this_adj);
     }
-    if (dyn >= 0) {
+    /* v7.6.2 REGRESSION FIX -- in the NORMAL (non-legacy) chain the accessor is
+     * a virtual method whose correct override is on pRes's PRIMARY vtable; a
+     * secondary match is the base-class version reading wrong fields (same bug
+     * class as gd3d). Reject secondary in normal mode; fall back to hardcoded
+     * primary slot 19. In LEGACY mode the GetBackBuffer device target genuinely
+     * exposes its accessor on a secondary MI subobject (WARP: +120), so allow
+     * secondary matches there. */
+    int accept = (dyn >= 0) && (legacy || this_adj == 0);
+    if (accept) {
         g_dyn_slot_acc = dyn;
         g_dyn_acc_vtbl = matched_vtbl;
         g_dyn_acc_this_adj = this_adj;
@@ -712,10 +797,16 @@ static void discover_acc_slot_once(void *pRes, int hardcoded) {
             if (dyn == hardcoded && matched_vtbl == primary)
                 diag("vtable: acc_slot dynamic=%d hardcoded=%d MATCH (primary vtbl)", dyn, hardcoded);
             else
-                diag("vtable: acc_slot dynamic=%d hardcoded=%d DRIFT (%s vtbl=%p this_adj=+%d) -- using dynamic",
-                     dyn, hardcoded, loc, matched_vtbl, this_adj);
+                diag("vtable: acc_slot dynamic=%d hardcoded=%d %s (%s vtbl=%p this_adj=+%d) -- using dynamic",
+                     dyn, hardcoded, legacy ? "LEGACY" : "DRIFT", loc, matched_vtbl, this_adj);
         }
     } else {
+        if (dyn >= 0 && !legacy) {
+            static volatile LONG s_rej = 0;
+            if (InterlockedCompareExchange(&s_rej, 1, 0) == 0)
+                diag("vtable: acc_slot RVA found only on secondary (adj=+%d, base-class "
+                     "version) -- using primary slot %d override instead (v7.6.2)", this_adj, hardcoded);
+        }
         g_dyn_slot_acc = -1; g_dyn_acc_vtbl = nullptr; g_dyn_acc_this_adj = 0;
     }
 }
@@ -5473,9 +5564,15 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor
                 }
                 return nullptr;
             }
-            /* Skip any object whose scan didn't carry BOTH getters. */
-            if ((g_dyn_slot_gpb < 0) || (g_dyn_slot_gd3d < 0))
-                return nullptr;   /* retry next frame's object */
+            /* v7.7.1 CRASH-SAFETY -- skip this object unless BOTH getters were
+             * RVA-VERIFIED by discovery. A dyn slot >= 0 means the slot's fn RVA
+             * matched the DISPLAY getter (primary) OR the LEGACY getter
+             * (CLegacySwapChain::GetPhysicalBackBuffer). A -1 means "no known
+             * getter on this object" -- we must NOT blind-call a hardcoded slot,
+             * because a wrong-function call at slot 24 is the dharpan2010 /
+             * mariigjd DWM crash (SEH can't catch the delayed corruption). Skip
+             * now -> retry next object -> SAFE-MODE after GBT_MAX_ATTEMPTS. */
+            if (g_dyn_slot_gpb < 0 || g_dyn_slot_gd3d < 0) return nullptr;
         }
 
         const int slot_gpb  = effective_gpb_slot();
@@ -5500,6 +5597,8 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor
             }
             return nullptr;
         }
+        /* v7.7.1 -- GPB (getDevice) slot is RVA-verified by discover_gpb_slot_once
+         * (dyn >= 0 gate above); is_ptr_in_dwmcore is the belt-and-suspenders. */
         /* v7.6.0 -- this-adjust: primary adj=0 (no-op on our box).
          * Secondary MI subobjects need obj+offset, not the most-derived
          * pointer. dharpan2010 2026-09-26: slot 28 on secondary vtbl
@@ -5525,6 +5624,13 @@ static ID3D11Texture2D *get_backbuffer_texture(void *pLayer, void **out_accessor
             }
             return nullptr;
         }
+        /* v7.7.1 -- GD3D slot is RVA-VERIFIED by discover_gd3d_slot_once: it is
+         * either the DISPLAY GetPhysicalBackBuffer (primary) or the LEGACY
+         * CLegacySwapChain::GetPhysicalBackBuffer (g_using_legacy_getter), matched
+         * by exact RVA. Objects where neither is present were already skipped by
+         * the dyn>=0 gate above, so this call never hits a wrong function -> no
+         * crash. (This replaces the display-only RVA guard that would have wrongly
+         * rejected the legacy getter and blanked geko9777mellado.) */
         void *pRes = ((pfnVGet)fn_gd3d)(adjust_this(pLayer, g_dyn_gd3d_this_adj));
 #if SVCLDB_TEST_FORCE_LEGACY
         pRes = nullptr;   /* DEV VALIDATION: force legacy GetBackBuffer path on real GPU */
@@ -7421,19 +7527,11 @@ static void draw_home_hub(const ui_theme_t &T, float scale, float alpha_cur,
         if (cta_button("##h_lean", IC_LEAN, lean_on ? "Lean mode: ON" : "Lean mode: OFF",
                        lean_on != 0, scale, T)) ui_toggle_lean();
     }
-    /* v3.4 (2026-09-23) -- Deep-hide toggle. Mirror of Electron's "Deep
-     * hide" chip (SVC_OVFLAG_SILENT_MODS). When on, bare Ctrl/Shift/Alt
-     * key events are swallowed so the target app never sees them --
-     * concealment mode for typing-heavy exams where "user held Ctrl"
-     * would be evidence. In-app shortcuts (Ctrl+C copy, Ctrl+A select-
-     * all) stop working while on -- explicit opt-in trade-off. */
-    ImGui::SameLine(0, 6.0f * scale);
-    {
-        int dh = ui_get_silent_mods();
-        if (cta_button("##h_deephide", IC_EYE_OFF,
-                       dh ? "Deep hide: ON" : "Deep hide: OFF",
-                       dh != 0, scale, T)) ui_toggle_silent_mods();
-    }
+    /* v7.8.0 (2026-09-28) -- Deep-hide toggle REMOVED (feature deleted; it
+     * swallowed Ctrl/Alt at the LL hook which blinded the OS to the modifier
+     * and stranded it "held forever"). Equal-stealth replacement: set the
+     * overlay TOGGLE hotkey to a triple-left-click and use the on-screen
+     * buttons. See rawinput_hook.c v7.8.0 note. */
     card_end();
 
     ImGui::Dummy(ImVec2(0, 8.0f * scale));

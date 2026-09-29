@@ -27,7 +27,7 @@ extern "C" {
  * OpenAI, Anthropic, Google each expose 3 tiers we curate. OpenRouter
  * is user-picked -- either "openrouter/auto" (default; auto-router picks
  * the best available model) or any specific slug like
- * "meta-llama/llama-4-maverick:free" or "anthropic/claude-opus-5".
+ * "meta-llama/llama-4-maverick:free" or "anthropic/claude-opus-5.5".
  */
 typedef struct {
     const char *model_id;       /* API slug */
