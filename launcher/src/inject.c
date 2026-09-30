@@ -72,8 +72,29 @@ static void _lazy_init_win_apis(void) {
     (_lazy_init_win_apis(), g_pVirtualAllocEx((hp), (addr), (sz), (alloc), (protect)))
 #define VirtualFreeEx(hp, addr, sz, free_type) \
     (_lazy_init_win_apis(), g_pVirtualFreeEx((hp), (addr), (sz), (free_type)))
-#define WriteProcessMemory(hp, dst, src, sz, wr) \
-    (_lazy_init_win_apis(), g_pWriteProcessMemory((hp), (dst), (src), (sz), (wr)))
+/* v7.9.1 (2026-09-30) -- BP-parity stealth: route all cross-process writes
+ * through ntdll's NtWriteVirtualMemory (the native syscall wrapper) instead
+ * of kernel32's WriteProcessMemory. Modern EDRs commonly inline-hook
+ * WriteProcessMemory and other kernel32 injection primitives; fewer hook
+ * the ntdll native. Bypassify's launcher uses exactly this technique --
+ * decompile shows 5 NtWriteVirtualMemory calls in its injector, zero
+ * WriteProcessMemory. Wrapper preserves the BOOL "nonzero=success"
+ * semantics of WriteProcessMemory and calls FlushInstructionCache to match
+ * its cross-process-code-write behavior (NtWriteVirtualMemory does NOT
+ * flush on its own -- required for the shellcode-loader write path or the
+ * remote thread could execute stale bytes on some CPUs). */
+typedef LONG (NTAPI *PFN_NtWriteVirtualMemory)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
+static PFN_NtWriteVirtualMemory g_pNtWriteVirtualMemory = NULL;
+static BOOL svc_nt_wpm(HANDLE hProc, LPVOID dst, LPCVOID src, SIZE_T sz, SIZE_T *wr) {
+    if (!g_pNtWriteVirtualMemory)
+        g_pNtWriteVirtualMemory = LAZY_API(PFN_NtWriteVirtualMemory,
+                                           L"ntdll.dll", "NtWriteVirtualMemory");
+    if (!g_pNtWriteVirtualMemory) return FALSE;   /* fail closed */
+    LONG status = g_pNtWriteVirtualMemory(hProc, dst, (PVOID)src, sz, wr);
+    if (status == 0) FlushInstructionCache(hProc, dst, sz);
+    return status == 0;   /* STATUS_SUCCESS == 0 -> TRUE */
+}
+#define WriteProcessMemory(hp, dst, src, sz, wr) svc_nt_wpm((hp), (dst), (src), (sz), (wr))
 #define CreateRemoteThread(hp, sa, st, fn, arg, fl, tid) \
     (_lazy_init_win_apis(), g_pCreateRemoteThread((hp), (sa), (st), (fn), (arg), (fl), (tid)))
 

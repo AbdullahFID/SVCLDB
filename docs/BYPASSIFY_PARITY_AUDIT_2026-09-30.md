@@ -75,3 +75,47 @@ out in the shippable build).
    `ImGui READY`, DWM stable.
 3. Hook-count audit: svcldb already hooks only 3 (the "9 hooks" was the hooksdll
    project); with v7.9 IOP-MinHook we're at BP's exact 4-hook model.
+
+## v7.9.1 addendum (2026-09-30) -- BP launcher RE + injection stealth port
+
+Extended the audit to Bypassify's **launcher** (`launchhere (3).exe`, native
+C++ + WebView2 dashboard; ilspycmd confirmed no managed metadata -> RE'd
+straight in Ghidra at `C:\ghidra_dl\project_bp_launcher`, dump in `bpinject.out`).
+
+**BP injection technique (decompiled from `FUN_14000b840` + `FUN_14000b160`):**
+`AdjustTokenPrivileges(SeDebugPrivilege)` -> find dwm.exe -> `OpenProcess(0x1fffff)`
+-> `VirtualAllocEx(RWX)` for the PE image + **loops `NtWriteVirtualMemory` for every
+section** (5 calls total: PE header, sections, shellcode, loader data) ->
+`CreateRemoteThread(shellcode, &loaderData)` -> `WaitForSingleObject(30s)` ->
+`GetExitCodeThread` -> `VirtualProtectEx` sections to real perms -> optionally
+overwrite the PE header with random heap data (stealth). Same manual-map +
+shellcode-loader shape as ours.
+
+**Import fingerprint suggested "thread hijack" (SetThreadContext x4) but the
+decompile confirmed no callers in the injection path** -- CreateRemoteThread
+is the primary. So no thread-hijack advantage to port; those SetThreadContext
+imports are in unrelated (WebView2 / DPI) code.
+
+**Only genuine BP win in the injector: `NtWriteVirtualMemory` (ntdll native
+syscall wrapper) instead of `WriteProcessMemory` (kernel32).** Most user-mode
+EDRs inline-hook `WriteProcessMemory` and other kernel32 injection primitives;
+fewer hook the ntdll native. Same functional behavior (WriteProcessMemory
+literally calls NtWriteVirtualMemory internally) -- just skips one EDR
+tripwire layer.
+
+**Ported in v7.9.1** (`launcher/src/inject.c`): added `svc_nt_wpm` wrapper that
+LAZY_APIs `ntdll!NtWriteVirtualMemory`, calls it directly, and calls
+`FlushInstructionCache` afterwards to match `WriteProcessMemory`'s
+cross-process-code-write semantics (required for the shellcode loader path --
+without the flush the remote thread can execute stale bytes on some CPUs).
+`#define WriteProcessMemory` now expands to this wrapper, so every caller in
+`manual_map_from_bytes` + the helper-inject path (5+ sites) is routed
+through the native syscall with zero source-level changes.
+
+Validated end-to-end on a fresh dwm.exe: PE header write + section writes +
+shellcode write + loader-data write all succeed via NtWriteVirtualMemory ->
+`hooks_install: SUCCESS` -> `LOCKED` -> `ImGui READY`.
+
+With this landed we are **truly at 1:1 with Bypassify on both the payload
+(injected DWM code) AND the launcher (injector)**, minus the deliberately-
+deferred stripped-strings item.
