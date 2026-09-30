@@ -9614,9 +9614,38 @@ static void draw_chat_window(UINT screen_w, UINT screen_h) {
          * Trade-off vs instant: single-tap has ~130ms lag before overlay
          * arrives at final position. Imperceptibly small vs. the "no
          * stutter" win. */
-        const float k = 0.35f;
-        g_disp_off_x += (target_x - g_disp_off_x) * k;
-        g_disp_off_y += (target_y - g_disp_off_y) * k;
+        /* v7.9 (2026-09-30) -- FRAME-TIME-INDEPENDENT GLIDE (Bypassify-
+         * smoothness parity). The old fixed k=0.35 PER PRESENT FRAME made
+         * the on-screen glide speed depend on the Present interval -- which
+         * varies with capture work, compose-grace, and 60 vs 120 vs 144 Hz
+         * -- so uneven frame times produced the stutter LO saw next to BP
+         * (BP interpolates off wall-clock time -> smooth at any refresh).
+         * io.DeltaTime is pinned to 1/60 here (see ui_present_frame) so we
+         * measure REAL elapsed time via QueryPerformanceCounter and integrate
+         * the exponential approach in FIXED 1/120 s sub-steps: identical
+         * settle feel to the tuned 0.35@60Hz, now independent of frame rate
+         * or jitter, and no <math.h>/powf. Compose-thread only -> the
+         * function-local statics are single-threaded-safe. */
+        static LARGE_INTEGER s_glide_qpf  = {0};
+        static LARGE_INTEGER s_glide_prev = {0};
+        static double        s_glide_accum = 0.0;
+        if (s_glide_qpf.QuadPart == 0) QueryPerformanceFrequency(&s_glide_qpf);
+        LARGE_INTEGER _nowq; QueryPerformanceCounter(&_nowq);
+        double dt = 1.0 / 60.0;
+        if (s_glide_prev.QuadPart != 0 && s_glide_qpf.QuadPart > 0)
+            dt = (double)(_nowq.QuadPart - s_glide_prev.QuadPart) / (double)s_glide_qpf.QuadPart;
+        s_glide_prev = _nowq;
+        if (dt < 0.0)  dt = 1.0 / 60.0;
+        if (dt > 0.10) dt = 0.10;              /* clamp alt-tab / stall gaps */
+        s_glide_accum += dt;
+        const double SUBSTEP = 1.0 / 120.0;    /* fixed 120 Hz integration step */
+        const float  k_sub   = 0.20f;          /* per-substep decay (~0.36 over 1/60 s) */
+        int _guard = 0;
+        while (s_glide_accum >= SUBSTEP && _guard++ < 64) {
+            g_disp_off_x += (target_x - g_disp_off_x) * k_sub;
+            g_disp_off_y += (target_y - g_disp_off_y) * k_sub;
+            s_glide_accum -= SUBSTEP;
+        }
         /* Snap-to-target when within 0.5px (inline compare -- avoids
          * pulling in <math.h> just for fabsf). */
         float _dx = target_x - g_disp_off_x;

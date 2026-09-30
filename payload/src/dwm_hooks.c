@@ -179,6 +179,8 @@ static int in_compose_grace_window(void) {
 static pfnCOverlayPresent_t g_orig_present    = NULL;
 static pfnPresentNeeded_t   g_orig_pn1        = NULL;   /* CDDisplayRenderTarget */
 static pfnPresentNeeded_t   g_orig_pn2        = NULL;   /* CLegacyRenderTarget   */
+static pfnPresentNeeded_t   g_orig_iop        = NULL;   /* IsOverlayPrevented (v7.9 MinHook; same 1-arg __fastcall BOOL shape) */
+static void                *g_ht_iop          = NULL;   /* IOP hook target (crash-bump) */
 static pfnForceFullDirty_t  g_force_full_dirty = NULL;  /* NOT hooked, just resolved */
 static pfnScheduleCompositionPass_t g_schedule_composition = NULL;  /* the KEY wake fn */
 static pfnAddDirtyRect_t    g_add_dirty_display = NULL;   /* CDDisplayRenderTarget::AddDirtyRect */
@@ -567,6 +569,12 @@ static BYTE  g_iop_saved_bytes[6] = {0};
 static BYTE  g_iop_saved_tail[2]  = {0};
 static void *g_iop_patch_addr     = NULL;
 static BOOL  g_iop_patched        = FALSE;
+/* v7.9 (2026-09-30) -- IsOverlayPrevented is now hooked via MinHook
+ * (Detour_IsOverlayPrevented), Bypassify-exact, instead of the byte-patch.
+ * The byte-patch block in hooks_install is retired behind this flag (kept
+ * compiled as inline reference + instant revert path). Mutable (not const)
+ * so MSVC doesn't constant-fold the guard into a C4127. */
+static int   g_iop_byte_patch_retired = 1;
 
 /* v1.7.4.14 (2026-07-24) -- ForceFullDirtyRendering-adjacent byte-patch
  * to force dwmcore into "always full-dirty compose" mode. BP does
@@ -971,6 +979,40 @@ static BOOL __fastcall Detour_LegacyPresentNeeded(void *pThis) {
 
     /* AddDirtyRect DISABLED -- see PN1 detour comment above. */
     return TRUE;
+}
+
+/* v7.9 (2026-09-30) -- Detour_IsOverlayPrevented (Bypassify-exact MinHook).
+ *
+ * Replaces the v1.7.4.11 -> v3.1 byte-patch + per-build prologue-shape
+ * detection (OLD-GETTER / NEW-CFG-CALL / CET-ENDBR64). MinHook relocates
+ * WHATEVER prologue this build ships into the trampoline, so we never again
+ * guess a patch offset -- exactly how Bypassify handles it (their IOP is a
+ * MinHook, not a byte-patch), and how it stays working across Windows updates.
+ *
+ * `IsOverlayPrevented` asks "is hardware overlay (MPO) prevented?":
+ *   TRUE  -> DWM MUST use the software composite path -> every app's pixels
+ *            flow through the shared surface -> our injected pixels (drawn
+ *            last in the Present hook) land ON TOP of every app.
+ *   FALSE -> DirectComposition apps get their own HW overlay plane -> our
+ *            overlay drops BEHIND them.
+ * So while active we force TRUE.
+ *
+ * We CALL ORIG FIRST (via the trampoline) so the function's own init
+ * side-effects run -- v3.1 proved that skipping the post-KB init `call`
+ * with a naive offset-0 byte-patch could AV other dwmcore paths. BP skips
+ * orig and survives, but running it is strictly safer and costs one call
+ * per compose. On shutdown (!g_active) we return orig's real value =
+ * native behavior; MH_DisableHook then removes the detour cleanly (no
+ * byte-revert bookkeeping needed). */
+static BOOL __fastcall Detour_IsOverlayPrevented(void *pThis) {
+    BOOL orig = FALSE;
+    __try {
+        if (g_orig_iop) orig = g_orig_iop(pThis);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        hook_crash_bump(g_ht_iop, "IOP orig");
+    }
+    if (!g_active) return orig;   /* shutdown/teardown -> native */
+    return TRUE;                  /* running -> overlay prevented -> software composite */
 }
 
 /* Forward declarations (definitions after hooks_install for grouping). */
@@ -1946,7 +1988,10 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
      * If old prologue (`8A 81 ...`), fall through to legacy offset-0 patch.
      * Any other unrecognized prologue: SKIP entirely (safer to let
      * IsOverlayPrevented behave natively than to guess). */
-    if (off->isOverlayPrevented) {
+    if (off->isOverlayPrevented && !g_iop_byte_patch_retired) {
+        /* v7.9 RETIRED -- superseded by the MinHook install below. Kept
+         * compiled as reference / instant-revert (flip g_iop_byte_patch_retired
+         * to 0 to restore the byte-patch + comment out the MinHook block). */
         BYTE *iop = (BYTE *)dwmcore + off->isOverlayPrevented;
         BYTE fp[8] = {0};
         BOOL readable = FALSE;
@@ -2065,6 +2110,33 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
                                 GetLastError());
                 }
             }
+        }
+    }
+
+    /* ── 6b. IsOverlayPrevented via MinHook (v7.9, 2026-09-30) ──
+     * Bypassify-exact: BP MinHooks IsOverlayPrevented rather than byte-patching
+     * it, which is why it survives every Windows dwmcore update -- MinHook
+     * relocates whatever prologue this build ships (old getter / NEW-CFG call /
+     * CET endbr64) into the trampoline, so there is no per-build patch-offset to
+     * guess (the v3.1 prologue-shape logic above is retired). See
+     * Detour_IsOverlayPrevented: it calls orig (runs the init side-effect v3.1
+     * cared about) then forces TRUE while active. Cleanly removed by
+     * MH_Uninitialize on uninstall -- no byte-revert bookkeeping. */
+    if (off->isOverlayPrevented) {
+        void *iop_target = (BYTE *)dwmcore + off->isOverlayPrevented;
+        MH_STATUS iop_s = MH_CreateHook(iop_target, (LPVOID)Detour_IsOverlayPrevented,
+                                        (LPVOID *)&g_orig_iop);
+        if (iop_s == MH_OK && MH_EnableHook(iop_target) == MH_OK) {
+            g_ht_iop = iop_target;
+            hook_registry_add(iop_target, "IOP");
+            slog_writef("msvc_dbg_a.dat",
+                        "IsOverlayPrevented hooked @ %p (MinHook v7.9 -- was byte-patch)", iop_target);
+            hook_diag("hooks: IsOverlayPrevented hooked (MinHook)");
+        } else {
+            slog_writef("msvc_dbg_a.dat",
+                        "IsOverlayPrevented MinHook FAILED s=%d -- overlay may drop behind "
+                        "DirectComposition apps (DWM stays stable)", iop_s);
+            hook_diag("hooks: IsOverlayPrevented MinHook FAILED");
         }
     } else {
         slog_write("msvc_dbg_a.dat", SS(SVC_STR_IOP_NOT_IN_BLOB));
