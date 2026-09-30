@@ -9,6 +9,14 @@ compatibility_flags = ["nodejs_compat"]
 SUPABASE_URL = "https://rrrpkmzdnaodmvsuxdkw.supabase.co"
 SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJycnBrbXpkbmFvZG12c3V4ZGt3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njc2ODUyNzgsImV4cCI6MjA4MzI2MTI3OH0.J4kdDarCDVjkt0M9hbShgJaV7B12W56K_hUQAPSZ1-c"
 
+# Expired-JWT grace window (seconds). When the client can't refresh its 1-hour
+# Supabase JWT mid-exam (SEB / school firewall blocks Supabase), the worker
+# accepts a signed-but-recently-expired token up to this old, re-verified
+# against the public JWKS. active-sub + credits are still gated per call, so
+# this only widens IDENTITY assertion. Set to 0 to disable (pure getUser).
+# Default in code is 604800 (7 days); this makes it explicit + tunable.
+JWT_EXPIRED_GRACE_S = "604800"
+
 # Direct worker-to-worker dispatch to viper's openrouter-proxy (which holds the
 # funded OpenRouter key). Same account => service binding, not a public URL.
 [[services]]

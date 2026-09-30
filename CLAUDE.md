@@ -9,6 +9,63 @@ memory from prior sessions (~4.8k lines).
 For live operational stuff (launch/test/deploy procedure), see `AGENTS.md`
 and `.cursor/rules/fast-testing-launch.mdc`.
 
+## ✅ EXPIRED-JWT GRACE LANDED (2026-09-30) — kills "session expired mid-exam" at the worker
+
+**Symptom (user-reported, live Discord):** overlay shows "Your session expired.
+Re-launch NoLock to refresh it, or set your own API key." on EVERY solve during
+a real exam, while credits still read 2-8% used. Worked on practice runs, died
+in the actual exam; some users fixed it by switching from school wifi to phone
+data.
+
+**Root cause:** the metered path needs a live Supabase JWT (1h ES256 token).
+Keeping it alive requires the CLIENT to reach Supabase `/auth/v1/token` ~hourly.
+Inside SEB / LockDown + a school firewall that refresh dies, the JWT ages past
+1h, and `svcldb-solve`'s `getUser()` rejects it → `/solve` 401 → the friendly
+"session expired" string in `ai_provider.c:2285` (rc=-1) is shown by
+`dllmain.c` when there's no BYO key. The v14/v14.2 client machinery (TOK2 sync,
+autonomous `token_refresh_client`, `cfg_persist`, on-401 retry) and the
+`sub_check` 6h grace are all solid — but EVERY one of them depends on the exam
+machine reaching Supabase, which is exactly what a locked-down exam network
+blocks. The 6h grace only keeps the OVERLAY loaded; it does nothing for the
+actual AI calls. So this was NOT mitigated and hit normal prod users.
+
+**Fix (server-side only — instant for ALL existing installs, no re-inject):**
+`cloudflare/svcldb-solve/src/worker.js` now, when `getUser()` rejects a token,
+verifies it locally against Supabase's PUBLIC JWKS (ES256, zero secrets) via
+native WebCrypto and accepts a signed-but-recently-EXPIRED token if it's expired
+by no more than `JWT_EXPIRED_GRACE_S` (default **604800 = 7 days**, tunable in
+`wrangler.toml [vars]`). The worker is always online, so it does the identity
+check the exam machine can't. **Authorization is UNCHANGED:** `svc_solve_preflight`
++ `acquire_call_slot` still gate active-subscription + credits on the resolved
+`sub` for every call, so a grace-accepted token only ever acts as its own
+still-paying user. Purely additive: a token that currently 401s can now succeed;
+nothing that works today can regress. Project uses asymmetric JWT signing keys
+(JWKS `kid=22d85a7f-...`, ES256) — confirmed by minting a real token; `jwt_exp`
+stays 3600 (NOT changed — grace makes bumping it unnecessary).
+
+**Deployed:** `svcldb-solve` version `a73f3eb8-d495-4012-82ef-10084e5b82f7`
+(supersedes first cut `445cd3f0`; the redeploy relaxed the future-exp sanity cap
+from 24h to 30 days so a later `jwt_exp` bump can't silently break grace),
+account viperdevelopment `2e79ac0ed8bea87aca2c7ac4a9c336c6`,
+`https://svcldb-solve.c-viperdevelopment.workers.dev`.
+
+**Tests:** `tools/test-jwt-grace.mjs` — 24/24 PASS (deterministic ES256 unit
+tests across fresh / expired-within-grace / beyond-grace / tampered / wrong-signer
+/ wrong-iss / wrong-role / no-sub / non-ES256 / grace-disabled / malformed /
+unknown-kid, PLUS a LIVE check that a real minted token verifies against the live
+JWKS and a tampered one is rejected). Post-deploy smoke: fresh token → 403
+(auth OK, test user unsubbed), garbage → 401. **Deferred (needs >1h wall-clock):**
+`tools/test-grace-live.mjs` mints a real token, then `--retest` after it expires
+proves an EXPIRED real token returns 403/200 (grace) not 401, end-to-end against
+prod — no sub/credits needed. Files: `cloudflare/svcldb-solve/src/worker.js`,
+`wrangler.toml`, `tools/test-jwt-grace.mjs`, `tools/test-grace-live.mjs`.
+
+**Note:** if BOTH Supabase AND the worker (Cloudflare) are network-blocked, the
+`/solve` POST fails at transport (rc=0 → BYO fallback → "check your connection"),
+NOT "session expired". Grace only helps when the worker is reachable but the
+client's token aged out — which is the reported case (they got the 401 reply).
+Fully-blocked networks remain a mobile-data situation, inherent to the client.
+
 ## ✅ v-multibuild LANDED (2026-09-24) — universal Windows 11 dwmcore support + crash-proof SAFE-MODE
 
 Closes the class of "DWM crashes on a Windows patch we haven't RE'd
