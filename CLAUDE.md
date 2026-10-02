@@ -9,6 +9,45 @@ memory from prior sessions (~4.8k lines).
 For live operational stuff (launch/test/deploy procedure), see `AGENTS.md`
 and `.cursor/rules/fast-testing-launch.mdc`.
 
+## ✅ OVERLAY PROVIDER-SWITCH KEY BUG FIXED (2026-10-02, round 2) — the ACTUAL "switch provider -> red" cause
+
+**Symptom (James_1738, Discord, after reinstalling):** autosolver dot works on
+CloakGPT credits, but "as soon as I switch provider in the overlay it doesn't
+work -- it'll go yellow for a sec then just red." Fast red (~1s), NOT a timeout.
+
+**Root cause:** the overlay `CYCLE_PROVIDER` hotkey (dllmain.c) sets
+`mcfg->provider = nx` but NEVER updates `mcfg->api_key`. The non-streaming
+autosolver path (`ai_ask_multi` -> `build_request`) authenticated EVERY provider
+with the legacy shared `cfg->api_key`, and `ai_ask_multi` bailed immediately if
+`cfg->api_key[0]==0`. A user with per-provider keys only (legacy field empty,
+which is the norm when the dashboard default is credits) -> cycle to Gemini ->
+`build_request` sends `x-goog-api-key:` empty / the early check fires "no api
+key" -> instant red. Credits works because it uses `access_token`, not api_key.
+**Asymmetry that masked it:** the STREAMING path (`ai_ask_streaming`, used by
+chat/ask) ALREADY resolved the per-provider key (`ai_pick_provider_key`) and
+planted it before `build_request` -- so chat worked while the dot didn't. My
+round-1 Gemini fixes (timeout/extract/thinking) assumed the key was present, so
+they didn't touch this; this is why James still saw red after reinstalling.
+
+**Fix (`ai_provider.c`, 3 edits, in the AI layer so ALL switch sites are
+covered at once):**
+1. `build_request` now resolves `ai_pick_provider_key(cfg, cfg->provider)` at the
+   top and uses it for all four providers' auth headers (was `cfg->api_key`).
+2. `ai_ask_multi`'s early "no api key" gate now checks the resolved per-provider
+   key, not the legacy field.
+3. `ai_pick_provider_key` precedence FLIPPED: per-provider slot first, legacy
+   field only as a single-key fallback (was legacy-wins, which let a stale
+   legacy key shadow the switched-to provider).
+
+**Verified live (2026-10-02):** with ONLY the per-provider slot set and legacy
+`api_key` EMPTY (== James's config after a switch): Google `got=1`, Anthropic
+`got=1` (both previously would have been instant "no api key" red). OpenAI
+returned a real 401 "invalid_api_key" -- the key reached OpenAI (resolution
+works) but that key had been externally revoked since the earlier run (leaked-key
+auto-disable); not a code issue. No regression to the both-keys-set case
+(per-provider == legacy -> same key). Pairs with round 1 below so Gemini BYO via
+an overlay switch now works end-to-end.
+
 ## ✅ GEMINI BYO AUTOSOLVER "turns red" FIXED (2026-10-02) — 4 compounding defects on the new /interactions endpoint
 
 **Symptom (user-reported, live Discord — James_1738):** CloakGPT credits

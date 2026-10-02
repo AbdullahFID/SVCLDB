@@ -1840,6 +1840,25 @@ static int build_request(const svc_config_t *cfg,
                          char *extra_hdr, size_t extra_sz,
                          const char **hdrs,
                          char *err, size_t err_sz) {
+    /* v (2026-10-02) -- resolve the key for the ACTIVE provider rather than
+     * blindly sending the legacy shared cfg->api_key. The overlay
+     * CYCLE_PROVIDER hotkey changes cfg->provider WITHOUT touching
+     * cfg->api_key, so a user who set only per-provider keys (legacy field
+     * empty) or whose legacy field holds a different provider's key would
+     * auth the newly-selected provider with the wrong/empty key -> instant
+     * 401 / "no api key" -> the autosolver dot flashes yellow then goes red
+     * on every provider switch (user-reported: works on credits, dies the
+     * moment you switch provider in the overlay). ai_pick_provider_key
+     * prefers the per-provider slot and falls back to the legacy field.
+     * The streaming path (ai_ask_streaming) already planted the per-provider
+     * key before calling build_request; doing it HERE fixes the
+     * non-streaming autosolver path (ai_ask_multi) too, in one place. */
+    const char *api_key = ai_pick_provider_key(cfg, cfg->provider);
+    if (!api_key) {
+        _snprintf(err, err_sz - 1, "no api key for %s", ai_provider_name(cfg->provider));
+        err[err_sz - 1] = 0;
+        return 0;
+    }
     switch (cfg->provider) {
         case SVC_PROVIDER_OPENAI:
             if (!build_openai_body(cfg, turns, n_turns, model_id,
@@ -1848,7 +1867,7 @@ static int build_request(const svc_config_t *cfg,
                 return 0;
             }
             _snprintf(url,      url_sz - 1,  "%s", SS(SVC_STR_OPENAI_CHAT_URL));
-            _snprintf(auth_hdr, auth_sz - 1, SS(SVC_STR_AUTH_HEADER_FMT), cfg->api_key);
+            _snprintf(auth_hdr, auth_sz - 1, SS(SVC_STR_AUTH_HEADER_FMT), api_key);
             hdrs[0] = "Content-Type: application/json";
             hdrs[1] = auth_hdr;
             hdrs[2] = NULL;
@@ -1860,7 +1879,7 @@ static int build_request(const svc_config_t *cfg,
                 return 0;
             }
             _snprintf(url,       url_sz - 1,   "%s", SS(SVC_STR_OPENROUTER_URL));
-            _snprintf(auth_hdr,  auth_sz - 1,  SS(SVC_STR_AUTH_HEADER_FMT), cfg->api_key);
+            _snprintf(auth_hdr,  auth_sz - 1,  SS(SVC_STR_AUTH_HEADER_FMT), api_key);
             _snprintf(extra_hdr, extra_sz - 1, "HTTP-Referer: https://localhost");
             hdrs[0] = "Content-Type: application/json";
             hdrs[1] = auth_hdr;
@@ -1875,7 +1894,7 @@ static int build_request(const svc_config_t *cfg,
                 return 0;
             }
             _snprintf(url,      url_sz - 1,  "%s", SS(SVC_STR_ANTHROPIC_MSG_URL));
-            _snprintf(auth_hdr, auth_sz - 1, "x-api-key: %s", cfg->api_key);
+            _snprintf(auth_hdr, auth_sz - 1, "x-api-key: %s", api_key);
             hdrs[0] = "Content-Type: application/json";
             hdrs[1] = auth_hdr;
             hdrs[2] = SS(SVC_STR_ANTHROPIC_VERSION);
@@ -1906,7 +1925,7 @@ static int build_request(const svc_config_t *cfg,
                           model_id,
                           enable_streaming ? "streamGenerateContent?alt=sse" : "generateContent");
             }
-            _snprintf(auth_hdr, auth_sz - 1, "x-goog-api-key: %s", cfg->api_key);
+            _snprintf(auth_hdr, auth_sz - 1, "x-goog-api-key: %s", api_key);
             hdrs[0] = "Content-Type: application/json";
             hdrs[1] = auth_hdr;
             hdrs[2] = NULL;
@@ -1941,7 +1960,11 @@ int ai_ask_multi(const svc_config_t *cfg,
     *out_reply = NULL;
     err[0] = 0;
 
-    if (cfg->api_key[0] == 0) {
+    /* v (2026-10-02) -- gate on the ACTIVE provider's resolved key, not the
+     * legacy shared field. A provider switched in the overlay (CYCLE_PROVIDER
+     * sets ->provider only) with its key in the per-provider slot would
+     * otherwise bail here with a spurious "no api key" -> red dot. */
+    if (!ai_pick_provider_key(cfg, cfg->provider)) {
         _snprintf(err, err_sz - 1, "no api key configured"); err[err_sz - 1] = 0;
         return 0;
     }
@@ -3181,9 +3204,13 @@ static DWORD ai_select_receive_timeout(const svc_config_t *cfg, const char *mode
 
 const char *ai_pick_provider_key(const svc_config_t *cfg, int provider) {
     if (!cfg) return NULL;
-    /* Legacy shared field wins if set -- preserves existing single-key
-     * setups from users who haven't populated the v5 per-provider fields. */
-    if (cfg->api_key[0]) return cfg->api_key;
+    /* v (2026-10-02) -- per-provider slot takes PRECEDENCE over the legacy
+     * shared field (was the other way round). The old "legacy wins" order
+     * meant a stale cfg->api_key (e.g. synced to whatever provider was
+     * active at inject time) would be sent to a DIFFERENT provider after an
+     * overlay CYCLE_PROVIDER switch -> wrong-key 401 -> autosolver dot red.
+     * The legacy field is now only a fallback for single-key installs that
+     * never populated the v5 per-provider slots, which still works. */
     const char *k = NULL;
     switch (provider) {
         case SVC_PROVIDER_OPENAI:     k = cfg->api_key_openai;     break;
@@ -3191,7 +3218,9 @@ const char *ai_pick_provider_key(const svc_config_t *cfg, int provider) {
         case SVC_PROVIDER_GOOGLE:     k = cfg->api_key_google;     break;
         case SVC_PROVIDER_OPENROUTER: k = cfg->api_key_openrouter; break;
     }
-    return (k && k[0]) ? k : NULL;
+    if (k && k[0]) return k;
+    if (cfg->api_key[0]) return cfg->api_key;   /* legacy single-key fallback */
+    return NULL;
 }
 
 /* Iterate providers in fallback order: active provider first, then
