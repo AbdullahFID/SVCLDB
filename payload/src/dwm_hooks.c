@@ -317,6 +317,21 @@ static volatile LONG g_integrity_tamper_hits = 0;
 static HANDLE g_keepalive_thread   = NULL;
 static HANDLE g_ghost_wnd_thread_h = NULL;   /* _h suffix: separate from HWND g_ghost_wnd */
 static HANDLE g_canary_thread      = NULL;
+/* v7.9.2 (2026-10-02) -- interruptible-sleep event for the canary thread.
+ * Prior code used Sleep(sleep_ms) with sleep_ms up to 30000 (exponential
+ * backoff when Present is healthy). That meant hooks_uninstall could be
+ * waiting 2000ms for the canary to exit while the thread was 10s into a
+ * 30s nap -> wait TIMEOUT -> "may crash on next unload cycle" log line.
+ * In practice we got away with it (OS grace on module unmap + scheduler
+ * context-switch after Sleep returned usually caught the thread before
+ * instruction fetch into unmapped memory) BUT it was a theoretical AV
+ * waiting to happen under high load / rapid reinject cycles.
+ *
+ * Fix: manual-reset Event signaled by hooks_uninstall before the thread
+ * wait. The canary's sleep is now `WaitForSingleObject(g_canary_stop_event,
+ * sleep_ms)` which wakes IMMEDIATELY on signal, returns WAIT_OBJECT_0,
+ * thread exits cleanly within milliseconds instead of up to 30s. */
+static HANDLE g_canary_stop_event  = NULL;
 
 static void hook_registry_add(void *target, const char *name) {
     LONG idx = InterlockedIncrement(&g_hook_reg_count) - 1;
@@ -1350,7 +1365,16 @@ static DWORD WINAPI present_fire_canary_thread(LPVOID unused) {
 
     for (;;) {
         if (g_stop_draw) return 0;
-        Sleep(sleep_ms);
+        /* v7.9.2 -- interruptible sleep: wake INSTANTLY when hooks_uninstall
+         * signals g_canary_stop_event, instead of napping up to 30s and
+         * potentially executing from freed memory after the DLL unloads.
+         * Falls back to Sleep() if the event failed to create (defensive). */
+        if (g_canary_stop_event) {
+            DWORD wr = WaitForSingleObject(g_canary_stop_event, sleep_ms);
+            if (wr == WAIT_OBJECT_0) return 0;   /* signaled -> clean exit */
+        } else {
+            Sleep(sleep_ms);
+        }
         if (g_stop_draw) return 0;
 
         LONG n = g_present_calls;
@@ -2214,6 +2238,12 @@ int hooks_install(const pl_offsets_t *off, present_cb_t present_cb) {
      * screams, ship-block flag flies, future inject attempts can
      * short-circuit into no-hook mode. */
     /* v-audit-hardening: keep the canary handle so uninstall can join it. */
+    /* v7.9.2: create the stop event BEFORE spawning the thread so the
+     * canary's first WaitForSingleObject has a valid handle. Manual-reset
+     * (TRUE) so a single SetEvent in uninstall wakes the thread and stays
+     * signaled; initial state unsignaled (FALSE); unnamed. If creation
+     * fails (very rare), canary falls back to Sleep() unchanged. */
+    g_canary_stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
     g_canary_thread = CreateThread(NULL, 0, present_fire_canary_thread, NULL, 0, NULL);
 
     hook_diag(SS(SVC_STR_HK_INSTALL_SUCCESS));
@@ -2335,6 +2365,13 @@ void hooks_uninstall(void) {
         g_ghost_wnd_thread_h = NULL;
     }
     if (g_canary_thread) {
+        /* v7.9.2 -- signal the stop event BEFORE waiting so the canary
+         * wakes from its WaitForSingleObject() instantly instead of
+         * blocking up to 30s on its exponential-backoff Sleep. The 2000ms
+         * wait budget below is now generous (thread exits in <10ms post-
+         * signal under normal scheduling). Belt-and-suspenders: g_stop_draw
+         * is also set above, so the fallback-Sleep code path still exits. */
+        if (g_canary_stop_event) SetEvent(g_canary_stop_event);
         DWORD wr = WaitForSingleObject(g_canary_thread, 2000);
         if (wr != WAIT_OBJECT_0) {
             hook_diag("hooks_uninstall: canary_thread wait TIMEOUT "
@@ -2342,6 +2379,14 @@ void hooks_uninstall(void) {
         }
         CloseHandle(g_canary_thread);
         g_canary_thread = NULL;
+        /* v7.9.2: thread has definitely exited (or we timed out), safe to
+         * close the event handle now. Done AFTER the thread wait so there's
+         * zero chance of a race where we close the event while the canary
+         * is still mid-WaitForSingleObject on it. */
+        if (g_canary_stop_event) {
+            CloseHandle(g_canary_stop_event);
+            g_canary_stop_event = NULL;
+        }
     }
 
     /* Step 1 (Bypassify pattern): the shutdown flag is now set.

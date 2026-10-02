@@ -206,15 +206,19 @@ document.getElementById('tb-quit').addEventListener('click', () => {
   try {
     const v = await window.svc.app.getVersion();
     if (!v) return;
-    /* v6.7.0.0 (2026-09-22): user-visible convention is 4-part (Windows
-     * file-version style). package.json holds 3-part (npm/semver limit
-     * enforced by electron-builder 25), so we append a ".0" fourth
-     * segment for the UI when the raw version is 3 dotted numbers. */
-    const parts = String(v).split('.');
-    const display = (parts.length === 3 && parts.every(p => /^\d+$/.test(p)))
-      ? v + '.0' : v;
-    const short = 'v' + display;                                    // full version, e.g. "v6.7.0.0"
-    const long  = 'CloakGPT v' + display;                             // "CloakGPT v6.7.0.0"
+    /* v8.0 (2026-10-02): user-visible convention is SHORT (strip trailing
+     * zero segments beyond major.minor). package.json holds the semver
+     * triple (electron-builder requires valid 3-part semver), so for the
+     * UI we strip trailing ".0" segments down to a minimum of
+     * major.minor. e.g. "8.0.0" -> "v8.0", "8.1.0" -> "v8.1",
+     * "8.1.3" -> "v8.1.3", "7.9.1" -> "v7.9.1". Keeps titlebar + login
+     * clean while preserving semver precision when a real patch bump
+     * happens. */
+    const parts = String(v).split('.').filter(p => /^\d+$/.test(p));
+    while (parts.length > 2 && parts[parts.length - 1] === '0') parts.pop();
+    const display = parts.join('.');
+    const short = 'v' + display;                                    // short form, e.g. "v8.0"
+    const long  = 'CloakGPT v' + display;                             // "CloakGPT v8.0"
     const tb    = document.getElementById('titlebar-ver');
     if (tb)  tb.textContent = short;
     const lv   = document.getElementById('login-app-ver');
