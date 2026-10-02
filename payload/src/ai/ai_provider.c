@@ -1215,16 +1215,63 @@ static int is_gemini_new_endpoint(const char *model_id) {
 }
 
 /* Map cfg->reasoning_effort (1..5) to Gemini's `thinking_level` enum.
- * 1=minimal, 2=low, 3=medium, 4=high, 5=high (docs cap at high). */
+ *
+ * v (2026-10-02) -- RE-MAPPED after live reproduction of the user-reported
+ * "switch to Gemini -> autosolver dot turns red" bug (James_1738, Discord).
+ * Two concrete failures on the new /v1beta/interactions endpoint, both
+ * reproduced live against gemini-3.8-flash with a real API key:
+ *
+ *   (a) "minimal" is REJECTED -> HTTP 400 "Thinking level
+ *       THINKING_LEVEL_MINIMAL is not supported for this model." So the
+ *       old `1 -> "minimal"` guaranteed a red dot for anyone on effort 1.
+ *       Fixed: 1 -> "low" (the lowest level the 3.x models actually accept).
+ *
+ *   (b) "high" (the DEFAULT -- injector.js ships reasoning_effort=4) can
+ *       DIVERGE: on a hard question the model spirals in its thinking
+ *       channel, and because thinking tokens count against
+ *       max_output_tokens on this endpoint it returns status:"incomplete"
+ *       with the answer truncated mid-reasoning (31k+ thinking tokens, no
+ *       JSON, 126 s wall-clock). "medium" completed the SAME question with
+ *       correct JSON in ~23 s. So the default now maps to "medium"; only an
+ *       explicit xHigh (effort 5) opts into "high" (covered by the longer
+ *       timeout + the gemini-3.x -> 2.5 fallback below). */
 static const char *gemini_thinking_level(int effort) {
     switch (effort) {
-        case 1:  return "minimal";
+        case 1:  return "low";      /* was "minimal" -- API rejects it on 3.x */
         case 2:  return "low";
         case 3:  return "medium";
-        case 4:
-        case 5:  return "high";
-        default: return "high";
+        case 4:  return "medium";   /* was "high" -- diverges/incomplete */
+        case 5:  return "high";     /* explicit xHigh only */
+        default: return "medium";   /* 0/unknown -> safe, reliable default */
     }
+}
+
+/* Output-token budget for the NEW /v1beta/interactions endpoint.
+ *
+ * v (2026-10-02) -- On this endpoint, thinking tokens are counted AGAINST
+ * max_output_tokens (unlike the legacy generateContent path, where
+ * thinkingBudget is a separate pool). The tier answer budgets (STRONG
+ * 12288 / MEDIUM 8192 / CHEAP 4096) were sized for ANSWER tokens only;
+ * once several thousand thinking tokens eat into that same ceiling the
+ * JSON answer truncates -> status:"incomplete" -> extract yields garbage
+ * or nothing -> autosolver dot red. Give thinking its own headroom ON TOP
+ * of the tier answer budget so the answer always has room to finish,
+ * clamped to the models' 65536 output ceiling. Reserve tracks the
+ * thinking_level we actually send (see gemini_thinking_level above). */
+static int gemini_new_endpoint_max_tokens(const svc_config_t *cfg) {
+    int answer_budget = resolve_max_output_tokens(cfg);
+    int reserve;
+    switch (cfg->reasoning_effort) {
+        case 5:  reserve = 32768; break;   /* "high"   -- room for long chains */
+        case 3:
+        case 4:  reserve = 16384; break;   /* "medium" -- typical ~5-6k observed */
+        case 1:
+        case 2:  reserve = 8192;  break;   /* "low" */
+        default: reserve = 16384; break;   /* matches default "medium" */
+    }
+    int total = answer_budget + reserve;
+    if (total > 65536) total = 65536;      /* 3.x models' outputTokenLimit */
+    return total;
 }
 
 /* ── Google Gemini body builder ───────────────────────────────────
@@ -1306,7 +1353,9 @@ static int build_google_body(const svc_config_t *cfg,
 
         jb_key(jb, "generation_config");
         jb_obj_begin(jb);
-            jb_key(jb, "max_output_tokens"); jb_num_i(jb, resolve_max_output_tokens(cfg));
+            /* Thinking counts against this budget on /v1beta/interactions,
+             * so size it to cover thinking + answer (not answer alone). */
+            jb_key(jb, "max_output_tokens"); jb_num_i(jb, gemini_new_endpoint_max_tokens(cfg));
             jb_key(jb, "temperature");       jb_num_d(jb, 0.7);
             jb_key(jb, "thinking_level");    jb_str(jb, gemini_thinking_level(cfg->reasoning_effort));
         jb_obj_end(jb);
@@ -1530,56 +1579,84 @@ static int extract_google_reply(const char *body, char **out_reply) {
         /* output_text present but empty -> fall through to steps walk. */
     }
 
-    /* Walk `steps[]` for the LAST text-typed content block. Same string-
-     * aware brace-scanning helper as the legacy path so LaTeX + code
-     * blocks with unbalanced-looking braces inside string values don't
-     * truncate mid-object. */
+    /* Walk `steps[] -> content[]` for the LAST non-empty text block.
+     *
+     * v (2026-10-02) -- REWRITTEN after live-reproducing the user-reported
+     * "Gemini autosolver dot turns red" bug. The previous version anchored
+     * on the literal `"type":"text"` token and walked BACKWARD to the
+     * nearest '{', ASSUMING that brace was the content object's structural
+     * opener. On this endpoint the text VALUE is routinely a JSON answer
+     * full of UNescaped '{' / '}' -- e.g. the autosolver's
+     * {status,...,"actions":[{"type":"click",...}]} -- so the backward walk
+     * stopped on a brace INSIDE the answer string, find_object_end bounded a
+     * garbage fragment, json_get_str(.,"text") found no key, extract
+     * returned 0 -> "no reply text in response body" -> red dot. Trivial
+     * replies ("4", "Green") have no inner braces, which is exactly why
+     * ad-hoc probes passed while every real JSON answer failed.
+     *
+     * NOW: iterate the steps array, then each step's content array, using
+     * the string-aware json_skip_object walker (the same one the 2026-07-05
+     * LaTeX fix relies on) to bound every object cleanly, and json_get_str
+     * each content object's "text". Keep the LAST non-empty one -- the
+     * model_output step follows the thought step, so the final answer wins.
+     * Brace-content-safe by construction. */
     if (strstr(body, "\"steps\"")) {
-        const char *last_text_obj_start = NULL;
-        const char *last_text_obj_end   = NULL;
-        const char *scan = body;
-        for (;;) {
-            const char *t = strstr(scan, "\"type\":\"text\"");
-            if (!t) {
-                /* Also accept "type": "text" with spaces (some serializers). */
-                t = strstr(scan, "\"type\": \"text\"");
-            }
-            if (!t) break;
-            /* Walk back to the enclosing '{' -- t is anchored on a real
-             * JSON key so the previous '{' is a structural brace. */
-            const char *ob = t;
-            while (ob > body && *ob != '{') ob--;
-            const char *oe = find_object_end(ob);
-            if (oe) {
-                last_text_obj_start = ob;
-                last_text_obj_end   = oe;
-                scan = oe;
-            } else {
-                scan = t + 8;
-            }
-        }
-        if (last_text_obj_start && last_text_obj_end) {
-            size_t sz = (size_t)(last_text_obj_end - last_text_obj_start);
-            char *obuf = (char *)malloc(sz + 1);
-            if (obuf) {
-                memcpy(obuf, last_text_obj_start, sz); obuf[sz] = 0;
-                size_t need = json_get_str_len(obuf, "text");
-                if (need > 0) {
-                    size_t cap = need + 16;
-                    if (cap > 8u * 1024u * 1024u) cap = 8u * 1024u * 1024u;
-                    char *reply = (char *)malloc(cap);
-                    if (reply) {
-                        if (json_get_str(obuf, "text", reply, cap) && reply[0]) {
-                            *out_reply = reply;
-                            free(obuf);
-                            return 1;
+        const char *steps_key = strstr(body, "\"steps\"");
+        const char *arr = steps_key ? strchr(steps_key, '[') : NULL;
+        char *last_text = NULL;
+        if (arr) {
+            const char *p = arr + 1;
+            for (;;) {
+                while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ',') p++;
+                if (*p == ']' || *p == 0) break;
+                if (*p != '{') { p++; continue; }
+                const char *step_end = json_skip_object(p);      /* string-aware */
+                if (!step_end) break;
+                size_t step_sz = (size_t)(step_end - p);
+                char *step = (char *)malloc(step_sz + 1);
+                if (step) {
+                    memcpy(step, p, step_sz); step[step_sz] = 0;
+                    /* content is an array of {type,text} objects (absent on
+                     * thought-only steps). */
+                    const char *content = strstr(step, "\"content\"");
+                    const char *carr = content ? strchr(content, '[') : NULL;
+                    if (carr) {
+                        const char *cp = carr + 1;
+                        for (;;) {
+                            while (*cp == ' ' || *cp == '\t' || *cp == '\r' || *cp == '\n' || *cp == ',') cp++;
+                            if (*cp == ']' || *cp == 0) break;
+                            if (*cp != '{') { cp++; continue; }
+                            const char *ci_end = json_skip_object(cp);  /* string-aware */
+                            if (!ci_end) break;
+                            size_t ci_sz = (size_t)(ci_end - cp);
+                            char *citem = (char *)malloc(ci_sz + 1);
+                            if (citem) {
+                                memcpy(citem, cp, ci_sz); citem[ci_sz] = 0;
+                                size_t need = json_get_str_len(citem, "text");
+                                if (need > 0) {
+                                    size_t cap = need + 16;
+                                    if (cap > 8u * 1024u * 1024u) cap = 8u * 1024u * 1024u;
+                                    char *reply = (char *)malloc(cap);
+                                    if (reply) {
+                                        if (json_get_str(citem, "text", reply, cap) && reply[0]) {
+                                            free(last_text);      /* keep the latest */
+                                            last_text = reply;
+                                        } else {
+                                            free(reply);
+                                        }
+                                    }
+                                }
+                                free(citem);
+                            }
+                            cp = ci_end;
                         }
-                        free(reply);
                     }
+                    free(step);
                 }
-                free(obuf);
+                p = step_end;
             }
         }
+        if (last_text) { *out_reply = last_text; return 1; }
     }
 
     /* ── Fall back to LEGACY candidates[] shape (Gemini 2.5.x) ── */
@@ -1945,8 +2022,21 @@ int ai_ask_multi(const svc_config_t *cfg,
         int attempt = 0, max_attempts = 3;
         int ok = 0;
         int transport_fail = 0;
+        /* v (2026-10-02) -- model-appropriate receive timeout. The bare
+         * whreq_post() inherited WinHTTP's 20 s default dwReceiveTimeout.
+         * NON-STREAMING gets ZERO bytes until the server finishes the WHOLE
+         * response (thinking + generation), so a reasoning/thinking model on
+         * a hard question blows past 20 s -> WinHttpReceiveResponse 12002 ->
+         * ai_ask_multi returns 0 -> autosolver dot red. This is the exact
+         * mechanism behind the user-reported "Gemini turns red" (reproduced
+         * live: a hard question on gemini-3.8-flash took ~31 s). Use the SAME
+         * selector the streaming path already uses: MEDIUM 120 s, STRONG /
+         * reasoning 900 s, CHEAP 60 s -- all comfortably above observed
+         * latencies. A larger receive timeout only permits longer waits; it
+         * never shortens a fast response. */
+        DWORD recv_to = ai_select_receive_timeout(&eff_cfg, use_model);
         for (; attempt < max_attempts; attempt++) {
-            ok = whreq_post(url, hdrs, jb.buf, jb.len, &r);
+            ok = whreq_post_ex(url, hdrs, jb.buf, jb.len, recv_to, &r);
             if (!ok) {
                 _snprintf(err, err_sz - 1, "transport: %s", r.err); err[err_sz - 1] = 0;
                 transport_fail = 1;
@@ -1972,9 +2062,19 @@ int ai_ask_multi(const svc_config_t *cfg,
         }
         jb_free(&jb);
 
-        /* Decide whether the Fable->Opus fallback applies to this failure. */
+        /* Decide whether a model-fallback applies to this failure. */
         int anthropic_fb_eligible =
             (cfg->provider == SVC_PROVIDER_ANTHROPIC) && !model_fallback_used;
+        /* v (2026-10-02) -- Google fallback in the NON-streaming path, mirroring
+         * the one that already exists in ai_ask_streaming. A gemini-3.x request
+         * that times out (slow/divergent thinking) or 503s falls back ONCE to the
+         * stable gemini-2.5 family, which uses the legacy generateContent endpoint
+         * where thinkingBudget is a SEPARATE pool (so the answer can't be starved)
+         * and which is markedly faster -- turning a would-be red dot into an
+         * answer. Previously only the streaming path had this; the autosolver is
+         * non-streaming, so it had no safety net at all. */
+        int google_fb_eligible =
+            (cfg->provider == SVC_PROVIDER_GOOGLE) && !model_fallback_used;
 
         if (transport_fail) {
             whreq_free_result(&r);
@@ -1982,6 +2082,16 @@ int ai_ask_multi(const svc_config_t *cfg,
                 const char *fb = ai_anthropic_stable_fallback(use_model);
                 if (fb) {
                     slog_writef("msvc_dbg_d.dat", "ai_ask Anthropic model-fallback %s -> %s (transport)",
+                                use_model, fb);
+                    model_override = fb;
+                    model_fallback_used = 1;
+                    continue;
+                }
+            }
+            if (google_fb_eligible) {
+                const char *fb = ai_google_stable_fallback(use_model);
+                if (fb) {
+                    slog_writef("msvc_dbg_d.dat", "ai_ask Google model-fallback %s -> %s (transport/timeout)",
                                 use_model, fb);
                     model_override = fb;
                     model_fallback_used = 1;
@@ -2005,6 +2115,16 @@ int ai_ask_multi(const svc_config_t *cfg,
                 if (fb) {
                     slog_writef("msvc_dbg_d.dat", "ai_ask Anthropic model-fallback %s -> %s (status=%u)",
                                 use_model, fb, last_status);
+                    model_override = fb;
+                    model_fallback_used = 1;
+                    continue;
+                }
+            }
+            if (google_fb_eligible && last_status == 503) {
+                const char *fb = ai_google_stable_fallback(use_model);
+                if (fb) {
+                    slog_writef("msvc_dbg_d.dat", "ai_ask Google model-fallback %s -> %s (status=503)",
+                                use_model, fb);
                     model_override = fb;
                     model_fallback_used = 1;
                     continue;

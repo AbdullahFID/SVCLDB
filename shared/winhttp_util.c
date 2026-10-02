@@ -380,11 +380,27 @@ char *whreq_find_header(const char *headers_raw, const char *name) {
  * whreq_post_stream call this AFTER req_open() so the value overrides
  * the 20s default set inside req_open. Pass 0 to keep the default. */
 static void apply_receive_timeout(req_ctx_t *c, DWORD receive_timeout_ms) {
-    if (!c || !c->session || receive_timeout_ms == 0) return;
-    /* WinHttpSetTimeouts on an existing session -- resolve/connect/send
-     * default is -1 = don't change. Only override dwReceiveTimeout so
-     * reasoning-model long streams don't drop between tokens. */
-    WinHttpSetTimeouts(c->session, -1, -1, -1, (int)receive_timeout_ms);
+    if (!c || receive_timeout_ms == 0) return;
+    /* v (2026-10-02) -- target the REQUEST handle, not just the session.
+     *
+     * WinHttpSetTimeouts on a SESSION handle only changes the default
+     * inherited by request handles created AFTER the call. req_open()
+     * has ALREADY created c->request by the time we get here, so the
+     * old session-only override silently did nothing to the live
+     * request -- WinHttpReceiveResponse / WinHttpReadData kept the 20s
+     * default baked in at request-creation time. For NON-STREAMING calls
+     * (which block in WinHttpReceiveResponse until the whole response is
+     * ready) that meant any reasoning/thinking model on a hard prompt
+     * timed out at 20s with ERROR_WINHTTP_TIMEOUT (12002) no matter what
+     * the caller requested -- the autosolver "Gemini turns red" bug.
+     * Streaming masked it because inter-chunk gaps stay under 20s.
+     *
+     * Set dwReceiveTimeout on the live request handle (what actually
+     * governs this transaction) and refresh the session default too so
+     * any later child handle inherits it. resolve/connect/send stay -1
+     * (unchanged). */
+    if (c->request) WinHttpSetTimeouts(c->request, -1, -1, -1, (int)receive_timeout_ms);
+    if (c->session) WinHttpSetTimeouts(c->session, -1, -1, -1, (int)receive_timeout_ms);
 }
 
 /* Perform request. body_len==0 = no body. */
