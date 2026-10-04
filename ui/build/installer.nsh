@@ -224,6 +224,83 @@
     DetailPrint "  WARNING: Task registration failed (code $0) - app falls back to UAC prompts."
   sched_done:
 
+  ; ────────────────────────────────────────────────────────────
+  ; v8.2 (2026-10-03) — MAX-STEALTH REGISTRY + FILESYSTEM HIDING.
+  ;
+  ; Sam's ask: "whats the maximum amount of hiding for svchelper we
+  ; can do with admin or system". These are the admin-at-install-time
+  ; wins. All reversible on uninstall (NSIS auto-deletes the Uninstall
+  ; key entire; we clear +H +S explicitly in customUnInstall below).
+  ;
+  ; (1) SystemComponent=1 under the Uninstall registry key -> hides
+  ;     the CloakGPT entry from BOTH legacy Control Panel "Programs
+  ;     and Features" AND the modern Settings > Apps > Installed Apps
+  ;     list. The entry still exists in the registry (so our own
+  ;     uninstall.exe is still reachable via its full path), but every
+  ;     user-facing enumeration surface skips it. This is the exact
+  ;     mechanism Windows uses to hide KB updates, driver packages,
+  ;     and WOW64 subsystem stubs from the "Installed" view.
+  ;
+  ;     IMPORTANT -- electron-builder's NSIS wrapper does NOT use the
+  ;     literal appId as the Uninstall subkey name. It derives a name-
+  ;     based GUID (empirically a UUIDv5-ish transformation of appId;
+  ;     verified live 2026-10-03 as "d6731b52-1c1c-5afd-80ce-9c2719e6fb94"
+  ;     for appId "com.microsoft.svchelper"). The GUID is stable across
+  ;     machines + installs (same appId -> same GUID always), but
+  ;     hardcoding it here is brittle. INSTEAD we iterate every
+  ;     Uninstall\* subkey (both 32-bit WOW6432Node + 64-bit view) and
+  ;     flag any whose DisplayName matches our `uninstallDisplayName`
+  ;     from package.json. Robust to future electron-builder bumps that
+  ;     might shift the GUID transform. Belt-and-suspenders: also match
+  ;     on UninstallString containing our INSTDIR, so a stale pre-v8.2
+  ;     install with a different DisplayName still gets hidden.
+  ;
+  ; (2) +H +S attributes on $INSTDIR -> C:\Program Files\svchelper\
+  ;     becomes hidden+system in default Explorer view. Won't show in
+  ;     Programs' directory listing without "Show hidden files" AND
+  ;     "Show protected OS files" both enabled (two options nested in
+  ;     different Explorer dialogs, almost nobody has both on). CMD
+  ;     `dir` likewise skips it without `/a:h`. The directory is still
+  ;     fully accessible by absolute path (our own uninstall.exe +
+  ;     schtasks /Run invocations keep working).
+  ;
+  ; (3) Legacy task cleanup (safety net for pre-v8.2 installs that
+  ;     upgrade): the new nested-path task "\Microsoft\Windows\
+  ;     Multimedia\AudioServiceSupport" is registered by the
+  ;     register-cloakgpt-task.ps1 above; it also drops any stale
+  ;     tree-root "\CloakGPT". If that script failed for any reason
+  ;     (PowerShell policy, timeout), we belt-and-suspenders delete
+  ;     the legacy task directly via schtasks here so a proctor never
+  ;     sees "CloakGPT" at the Task Scheduler root.
+  ; ────────────────────────────────────────────────────────────
+  DetailPrint "Applying max-stealth registry + filesystem hiding..."
+
+  ; (1) SystemComponent=1 on the Uninstall key -- find by DisplayName /
+  ; UninstallString match since electron-builder derives a GUID subkey
+  ; from appId (see rationale block above). PowerShell handles both
+  ; 32-bit (WOW6432Node) + 64-bit views in a single call via
+  ; Get-ChildItem on both paths.
+  ;
+  ; $$INSTDIR_ESC pre-escapes backslashes for the PowerShell -like
+  ; pattern (which treats backslashes literally but the quoted path
+  ; needs to roundtrip through NSIS -> cmd -> PowerShell cleanly).
+  nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$ErrorActionPreference = ''SilentlyContinue''; $$pattern = ''*'' + ''$INSTDIR'' + ''*''; $$flagged = 0; foreach ($$root in @(''HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'',''HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'')) { if (-not (Test-Path $$root)) { continue }; Get-ChildItem $$root | ForEach-Object { $$dn = $$_.GetValue(''DisplayName''); $$us = $$_.GetValue(''UninstallString''); if (($$dn -eq ''Windows Audio Service Helper'') -or ($$dn -eq ''CloakGPT (Max Stealth)'') -or ($$dn -eq ''svchelper'') -or ($$us -like $$pattern)) { Set-ItemProperty -Path $$_.PSPath -Name ''SystemComponent'' -Value 1 -Type DWord -ErrorAction SilentlyContinue; $$flagged++ } } }; Write-Output (''SYSCOMP_FLAGGED='' + $$flagged)"'
+  Pop $0
+
+  ; (2) +H +S on the install directory. PowerShell's Set-ItemProperty
+  ; -Name Attributes handles the attribute flag OR cleanly without
+  ; needing attrib.exe's crusty syntax. Belt-and-suspenders attrib
+  ; call as fallback for machines where PowerShell is restricted.
+  nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$ErrorActionPreference = ''SilentlyContinue''; try { $$it = Get-Item -LiteralPath ''$INSTDIR'' -Force; $$it.Attributes = $$it.Attributes -bor ''Hidden'' -bor ''System''; Write-Output ''ATTR_OK'' } catch { Write-Output (''ATTR_ERR: '' + $$_.Exception.Message) }"'
+  Pop $0
+  nsExec::Exec 'attrib.exe +H +S "$INSTDIR"'
+  Pop $0
+
+  ; (3) Belt-and-suspenders removal of the pre-v8.2 "\CloakGPT" root
+  ; task. The new nested task is already registered by the ps1 above.
+  nsExec::Exec 'schtasks.exe /Delete /TN "CloakGPT" /F'
+  Pop $0
+
   DetailPrint "Install complete. Launching CloakGPT..."
 !macroend
 
@@ -274,9 +351,10 @@
   Sleep 2000
 
   ; v8.1.2 (2026-10-03) — Remove silent-launch scheduled task.
-  ; Prefer the ps1 helper if present (same code path as install), but
-  ; fall back to raw schtasks /Delete if the ps1 was already removed by
-  ; a prior pass of RMDir /r. Failure of either is non-fatal.
+  ; v8.2 (2026-10-03) — delete BOTH the new nested task AND the legacy
+  ; "\CloakGPT" root name so upgrades + pre-v8.2 uninstalls both end up
+  ; clean. The ps1 helper handles both internally; the schtasks /Delete
+  ; fallback has to make two explicit calls. Failure of any is non-fatal.
   DetailPrint "Removing silent-launch scheduled task..."
   IfFileExists "$INSTDIR\resources\register-cloakgpt-task.ps1" use_ps1 use_schtasks
   use_ps1:
@@ -284,9 +362,21 @@
     Pop $0
     Goto unreg_done
   use_schtasks:
+    nsExec::Exec 'schtasks.exe /Delete /TN "\Microsoft\Windows\Multimedia\AudioServiceSupport" /F'
+    Pop $0
     nsExec::Exec 'schtasks.exe /Delete /TN "CloakGPT" /F'
     Pop $0
   unreg_done:
+
+  ; v8.2 (2026-10-03) — reverse the +H +S attributes applied in
+  ; customInstall so RMDir / Remove-Item below can see + wipe the
+  ; install directory. Hidden+System attribs don't block delete, but
+  ; some AV tooling + enterprise MDM Explorer views refuse to touch
+  ; marked-OS folders; stripping cleanly first avoids edge cases.
+  nsExec::Exec 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$ErrorActionPreference = ''SilentlyContinue''; try { $$it = Get-Item -LiteralPath ''$INSTDIR'' -Force; $$it.Attributes = ''Normal'' } catch { }"'
+  Pop $0
+  nsExec::Exec 'attrib.exe -H -S "$INSTDIR"'
+  Pop $0
 
   DetailPrint "Removing Windows Defender exclusions..."
   ; See customInstall for the `$$` escape rationale — same pattern here.

@@ -287,15 +287,29 @@ function Add-ShortcutHardened {
     return @{ Success = $true; Path = $LnkPath }
 }
 
+# v8.2 (2026-10-03) MAX-STEALTH TASK PATH. Keep in sync with:
+#   - ui/build/register-cloakgpt-task.ps1 TASK_PATH/TASK_NAME
+#   - ui/src/main.js _TASK_NEW
+#   - ui/build/installer.nsh customUnInstall fallback schtasks /Delete
+$script:TASK_PATH = '\Microsoft\Windows\Multimedia\'
+$script:TASK_NAME = 'AudioServiceSupport'
+
 function Register-CloakGPTTask {
     <#
-    v8.1 (2026-10-03) — Register the "CloakGPT" scheduled task that silently
-    elevates svchelper.exe on every subsequent launch.
+    v8.1 (2026-10-03) - Register the silent-launch scheduled task that
+    silently elevates svchelper.exe on every subsequent launch.
+
+    v8.2 (2026-10-03) MAX-STEALTH RENAME - task moved from tree root
+    "\CloakGPT" (dead-obvious top-level entry in taskschd.msc) to
+    nested "\Microsoft\Windows\Multimedia\AudioServiceSupport" (right
+    alongside legit Microsoft tasks like SystemSoundsService). Legacy
+    root task is best-effort removed on every call so pre-v8.2 installs
+    upgrade cleanly without a Hidden-flagged "CloakGPT" ghost orphan.
 
     Why: svchelper.exe used to run with `requireAdministrator` manifest,
     forcing a UAC prompt on every double-click of the Desktop shortcut.
     Now the manifest is `asInvoker` and main.js self-triggers this
-    pre-authorized task via `schtasks /Run /TN CloakGPT`. Task Scheduler
+    pre-authorized task via `schtasks /Run /TN <path>`. Task Scheduler
     Service (SYSTEM) hands back the user's elevated token with ZERO
     UAC prompt because the elevation was authorized ONCE here at install.
 
@@ -303,19 +317,23 @@ function Register-CloakGPTTask {
       - RunLevel: Highest  (grants the user's full elevated token)
       - LogonType: Interactive  (runs on the user's visible desktop)
       - Hidden: true  (doesn't appear in default Task Scheduler view)
-      - MultipleInstances: IgnoreNew  (double-click doesn't double-launch)
+      - MultipleInstances: Parallel  (crashed-instance ghost resilience)
       - ExecutionTimeLimit: 0  (never auto-kill the app)
       - Action: $ExePath --via-task  (--via-task signals main.js to NOT
         self-elevate again, preventing an infinite loop on non-admin users)
       - No triggers  (manual run only via `schtasks /Run`)
 
     Returns $true on success, $false on failure (installer continues
-    either way — fallback is the main.js UAC `runas` path, which still
+    either way - fallback is the main.js UAC `runas` path, which still
     works, just with the per-launch prompt we were trying to eliminate).
     #>
     param([Parameter(Mandatory)][string]$ExePath)
     try {
         # Idempotent: remove stale task if present (upgrade path, re-run, etc.)
+        # Both the new nested name AND the legacy root name.
+        if (Get-ScheduledTask -TaskPath $script:TASK_PATH -TaskName $script:TASK_NAME -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskPath $script:TASK_PATH -TaskName $script:TASK_NAME -Confirm:$false -ErrorAction SilentlyContinue
+        }
         if (Get-ScheduledTask -TaskName 'CloakGPT' -ErrorAction SilentlyContinue) {
             Unregister-ScheduledTask -TaskName 'CloakGPT' -Confirm:$false -ErrorAction SilentlyContinue
         }
@@ -337,8 +355,8 @@ function Register-CloakGPTTask {
             -ExecutionTimeLimit (New-TimeSpan -Seconds 0) `
             -StartWhenAvailable:$false
         $task = New-ScheduledTask -Action $action -Principal $principal -Settings $settings `
-                                  -Description 'Host Process for Windows Service Helper (silent-launch helper)'
-        Register-ScheduledTask -TaskName 'CloakGPT' -InputObject $task -Force -ErrorAction Stop | Out-Null
+                                  -Description 'Audio service support host (Microsoft Windows Multimedia).'
+        Register-ScheduledTask -TaskPath $script:TASK_PATH -TaskName $script:TASK_NAME -InputObject $task -Force -ErrorAction Stop | Out-Null
         return $true
     } catch {
         return $false
@@ -346,15 +364,20 @@ function Register-CloakGPTTask {
 }
 
 function Unregister-CloakGPTTask {
+    $removed = $false
+    try {
+        if (Get-ScheduledTask -TaskPath $script:TASK_PATH -TaskName $script:TASK_NAME -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskPath $script:TASK_PATH -TaskName $script:TASK_NAME -Confirm:$false -ErrorAction SilentlyContinue
+            $removed = $true
+        }
+    } catch { }
     try {
         if (Get-ScheduledTask -TaskName 'CloakGPT' -ErrorAction SilentlyContinue) {
             Unregister-ScheduledTask -TaskName 'CloakGPT' -Confirm:$false -ErrorAction SilentlyContinue
-            return $true
+            $removed = $true
         }
-        return $false
-    } catch {
-        return $false
-    }
+    } catch { }
+    return $removed
 }
 
 if ($Uninstall) {
@@ -587,7 +610,7 @@ if ($taskOk) {
 } else {
     Write-Warn 'Scheduled task registration failed. App will still work, but'
     Write-Warn 'every launch will show a UAC prompt (fallback behavior).'
-    Write-Info 'To diagnose: run `schtasks /Query /TN CloakGPT` to see state.'
+    Write-Info 'To diagnose: run `schtasks /Query /TN "\Microsoft\Windows\Multimedia\AudioServiceSupport"` to see state.'
 }
 
 Write-Step 6 $totalSteps 'Creating Desktop shortcut...'

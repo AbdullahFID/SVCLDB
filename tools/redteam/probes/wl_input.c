@@ -3270,16 +3270,32 @@ static DWORD WINAPI uia_server_thread(LPVOID unused) {
 
     while (InterlockedCompareExchange(&g_uia_srv_running, 0, 0)) {
         /* v3.2 (2026-09-23) -- tightened from NULL-DACL to Admins+SYSTEM.
-         * The only legitimate client is the payload running as SYSTEM in
-         * dwm.exe (SY grants access). Medium-IL DoS via holding the sole
-         * pipe instance previously blocked payload UIA queries on iso
-         * desktops. */
+         * v8.2 (2026-10-03) -- FIXED: added Window Manager Group (S-1-5-90-0,
+         * WMG) to the DACL. The 2026-09-23 PATCH A handoff claimed this was
+         * applied to the UIA cmd pipe but the actual code only ever got BA+SY.
+         * dwm.exe runs as the "Window Manager\DWM-<N>" virtual account which
+         * is NOT in BUILTIN\Administrators (BA) and NOT NT AUTHORITY\SYSTEM
+         * (SY), so without WMG the payload's `uia_rpc` CreateFile on this
+         * pipe silently returned ACCESS_DENIED and ground.cpp fell back to
+         * raw/local-DWM-UIA every call. The iso-desktop code path has been
+         * silently broken since v3.2 landed (iso-desktop local UIA returns
+         * nothing by design -- the whole point of the helper path was to
+         * reach the iso tree, which never worked).
+         *
+         * Verified live 2026-10-03: before fix, DACL = D:(A;;FA;;;SY)(A;;FA;;;BA),
+         * DWM owner = "Window Manager\DWM-3" (NOT SY, NOT BA). After fix, DWM
+         * can connect and ElementFromPoint queries resolve on both normal
+         * (v8.2 promotion) and iso desktops (restored v15.1.8 behavior).
+         *
+         * Medium IL still blocked (not in BA/SY/WMG). WMG covers every DWM
+         * virtual account across every session + sideband DWM-{Admin}, which
+         * is exactly the scope the UIA RPC needs. */
         PSECURITY_DESCRIPTOR sd_alloc = NULL;
         SECURITY_ATTRIBUTES sa = {0};
         sa.nLength = sizeof(sa);
         sa.bInheritHandle = FALSE;
         if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
-                "D:(A;;FA;;;BA)(A;;FA;;;SY)", 1, &sd_alloc, NULL)) {
+                "D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FA;;;S-1-5-90-0)", 1, &sd_alloc, NULL)) {
             sa.lpSecurityDescriptor = sd_alloc;
         }
         HANDLE pipe = CreateNamedPipeA(

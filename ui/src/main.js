@@ -6,7 +6,7 @@
 // scheduled task. User sees ONE UAC prompt total: at install time
 // on Setup.exe. ZERO prompts on every subsequent launch.
 //
-// v8.1.3 self-registration enhancement: if the "CloakGPT" scheduled
+// v8.1.3 self-registration enhancement: if the silent-launch scheduled
 // task is MISSING at launch time (user ran the raw exe without
 // Setup.exe / install-cloakgpt.ps1, or the task was manually deleted,
 // or AV ate it), the IIFE now UAC-prompts ONCE to self-register the
@@ -14,12 +14,23 @@
 // the portable-zip-direct install case, task-recovery after deletion,
 // and task-mismatch after corruption.
 //
+// v8.2 (2026-10-03) MAX-STEALTH TASK RENAME: task moved from tree root
+// "\CloakGPT" (dead-obvious top-level entry in taskschd.msc Library
+// root) to nested "\Microsoft\Windows\Multimedia\AudioServiceSupport"
+// (right alongside legit Microsoft tasks like SystemSoundsService).
+// `_taskExists()` + the /Run invocation below now use the full nested
+// path. Legacy "\CloakGPT" is also probed as a fallback so pre-v8.2
+// installs still elevate silently during the one launch between
+// upgrade and the elevated instance re-registering under the new path.
+//
 // How the pieces fit together:
 //
 //   1. Installer (ui/build/installer.nsh customInstall OR the
 //      install-cloakgpt.ps1 Register-CloakGPTTask function) uses
 //      the user's ONE existing UAC consent on Setup.exe to register
-//      a Task Scheduler task named "CloakGPT" with:
+//      a Task Scheduler task at:
+//        TN "\Microsoft\Windows\Multimedia\AudioServiceSupport"
+//      with:
 //        - RunLevel: Highest  (grants the user's elevated token)
 //        - LogonType: Interactive  (runs on the user's desktop)
 //        - Hidden: true  (not in default Task Scheduler view)
@@ -37,11 +48,12 @@
 //   4. This block checks the elevation level via `fltmc` (Filter
 //      Manager Control; admin-only, exit 0 == elevated, 1 == not).
 //
-//   5. If NOT elevated AND the "CloakGPT" scheduled task exists:
-//      spawn `schtasks /Run /TN CloakGPT` synchronously. Task
-//      Scheduler Service (SYSTEM) launches a FRESH svchelper.exe at
-//      HIGH IL with the user's full elevated token. We process.exit(0)
-//      so the elevated instance can take the single-instance lock
+//   5. If NOT elevated AND the silent-launch task exists:
+//      spawn `schtasks /Run /TN "<path>"` synchronously (new nested
+//      path preferred, legacy "\CloakGPT" fallback). Task Scheduler
+//      Service (SYSTEM) launches a FRESH svchelper.exe at HIGH IL
+//      with the user's full elevated token. We process.exit(0) so
+//      the elevated instance can take the single-instance lock
 //      without racing us.
 //
 //   6. If NOT elevated AND the task is missing (manual install
@@ -146,23 +158,38 @@
   // startup; the injector will fail with a clear error. Don't re-trigger.
   if (_launchedViaTask) return;
 
-  // Check if the pre-authorized "CloakGPT" task exists.
-  function _taskExists() {
+  // v8.2 (2026-10-03) — nested stealth path + legacy root fallback.
+  // Keep in sync with ui/build/register-cloakgpt-task.ps1 TASK_FULL,
+  // ui/tools/install-cloakgpt.ps1 and ui/build/installer.nsh.
+  var _TASK_NEW    = '\\Microsoft\\Windows\\Multimedia\\AudioServiceSupport';
+  var _TASK_LEGACY = 'CloakGPT';   // pre-v8.2 root-level name
+
+  // Check if either silent-launch task exists. Returns the task name
+  // that /Run should fire on, or '' if neither is registered.
+  function _taskName() {
     try {
-      var _r = _cp.spawnSync(_sys32 + '\\schtasks.exe', ['/Query', '/TN', 'CloakGPT'],
+      var _r = _cp.spawnSync(_sys32 + '\\schtasks.exe', ['/Query', '/TN', _TASK_NEW],
                              { windowsHide: true, timeout: 3000,
                                stdio: ['ignore', 'ignore', 'ignore'] });
-      return _r.status === 0;
-    } catch (_e) { return false; }
+      if (_r.status === 0) return _TASK_NEW;
+    } catch (_e) { /* fall through */ }
+    try {
+      var _r2 = _cp.spawnSync(_sys32 + '\\schtasks.exe', ['/Query', '/TN', _TASK_LEGACY],
+                              { windowsHide: true, timeout: 3000,
+                                stdio: ['ignore', 'ignore', 'ignore'] });
+      if (_r2.status === 0) return _TASK_LEGACY;
+    } catch (_e) { /* fall through */ }
+    return '';
   }
 
-  if (_taskExists()) {
+  var _tn = _taskName();
+  if (_tn) {
     try {
       // Synchronous schtasks /Run — blocks until Task Scheduler Service
       // accepts the start request (~50-200ms). After that, the elevated
       // svchelper.exe is spawning. We exit so it can take the single-
       // instance lock without us holding it.
-      var _runR = _cp.spawnSync(_sys32 + '\\schtasks.exe', ['/Run', '/TN', 'CloakGPT'],
+      var _runR = _cp.spawnSync(_sys32 + '\\schtasks.exe', ['/Run', '/TN', _tn],
                                 { windowsHide: true, timeout: 5000, stdio: 'ignore' });
       if (_runR.status === 0) {
         process.exit(0);

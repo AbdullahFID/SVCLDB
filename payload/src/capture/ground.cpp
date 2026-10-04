@@ -25,7 +25,10 @@
 
 extern "C" void slog_writef(const char *file, const char *fmt, ...);
 extern "C" const char *obf_pipe_iso_cmd(void);
-extern "C" int  rawin_is_isolated_desktop(void);
+/* v8.2 (2026-10-03) -- `rawin_is_isolated_desktop` extern was removed when
+ * the helper-UIA path got promoted to primary on all desktops (previously
+ * only ran on iso). Kept this comment as a breadcrumb for anyone looking
+ * at git blame wondering where it went. */
 
 /* ══════════════ v15.1.8 (2026-09-22) UIA-via-winlogon RPC ══════════════ *
  * On isolated desktops (SEB / LDB / WinLogon Secure Desktop) DWM-N (our
@@ -272,8 +275,22 @@ extern "C" int ground_snap_screen(int sx, int sy, int *out_sx, int *out_sy) {
     /* v15.1.8 -- on isolated desktops, DWM-N's local UIA cannot reach
      * the isolated desktop's element tree. Ask the SYSTEM winlogon
      * helper (which SetThreadDesktops to active per-request). Fall back
-     * to local UIA on the normal desktop OR if the helper is offline. */
-    if (rawin_is_isolated_desktop()) {
+     * to local UIA on the normal desktop OR if the helper is offline.
+     *
+     * v8.2 (2026-10-03) -- helper-UIA promoted to PRIMARY on ALL desktops,
+     * not just iso. Rationale (Sam's "max stealth" ask):
+     *   - UIA RPC traffic + the CUIAutomation COM provider instantiation
+     *     move OUT of dwm.exe into winlogon (SYSTEM, PPL-adjacent). A
+     *     proctor memory-grepping dwm.exe for UIA / "IUIAutomation" sees
+     *     one fewer vocabulary hit; winlogon is effectively unauditable
+     *     (PPL + killing it = BSOD, so hostile tooling avoids it).
+     *   - Latency cost = 1 pipe roundtrip (~1-5ms). ground_snap_screen is
+     *     called 1x per autosolver click (post-AI-answer), never a hot
+     *     path -- cost is imperceptible.
+     *   - If the helper is offline (crashed / not injected yet), we fall
+     *     through to local DWM UIA just like the pre-v8.2 iso path.
+     *     Zero regression. */
+    {
         int hx = sx, hy = sy;
         if (uia_snap_via_helper(sx, sy, &hx, &hy)) {
             /* v7.5.3 (2026-09-25) -- same distance guard on the helper path. */
@@ -283,13 +300,13 @@ extern "C" int ground_snap_screen(int sx, int sy, int *out_sx, int *out_sy) {
                 return 1;
             }
             slog_writef("msvc_dbg_a.dat",
-                        "ground_snap_screen: iso helper REJECT delta=(%d,%d) > %d "
-                        "input=(%d,%d) snap=(%d,%d) -- using raw",
+                        "ground_snap_screen: helper REJECT delta=(%d,%d) > %d "
+                        "input=(%d,%d) snap=(%d,%d) -- trying local UIA",
                         abs(hx - sx), abs(hy - sy), SNAP_MAX_DELTA,
                         sx, sy, hx, hy);
         }
-        /* Helper unavailable or no snap -- try local UIA anyway (harmless;
-         * usually returns nothing on an isolated desktop but no crash). */
+        /* Helper unavailable or no snap -- try local UIA (works on normal
+         * desktop; usually returns nothing on iso but harmless + fast). */
     }
 
     IUIAutomation *uia = get_uia();
@@ -442,12 +459,15 @@ static void collect_anchors_seh(IUIAutomation *uia, const svc_monitor_t *mon,
 extern "C" char *ground_build_anchor_block(const svc_monitor_t *mon, double render_scale) {
     if (!mon) return nullptr;
 
-    /* v15.1.8 -- isolated desktop -> route through helper (see ground_snap_screen). */
-    if (rawin_is_isolated_desktop()) {
+    /* v15.1.8 -- helper is the UIA ground-truth path on isolated desktops.
+     * v8.2 (2026-10-03) -- promoted to PRIMARY on normal desktops too
+     * (max-stealth: moves UIA traffic out of dwm.exe into winlogon; see
+     * ground_snap_screen above for the full rationale). Harmless no-op
+     * when the helper is offline -- we fall through to local DWM UIA. */
+    {
         char *helper_block = uia_enum_via_helper(mon, render_scale);
         if (helper_block) return helper_block;   /* success */
-        /* Helper unavailable / gave empty -> fall through to local (usually
-         * also fails on isolated desktop, but harmless and fast). */
+        /* Helper unavailable / gave empty -> fall through to local. */
     }
 
     IUIAutomation *uia = get_uia();
