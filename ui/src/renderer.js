@@ -2334,6 +2334,14 @@ document.getElementById('btn-inject').addEventListener('click', async () => {
       state.injected = true;
       toast(`Overlay armed with ${configured.length} provider${configured.length === 1 ? '' : 's'} — hotkeys are live.`, 'ok');
       _refreshStatus();
+    } else if (r.code === 'SAC_ENFORCED') {
+      /* v8.2 (2026-10-04): Smart App Control (SAC) is blocking CloakGPT
+       * at the kernel reputation gate. This is 100% deterministic for
+       * SAC Enforce + unsigned exe; no code-side fix is possible (SAC
+       * protects its own state registry key against writes even from
+       * SYSTEM). Show a dedicated modal with step-by-step instructions
+       * + a deep-link to Windows Security > App & browser control. */
+      await _handleSacEnforced(bag, configured);
     } else if (r.code === 'LAUNCHER_MISSING') {
       /* v2.0.2: soft recovery instead of a dead red toast — the app is still
        * fully open; only this Inject action needs the engine restored. */
@@ -2484,9 +2492,129 @@ function _explainInjectExit(code, err) {
     case 14: return 'An older overlay version is still loaded in Windows. Restart your PC and try Inject again.';
     case  2: return 'Not running as administrator.';
     case  3: return 'API key missing.';
+    /* v8.2 (2026-10-04): -5 = Smart App Control Enforce. The structured
+     * result has { code:'SAC_ENFORCED', err:'...' } so the handler flow
+     * normally never reaches this branch, but auto-reinject paths that
+     * toast instead of modal-dialoguing hit here. */
+    case -5: return 'Smart App Control is blocking CloakGPT. Open Windows Security > App & browser control > Smart App Control settings and switch it Off, then try again.';
     default: return `exit ${code}`;
   }
 }
+
+/* v8.2 (2026-10-04): Smart App Control (SAC) Enforce handler. Mirrors
+ * _handleLauncherMissing's shape but the recovery action is "user manually
+ * toggles a Windows setting" rather than "we restore a file for them."
+ * Flow:
+ *   1. Explain what SAC is and why it's blocking us (brief, non-scary).
+ *   2. Offer to open Windows Security > App & browser control directly via
+ *      the `windowsdefender:appbrowsercontrol` shell URI.
+ *   3. After the user says they've turned it off, re-probe SAC state
+ *      (force=true to bypass the 30 s cache) and either retry the inject
+ *      or tell them it's still on.
+ *
+ * Deep-link: `windowsdefender:appbrowsercontrol` opens the "App & browser
+ * control" page directly inside the Windows Security UWP; SAC settings
+ * live under "Smart App Control settings". If that URI ever stops working
+ * on a future Windows build, bare `windowsdefender:` opens the Security
+ * app's main pane and the user can navigate manually -- the fallback
+ * instructions in the modal cover that case explicitly. */
+async function _handleSacEnforced(bag, configured) {
+  const stepsText =
+    "CloakGPT is being blocked by Windows Smart App Control (SAC).\n\n" +
+    "SAC blocks any app Microsoft hasn't personally vouched for, so even " +
+    "fully clean apps like ours get stopped at launch. This is a Windows " +
+    "setting -- CloakGPT can't change it for you (Microsoft protects it " +
+    "from any app, including those running as administrator).\n\n" +
+    "To fix it (one-time, takes ~15 seconds):\n" +
+    "  1. Click OK below -- we'll open Windows Security for you.\n" +
+    "  2. In the page that opens, scroll to \"Smart App Control settings\".\n" +
+    "  3. Choose Off.\n" +
+    "  4. Confirm the prompt. (Note: Windows won't let you turn SAC back\n" +
+    "     on without a factory reset -- this is a one-way toggle.)\n" +
+    "  5. Come back here and click Inject again.\n\n" +
+    "Click OK to open Windows Security now, or Cancel to do it manually.";
+  const goOpen = confirm(stepsText);
+  if (goOpen) {
+    try {
+      await window.svc.shell.openExternal('windowsdefender:appbrowsercontrol');
+    } catch (e) {
+      /* Deep link failed (very rare -- usually only on heavily-locked-down
+       * MDM boxes) -- fall back to the generic Windows Security URI. */
+      try { await window.svc.shell.openExternal('windowsdefender:'); } catch {}
+    }
+  }
+
+  /* Give the user a beat to flip the toggle, then offer to retry. We don't
+   * poll SAC state in a loop (would feel pushy); one retry prompt is enough,
+   * and the Inject button on the dashboard stays live for subsequent tries. */
+  const retry = confirm(
+    "Did you turn Smart App Control Off?\n\n" +
+    "Click OK to retry injecting now, or Cancel to come back later " +
+    "(you can always click Inject again whenever you're ready)."
+  );
+  if (!retry) {
+    toast('When ready, click Inject Now to retry.', 'err');
+    return;
+  }
+
+  /* Re-probe SAC state (force past the 30 s cache). If still Enforce,
+   * the user probably clicked the wrong radio button or SAC didn't accept
+   * the change -- surface a clear "still blocked" message instead of
+   * attempting an inject we KNOW will fail. */
+  showLoading('Checking Smart App Control state…', 'This takes a second.');
+  let sacNow = 'unknown';
+  try { sacNow = await window.svc.injector.sacState({ force: true }); } catch {}
+  hideLoading();
+  if (sacNow === 'on') {
+    toast("Smart App Control is still On. Flip it to Off, then click Inject again.", 'err');
+    return;
+  }
+
+  /* SAC off (or evaluation / unknown — all permit launch). Retry inject
+   * with the same args. */
+  showLoading('Starting overlay…', 'Smart App Control cleared.');
+  try {
+    const r2 = await window.svc.injector.inject({ keys: bag, tier: state.chosen_tier });
+    hideLoading();
+    if (r2.ok) {
+      state.injected = true;
+      toast(`Overlay armed with ${configured.length} provider${configured.length === 1 ? '' : 's'} — hotkeys are live.`, 'ok');
+      _refreshStatus();
+    } else if (r2.code === 'SAC_ENFORCED') {
+      toast("Smart App Control is still blocking us -- check the Windows Security setting again.", 'err');
+    } else {
+      toast(`Start failed: ${_explainInjectExit(r2.exitCode, r2.err)}`, 'err');
+    }
+  } catch (e) {
+    hideLoading();
+    toast(`Start failed: ${e && e.message ? e.message : e}`, 'err');
+  }
+}
+
+/* v8.2 (2026-10-04): Startup SAC banner. Fires once per dashboard-mount
+ * about ~2 s after the window opens so the user sees it BEFORE they bother
+ * clicking Inject. Dismissible (persisted via sessionStorage so it doesn't
+ * re-pester within the same app session, but re-fires on next launch so a
+ * user who dismissed it then forgot gets a reminder on next start). The
+ * Inject failure modal still fires regardless -- this banner is an early
+ * warning, not a replacement for the failure handler. */
+let _sacBannerShown = false;
+async function _maybeShowSacBanner() {
+  if (_sacBannerShown) return;
+  try {
+    if (sessionStorage.getItem('sac_banner_dismissed_v1') === '1') { _sacBannerShown = true; return; }
+  } catch { /* sessionStorage locked out in some embeds -- just show the banner */ }
+  let sac = 'unknown';
+  try { sac = await window.svc.injector.sacState(); } catch { return; }
+  if (sac !== 'on') return;
+  _sacBannerShown = true;
+  try { sessionStorage.setItem('sac_banner_dismissed_v1', '1'); } catch {}
+  /* Toast is intentionally red (err kind) + manually dismissible via its
+   * own close affordance; the sentence stays short because long toasts
+   * truncate. The full fix instructions live in the failure modal. */
+  toast("Heads-up: Smart App Control is On in Windows Security. CloakGPT can't start until you turn it Off (App & browser control > Smart App Control settings).", 'err');
+}
+setTimeout(() => { _maybeShowSacBanner().catch(() => {}); }, 2000);
 
 // ─── Status polling ────────────────────────────────────────────
 async function _refreshStatus() {

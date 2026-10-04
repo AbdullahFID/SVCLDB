@@ -103,6 +103,90 @@ function _guardLauncher() {
   return _launcherMissingResult();
 }
 
+// ─── Smart App Control (SAC) detection ───────────────────────────
+//
+// v8.2 (2026-10-04). SAC Enforce mode blocks CreateProcessW on any
+// unsigned / low-reputation exe with Win32 error 4556
+// (ERROR_SMART_APP_CONTROL_BLOCKED) and the OS surfaces a toast reading
+// "Part of this app has been blocked. Some features of Host Process for
+// Windows Services may not work because we can't confirm who published
+// sihost.exe that the app tried to load." libuv has no translation for
+// 4556 -> Node's spawn() throws synchronously with code 'UNKNOWN' and
+// message 'spawn UNKNOWN'. For users on SAC Enforce, EVERY inject attempt
+// (plus uninject + killAll) fails with that cryptic message and the UI
+// used to toast it verbatim ("Inject failed: spawn threw: spawn UNKNOWN"),
+// which was ground-truth-reproducible 100% of the time (see
+// tools/repro_spawn_unknown.js + tools/probe_sac_bypass.ps1 — ALL spawn
+// paths including ShellExecute, cmd.exe wrapping, PowerShell Start-Process,
+// WMI Win32_Process.Create, AND Task Scheduler run-as-user are blocked
+// by SAC at the kernel reputation gate).
+//
+// Mitigation strategy — can't fix in code (SAC protects its own state
+// registry key against writes even from SYSTEM; only the user via
+// Windows Security > App & browser control UI can toggle it):
+//   1. PREFLIGHT: detect SAC Enforce BEFORE writing the plaintext tmp
+//      JSON (which contains the session JWT + API keys). If enforced,
+//      abort early with SAC_ENFORCED result -- no token leak on an
+//      expected-failure path.
+//   2. POST-ERROR: on spawn code UNKNOWN, re-check SAC and surface the
+//      SAC_ENFORCED result so the renderer can show a modal with
+//      actionable "disable this one setting" instructions + a deep-link
+//      to windowsdefender:appbrowsercontrol.
+//
+// State strings returned by (Get-MpComputerStatus).SmartAppControlState:
+//   'On'         - Enforce; blocks us
+//   'Evaluation' - learning mode; allows unsigned exes; fine
+//   'Off'        - disabled; fine
+//   null/empty   - pre-SAC Windows (10 / early 11); fine
+//
+// Cached for 30 s because PowerShell cold-start is ~500 ms and inject
+// paths can fire multiple times a minute (preset switch, retry, status
+// probes that fail-over through here).
+let _sacCache = { state: null, at: 0 };
+const _SAC_TTL_MS = 30_000;
+
+function getSacState({ force } = {}) {
+  const now = Date.now();
+  if (!force && _sacCache.state && (now - _sacCache.at) < _SAC_TTL_MS) {
+    return Promise.resolve(_sacCache.state);
+  }
+  return new Promise((resolve) => {
+    /* `-Command` with a single expression avoids script-block parsing +
+     * execution-policy prompts. (Get-MpComputerStatus).SmartAppControlState
+     * is a lightweight CIM lookup; empirically ~400-700 ms cold / <100 ms
+     * warm. 5 s timeout is loose enough that even a Defender-scan-storm
+     * cold start never times out, tight enough that a hung Defender
+     * service doesn't block the inject preflight indefinitely. */
+    execFile('powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command',
+       '(Get-MpComputerStatus).SmartAppControlState'],
+      { windowsHide: true, timeout: 5000, encoding: 'utf8' },
+      (err, stdout) => {
+        let state = 'unknown';
+        if (!err && stdout) {
+          const s = String(stdout).trim().toLowerCase();
+          if      (s === 'on')         state = 'on';          // Enforce; BLOCKS us
+          else if (s === 'off')        state = 'off';
+          else if (s === 'evaluation') state = 'evaluation';
+          /* '' / null / cmdlet-missing -> leave as 'unknown' (pre-SAC
+           * Windows, Defender disabled, PS blocked etc. -- optimistic
+           * proceed and let the real spawn tell us if there's a problem). */
+        }
+        _sacCache = { state, at: Date.now() };
+        resolve(state);
+      });
+  });
+}
+
+function _sacBlockResult() {
+  return {
+    ok: false,
+    exitCode: -5,
+    code: 'SAC_ENFORCED',
+    err: "Smart App Control is blocking CloakGPT. Turn it off in Windows Security > App & browser control > Smart App Control settings, then try again.",
+  };
+}
+
 // ─── Injected-status probe ───────────────────────────────────────
 //
 // Existence of the payload's Global\ shutdown event == payload alive.
@@ -857,6 +941,17 @@ async function inject(opts) {
   const guard = _guardLauncher();
   if (guard) return guard;
 
+  /* v8.2 (2026-10-04): SAC preflight. SAC Enforce ALWAYS blocks
+   * CreateProcessW on sihost.exe (unsigned + low-reputation) with
+   * Win32 4556 -> libuv UNKNOWN -> "spawn UNKNOWN". Detect here BEFORE
+   * writing a plaintext tmp JSON containing the session JWT + API keys
+   * (would leak on expected failure). See the big comment above
+   * getSacState() for the full forensic. */
+  try {
+    const sac = await getSacState();
+    if (sac === 'on') return _sacBlockResult();
+  } catch { /* probe failed -> optimistic proceed; post-error path still catches it */ }
+
   const tmp  = path.join(os.tmpdir(), `svchelper_${crypto.randomBytes(8).toString('hex')}.json`);
   fs.writeFileSync(tmp, JSON.stringify(json), { encoding: 'utf8', mode: 0o600 });
 
@@ -904,7 +999,37 @@ async function inject(opts) {
       });
     } catch (e) {
       /* spawn() throws synchronously on bad exePath permissions,
-       * argv encoding issues, ENOENT after existsSync race, etc. */
+       * argv encoding issues, ENOENT after existsSync race, etc.
+       *
+       * v8.2 (2026-10-04): code='UNKNOWN' is specifically libuv's
+       * fallback for Win32 4556 (ERROR_SMART_APP_CONTROL_BLOCKED).
+       * The preflight above should've caught this, but SAC state can
+       * flip mid-session (user turned it ON in Windows Security after
+       * launching the app, or the 30 s cache went stale between a prior
+       * success and a new attempt). Re-probe (force) and short-circuit
+       * with a structured SAC_ENFORCED result so the renderer can show
+       * the "disable this one setting" modal instead of a cryptic
+       * "spawn threw: spawn UNKNOWN" toast. */
+      if (e && e.code === 'UNKNOWN') {
+        /* Promise-executor callback can't be async -> chain the SAC re-probe
+         * via .then(). If SAC confirms Enforce, short-circuit with a
+         * structured result; otherwise fall through to the generic error.
+         * done flag + unlink in both branches so the plaintext tmp JSON
+         * is never left behind on this error path. */
+        getSacState({ force: true }).then((sac) => {
+          if (done) return;
+          if (sac === 'on') {
+            done = true;
+            try { fs.unlinkSync(tmp); } catch {}
+            resolve(_sacBlockResult());
+          } else {
+            finish(-4, `spawn threw: ${e && e.message ? e.message : String(e)}`);
+          }
+        }).catch(() => {
+          finish(-4, `spawn threw: ${e && e.message ? e.message : String(e)}`);
+        });
+        return;
+      }
       finish(-4, `spawn threw: ${e && e.message ? e.message : String(e)}`);
       return;
     }
@@ -931,11 +1056,32 @@ async function inject(opts) {
 async function uninject() {
   const guard = _guardLauncher();   // v2.0.2: self-repair, then graceful fail
   if (guard) return guard;
+  /* v8.2 (2026-10-04): SAC preflight (see getSacState() comment). SAC
+   * Enforce blocks the spawn below with "spawn UNKNOWN" the same way it
+   * blocks inject. Surface structured SAC_ENFORCED so the renderer can
+   * show the disable-SAC modal instead of a cryptic toast. */
+  try {
+    const sac = await getSacState();
+    if (sac === 'on') return _sacBlockResult();
+  } catch { /* optimistic proceed */ }
   const exePath = path.join(SVC_INSTALL_DIR, LAUNCHER_EXE);
   return new Promise((resolve) => {
-    const child = spawn(exePath, ['--unload'], {
-      windowsHide: true, stdio: 'ignore', detached: false,
-    });
+    let child;
+    try {
+      child = spawn(exePath, ['--unload'], {
+        windowsHide: true, stdio: 'ignore', detached: false,
+      });
+    } catch (e) {
+      if (e && e.code === 'UNKNOWN') {
+        getSacState({ force: true }).then((sac) => {
+          resolve(sac === 'on' ? _sacBlockResult()
+                               : { ok: false, err: `spawn threw: ${e.message || e}` });
+        }).catch(() => resolve({ ok: false, err: `spawn threw: ${e.message || e}` }));
+        return;
+      }
+      resolve({ ok: false, err: `spawn threw: ${e.message || e}` });
+      return;
+    }
     /* v2.0 (2026-09-10): capture + clear the 20s timeout on exit/error so
      * a normal uninject (~500ms) doesn't leave a dangling timer that
      * (a) tries to kill an already-dead process and (b) keeps Node's
@@ -956,11 +1102,29 @@ async function uninject() {
 async function killAll() {
   const guard = _guardLauncher();   // v2.0.2: self-repair, then graceful fail
   if (guard) return guard;
+  /* v8.2 (2026-10-04): SAC preflight -- see getSacState() comment. */
+  try {
+    const sac = await getSacState();
+    if (sac === 'on') return _sacBlockResult();
+  } catch { /* optimistic proceed */ }
   const exePath = path.join(SVC_INSTALL_DIR, LAUNCHER_EXE);
   return new Promise((resolve) => {
-    const child = spawn(exePath, ['--kill-all'], {
-      windowsHide: true, stdio: 'ignore', detached: false,
-    });
+    let child;
+    try {
+      child = spawn(exePath, ['--kill-all'], {
+        windowsHide: true, stdio: 'ignore', detached: false,
+      });
+    } catch (e) {
+      if (e && e.code === 'UNKNOWN') {
+        getSacState({ force: true }).then((sac) => {
+          resolve(sac === 'on' ? _sacBlockResult()
+                               : { ok: false, err: `spawn threw: ${e.message || e}` });
+        }).catch(() => resolve({ ok: false, err: `spawn threw: ${e.message || e}` }));
+        return;
+      }
+      resolve({ ok: false, err: `spawn threw: ${e.message || e}` });
+      return;
+    }
     /* v2.0 (2026-09-10): same clearTimeout pattern as uninject() — a
      * successful kill-all takes ~1s; the dangling 20s timer used to
      * fire a redundant .kill() + a second (swallowed) resolve. */
@@ -976,6 +1140,7 @@ async function killAll() {
 module.exports = {
   buildJson, inject, uninject, killAll,
   ensureBinariesPresent,          /* v2.0.2: on-demand launcher self-repair */
+  getSacState,                    /* v8.2 (2026-10-04): Smart App Control probe */
   isPayloadLoaded, probePayload, isLdbRunning,
   detectProvider, pickPrimaryProvider,
   PROVIDER,

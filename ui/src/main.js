@@ -2426,6 +2426,25 @@ ipcMain.handle('system:restart-pc', async () => {
  *   3. Re-check once more after the exclusion lands (covers the AV race).
  * Returns { ok, launcherPresent, repaired[], source, reason? }. ok simply
  * mirrors launcherPresent so the renderer can gate its inject retry on it. */
+/* v8.2 (2026-10-04): Smart App Control state probe for the renderer.
+ * The renderer calls this (a) once at dashboard mount to show a persistent
+ * SAC-is-blocking-us banner if applicable, and (b) from the "I turned it
+ * off" button inside the SAC modal to verify the user actually flipped the
+ * toggle before we retry the inject. Returns a single string:
+ *   'on'         - SAC Enforce; we are 100% blocked, show modal
+ *   'off'        - fine, no banner
+ *   'evaluation' - learning mode, lets our unsigned exe through, fine
+ *   'unknown'    - pre-SAC Windows, Defender disabled, or PS probe failed
+ * See injector.js::getSacState for the full forensic + cache semantics. */
+ipcMain.handle('injector:sac-state', async (_e, args) => {
+  try {
+    return await injector.getSacState({ force: !!(args && args.force) });
+  } catch (e) {
+    console.log('[injector:sac-state] threw:', e && e.message || e);
+    return 'unknown';
+  }
+});
+
 ipcMain.handle('injector:repair', async () => {
   let rep = { launcherPresent: false, repaired: [], source: 'none' };
   try { rep = injector.ensureBinariesPresent(); } catch (e) { rep.reason = e && e.message; }

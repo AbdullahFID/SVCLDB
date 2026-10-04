@@ -9,6 +9,118 @@ memory from prior sessions (~4.8k lines).
 For live operational stuff (launch/test/deploy procedure), see `AGENTS.md`
 and `.cursor/rules/fast-testing-launch.mdc`.
 
+## ✅ v9.0 SMART APP CONTROL BLOCK HANDLED (2026-10-04) — "Inject failed: spawn threw: spawn UNKNOWN"
+
+**Symptom (user-reported, live Discord — one user, all SAC-on):** the toast
+`Inject failed: spawn threw: spawn UNKNOWN` fires on every Inject-Now click.
+Reproducible with a Windows notification `Part of this app has been blocked.
+Some features of Host Process for Windows Services may not work because we
+can't confirm who published sihost.exe that the app tried to load.` Works
+for other users (and me) with full stealth stance (CFA on, Defender RT on,
+Tamper Protection on, SAC on) — so visibly a security-stance delta, not
+a code regression.
+
+**Root cause (reproduced live via `tools/repro_spawn_unknown.js`
++ `tools/probe_sac_bypass.ps1`):** Smart App Control (SAC) in Enforce mode
+blocks `CreateProcessW` on any unsigned / low-reputation exe with
+Win32 error **4556** `ERROR_SMART_APP_CONTROL_BLOCKED` + system message
+`"An Application Control policy has blocked this file. Malicious binary
+reputation."` libuv has no entry for 4556 in its error_table → `uv_spawn`
+returns `UV_UNKNOWN` → Node's `child_process.spawn()` throws synchronously
+with `code: 'UNKNOWN'`, `message: 'spawn UNKNOWN'` → `injector.js`'s
+try/catch surfaces that string verbatim as `spawn threw: spawn UNKNOWN`.
+**Independent of Defender exclusions** — SAC uses the Microsoft
+Intelligent Security Graph (ISG) reputation check, not the Defender
+scan path, and ignores exclusion lists entirely. **Independent of
+spawn mechanism** — reproduced blocked on CreateProcessW, ShellExecute
+(`UseShellExecute=true`), `cmd.exe /c <exe>`, PowerShell
+`Start-Process`, WMI `Win32_Process.Create`, AND Task Scheduler
+`Register + Start` with Interactive+Highest principal (LastTaskResult
+= 0x8007_11CC = HRESULT_FROM_WIN32(4556)). The user I did NOT reproduce
+on was mis-reading my own install; both groups actually fail without
+SAC-off, but I'd verified historical runs on a different stance.
+
+**Why we can't fix in code:** SAC protects its own state registry key
+(`HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy\VerifiedAndReputablePolicyState`)
+against writes even from SYSTEM. The only toggle paths are the Windows
+Security UWP UI (`windowsdefender:appbrowsercontrol` -> Smart App Control
+settings -> Off) and factory reset. Microsoft's docs say Off is one-way
+(no return to On without factory reset); empirically some boxes let the
+radio flip both ways but we don't rely on that. **Signing the binary
+with an EV cert WOULD bypass SAC** — but that's a $400-800/year +
+2-month-reputation-build procurement we haven't done.
+
+**Fix (JS-only, 4 files, no C-side changes):**
+
+1. `ui/src/injector/injector.js` — new `getSacState({force})` helper
+ that calls `(Get-MpComputerStatus).SmartAppControlState` via PowerShell
+ (~500ms cold, <100ms warm, 5s timeout, 30s result cache). Returns
+ `'on'|'off'|'evaluation'|'unknown'`. New `_sacBlockResult()` returns
+ structured `{ok:false, exitCode:-5, code:'SAC_ENFORCED', err:'...'}`.
+ Both `inject()`, `uninject()`, `killAll()` get a two-layer guard:
+ - PREFLIGHT: `await getSacState()` before writing the plaintext tmp
+ JSON. On `'on'`, abort cold → no plaintext session JWT + API keys ever
+ touch `%TEMP%` on an expected-failure path. (Crucial: Pre-v8.2 the
+ tmp JSON was written BEFORE the spawn site, so every failed SAC
+ inject leaked a 5-10 KB tmp file containing the full handoff until
+ the `.unlink` fired on the catch branch — minor forensic exposure.)
+ - POST-ERROR: on spawn throwing `code: 'UNKNOWN'`, re-probe (force)
+ and surface `SAC_ENFORCED` structured result if the state flipped
+ mid-session (user turned SAC on in Windows Security WHILE the Electron
+ app was running). The Promise executor is not async, so the catch
+ branch uses `.then()` chaining instead of `await`.
+ Preload exposes `sacState({force})` → IPC `injector:sac-state`.
+
+2. `ui/src/main.js` — new `ipcMain.handle('injector:sac-state')`
+ forwards to `injector.getSacState()`. Returns `'unknown'` on throw so
+ renderer never crashes on the probe.
+
+3. `ui/src/preload.js` — exposes `window.svc.injector.sacState(opts)`.
+
+4. `ui/src/renderer.js` — new `_handleSacEnforced(bag, configured)`
+ modal (symmetric with `_handleLauncherMissing`): native `confirm()`
+ explains SAC in plain language + exact 5-step fix + opens
+ `windowsdefender:appbrowsercontrol` via `shell.openExternal` (fallback
+ to bare `windowsdefender:` on heavily-locked MDM boxes). After user
+ says "I turned it off," re-probes `sacState({force:true})`; retries
+ `inject()` only if the SAC toggle actually flipped. New
+ `_maybeShowSacBanner()` fires 2s after dashboard mount with a red toast
+ ("Heads-up: Smart App Control is On...") if applicable; dismissible
+ via `sessionStorage` so same-session nag doesn't re-pester but it
+ re-fires on next app launch. `_explainInjectExit` grew a `case -5`
+ branch for the fallback auto-reinject paths that toast instead of
+ modal-dialoguing.
+
+**Validated live 2026-10-04 (`tools/test_sac_handling.js`):**
+- Group A (SAC Off): `getSacState() === 'off'` + `uninject()` returns
+ ok:true (NOT SAC_ENFORCED). 2/2 pass. Non-destructive: no live
+ `inject()` call that would clobber `config.dat` with a dummy session.
+- Group B (SAC On, deferred for user to flip and re-run): will assert
+ `inject().code === 'SAC_ENFORCED'`, `exitCode === -5`, err mentions
+ "Smart App Control", **ZERO plaintext tmp JSONs appear in `%TEMP%`
+ during the attempt** (proves preflight short-circuit happens before
+ the `fs.writeFileSync(tmp, ...)` line). `uninject()` + `killAll()`
+ same structured result.
+- Ground-truth probe (`tools/repro_spawn_unknown.js`): SAC Off →
+ `node spawn()` exit 3 clean; SAC On → `{threw:true, code:'UNKNOWN',
+ errno:-4094, message:'spawn UNKNOWN'}` + native `CreateProcessW`
+ returns `{ok:false, win32:4556, desc:'An Application Control policy
+ has blocked this file. Malicious binary reputation.'}`.
+
+**Dev-mode launch (user validation):** `cd ui && pnpm start`. The
+`_svcSelfElevate` IIFE skips in dev-tree so no scheduled-task spawn
+confusion; renderer JS edits are picked up immediately; preload re-runs
+on `Ctrl+R`. **Shipping:** no C-side rebuild needed; `ui/pnpm build`
+(the usual packaging recipe in `AGENTS.md`) ships the JS fix inside the
+Electron app. Zero behavioral change for non-SAC users.
+
+**NOT a fix for:** WDAC (Windows Defender Application Control) policies
+in enterprise MDM environments — same ERROR_INVALID_IMAGE_HASH (577)
+family would also surface as `spawn UNKNOWN`, but it's a different
+Win32 code and a different user population. Future hardening could
+extend `_explainInjectExit` + add a WDAC probe (`AppLocker` MMC
+export analysis), but zero current field reports → deferred.
+
 ## ✅ OVERLAY PROVIDER-SWITCH KEY BUG FIXED (2026-10-02, round 2) — the ACTUAL "switch provider -> red" cause
 
 **Symptom (James_1738, Discord, after reinstalling):** autosolver dot works on

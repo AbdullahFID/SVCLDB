@@ -172,6 +172,14 @@ contextBridge.exposeInMainWorld('svc', {
      * "Repair & retry" dialog shown on a LAUNCHER_MISSING inject failure.
      * Returns { ok, launcherPresent, repaired:[...], source, reason? }. */
     repair:        ()      => ipcRenderer.invoke('injector:repair'),
+    /* v8.2 (2026-10-04): probe Smart App Control (SAC) state. SAC Enforce
+     * blocks our unsigned sihost.exe with "spawn UNKNOWN" (Win32 4556 ->
+     * libuv has no mapping -> cryptic error). Renderer uses this to
+     * show a persistent "disable SAC" banner + a dedicated SAC_ENFORCED
+     * failure modal with deep-link to windowsdefender:appbrowsercontrol.
+     * Returns 'on' | 'off' | 'evaluation' | 'unknown'. Pass {force:true}
+     * to bypass the 30 s cache (used by the "I turned it off" retry). */
+    sacState:      (opts)  => ipcRenderer.invoke('injector:sac-state', opts || {}),
     /* v1.7.4 (2026-07-23): boolean-only payload-loaded probe. Used by
      * the preset auto-reinject flow to decide whether to fire an
      * inject after a preset click (only re-inject if payload is
