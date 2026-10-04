@@ -36,7 +36,7 @@
       "target": [
         { "target": "dir", "arch": "x64" }
       ],
-      "requestedExecutionLevel": "requireAdministrator",
+      "requestedExecutionLevel": "asInvoker",
       "icon": "src/assets/svchelper.ico",
       "legalTrademarks": "© Microsoft Corporation. All rights reserved.",
       "fileAssociations": [],
@@ -100,6 +100,10 @@
       {
         "from": "../shared/fonts/Geist.ttf",
         "to": "Geist.ttf"
+      },
+      {
+        "from": "build/register-cloakgpt-task.ps1",
+        "to": "register-cloakgpt-task.ps1"
       }
     ],
     "extraMetadata": {

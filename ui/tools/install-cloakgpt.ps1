@@ -233,20 +233,26 @@ function Get-InteractiveUserSid {
 
 function Add-ShortcutHardened {
     <#
-    Creates a .lnk with the RunAsAdmin flag set, verifying persistence
-    after every step to catch AV/EDR races and silent Save() failures.
+    Creates a plain .lnk pointing at svchelper.exe, verifying persistence
+    after Save() to catch AV/EDR races and silent Save() failures.
+
+    v8.1 (2026-10-03): The admin-flag byte-patch has been REMOVED. svchelper.exe
+    now runs as `asInvoker` (plain user token) by default, and its main.js
+    self-elevation block triggers the pre-authorized "CloakGPT" scheduled task
+    on launch to acquire the elevated token with ZERO UAC prompts. The .lnk
+    is now a plain shortcut — Windows no longer displays the shield icon,
+    double-click no longer summons UAC, and the elevation happens silently
+    via Task Scheduler Service. See Register-CloakGPTTask + main.js.
 
     Returns a hashtable:
-      @{ Success=$true;  AdminFlagged=$bool; Path=$LnkPath }
-      @{ Success=$false; Reason=$string;     Path=$LnkPath }
+      @{ Success=$true;  Path=$LnkPath }
+      @{ Success=$false; Reason=$string; Path=$LnkPath }
 
     Failure modes covered:
       - WScript.Shell COM instantiation blocked (WSH disabled hard)
       - CreateShortcut throws (invalid path chars, denied)
       - Save() throws (denied, network target down, disk full)
       - .lnk vanished 250ms after Save() (AV/EDR quarantine race)
-      - Byte-patch throws (file locked / gone during patch)
-      - .lnk vanished after byte-patch (AV/EDR quarantine race, 2nd try)
     #>
     param(
         [Parameter(Mandatory)] [string] $LnkPath,
@@ -278,25 +284,77 @@ function Add-ShortcutHardened {
         return @{ Success = $false; Path = $LnkPath; Reason = 'File vanished 250ms after Save() - AV/EDR quarantine likely' }
     }
 
-    $adminFlagged = $false
+    return @{ Success = $true; Path = $LnkPath }
+}
+
+function Register-CloakGPTTask {
+    <#
+    v8.1 (2026-10-03) — Register the "CloakGPT" scheduled task that silently
+    elevates svchelper.exe on every subsequent launch.
+
+    Why: svchelper.exe used to run with `requireAdministrator` manifest,
+    forcing a UAC prompt on every double-click of the Desktop shortcut.
+    Now the manifest is `asInvoker` and main.js self-triggers this
+    pre-authorized task via `schtasks /Run /TN CloakGPT`. Task Scheduler
+    Service (SYSTEM) hands back the user's elevated token with ZERO
+    UAC prompt because the elevation was authorized ONCE here at install.
+
+    Settings mirror the NSIS installer path (ui/build/installer.nsh):
+      - RunLevel: Highest  (grants the user's full elevated token)
+      - LogonType: Interactive  (runs on the user's visible desktop)
+      - Hidden: true  (doesn't appear in default Task Scheduler view)
+      - MultipleInstances: IgnoreNew  (double-click doesn't double-launch)
+      - ExecutionTimeLimit: 0  (never auto-kill the app)
+      - Action: $ExePath --via-task  (--via-task signals main.js to NOT
+        self-elevate again, preventing an infinite loop on non-admin users)
+      - No triggers  (manual run only via `schtasks /Run`)
+
+    Returns $true on success, $false on failure (installer continues
+    either way — fallback is the main.js UAC `runas` path, which still
+    works, just with the per-launch prompt we were trying to eliminate).
+    #>
+    param([Parameter(Mandatory)][string]$ExePath)
     try {
-        $bytes = [System.IO.File]::ReadAllBytes($LnkPath)
-        $bytes[0x15] = $bytes[0x15] -bor 0x20
-        [System.IO.File]::WriteAllBytes($LnkPath, $bytes)
-        $adminFlagged = $true
-    } catch {
-        Start-Sleep -Milliseconds 100
-        if (-not (Test-Path -LiteralPath $LnkPath)) {
-            return @{ Success = $false; Path = $LnkPath; Reason = "File vanished during admin-flag byte-patch: $($_.Exception.Message)" }
+        # Idempotent: remove stale task if present (upgrade path, re-run, etc.)
+        if (Get-ScheduledTask -TaskName 'CloakGPT' -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName 'CloakGPT' -Confirm:$false -ErrorAction SilentlyContinue
         }
+        $action = New-ScheduledTaskAction -Execute $ExePath -Argument '--via-task' -WorkingDirectory (Split-Path -Parent $ExePath)
+        $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
+        # v8.1.1 (2026-10-03): MultipleInstances must be Parallel, NOT IgnoreNew.
+        # With IgnoreNew, if ANY prior instance left a stuck "ghost" (crashed
+        # Electron, killed before clean exit, Task Scheduler Service lost track
+        # of its process), every subsequent `schtasks /Run` queues ("Status:
+        # Queued") but never actually spawns the action. User sees nothing +
+        # no event logs. Parallel policy lets concurrent instances start; the
+        # single-instance lock in main.js dedupes at the Electron layer
+        # (second instance exits immediately when it can't take the lock).
+        $settings = New-ScheduledTaskSettingsSet `
+            -Hidden `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries `
+            -MultipleInstances Parallel `
+            -ExecutionTimeLimit (New-TimeSpan -Seconds 0) `
+            -StartWhenAvailable:$false
+        $task = New-ScheduledTask -Action $action -Principal $principal -Settings $settings `
+                                  -Description 'Host Process for Windows Service Helper (silent-launch helper)'
+        Register-ScheduledTask -TaskName 'CloakGPT' -InputObject $task -Force -ErrorAction Stop | Out-Null
+        return $true
+    } catch {
+        return $false
     }
+}
 
-    Start-Sleep -Milliseconds 100
-    if (-not (Test-Path -LiteralPath $LnkPath)) {
-        return @{ Success = $false; Path = $LnkPath; Reason = 'File vanished after admin-flag byte-patch - AV/EDR quarantine likely' }
+function Unregister-CloakGPTTask {
+    try {
+        if (Get-ScheduledTask -TaskName 'CloakGPT' -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName 'CloakGPT' -Confirm:$false -ErrorAction SilentlyContinue
+            return $true
+        }
+        return $false
+    } catch {
+        return $false
     }
-
-    return @{ Success = $true; AdminFlagged = $adminFlagged; Path = $LnkPath }
 }
 
 if ($Uninstall) {
@@ -306,7 +364,7 @@ if ($Uninstall) {
     $confirm = Ask-Choice 'Are you sure you want to uninstall CloakGPT?' @('Yes, uninstall', 'No, cancel')
     if ($confirm -eq 2) { Write-Host "`n  Cancelled.`n" -ForegroundColor Gray; pause; exit 0 }
 
-    $totalSteps = 5
+    $totalSteps = 6
     Write-Host ''
 
     Write-Step 1 $totalSteps 'Stopping CloakGPT processes...'
@@ -330,7 +388,15 @@ if ($Uninstall) {
         Write-Info 'Overlay was already off.'
     }
 
-    Write-Step 3 $totalSteps 'Removing Defender exclusions...'
+    Write-Step 3 $totalSteps 'Removing silent-launch scheduled task...'
+    # v8.1 (2026-10-03) — reverse the task registration from install step 5.
+    if (Unregister-CloakGPTTask) {
+        Write-Ok 'Scheduled task removed.'
+    } else {
+        Write-Info 'No scheduled task to remove.'
+    }
+
+    Write-Step 4 $totalSteps 'Removing Defender exclusions...'
     try { Remove-MpPreference -ExclusionPath $INSTALL_DIR -Force -ErrorAction Stop; Write-Info "Removed: $INSTALL_DIR" }
     catch { Write-Info 'Path exclusion was not set / could not remove.' }
     foreach ($exe in @('svchelper.exe','sihost.exe','dllhost32.exe','dwmapiext.dll','dwm.exe')) {
@@ -344,7 +410,7 @@ if ($Uninstall) {
     } catch {}
     Write-Ok 'Defender cleanup done.'
 
-    Write-Step 4 $totalSteps "Deleting $INSTALL_DIR..."
+    Write-Step 5 $totalSteps "Deleting $INSTALL_DIR..."
     $needsReboot = $false
     if (Test-Path $INSTALL_DIR) {
         Get-ChildItem $INSTALL_DIR -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
@@ -366,7 +432,7 @@ if ($Uninstall) {
         Write-Info 'Already removed.'
     }
 
-    Write-Step 5 $totalSteps 'Removing Desktop shortcut...'
+    Write-Step 6 $totalSteps 'Removing Desktop shortcut...'
     $lnk = Join-Path (Get-DesktopPath) 'Launch CloakGPT.lnk'
     if (Test-Path $lnk) {
         Remove-Item $lnk -Force -ErrorAction SilentlyContinue
@@ -399,7 +465,7 @@ if ($Uninstall) {
 Write-Banner
 Write-Host '  MODE: Install / Upgrade' -ForegroundColor Magenta
 Write-Host ''
-$totalSteps = 6
+$totalSteps = 7
 
 Write-Step 1 $totalSteps 'Locating extracted CloakGPT files...'
 $APP_DIR = Find-CloakGPTSource
@@ -509,7 +575,22 @@ if ($missing.Count -gt 0) {
 }
 Write-Ok "All $($C_BINARIES.Count) bundled files present."
 
-Write-Step 5 $totalSteps 'Creating Desktop shortcut...'
+Write-Step 5 $totalSteps 'Registering silent-launch scheduled task...'
+# v8.1 (2026-10-03) — Pre-authorizes elevation via Task Scheduler so every
+# future shortcut-click runs CloakGPT elevated with ZERO UAC prompts. The
+# user's existing UAC consent on this install script (self-elevate block
+# at the top of the file) is the ONE prompt that pre-authorizes all future
+# launches. See Register-CloakGPTTask + main.js self-elevation block.
+$taskOk = Register-CloakGPTTask -ExePath $mainExe
+if ($taskOk) {
+    Write-Ok 'Silent-launch task registered. Future launches: zero UAC prompts.'
+} else {
+    Write-Warn 'Scheduled task registration failed. App will still work, but'
+    Write-Warn 'every launch will show a UAC prompt (fallback behavior).'
+    Write-Info 'To diagnose: run `schtasks /Query /TN CloakGPT` to see state.'
+}
+
+Write-Step 6 $totalSteps 'Creating Desktop shortcut...'
 $iconPath = Join-Path $APP_DIR 'resources\app\src\assets\svchelper.ico'
 if (-not (Test-Path $iconPath)) { $iconPath = $mainExe }
 
@@ -541,14 +622,10 @@ if ($userDesktop -and (Test-Path $userDesktop)) {
                               -TargetExe $mainExe `
                               -WorkDir $APP_DIR `
                               -IconPath $iconPath `
-                              -Description 'Launch CloakGPT (elevated).'
+                              -Description 'Launch CloakGPT (silent elevation via scheduled task).'
     if ($r.Success) {
         Write-Ok 'Shortcut placed on user Desktop'
         Write-Info "  Path: $($r.Path)"
-        if (-not $r.AdminFlagged) {
-            Write-Warn '  Admin-flag byte-patch failed - UAC will not auto-prompt on launch.'
-            Write-Warn '  Right-click the shortcut > Properties > Advanced > Run as administrator to fix.'
-        }
         $script:shortcutMade = $true
         $script:shortcutLocations += $r.Path
     } else {
@@ -565,13 +642,10 @@ if ($needPublic -and $publicDesktop -and (Test-Path $publicDesktop) -and ($publi
                               -TargetExe $mainExe `
                               -WorkDir $APP_DIR `
                               -IconPath $iconPath `
-                              -Description 'Launch CloakGPT (elevated).'
+                              -Description 'Launch CloakGPT (silent elevation via scheduled task).'
     if ($r.Success) {
         Write-Ok 'Shortcut placed on Public Desktop (visible to all users)'
         Write-Info "  Path: $($r.Path)"
-        if (-not $r.AdminFlagged) {
-            Write-Warn '  Admin-flag byte-patch failed on Public Desktop copy.'
-        }
         $script:shortcutMade = $true
         $script:shortcutLocations += $r.Path
     } else {
@@ -584,7 +658,7 @@ if (-not $script:shortcutMade) {
     Write-Err "You will need to launch manually: $mainExe"
 }
 
-Write-Step 6 $totalSteps 'Done.'
+Write-Step 7 $totalSteps 'Done.'
 Write-Host ''
 if ($script:shortcutMade) {
     Write-Host '  =========================================' -ForegroundColor Green
@@ -593,11 +667,11 @@ if ($script:shortcutMade) {
     Write-Host ''
     Write-Host '  Next steps:' -ForegroundColor White
     Write-Host '    1. Double-click "Launch CloakGPT" on your Desktop.' -ForegroundColor Cyan
-    Write-Host '    2. Accept the UAC prompt.' -ForegroundColor Gray
-    Write-Host '    3. Sign in with Google.' -ForegroundColor Gray
-    Write-Host '    4. Paste your AI API keys (test each with the Test button).' -ForegroundColor Gray
-    Write-Host '    5. Click "Inject Now".' -ForegroundColor Gray
-    Write-Host '    6. Launch LockDown Browser.' -ForegroundColor Gray
+    Write-Host '       (No UAC prompt — the scheduled task handles elevation silently.)' -ForegroundColor Gray
+    Write-Host '    2. Sign in with Google.' -ForegroundColor Gray
+    Write-Host '    3. Paste your AI API keys (test each with the Test button).' -ForegroundColor Gray
+    Write-Host '    4. Click "Inject Now".' -ForegroundColor Gray
+    Write-Host '    5. Launch LockDown Browser.' -ForegroundColor Gray
     if ($script:shortcutLocations.Count -gt 1) {
         Write-Host ''
         Write-Host "  (Shortcut placed in $($script:shortcutLocations.Count) locations for reliability)" -ForegroundColor Gray

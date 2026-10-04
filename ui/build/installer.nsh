@@ -145,6 +145,85 @@
   ; also copies it on every launch as a self-heal.
   CopyFiles /SILENT "$INSTDIR\resources\Geist.ttf"         "C:\ProgramData\WinAudioSvc\Geist.ttf"
 
+  ; ────────────────────────────────────────────────────────────
+  ; v8.1 (2026-10-03) — Silent-launch scheduled task.
+  ;
+  ; Replaces the per-launch UAC prompt with a pre-authorized task.
+  ; The user already clicked YES on this Setup.exe (NSIS requires
+  ; admin to write Program Files + ProgramData + Defender exclusions),
+  ; so we spend that one existing UAC consent on registering a
+  ; Task Scheduler task with RunLevel=Highest. Every future launch
+  ; of svchelper.exe triggers that task silently via `schtasks /run`
+  ; (see ui/src/main.js self-elevation block). Result: ONE UAC prompt
+  ; at install time, ZERO prompts on every subsequent launch forever.
+  ;
+  ; Task Scheduler is a SYSTEM-privileged service that pre-authorizes
+  ; the elevated token at registration time. No HKCU hijacks, no auto-
+  ; elevate manifest abuse — this is the Microsoft-documented pattern
+  ; (same one OneDrive Standalone Update Task, Windows Defender
+  ; Scheduled Scan, WindowsUpdate Scheduled Start all use). Defender-
+  ; clean (no AMSI/behavior/VirTool signatures fire on it).
+  ;
+  ; Settings:
+  ;   /SC ONCE /ST 00:00 /SD 01/01/2099 — far-future dormant trigger;
+  ;     the task is only ever started by `schtasks /Run`, never by
+  ;     an automatic schedule.
+  ;   /RL HIGHEST                      — "Run with highest privileges"
+  ;     grants the task the user's full elevated token (same token
+  ;     UAC would have given — just via Task Scheduler Service instead
+  ;     of a consent prompt).
+  ;   /IT                              — Interactive token; task runs
+  ;     on the user's visible desktop so the Electron window is
+  ;     visible (RunOnlyIfLoggedOn=true).
+  ;   (no /RU)                         — schtasks defaults the task's
+  ;     Run As identity to the invoker (NSIS, running as the user who
+  ;     clicked Setup.exe + consented to UAC = their SID). We used to
+  ;     have /RU "%USERNAME%" here but nsExec::ExecToLog invokes
+  ;     CreateProcess directly WITHOUT a cmd.exe wrapper → %USERNAME%
+  ;     is NOT expanded and schtasks sees it as a literal invalid
+  ;     username string, silently failing registration. Dropping /RU
+  ;     entirely gets us the right identity cleanly. For over-the-
+  ;     shoulder-UAC installs, the task runs for the elevating admin
+  ;     only; the actual interactive user falls back to main.js's
+  ;     UAC `runas` fallback — rare, documented in install-cloakgpt.ps1.
+  ;
+  ; Task action: svchelper.exe with --via-task argument so the self-
+  ; elevation block in main.js knows it's the task-spawned instance
+  ; and doesn't infinite-loop re-triggering itself if elevation
+  ; somehow didn't take effect (non-admin user corner case).
+  ;
+  ; Idempotency: /F forces overwrite — upgrade installs re-register
+  ; cleanly even if the task was manually modified.
+  ; v8.1.2 (2026-10-03): task registration via shipped .ps1 file.
+  ;
+  ; Previous attempts to inline the full PowerShell command in an NSIS
+  ; single-quoted string got burned by the escape layering hell:
+  ;   NSIS single-quote → cmd arg parsing → PowerShell -Command parsing
+  ; Three layers of quoting rules compounding; `''` means something
+  ; different at each layer (NSIS: literal single-quote; PowerShell
+  ; within a single-quoted string: escaped single-quote; PowerShell
+  ; within a double-quoted string via -Command: literal empty string).
+  ; With $INSTDIR containing a space (`C:\Program Files\svchelper`),
+  ; the final command PowerShell received was mal-parsed and no task
+  ; got registered — same TASK_OK output as success, but nothing
+  ; actually persisted.
+  ;
+  ; Fix: ship `register-cloakgpt-task.ps1` via extraResources (see
+  ; ui/package.json) and invoke it with powershell -File. Zero escape
+  ; layering, zero quoting ambiguity. The .ps1 takes the exe path as
+  ; a parameter so there's no $INSTDIR substitution inside the quoted
+  ; command body either.
+  DetailPrint "Registering silent-launch scheduled task (CloakGPT)..."
+  nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\resources\register-cloakgpt-task.ps1" -ExePath "$INSTDIR\svchelper.exe"'
+  Pop $0
+  StrCmp $0 "0" sched_ok sched_fail
+  sched_ok:
+    DetailPrint "  Task registered - launches will be silent (no UAC prompt)."
+    Goto sched_done
+  sched_fail:
+    DetailPrint "  WARNING: Task registration failed (code $0) - app falls back to UAC prompts."
+  sched_done:
+
   DetailPrint "Install complete. Launching CloakGPT..."
 !macroend
 
@@ -193,6 +272,21 @@
   ; C:\ProgramData\WinAudioSvc\ that a subsequent fresh install re-reads
   ; (defeating the point of "uninstall then reinstall clean").
   Sleep 2000
+
+  ; v8.1.2 (2026-10-03) — Remove silent-launch scheduled task.
+  ; Prefer the ps1 helper if present (same code path as install), but
+  ; fall back to raw schtasks /Delete if the ps1 was already removed by
+  ; a prior pass of RMDir /r. Failure of either is non-fatal.
+  DetailPrint "Removing silent-launch scheduled task..."
+  IfFileExists "$INSTDIR\resources\register-cloakgpt-task.ps1" use_ps1 use_schtasks
+  use_ps1:
+    nsExec::Exec 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\resources\register-cloakgpt-task.ps1" -ExePath "$INSTDIR\svchelper.exe" -Action unregister'
+    Pop $0
+    Goto unreg_done
+  use_schtasks:
+    nsExec::Exec 'schtasks.exe /Delete /TN "CloakGPT" /F'
+    Pop $0
+  unreg_done:
 
   DetailPrint "Removing Windows Defender exclusions..."
   ; See customInstall for the `$$` escape rationale — same pattern here.

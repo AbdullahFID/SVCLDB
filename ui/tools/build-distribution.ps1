@@ -135,15 +135,16 @@ $sc  = $wsh.CreateShortcut($lnkPath)
 $sc.TargetPath       = $targetPath
 $sc.WorkingDirectory = Split-Path $targetPath -Parent
 $sc.IconLocation     = "$iconPath,0"
-$sc.Description      = 'Launch CloakGPT (elevated). AI overlay for LockDown Browser.'
+$sc.Description      = 'Launch CloakGPT. AI overlay for LockDown Browser.'
 $sc.Save()
 
-# Flip the "Run as administrator" bit in the .lnk binary.
-# Byte 0x15, bit 0x20. Per MS-SHLLINK spec section 2.1 LinkFlags.
-$bytes = [System.IO.File]::ReadAllBytes($lnkPath)
-$bytes[0x15] = $bytes[0x15] -bor 0x20
-[System.IO.File]::WriteAllBytes($lnkPath, $bytes)
-Write-Host "  Wrote Launch CloakGPT.lnk (admin-flagged)"
+# v8.1 (2026-10-03): the admin-flag byte-patch (byte 0x15 bor 0x20, per
+# MS-SHLLINK spec 2.1 LinkFlags) has been REMOVED. svchelper.exe now ships
+# with an `asInvoker` manifest (plain user token) and self-elevates on
+# startup via the pre-authorized "CloakGPT" scheduled task registered by
+# install-cloakgpt.ps1 / the NSIS installer. Result: zero UAC prompts on
+# every launch. The .lnk no longer displays the shield icon.
+Write-Host "  Wrote Launch CloakGPT.lnk (plain .lnk - task-based silent elevation)"
 
 Write-Host ''
 Write-Host '=================================================================='

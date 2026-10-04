@@ -1,8 +1,211 @@
 // ═══════════════════════════════════════════════════════════════
+// v8.1.3 (2026-10-03) — SELF-ELEVATION + SELF-REGISTRATION (MUST RUN FIRST).
+//
+// Replaces the per-launch UAC prompt (previously enforced by the
+// manifest's requireAdministrator setting) with a pre-authorized
+// scheduled task. User sees ONE UAC prompt total: at install time
+// on Setup.exe. ZERO prompts on every subsequent launch.
+//
+// v8.1.3 self-registration enhancement: if the "CloakGPT" scheduled
+// task is MISSING at launch time (user ran the raw exe without
+// Setup.exe / install-cloakgpt.ps1, or the task was manually deleted,
+// or AV ate it), the IIFE now UAC-prompts ONCE to self-register the
+// task, then every future launch is silent via the task path. Covers
+// the portable-zip-direct install case, task-recovery after deletion,
+// and task-mismatch after corruption.
+//
+// How the pieces fit together:
+//
+//   1. Installer (ui/build/installer.nsh customInstall OR the
+//      install-cloakgpt.ps1 Register-CloakGPTTask function) uses
+//      the user's ONE existing UAC consent on Setup.exe to register
+//      a Task Scheduler task named "CloakGPT" with:
+//        - RunLevel: Highest  (grants the user's elevated token)
+//        - LogonType: Interactive  (runs on the user's desktop)
+//        - Hidden: true  (not in default Task Scheduler view)
+//        - MultipleInstances: IgnoreNew  (double-click doesn't dupe)
+//        - Action: svchelper.exe --via-task  (--via-task flag below)
+//        - No triggers  (manual-run-only via `schtasks /Run`)
+//
+//   2. ui/package.json's manifest is now `asInvoker`, so launching
+//      svchelper.exe directly (shortcut double-click, Start Menu,
+//      Explorer, cmd) no longer summons UAC.
+//
+//   3. svchelper.exe starts at the user's default IL (medium-IL
+//      filtered-admin for admin-group users, standard for non-admin).
+//
+//   4. This block checks the elevation level via `fltmc` (Filter
+//      Manager Control; admin-only, exit 0 == elevated, 1 == not).
+//
+//   5. If NOT elevated AND the "CloakGPT" scheduled task exists:
+//      spawn `schtasks /Run /TN CloakGPT` synchronously. Task
+//      Scheduler Service (SYSTEM) launches a FRESH svchelper.exe at
+//      HIGH IL with the user's full elevated token. We process.exit(0)
+//      so the elevated instance can take the single-instance lock
+//      without racing us.
+//
+//   6. If NOT elevated AND the task is missing (manual install
+//      skipped Register-CloakGPTTask, AV ate the task, task was
+//      manually deleted): fall back to the classic PowerShell
+//      `Start-Process -Verb RunAs` UAC prompt. App still works —
+//      just with the prompt we were trying to eliminate.
+//
+//   7. If we're the task-spawned instance (--via-task argument
+//      present) BUT STILL at medium IL (non-admin user corner case
+//      where RunLevel=Highest returns their standard token because
+//      no admin token exists): proceed to app startup anyway. The
+//      renderer will show a clear "admin required" error when the
+//      user tries to inject. Prevents an infinite re-trigger loop.
+//
+// Defender-clean: Task Scheduler Service is a Microsoft-signed
+// SYSTEM service that pre-authorizes elevation at registration time.
+// No HKCU hijacks, no auto-elevate manifest abuse. Same pattern
+// OneDrive Standalone Update Task, Windows Update Scheduled Start,
+// and Defender's own Scheduled Scan use. Zero AMSI/behavior/VirTool
+// signatures fire on it (empirically verified on 25H2 26300 with
+// Administrator Protection ON — see 2026-10-03 handoff).
+//
+// Opt-out hatches: `--no-self-elevate` CLI flag skips the block
+// entirely (for debugging). Running under `node_modules\electron\`
+// (dev tree) also skips, so `electron .` works without a packaged
+// task existing.
+//
+// CLI flags understood here:
+//   --via-task       (set by the scheduled task action; signals we
+//                     were spawned by Task Scheduler Service — don't
+//                     re-trigger even if we somehow land at medium IL)
+//   --register-task  (set by the self-elevation UAC fallback below;
+//                     signals the newly-elevated instance to register
+//                     the scheduled task before continuing to app
+//                     startup, so future launches go silent)
+//   --no-self-elevate (debug: skip the whole block, run as-is)
+// ═══════════════════════════════════════════════════════════════
+(function _svcSelfElevate() {
+  if (process.platform !== 'win32') return;
+
+  // Dev-tree detection: skip entirely so `electron .` from source
+  // doesn't try to invoke a packaged scheduled task.
+  try {
+    var _ep = String(process.execPath || '').toLowerCase();
+    if (_ep.endsWith('\\electron.exe') || _ep.endsWith('/electron.exe')) return;
+    if (_ep.indexOf('\\node_modules\\electron\\') !== -1) return;
+    if (_ep.indexOf('/node_modules/electron/') !== -1) return;
+  } catch (_e) { return; }
+
+  // Emergency CLI opt-out.
+  if (process.argv.indexOf('--no-self-elevate') !== -1) return;
+
+  var _launchedViaTask = process.argv.indexOf('--via-task') !== -1;
+  var _shouldRegisterTask = process.argv.indexOf('--register-task') !== -1;
+
+  var _cp = require('child_process');
+  var _path = require('path');
+  var _sys32 = (process.env.SystemRoot || 'C:\\Windows') + '\\System32';
+
+  // Fast IL check: `fltmc` (Filter Manager Control) requires admin to
+  // enumerate kernel filter drivers. Exit 0 for elevated, 1 for medium-IL
+  // or standard. ~50ms synchronous, no native deps, no network, no file
+  // I/O side effects. Empirically verified on 25H2 26300 with Admin
+  // Protection ON (2026-10-03). This is the same probe thousands of
+  // "am I admin?" PowerShell scripts use. We deliberately did NOT use
+  // `fsutil dirty query` here (first choice during design) because
+  // Microsoft relaxed it in a recent build — fsutil now exits 0 for
+  // medium-IL users too, giving false positives.
+  function _amIElevated() {
+    try {
+      var _r = _cp.spawnSync(_sys32 + '\\fltmc.exe', [],
+                             { windowsHide: true, timeout: 3000,
+                               stdio: ['ignore', 'ignore', 'ignore'] });
+      return _r.status === 0;
+    } catch (_e) { return false; }
+  }
+
+  // Already elevated (task spawned us, OR user launched from elevated
+  // terminal, OR we came back from the UAC fallback RunAs prompt).
+  // If this is the UAC-fallback return with --register-task, use this
+  // one-time elevation to register the scheduled task so FUTURE launches
+  // go silent via the task path. ~2-3s synchronous powershell -File
+  // invocation, then drop through to normal app startup.
+  if (_amIElevated()) {
+    if (_shouldRegisterTask) {
+      try {
+        var _ps1 = _path.join(_path.dirname(process.execPath),
+                              'resources', 'register-cloakgpt-task.ps1');
+        _cp.spawnSync(_sys32 + '\\WindowsPowerShell\\v1.0\\powershell.exe',
+          ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+           '-File', _ps1, '-ExePath', process.execPath],
+          { windowsHide: true, timeout: 15000, stdio: 'ignore' });
+      } catch (_e) { /* best-effort — app still works without the task,
+                      * next launch will UAC-prompt again and retry */ }
+    }
+    return;
+  }
+
+  // Non-admin user corner case: task hands back their standard token
+  // because they have no elevated token available. Proceed to app
+  // startup; the injector will fail with a clear error. Don't re-trigger.
+  if (_launchedViaTask) return;
+
+  // Check if the pre-authorized "CloakGPT" task exists.
+  function _taskExists() {
+    try {
+      var _r = _cp.spawnSync(_sys32 + '\\schtasks.exe', ['/Query', '/TN', 'CloakGPT'],
+                             { windowsHide: true, timeout: 3000,
+                               stdio: ['ignore', 'ignore', 'ignore'] });
+      return _r.status === 0;
+    } catch (_e) { return false; }
+  }
+
+  if (_taskExists()) {
+    try {
+      // Synchronous schtasks /Run — blocks until Task Scheduler Service
+      // accepts the start request (~50-200ms). After that, the elevated
+      // svchelper.exe is spawning. We exit so it can take the single-
+      // instance lock without us holding it.
+      var _runR = _cp.spawnSync(_sys32 + '\\schtasks.exe', ['/Run', '/TN', 'CloakGPT'],
+                                { windowsHide: true, timeout: 5000, stdio: 'ignore' });
+      if (_runR.status === 0) {
+        process.exit(0);
+      }
+      // schtasks /Run failed — fall through to classic UAC fallback.
+    } catch (_e) { /* fall through */ }
+  }
+
+  // Fallback: task missing OR /Run failed. Classic ShellExecute runas
+  // UAC prompt via PowerShell Start-Process. v8.1.3: inject
+  // --register-task into the relaunch args so the elevated instance
+  // self-registers the scheduled task before showing its window. From
+  // the second launch onward, this path is unused — the task-exists
+  // branch above fires silently.
+  try {
+    // Build a safely-escaped PowerShell argument list, prepending
+    // --register-task so the elevated instance registers the task
+    // for future silent launches.
+    var _args = ['--register-task'].concat(process.argv.slice(1));
+    var _argStr = _args.length > 0
+      ? _args.map(function (a) { return "'" + String(a).replace(/'/g, "''") + "'"; }).join(',')
+      : "''";
+    var _exeEsc = process.execPath.replace(/'/g, "''");
+    var _psCmd = "Start-Process -FilePath '" + _exeEsc +
+                 "' -ArgumentList " + _argStr + " -Verb RunAs";
+    _cp.spawnSync(_sys32 + '\\WindowsPowerShell\\v1.0\\powershell.exe',
+                  ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+                   '-WindowStyle', 'Hidden', '-Command', _psCmd],
+                  { windowsHide: true, timeout: 120000, stdio: 'ignore' });
+    // Either user clicked Yes (elevated instance now starting +
+    // registering task) or No (nothing to do without admin). Exit
+    // either way; the elevated instance drives from here.
+  } catch (_e) { /* UAC declined or ShellExecute failed */ }
+  process.exit(0);
+})();
+
+// ═══════════════════════════════════════════════════════════════
 // main.js — Electron entry point for svchelper (CloakGPT UI).
 //
 // Responsibilities:
-//   1. Enforce single-instance + admin elevation (declared in manifest).
+//   1. Enforce single-instance + admin elevation (v8.1+: elevation now
+//      flows through the self-elevation block above via a pre-authorized
+//      scheduled task, not the manifest — manifest is `asInvoker`).
 //   2. Create the frameless 900×680 window with the CloakGPT palette.
 //   3. Wire IPC handlers the renderer calls:
 //      - license:load         → { session, subscription } or null
